@@ -1,34 +1,37 @@
-// Fill-odds lock engine — mirrors src/ComboLocks.jsx decideAtFill exactly.
+// Fill-odds lock engine — mirrors src/ComboLocks.jsx exactly.
 'use strict';
-// MAKER fee coefficient. You are the quoter/maker on combo (KXMVE) RFQs, and per Kalshi's
-// fee schedule + the RFQ fee filing (eff. 2026-07-24) the accepted quoter pays the MAKER fee
-// = 0.0175 × C × P × (1−P) — one quarter of the 0.07 taker fee. Confirmed vs kalshi.com fee PDF.
-const KFEE = 0.0175;
+// The fill odds you enter are the odds you SELL at AFTER your maker fee — already baked in.
+// So the lock math uses them directly (no separate fee term). KFEE/TAKER_FEE are only used to
+// recover the nominal exchange price and the taker's matched odds for display.
+const KFEE = 0.0175; // your maker fee (¼ of taker); baked into the fill odds you enter
+const TAKER_FEE = 0.07; // the taker (other side of your combo) pays this
 const aToDec = (a) => (a > 0 ? 1 + a / 100 : 1 + 100 / Math.abs(a));
-const TAKER_FEE = 0.07; // the RFQ taker (person taking your combo) pays this
 const impliedProb = (a) => (a > 0 ? 100 / (a + 100) : Math.abs(a) / (Math.abs(a) + 100));
-const feePer = (p, th = KFEE) => th * p * (1 - p);
-const r2 = (x) => Math.round(x * 100) / 100;
 const americanFromProb = (p) => (!(p > 0 && p < 1) ? null : p < 0.5 ? Math.round((100 * (1 - p)) / p) : -Math.round((100 * p) / (1 - p)));
-// Fill odds with fees baked in, from your nominal fill (american).
-//   effMaker : the odds YOU are truly laying the combo at once your 1.75% maker fee is included
-//   effTaker : the odds the TAKER actually receives after their 7% taker fee (competitiveness gauge)
-function effectiveOdds(fillAmerican) {
-  const P = impliedProb(fillAmerican);
-  return { effMaker: americanFromProb(P - feePer(P, KFEE)), effTaker: americanFromProb(P + feePer(P, TAKER_FEE)) };
+const r2 = (x) => Math.round(x * 100) / 100;
+
+// Your fill is net of your maker fee. Recover the nominal exchange price you'd quote, and from it
+// the taker's matched odds (nominal price + their 7% taker fee — worse than yours).
+function nominalProbFromEff(sEff) {
+  const b = 1 - KFEE; // solve KFEE*sNom^2 + (1-KFEE)*sNom - sEff = 0
+  return (-b + Math.sqrt(b * b + 4 * KFEE * sEff)) / (2 * KFEE);
+}
+function fillView(fillAfterFeeAmerican) {
+  const sEff = impliedProb(fillAfterFeeAmerican);
+  const sNom = nominalProbFromEff(sEff);
+  const takerProb = sNom + TAKER_FEE * sNom * (1 - sNom);
+  return { sEff, sNom, effTaker: americanFromProb(takerProb), noBid: r2(1 - sNom).toFixed(2) };
 }
 
-// Contracts cap for a hedge mode — derived from stake + boosted odds + fill odds.
-//   riskfree : fewest contracts so the LOSING (miss) side breaks even (~$0 floor), keeps hit upside
-//   1x       : pure hedge — equal payoff whether the combo hits or misses (= stake * decimal boost)
-//   2x / 3x  : multiples of the pure hedge. NOTE these OVERSHOOT the hedge into a directional short
-//              (profit if the combo misses, large loss if it hits). Kept as an explicit choice.
+// Contracts cap for a hedge mode. Fill odds already include your maker fee, so no fee term here.
+//   riskfree : fewest contracts so the losing (miss) side breaks even (~$0 floor), keeps hit upside
+//   1x       : pure hedge — equal payoff whether the combo hits or misses (= stake × decimal boost)
+//   2x / 3x  : multiples of the pure hedge — directional short past the hedge (big loss on hit)
 function hedgeCap({ stake, boostAmerican, fillAmerican, mode = '1x' }) {
   if (!(stake > 0) || !boostAmerican || !fillAmerican) return 0;
-  const winReturn = stake * aToDec(boostAmerican); // pure hedge = total return if the book bet wins
+  const winReturn = stake * aToDec(boostAmerican);
   const s = impliedProb(fillAmerican);
-  const denom = s * (1 - KFEE * (1 - s));
-  const riskfree = denom > 0 ? Math.ceil(stake / denom) : 0; // min N so miss >= 0
+  const riskfree = s > 0 ? Math.ceil(stake / s) : 0;
   switch (String(mode)) {
     case 'riskfree': return riskfree;
     case '2x': return Math.round(2 * winReturn);
@@ -45,15 +48,15 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
   const cap = hedgeCap({ stake: parlayStake, boostAmerican: parlayAmerican, fillAmerican, mode: hedgeMode });
   const N = Math.min(rfqContracts, cap); // partial fill: a bigger RFQ fills to the cap, not rejected
   if (!(N > 0)) return { ok: false, reason: 'zero_cap', cap };
-  const s = impliedProb(fillAmerican), fee = N * feePer(s);
-  const hit = bookHit + N * s - N - fee, miss = bookMiss + N * s - fee, worst = Math.min(hit, miss);
-  const eff = effectiveOdds(fillAmerican);
+  const s = impliedProb(fillAmerican); // already net of your maker fee
+  const hit = bookHit + N * s - N, miss = bookMiss + N * s, worst = Math.min(hit, miss);
+  const v = fillView(fillAmerican);
   return {
     ok: true, locks: worst >= 0, hit: r2(hit), miss: r2(miss), worst: r2(worst),
     partial: rfqContracts > cap, cap, hedgeMode,
     competitive: fairAmerican == null ? null : fillAmerican >= fairAmerican, fillAmerican,
-    effMakerFill: eff.effMaker, effTakerOdds: eff.effTaker,
-    quote: { yes_bid: '0.00', no_bid: r2(1 - s).toFixed(2), rest_remainder: false }, contracts: N,
+    effTakerOdds: v.effTaker,
+    quote: { yes_bid: '0.00', no_bid: v.noBid, rest_remainder: false }, contracts: N,
   };
 }
-module.exports = { decideAtFill, impliedProb, hedgeCap, effectiveOdds };
+module.exports = { decideAtFill, impliedProb, hedgeCap, fillView };
