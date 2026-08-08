@@ -11,6 +11,8 @@
 //   Kalshi_combo_key       private key PEM (armor optional; also accepts KALSHI_PRIVATE_KEY)
 //   SUPABASE_URL           your project URL
 //   SUPABASE_SERVICE_KEY   service-role key (bypasses RLS to read parlays / write logs)
+//   TELEGRAM_BOT_TOKEN     (optional) your bot token — enables match alerts
+//   TELEGRAM_ALERT_CHAT_ID (optional) your personal chat id to DM on a match
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
@@ -23,6 +25,22 @@ const MODE = 'SHADOW';
 const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+
+// Optional personal alert channel (notification only — never places an order).
+// Set both on the host to get a Telegram DM the instant an RFQ matches a parlay.
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TG_CHAT = process.env.TELEGRAM_ALERT_CHAT_ID;
+async function sendAlert(text) {
+  if (!TG_TOKEN || !TG_CHAT) { console.log(`[${MODE}] ALERT (telegram not configured): ${text.replace(/\n/g, ' | ')}`); return; }
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: TG_CHAT, text }),
+    });
+    if (!r.ok) console.error(`[${MODE}] telegram send failed`, r.status, await r.text());
+  } catch (e) { console.error(`[${MODE}] telegram error`, e.message); }
+}
+const sgn = (n) => (n > 0 ? '+' + n : '' + n);
 
 let parlays = [];
 let killByUser = {};
@@ -64,7 +82,21 @@ async function onRfq(rfq) {
     parlayStake: p.parlay_stake, parlayAmerican: p.parlay_american, fillAmerican: p.fill_american,
     fairAmerican: p.fair_american, rfqContracts: rfq.contracts, hedgeMode: p.hedge_mode || '1x',
   });
-  if (!d.ok) { counts.declined++; console.log(`[${MODE}] DECLINE ${p.label} rfq=${rfq.rfqId} (${d.reason})`); await log(p, rfq, null, 'declined'); return; }
+  if (!d.ok) {
+    counts.declined++;
+    console.log(`[${MODE}] DECLINE ${p.label} rfq=${rfq.rfqId} (${d.reason})`);
+    await log(p, rfq, null, 'declined');
+    await sendAlert(`⚠️ RFQ matched but DECLINED — ${p.label}\nrfq ${rfq.rfqId} · reason ${d.reason}`);
+    return;
+  }
+  // ALERT on every match (notification only). The order is yours to place.
+  await sendAlert(
+    `🎯 Combo RFQ MATCH — ${p.label}\n` +
+    `taker requested ${rfq.contracts} contracts (rfq ${rfq.rfqId})\n` +
+    `${d.locks ? '🔒 LOCKS' : '⚠️ NO-LOCK'}  worst $${d.worst}  (hit $${d.hit} / miss $${d.miss})\n` +
+    `➡️ PLACE: sell up to ${d.contracts} NO @ $${d.quote.no_bid}\n` +
+    `   your ${sgn(p.fill_american)} net · taker gets ${sgn(d.effTakerOdds)}`
+  );
   if (!d.locks) { counts.noLock++; console.log(`[${MODE}] NO-LOCK ${p.label} rfq=${rfq.rfqId} worst=$${d.worst}`); return; }
   counts.wouldQuote++;
   console.log(`[${MODE}] WOULD QUOTE ${engaged ? '(kill-switch engaged) ' : ''}${p.label} rfq=${rfq.rfqId} post=${JSON.stringify(d.quote)} lock worst=$${d.worst} hit=$${d.hit} miss=$${d.miss}`);
