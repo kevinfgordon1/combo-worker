@@ -117,7 +117,6 @@ async function main() {
   }
   console.log(`[${MODE}] starting — logs would-be quotes, NEVER places an order.`);
   await refresh();
-  await sendAlert(`✅ combo-worker online — watching ${parlays.length} parlay(s). Match alerts are live.`); // one-time startup ping
   setInterval(refresh, 30000);
   const client = createKalshiWs({
     keyId: KEY_ID, pem: PEM,
