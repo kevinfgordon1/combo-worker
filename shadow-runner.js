@@ -27,6 +27,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 let parlays = [];
 let killByUser = {};
 const counts = { rfqs: 0, combos: 0, matched: 0, wouldQuote: 0, declined: 0, noLock: 0 };
+let sampled = 0; // TEMP diagnostic — remove after confirming leg format
 
 async function refresh() {
   try {
@@ -56,6 +57,10 @@ async function onRfq(rfq) {
   counts.rfqs++;
   if (!rfq.isCombo || rfq.contracts == null) return;
   counts.combos++;
+  if (sampled < 10 && rfq.mveCollection === 'KXMVESPORTSMULTIGAMEEXTENDED-R') { // TEMP diagnostic
+    sampled++;
+    console.log(`[SHADOW][SAMPLE] coll=${rfq.mveCollection} contracts=${rfq.contracts} legs=${JSON.stringify(rfq.legKeys)}`);
+  }
   const p = matchParlay(rfq, parlays);
   if (!p) return;
   counts.matched++;
