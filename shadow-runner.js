@@ -47,7 +47,21 @@ const sgn = (n) => (n > 0 ? '+' + n : '' + n);
 
 let parlays = [];
 let killByUser = {};
+let wsConnected = false; // tracked from ws status — recorded to combo_worker_stats so a disconnect (e.g. the demo-WS 401) is visible in the DB, not just the console.
 const counts = { rfqs: 0, combos: 0, matched: 0, wouldQuote: 0, declined: 0, noLock: 0 };
+
+// Durable firehose record + heartbeat. Every row is a point-in-time snapshot of what
+// the worker has seen. Absence of recent rows = worker down; ws_connected=false = feed down.
+async function writeStats() {
+  try {
+    await supabase.from('combo_worker_stats').insert({
+      mode: MODE, ws_connected: wsConnected,
+      rfqs: counts.rfqs, combos: counts.combos, matched: counts.matched,
+      would_quote: counts.wouldQuote, declined: counts.declined, no_lock: counts.noLock,
+      active_parlays: parlays.length,
+    });
+  } catch (e) { console.error(`[${MODE}] stats insert failed`, e.message); }
+}
 
 async function refresh() {
   try {
@@ -107,7 +121,12 @@ async function onRfq(rfq) {
     `   your ${sgn(p.fill_american)} net · taker gets ${sgn(d.effTakerOdds)}\n` +
     `${d.locks ? '🔒 LOCKS' : '⚠️ NO-LOCK'}  worst $${d.worst}  (win $${d.hit} / lose $${d.miss})`
   );
-  if (!d.locks) { counts.noLock++; console.log(`[${MODE}] NO-LOCK ${p.label} rfq=${rfq.rfqId} worst=$${d.worst}`); return; }
+  if (!d.locks) {
+    counts.noLock++;
+    console.log(`[${MODE}] NO-LOCK ${p.label} rfq=${rfq.rfqId} worst=$${d.worst}`);
+    await log(p, rfq, d, 'nolock'); // record no-lock matches too — every match now leaves a durable row
+    return;
+  }
   counts.wouldQuote++;
   console.log(`[${MODE}] WOULD QUOTE ${engaged ? '(kill-switch engaged) ' : ''}${p.label} rfq=${rfq.rfqId} post=${JSON.stringify(d.quote)} lock worst=$${d.worst} hit=$${d.hit} miss=$${d.miss}`);
   await log(p, rfq, d, 'shadow'); // ALWAYS shadow here — this runner never posts.
@@ -124,10 +143,14 @@ async function main() {
   setInterval(refresh, 30000);
   const client = createKalshiWs({
     keyId: KEY_ID, pem: PEM,
-    onStatus: (s, i) => console.log(`[${MODE}] ws:${s}`, i || ''),
+    onStatus: (s, i) => {
+      wsConnected = (s === 'subscribed'); // only 'subscribed' means the feed is truly flowing
+      console.log(`[${MODE}] ws:${s}`, i || '');
+    },
     onRfqCreated: (rfq) => onRfq(rfq).catch((e) => console.error('onRfq', e)),
   });
-  setInterval(() => console.log(`[${MODE}] tallies`, counts), 60000);
+  setInterval(() => { console.log(`[${MODE}] tallies`, counts); writeStats(); }, 60000);
+  writeStats(); // one row at startup so the table shows the worker came up
   process.on('SIGINT', () => { client.stop(); console.log(`[${MODE}] final`, counts); process.exit(0); });
   client.start();
 }
