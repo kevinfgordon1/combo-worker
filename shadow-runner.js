@@ -22,8 +22,11 @@ const { matchParlay } = require('./rfq');
 const { decideAtFill } = require('./engine');
 
 const MODE = 'SHADOW';
-const KEY_ID = process.env.KALSHI_KEY_ID;
-const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
+// Demo read-check: if DEMO_KALSHI_* are present, use them (point KALSHI_WS_URL at the demo WS).
+// Non-destructive — production KALSHI_KEY_ID / Kalshi_combo_key are left untouched.
+const DEMO = !!process.env.DEMO_KALSHI_KEY_ID;
+const KEY_ID = process.env.DEMO_KALSHI_KEY_ID || process.env.KALSHI_KEY_ID;
+const PEM = normalizePem(process.env.DEMO_KALSHI_COMBO_KEY || process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 // Optional personal alert channel (notification only — never places an order).
@@ -116,6 +119,7 @@ async function main() {
     process.exit(1);
   }
   console.log(`[${MODE}] starting — logs would-be quotes, NEVER places an order.`);
+  if (DEMO) console.log(`[${MODE}] DEMO env — using DEMO_KALSHI key; WS=${process.env.KALSHI_WS_URL || '(default PROD — set KALSHI_WS_URL to the demo WS!)'}`);
   await refresh();
   setInterval(refresh, 30000);
   const client = createKalshiWs({
