@@ -1,6 +1,9 @@
 // Fill-odds lock engine — mirrors src/ComboLocks.jsx decideAtFill exactly.
 'use strict';
-const KFEE = 0.07;
+// MAKER fee coefficient. You are the quoter/maker on combo (KXMVE) RFQs, and per Kalshi's
+// fee schedule + the RFQ fee filing (eff. 2026-07-24) the accepted quoter pays the MAKER fee
+// = 0.0175 × C × P × (1−P) — one quarter of the 0.07 taker fee. Confirmed vs kalshi.com fee PDF.
+const KFEE = 0.0175;
 const aToDec = (a) => (a > 0 ? 1 + a / 100 : 1 + 100 / Math.abs(a));
 const impliedProb = (a) => (a > 0 ? 100 / (a + 100) : Math.abs(a) / (Math.abs(a) + 100));
 const feePer = (p, th = KFEE) => th * p * (1 - p);
