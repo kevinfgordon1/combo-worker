@@ -27,7 +27,6 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 let parlays = [];
 let killByUser = {};
 const counts = { rfqs: 0, combos: 0, matched: 0, wouldQuote: 0, declined: 0, noLock: 0 };
-let sampled = 0, rawDumped = false; // TEMP diagnostic — remove after confirming leg format
 
 async function refresh() {
   try {
@@ -48,35 +47,22 @@ async function log(p, rfq, d, status) {
     await supabase.from('combo_submissions').insert({
       user_id: p.user_id, parlay_id: p.id, rfq_id: rfq.rfqId, label: p.label,
       fill_american: d ? d.fillAmerican : p.fill_american,
-      contracts: rfq.contracts, worst_lock: d ? d.worst : null, status,
+      contracts: d ? d.contracts : rfq.contracts, worst_lock: d ? d.worst : null, status,
     });
   } catch (e) { console.error(`[${MODE}] log insert failed`, e.message); }
 }
 
-async function onRfq(rfq, env) {
+async function onRfq(rfq) {
   counts.rfqs++;
-  if (!rawDumped && env) { // TEMP diagnostic — dump first raw rfq_created so we can see real field names/leg shape
-    rawDumped = true;
-    console.log(`[SHADOW][RAW] ${JSON.stringify(env && env.msg ? env.msg : env).slice(0, 1800)}`);
-  }
   if (!rfq.isCombo || rfq.contracts == null) return;
   counts.combos++;
-  // TEMP diagnostic: flag any combo sharing a leg with an active parlay; otherwise sample a few for format.
-  const activeKeys = new Set(parlays.flatMap((p) => p.leg_keys || p.legKeys || []));
-  const overlap = (rfq.legKeys || []).filter((k) => activeKeys.has(k));
-  if (overlap.length > 0) {
-    console.log(`[SHADOW][MATCHLEG] overlap=${overlap.length}/${(rfq.legKeys || []).length} coll=${rfq.mveCollection} legs=${JSON.stringify(rfq.legKeys)}`);
-  } else if (sampled < 6) {
-    sampled++;
-    console.log(`[SHADOW][SAMPLE] coll=${rfq.mveCollection} legs=${JSON.stringify(rfq.legKeys)}`);
-  }
   const p = matchParlay(rfq, parlays);
   if (!p) return;
   counts.matched++;
   const engaged = killEngagedFor(p.user_id);
   const d = decideAtFill({
     parlayStake: p.parlay_stake, parlayAmerican: p.parlay_american, fillAmerican: p.fill_american,
-    fairAmerican: p.fair_american, rfqContracts: rfq.contracts, maxContracts: p.max_contracts, scaleFactor: p.scale_factor,
+    fairAmerican: p.fair_american, rfqContracts: rfq.contracts, hedgeMode: p.hedge_mode || '1x',
   });
   if (!d.ok) { counts.declined++; console.log(`[${MODE}] DECLINE ${p.label} rfq=${rfq.rfqId} (${d.reason})`); await log(p, rfq, null, 'declined'); return; }
   if (!d.locks) { counts.noLock++; console.log(`[${MODE}] NO-LOCK ${p.label} rfq=${rfq.rfqId} worst=$${d.worst}`); return; }
@@ -96,7 +82,7 @@ async function main() {
   const client = createKalshiWs({
     keyId: KEY_ID, pem: PEM,
     onStatus: (s, i) => console.log(`[${MODE}] ws:${s}`, i || ''),
-    onRfqCreated: (rfq, env) => onRfq(rfq, env).catch((e) => console.error('onRfq', e)),
+    onRfqCreated: (rfq) => onRfq(rfq).catch((e) => console.error('onRfq', e)),
   });
   setInterval(() => console.log(`[${MODE}] tallies`, counts), 60000);
   process.on('SIGINT', () => { client.stop(); console.log(`[${MODE}] final`, counts); process.exit(0); });
