@@ -27,7 +27,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 let parlays = [];
 let killByUser = {};
 const counts = { rfqs: 0, combos: 0, matched: 0, wouldQuote: 0, declined: 0, noLock: 0 };
-let sampled = 0; // TEMP diagnostic — remove after confirming leg format
+let sampled = 0, rawDumped = false; // TEMP diagnostic — remove after confirming leg format
 
 async function refresh() {
   try {
@@ -53,13 +53,22 @@ async function log(p, rfq, d, status) {
   } catch (e) { console.error(`[${MODE}] log insert failed`, e.message); }
 }
 
-async function onRfq(rfq) {
+async function onRfq(rfq, env) {
   counts.rfqs++;
+  if (!rawDumped && env) { // TEMP diagnostic — dump first raw rfq_created so we can see real field names/leg shape
+    rawDumped = true;
+    console.log(`[SHADOW][RAW] ${JSON.stringify(env && env.msg ? env.msg : env).slice(0, 1800)}`);
+  }
   if (!rfq.isCombo || rfq.contracts == null) return;
   counts.combos++;
-  if (sampled < 10 && rfq.mveCollection === 'KXMVESPORTSMULTIGAMEEXTENDED-R') { // TEMP diagnostic
+  // TEMP diagnostic: flag any combo sharing a leg with an active parlay; otherwise sample a few for format.
+  const activeKeys = new Set(parlays.flatMap((p) => p.leg_keys || p.legKeys || []));
+  const overlap = (rfq.legKeys || []).filter((k) => activeKeys.has(k));
+  if (overlap.length > 0) {
+    console.log(`[SHADOW][MATCHLEG] overlap=${overlap.length}/${(rfq.legKeys || []).length} coll=${rfq.mveCollection} legs=${JSON.stringify(rfq.legKeys)}`);
+  } else if (sampled < 6) {
     sampled++;
-    console.log(`[SHADOW][SAMPLE] coll=${rfq.mveCollection} contracts=${rfq.contracts} legs=${JSON.stringify(rfq.legKeys)}`);
+    console.log(`[SHADOW][SAMPLE] coll=${rfq.mveCollection} legs=${JSON.stringify(rfq.legKeys)}`);
   }
   const p = matchParlay(rfq, parlays);
   if (!p) return;
@@ -87,7 +96,7 @@ async function main() {
   const client = createKalshiWs({
     keyId: KEY_ID, pem: PEM,
     onStatus: (s, i) => console.log(`[${MODE}] ws:${s}`, i || ''),
-    onRfqCreated: (rfq) => onRfq(rfq).catch((e) => console.error('onRfq', e)),
+    onRfqCreated: (rfq, env) => onRfq(rfq, env).catch((e) => console.error('onRfq', e)),
   });
   setInterval(() => console.log(`[${MODE}] tallies`, counts), 60000);
   process.on('SIGINT', () => { client.stop(); console.log(`[${MODE}] final`, counts); process.exit(0); });
