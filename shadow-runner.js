@@ -90,12 +90,19 @@ async function onRfq(rfq) {
     return;
   }
   // ALERT on every match (notification only). The order is yours to place.
+  const cost = (d.contracts * parseFloat(d.quote.no_bid)).toFixed(0);
+  const sizeNote = d.partial
+    ? `fills your full ${d.cap} hedge (taker wanted ${rfq.contracts} — you take ${d.contracts})`
+    : d.contracts < d.cap
+      ? `PARTIAL hedge: only ${d.contracts} available vs your ${d.cap} even-hedge`
+      : `full even hedge (${d.contracts})`;
   await sendAlert(
     `🎯 Combo RFQ MATCH — ${p.label}\n` +
     `taker requested ${rfq.contracts} contracts (rfq ${rfq.rfqId})\n` +
-    `${d.locks ? '🔒 LOCKS' : '⚠️ NO-LOCK'}  worst $${d.worst}  (hit $${d.hit} / miss $${d.miss})\n` +
-    `➡️ PLACE: sell up to ${d.contracts} NO @ $${d.quote.no_bid}\n` +
-    `   your ${sgn(p.fill_american)} net · taker gets ${sgn(d.effTakerOdds)}`
+    `➡️ PLACE: sell ${d.contracts} NO @ $${d.quote.no_bid}  ≈ $${cost} to put up\n` +
+    `   ${sizeNote}\n` +
+    `   your ${sgn(p.fill_american)} net · taker gets ${sgn(d.effTakerOdds)}\n` +
+    `${d.locks ? '🔒 LOCKS' : '⚠️ NO-LOCK'}  worst $${d.worst}  (win $${d.hit} / lose $${d.miss})`
   );
   if (!d.locks) { counts.noLock++; console.log(`[${MODE}] NO-LOCK ${p.label} rfq=${rfq.rfqId} worst=$${d.worst}`); return; }
   counts.wouldQuote++;
