@@ -3,9 +3,9 @@
   "version": "0.2.0",
   "private": true,
   "type": "commonjs",
-  "description": "Always-on Kalshi combo RFQ worker for aibetbuilder — posts real quotes when kill-switch is disarmed.",
+  "description": "Always-on Kalshi combo RFQ worker for aibetbuilder — shadow mode: records matches to Supabase, places no orders.",
   "scripts": {
-    "start": "node live-runner.js"
+    "start": "node shadow-runner.js"
   },
   "engines": {
     "node": ">=18"
