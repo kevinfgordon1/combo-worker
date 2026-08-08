@@ -1,0 +1,15 @@
+{
+  "name": "combo-shadow-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "Always-on Kalshi combo RFQ shadow worker for aibetbuilder — logs would-be quotes, places no orders.",
+  "scripts": {
+    "start": "node shadow-runner.js"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "@supabase/supabase-js": "^2.39.0"
+  }
+}
