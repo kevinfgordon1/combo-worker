@@ -41,19 +41,38 @@ function hedgeCap({ stake, boostAmerican, fillAmerican, mode = '1x' }) {
   }
 }
 
-// Decide the quote at fill time. Fills UP TO the mode's cap (partial fill on bigger RFQs).
-function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican = null, rfqContracts, hedgeMode = '1x' }) {
+// Decide the quote at fill time. Fills UP TO the mode's per-fill hedge shape, AND never past the
+// parlay's CUMULATIVE ceiling across all prior fills.
+//
+//   maxContracts : the TOTAL contracts you will ever sell for this parlay (the "limit you put in").
+//                  Enforced cumulatively — this is the stop-once-reached ceiling.
+//   filledSoFar  : contracts already filled for this parlay (real fills from the DB + any filled
+//                  this session). The caller supplies this; the engine just respects it.
+//
+// remaining = maxContracts - filledSoFar. When remaining <= 0 the RFQ is DECLINED ('limit_reached').
+// A partial fill trims N to `remaining` so you land exactly on the ceiling, never past it.
+function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican = null, rfqContracts, hedgeMode = '1x', maxContracts = null, filledSoFar = 0 }) {
   if (!(parlayStake > 0) || !parlayAmerican || !fillAmerican || !(rfqContracts > 0)) return { ok: false, reason: 'bad_inputs' };
   const dec = aToDec(parlayAmerican), winReturn = parlayStake * dec, bookHit = winReturn - parlayStake, bookMiss = -parlayStake;
-  const cap = hedgeCap({ stake: parlayStake, boostAmerican: parlayAmerican, fillAmerican, mode: hedgeMode });
-  const N = Math.min(rfqContracts, cap); // partial fill: a bigger RFQ fills to the cap, not rejected
-  if (!(N > 0)) return { ok: false, reason: 'zero_cap', cap };
+  const cap = hedgeCap({ stake: parlayStake, boostAmerican: parlayAmerican, fillAmerican, mode: hedgeMode }); // per-fill hedge shape
+  // Total ceiling: the persisted limit if set, else fall back to the mode's hedge size.
+  const totalLimit = (maxContracts != null && maxContracts > 0) ? maxContracts : cap;
+  const already = filledSoFar > 0 ? filledSoFar : 0;
+  const remainingBefore = Math.max(0, totalLimit - already);
+  if (remainingBefore <= 0) {
+    return { ok: false, reason: 'limit_reached', cap, totalLimit, filledSoFar: already, remaining: 0 };
+  }
+  const N = Math.min(rfqContracts, cap, remainingBefore); // never exceed per-fill cap NOR the remaining ceiling
+  if (!(N > 0)) return { ok: false, reason: 'zero_cap', cap, totalLimit, filledSoFar: already, remaining: remainingBefore };
   const s = impliedProb(fillAmerican); // already net of your maker fee
   const hit = bookHit + N * s - N, miss = bookMiss + N * s, worst = Math.min(hit, miss);
   const v = fillView(fillAmerican);
+  const remainingAfter = remainingBefore - N;
+  const trimmedByLimit = N < Math.min(rfqContracts, cap); // this fill was clipped by the cumulative ceiling
   return {
     ok: true, locks: worst >= 0, hit: r2(hit), miss: r2(miss), worst: r2(worst),
-    partial: rfqContracts > cap, cap, hedgeMode,
+    partial: rfqContracts > N, trimmedByLimit, cap, hedgeMode,
+    totalLimit, filledSoFar: already, remaining: remainingAfter, limitReached: remainingAfter <= 0,
     competitive: fairAmerican == null ? null : fillAmerican >= fairAmerican, fillAmerican,
     effTakerOdds: v.effTaker,
     quote: { yes_bid: '0.00', no_bid: v.noBid, rest_remainder: false }, contracts: N,

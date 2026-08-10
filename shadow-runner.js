@@ -48,7 +48,15 @@ const sgn = (n) => (n > 0 ? '+' + n : '' + n);
 let parlays = [];
 let killByUser = {};
 let wsConnected = false; // tracked from ws status — recorded to combo_worker_stats so a disconnect (e.g. the demo-WS 401) is visible in the DB, not just the console.
-const counts = { rfqs: 0, combos: 0, matched: 0, wouldQuote: 0, declined: 0, noLock: 0 };
+// Cumulative share-limit tracking (per parlay id):
+//   filledByParlay    — contracts already filled, reconciled from the DB every refresh (survives restarts)
+//   simFilledByParlay — contracts this SHADOW run *would* have filled this session (so back-to-back RFQs
+//                       respect the running total and we can prove the ceiling stops new fills).
+// In LIVE (live-runner), the equivalent of simFilledByParlay is a REAL in-memory counter you bump on each
+// successful POST — see the handoff notes. The engine just takes filledSoFar and respects it.
+let filledByParlay = {};
+let simFilledByParlay = {};
+const counts = { rfqs: 0, combos: 0, matched: 0, wouldQuote: 0, declined: 0, noLock: 0, limitReached: 0 };
 
 // Durable firehose record + heartbeat. Every row is a point-in-time snapshot of what
 // the worker has seen. Absence of recent rows = worker down; ws_connected=false = feed down.
@@ -65,16 +73,22 @@ async function writeStats() {
 
 async function refresh() {
   try {
-    const [{ data: p }, { data: s }] = await Promise.all([
+    const [{ data: p }, { data: s }, { data: fills }] = await Promise.all([
       supabase.from('combo_parlays').select('*').eq('active', true),
       supabase.from('combo_settings').select('user_id,kill_switch'),
+      // Real fills already booked, per parlay — the source of truth for the cumulative ceiling.
+      supabase.from('combo_submissions').select('parlay_id,contracts,status,is_live').or('status.eq.filled,is_live.eq.true'),
     ]);
     parlays = p || [];
     killByUser = {};
     (s || []).forEach((r) => (killByUser[r.user_id] = r.kill_switch));
+    filledByParlay = {};
+    (fills || []).forEach((r) => { filledByParlay[r.parlay_id] = (filledByParlay[r.parlay_id] || 0) + Number(r.contracts || 0); });
     console.log(`[${MODE}] refreshed — ${parlays.length} active parlay(s)`);
   } catch (e) { console.error(`[${MODE}] refresh failed`, e.message); }
 }
+// Contracts counted against a parlay's ceiling: real booked fills (DB) + would-be fills this session.
+const filledSoFarFor = (id) => (filledByParlay[id] || 0) + (simFilledByParlay[id] || 0);
 const killEngagedFor = (userId) => killByUser[userId] !== false; // default engaged (safe)
 
 async function log(p, rfq, d, status) {
@@ -95,11 +109,21 @@ async function onRfq(rfq) {
   if (!p) return;
   counts.matched++;
   const engaged = killEngagedFor(p.user_id);
+  const filledSoFar = filledSoFarFor(p.id);
   const d = decideAtFill({
     parlayStake: p.parlay_stake, parlayAmerican: p.parlay_american, fillAmerican: p.fill_american,
     fairAmerican: p.fair_american, rfqContracts: rfq.contracts, hedgeMode: p.hedge_mode || '1x',
+    maxContracts: p.max_contracts, filledSoFar, // cumulative ceiling — stop once total is reached
   });
   if (!d.ok) {
+    // Ceiling hit: this parlay has already filled its full max_contracts — decline everything further.
+    if (d.reason === 'limit_reached') {
+      counts.limitReached++;
+      console.log(`[${MODE}] LIMIT REACHED ${p.label} rfq=${rfq.rfqId} — filled ${filledSoFar}/${d.totalLimit}, declining`);
+      await log(p, rfq, null, 'limitreached');
+      await sendAlert(`🛑 LIMIT REACHED — ${p.label}\nalready at ${filledSoFar}/${d.totalLimit} contracts — new RFQs are being DECLINED\nrfq ${rfq.rfqId} skipped`);
+      return;
+    }
     counts.declined++;
     console.log(`[${MODE}] DECLINE ${p.label} rfq=${rfq.rfqId} (${d.reason})`);
     await log(p, rfq, null, 'declined');
@@ -108,16 +132,17 @@ async function onRfq(rfq) {
   }
   // ALERT on every match (notification only). The order is yours to place.
   const cost = (d.contracts * parseFloat(d.quote.no_bid)).toFixed(0);
-  const sizeNote = d.partial
-    ? `fills your full ${d.cap} hedge (taker wanted ${rfq.contracts} — you take ${d.contracts})`
-    : d.contracts < d.cap
-      ? `PARTIAL hedge: only ${d.contracts} available vs your ${d.cap} even-hedge`
+  const sizeNote = d.trimmedByLimit
+    ? `⚠️ TRIMMED to ceiling: only ${d.contracts} left before your ${d.totalLimit} limit (${d.filledSoFar} already filled)`
+    : d.partial
+      ? `fills to your ${d.cap} hedge (taker wanted ${rfq.contracts} — you take ${d.contracts})`
       : `full even hedge (${d.contracts})`;
   await sendAlert(
     `🎯 Combo RFQ MATCH — ${p.label}\n` +
     `taker requested ${rfq.contracts} contracts (rfq ${rfq.rfqId})\n` +
     `➡️ PLACE: sell ${d.contracts} NO @ $${d.quote.no_bid}  ≈ $${cost} to put up\n` +
     `   ${sizeNote}\n` +
+    `   cumulative: ${d.filledSoFar}+${d.contracts} of ${d.totalLimit} limit · ${d.remaining} left after\n` +
     `   your ${sgn(p.fill_american)} net · taker gets ${sgn(d.effTakerOdds)}\n` +
     `${d.locks ? '🔒 LOCKS' : '⚠️ NO-LOCK'}  worst $${d.worst}  (win $${d.hit} / lose $${d.miss})`
   );
@@ -128,7 +153,12 @@ async function onRfq(rfq) {
     return;
   }
   counts.wouldQuote++;
-  console.log(`[${MODE}] WOULD QUOTE ${engaged ? '(kill-switch engaged) ' : ''}${p.label} rfq=${rfq.rfqId} post=${JSON.stringify(d.quote)} lock worst=$${d.worst} hit=$${d.hit} miss=$${d.miss}`);
+  // Consume the ceiling: count this would-be fill so the NEXT RFQ this session sees a smaller remaining
+  // and eventually gets declined at 'limit_reached'. (In live-runner, increment your REAL counter here,
+  // only AFTER a successful POST.)
+  simFilledByParlay[p.id] = (simFilledByParlay[p.id] || 0) + d.contracts;
+  console.log(`[${MODE}] WOULD QUOTE ${engaged ? '(kill-switch engaged) ' : ''}${p.label} rfq=${rfq.rfqId} post=${JSON.stringify(d.quote)} cumulative=${filledSoFar + d.contracts}/${d.totalLimit} lock worst=$${d.worst} hit=$${d.hit} miss=$${d.miss}`);
+  if (d.limitReached) console.log(`[${MODE}] CEILING HIT ${p.label} — reached ${d.totalLimit}; further RFQs will be declined`);
   await log(p, rfq, d, 'shadow'); // ALWAYS shadow here — this runner never posts.
 }
 
