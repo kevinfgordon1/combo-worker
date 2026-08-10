@@ -38,12 +38,15 @@ function sameSet(a, b) {
   return A.every((x, i) => x === B[i]);
 }
 // parlays: rows from combo_parlays (leg_keys text[], mve_collection).
+// Match on the LEG SET only. The exact set of market tickers + sides uniquely identifies the
+// combo; Kalshi files the same combo under different mve_collection tickers
+// (KXMVESPORTSMULTIGAMEEXTENDED-R vs KXMVECROSSCATEGORY-R, etc.), so the collection must NOT gate
+// the match — doing so previously rejected every RFQ even when all legs were identical.
 function matchParlay(rfq, parlays) {
   if (!rfq || !rfq.legKeys || !rfq.legKeys.length || !Array.isArray(parlays)) return null;
   for (const p of parlays) {
     const lk = p.leg_keys || p.legKeys;
     if (!Array.isArray(lk) || !lk.length) continue;
-    if (p.mve_collection && rfq.mveCollection && p.mve_collection !== rfq.mveCollection) continue;
     if (sameSet(rfq.legKeys, lk)) return p;
   }
   return null;
