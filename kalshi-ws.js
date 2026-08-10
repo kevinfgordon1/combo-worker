@@ -4,7 +4,6 @@
 const WebSocket = require('ws');
 const { authHeaders } = require('./kalshi-auth');
 const { parseEnvelope, isRfqCreated, normalizeRfq } = require('./rfq');
-const { captureRfq } = require('./rfq-debug'); // gated, read-only diagnostic (no-op unless RFQ_DEBUG_NEEDLE set)
 
 const WS_URL = process.env.KALSHI_WS_URL || 'wss://external-api-ws.kalshi.com/trade-api/ws/v2';
 const WS_SIGN_PATH = '/trade-api/ws/v2';
@@ -27,7 +26,6 @@ function createKalshiWs({ keyId, pem, onRfqCreated, onStatus, onEvent }) {
     ws.on('message', (d) => {
       const env = parseEnvelope(d.toString());
       if (!env) return;
-      captureRfq(env).catch(() => {}); // gated debug capture — no-op unless RFQ_DEBUG_NEEDLE is set
       try { onEvent && onEvent(env); } catch (_) {}
       if (isRfqCreated(env) && onRfqCreated) {
         try { onRfqCreated(normalizeRfq(env), env); } catch (e) { console.error('onRfqCreated', e); }
