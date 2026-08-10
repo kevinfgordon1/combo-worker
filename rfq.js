@@ -23,12 +23,16 @@ function normalizeRfq(e) {
   const m = (e && e.msg) || {};
   const legsRaw = m.mve_selected_legs || m.selected_legs || null;
   const legKeys = Array.isArray(legsRaw) ? legsRaw.map(normalizeLeg).filter(Boolean).sort() : null;
+  const targetCost = m.target_cost_dollars != null
+    ? (typeof m.target_cost_dollars === 'string' ? parseFloat(m.target_cost_dollars) : Number(m.target_cost_dollars))
+    : null;
   return {
     rfqId: m.id || m.rfq_id || null,
     mveCollection: m.mve_collection_ticker || null,
     legKeys,
     isCombo: !!(m.mve_collection_ticker || (legKeys && legKeys.length > 1)),
     contracts: parseContracts(m.contracts_fp),
+    targetCostDollars: Number.isFinite(targetCost) && targetCost > 0 ? targetCost : null,
     createdTs: m.created_ts || null,
   };
 }
@@ -37,7 +41,6 @@ function sameSet(a, b) {
   const A = [...a].sort(), B = [...b].sort();
   return A.every((x, i) => x === B[i]);
 }
-// parlays: rows from combo_parlays (leg_keys text[], mve_collection).
 // Match on the LEG SET only. The exact set of market tickers + sides uniquely identifies the
 // combo; Kalshi files the same combo under different mve_collection tickers
 // (KXMVESPORTSMULTIGAMEEXTENDED-R vs KXMVECROSSCATEGORY-R, etc.), so the collection must NOT gate
