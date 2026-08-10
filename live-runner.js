@@ -3,23 +3,22 @@
 // matches incoming combo RFQs against the user's active parlays (from Supabase),
 // and (when kill-switch is disarmed) posts a real quote via POST /communications/quotes.
 //
-// Cumulative share-limit: respects max_contracts across all fills for a parlay.
-// Once the ceiling is reached, further RFQs are declined with reason 'limit_reached'.
+// Features:
+//   • Cumulative share-limit (max_contracts) across fills
+//   • Supports both contract-sized and dollar-sized RFQs
+//   • Kill-switch gated posting
 //
-// Env (set on the host):
-//   KALSHI_KEY_ID          public Key ID
-//   Kalshi_combo_key       private key PEM (armor optional; also accepts KALSHI_PRIVATE_KEY)
-//   SUPABASE_URL           your project URL
-//   SUPABASE_SERVICE_KEY   service-role key (bypasses RLS to read parlays / write logs)
-//   TELEGRAM_BOT_TOKEN     (optional) your bot token — enables match alerts
-//   TELEGRAM_ALERT_CHAT_ID (optional) your personal chat id to DM on a match
+// Env:
+//   KALSHI_KEY_ID, Kalshi_combo_key (or KALSHI_PRIVATE_KEY)
+//   SUPABASE_URL, SUPABASE_SERVICE_KEY
+//   TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
 const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
-const { decideAtFill } = require('./engine');
+const { decideAtFill, fillView } = require('./engine');
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -28,6 +27,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT = process.env.TELEGRAM_ALERT_CHAT_ID;
+
 async function sendAlert(text) {
   if (!TG_TOKEN || !TG_CHAT) {
     console.log(`[${MODE}] ALERT (telegram not configured): ${text.replace(/\n/g, ' | ')}`);
@@ -48,9 +48,10 @@ const sgn = (n) => (n > 0 ? '+' + n : '' + n);
 
 let parlays = [];
 let killByUser = {};
-// Cumulative share-limit tracking (per parlay id)
-//   filledByParlay     — real contracts already filled (reconciled from DB every refresh)
-//   sessionFilledByParlay — contracts filled this LIVE session (bumped only after successful POST)
+
+// Cumulative share-limit tracking
+// filledByParlay     = real fills from DB (reconciled every refresh)
+// sessionFilledByParlay = fills this session (bumped only after successful POST)
 let filledByParlay = {};
 let sessionFilledByParlay = {};
 
@@ -64,6 +65,7 @@ const counts = {
   limitReached: 0,
   posted: 0,
   postFailed: 0,
+  dollarRfqs: 0,
 };
 
 async function refresh() {
@@ -71,7 +73,6 @@ async function refresh() {
     const [{ data: p }, { data: s }, { data: fills }] = await Promise.all([
       supabase.from('combo_parlays').select('*').eq('active', true),
       supabase.from('combo_settings').select('user_id,kill_switch'),
-      // Real fills already booked — source of truth for the cumulative ceiling
       supabase.from('combo_submissions')
         .select('parlay_id,contracts,status,is_live')
         .or('status.eq.filled,is_live.eq.true'),
@@ -91,7 +92,6 @@ async function refresh() {
   }
 }
 
-// Contracts already counted against a parlay's ceiling
 const filledSoFarFor = (id) => (filledByParlay[id] || 0) + (sessionFilledByParlay[id] || 0);
 const killEngagedFor = (userId) => killByUser[userId] !== false; // default engaged (safe)
 
@@ -103,7 +103,7 @@ async function log(p, rfq, d, status, extra = {}) {
       rfq_id: rfq.rfqId,
       label: p.label,
       fill_american: d ? d.fillAmerican : p.fill_american,
-      contracts: d ? d.contracts : rfq.contracts,
+      contracts: d ? d.contracts : (rfq.contracts || null),
       worst_lock: d ? d.worst : null,
       status,
       ...extra,
@@ -137,9 +137,39 @@ async function postQuote(rfq, d) {
   return JSON.parse(text); // { id: quote_id }
 }
 
+/**
+ * Derive a usable contract count for decideAtFill.
+ * - Contract-sized RFQ  → use rfq.contracts directly
+ * - Dollar-sized RFQ    → estimate contracts from target_cost_dollars ÷ yes-side price
+ *                         (we sell NO, so yes price ≈ 1 - no_bid)
+ */
+function resolveRfqContracts(rfq, fillAmerican) {
+  if (rfq.contracts != null && rfq.contracts > 0) {
+    return { contracts: rfq.contracts, source: 'contracts' };
+  }
+  if (rfq.targetCostDollars != null && rfq.targetCostDollars > 0) {
+    const v = fillView(fillAmerican);
+    const noBid = parseFloat(v.noBid);
+    const yesPrice = Math.max(0.01, 1 - noBid); // avoid div-by-zero
+    const estimated = Math.floor(rfq.targetCostDollars / yesPrice);
+    return {
+      contracts: Math.max(1, estimated),
+      source: 'dollar',
+      targetCost: rfq.targetCostDollars,
+      estimated,
+    };
+  }
+  return { contracts: null, source: 'none' };
+}
+
 async function onRfq(rfq) {
   counts.rfqs++;
-  if (!rfq.isCombo || rfq.contracts == null) return;
+
+  // Accept combos that have either a contract count OR a dollar target
+  if (!rfq.isCombo) return;
+  if (rfq.contracts == null && (rfq.targetCostDollars == null || !(rfq.targetCostDollars > 0))) {
+    return; // genuinely unusable
+  }
   counts.combos++;
 
   const p = matchParlay(rfq, parlays);
@@ -149,12 +179,22 @@ async function onRfq(rfq) {
   const engaged = killEngagedFor(p.user_id);
   const filledSoFar = filledSoFarFor(p.id);
 
+  // Resolve size (handles both contract and dollar RFQs)
+  const size = resolveRfqContracts(rfq, p.fill_american);
+  if (size.contracts == null || !(size.contracts > 0)) {
+    counts.declined++;
+    console.log(`[${MODE}] DECLINE ${p.label} rfq=${rfq.rfqId} (no usable size)`);
+    await log(p, rfq, null, 'declined');
+    return;
+  }
+  if (size.source === 'dollar') counts.dollarRfqs++;
+
   const d = decideAtFill({
     parlayStake: p.parlay_stake,
     parlayAmerican: p.parlay_american,
     fillAmerican: p.fill_american,
     fairAmerican: p.fair_american,
-    rfqContracts: rfq.contracts,
+    rfqContracts: size.contracts,
     hedgeMode: p.hedge_mode || '1x',
     maxContracts: p.max_contracts,
     filledSoFar,
@@ -169,7 +209,7 @@ async function onRfq(rfq) {
       await log(p, rfq, null, 'limitreached');
       await sendAlert(
         `🛑 LIMIT REACHED — ${p.label}\n` +
-        `already at ${filledSoFar}/${d.totalLimit} contracts — new RFQs are being DECLINED\n` +
+        `already at ${filledSoFar}/${d.totalLimit} contracts — new RFQs DECLINED\n` +
         `rfq ${rfq.rfqId} skipped`
       );
       return;
@@ -181,20 +221,24 @@ async function onRfq(rfq) {
     return;
   }
 
-  // Alert on every match
+  // Build alert
   const cost = (d.contracts * parseFloat(d.quote.no_bid)).toFixed(0);
   const sizeNote = d.trimmedByLimit
     ? `⚠️ TRIMMED to ceiling: only ${d.contracts} left before your ${d.totalLimit} limit (${d.filledSoFar} already filled)`
     : d.partial
-      ? `fills to your ${d.cap} hedge (taker wanted ${rfq.contracts} — you take ${d.contracts})`
+      ? `fills to your ${d.cap} hedge (taker wanted ~${size.contracts} — you take ${d.contracts})`
       : `full even hedge (${d.contracts})`;
+
+  const sourceNote = size.source === 'dollar'
+    ? ` (dollar RFQ $${size.targetCost} → ~${size.estimated} contracts)`
+    : '';
 
   await sendAlert(
     `🎯 Combo RFQ MATCH — ${p.label}\n` +
-    `taker requested ${rfq.contracts} contracts (rfq ${rfq.rfqId})\n` +
+    `taker requested ~${size.contracts} contracts${sourceNote} (rfq ${rfq.rfqId})\n` +
     `➡️ PLACE: sell ${d.contracts} NO @ $${d.quote.no_bid}  ≈ $${cost} to put up\n` +
     `   ${sizeNote}\n` +
-    `   cumulative: ${d.filledSoFar}+${d.contracts} of ${d.totalLimit} limit · ${d.remaining} left after\n` +
+    `   cumulative: ${d.filledSoFar}+${d.contracts} of ${d.totalLimit} · ${d.remaining} left after\n` +
     `   your ${sgn(p.fill_american)} net · taker gets ${sgn(d.effTakerOdds)}\n` +
     `${d.locks ? '🔒 LOCKS' : '⚠️ NO-LOCK'}  worst $${d.worst}  (win $${d.hit} / lose $${d.miss})`
   );
@@ -211,16 +255,16 @@ async function onRfq(rfq) {
     `[${MODE}] WOULD QUOTE ${engaged ? '(kill-switch engaged) ' : ''}${p.label} ` +
     `rfq=${rfq.rfqId} post=${JSON.stringify(d.quote)} ` +
     `cumulative=${filledSoFar + d.contracts}/${d.totalLimit} ` +
-    `lock worst=$${d.worst} hit=$${d.hit} miss=$${d.miss}`
+    `source=${size.source} lock worst=$${d.worst}`
   );
 
-  // ─── LIVE POST (only when kill-switch is disarmed) ─────────────────────
+  // ─── LIVE POST ─────────────────────────────────────────────────────────
   if (!engaged) {
     try {
       const result = await postQuote(rfq, d);
       counts.posted++;
 
-      // Bump the in-memory counter only after a successful POST
+      // Only bump the session counter after a successful POST
       sessionFilledByParlay[p.id] = (sessionFilledByParlay[p.id] || 0) + d.contracts;
 
       console.log(
@@ -241,7 +285,7 @@ async function onRfq(rfq) {
       );
 
       if (d.limitReached) {
-        console.log(`[${MODE}] CEILING HIT ${p.label} — reached ${d.totalLimit}; further RFQs will be declined`);
+        console.log(`[${MODE}] CEILING HIT ${p.label} — reached ${d.totalLimit}`);
       }
     } catch (e) {
       counts.postFailed++;
@@ -250,7 +294,6 @@ async function onRfq(rfq) {
       await sendAlert(`❌ LIVE QUOTE FAILED — ${p.label}\nrfq ${rfq.rfqId}\n${e.message}`);
     }
   } else {
-    // Kill-switch still engaged → pure shadow
     await log(p, rfq, d, 'shadow');
   }
 }
@@ -263,8 +306,8 @@ async function main() {
     process.exit(1);
   }
   console.log(
-    `[${MODE}] starting — will post real quotes when kill-switch is disarmed. ` +
-    `Respects cumulative max_contracts ceiling.`
+    `[${MODE}] starting — posts real quotes when kill-switch is disarmed. ` +
+    `Supports contract + dollar RFQs. Respects cumulative max_contracts.`
   );
   await refresh();
   setInterval(refresh, 30000);
