@@ -1,12 +1,10 @@
 // ─────────────────────────────────────────────────────────────────────────
 // live-runner.js — LIVE worker. Connects to the live Kalshi RFQ firehose,
 // matches incoming combo RFQs against the user's active parlays (from Supabase),
-// and (when kill-switch is disarmed AND RFQ size ≤ hedge cap) posts a real
-// quote via POST /communications/quotes.
+// and (when kill-switch is disarmed) posts a real quote via POST /communications/quotes.
 //
-// Conservative rule: only quotes when rfq.contracts ≤ hedge cap.
-// Larger RFQs are logged as shadow and skipped so we never risk more size
-// than planned.
+// Cumulative share-limit: respects max_contracts across all fills for a parlay.
+// Once the ceiling is reached, further RFQs are declined with reason 'limit_reached'.
 //
 // Env (set on the host):
 //   KALSHI_KEY_ID          public Key ID
@@ -50,25 +48,51 @@ const sgn = (n) => (n > 0 ? '+' + n : '' + n);
 
 let parlays = [];
 let killByUser = {};
+// Cumulative share-limit tracking (per parlay id)
+//   filledByParlay     — real contracts already filled (reconciled from DB every refresh)
+//   sessionFilledByParlay — contracts filled this LIVE session (bumped only after successful POST)
+let filledByParlay = {};
+let sessionFilledByParlay = {};
+
 const counts = {
-  rfqs: 0, combos: 0, matched: 0, wouldQuote: 0,
-  declined: 0, noLock: 0, tooBig: 0, posted: 0, postFailed: 0,
+  rfqs: 0,
+  combos: 0,
+  matched: 0,
+  wouldQuote: 0,
+  declined: 0,
+  noLock: 0,
+  limitReached: 0,
+  posted: 0,
+  postFailed: 0,
 };
 
 async function refresh() {
   try {
-    const [{ data: p }, { data: s }] = await Promise.all([
+    const [{ data: p }, { data: s }, { data: fills }] = await Promise.all([
       supabase.from('combo_parlays').select('*').eq('active', true),
       supabase.from('combo_settings').select('user_id,kill_switch'),
+      // Real fills already booked — source of truth for the cumulative ceiling
+      supabase.from('combo_submissions')
+        .select('parlay_id,contracts,status,is_live')
+        .or('status.eq.filled,is_live.eq.true'),
     ]);
     parlays = p || [];
     killByUser = {};
     (s || []).forEach((r) => (killByUser[r.user_id] = r.kill_switch));
+
+    filledByParlay = {};
+    (fills || []).forEach((r) => {
+      filledByParlay[r.parlay_id] = (filledByParlay[r.parlay_id] || 0) + Number(r.contracts || 0);
+    });
+
     console.log(`[${MODE}] refreshed — ${parlays.length} active parlay(s)`);
   } catch (e) {
     console.error(`[${MODE}] refresh failed`, e.message);
   }
 }
+
+// Contracts already counted against a parlay's ceiling
+const filledSoFarFor = (id) => (filledByParlay[id] || 0) + (sessionFilledByParlay[id] || 0);
 const killEngagedFor = (userId) => killByUser[userId] !== false; // default engaged (safe)
 
 async function log(p, rfq, d, status, extra = {}) {
@@ -123,6 +147,8 @@ async function onRfq(rfq) {
   counts.matched++;
 
   const engaged = killEngagedFor(p.user_id);
+  const filledSoFar = filledSoFarFor(p.id);
+
   const d = decideAtFill({
     parlayStake: p.parlay_stake,
     parlayAmerican: p.parlay_american,
@@ -130,9 +156,24 @@ async function onRfq(rfq) {
     fairAmerican: p.fair_american,
     rfqContracts: rfq.contracts,
     hedgeMode: p.hedge_mode || '1x',
+    maxContracts: p.max_contracts,
+    filledSoFar,
   });
 
   if (!d.ok) {
+    if (d.reason === 'limit_reached') {
+      counts.limitReached++;
+      console.log(
+        `[${MODE}] LIMIT REACHED ${p.label} rfq=${rfq.rfqId} — filled ${filledSoFar}/${d.totalLimit}, declining`
+      );
+      await log(p, rfq, null, 'limitreached');
+      await sendAlert(
+        `🛑 LIMIT REACHED — ${p.label}\n` +
+        `already at ${filledSoFar}/${d.totalLimit} contracts — new RFQs are being DECLINED\n` +
+        `rfq ${rfq.rfqId} skipped`
+      );
+      return;
+    }
     counts.declined++;
     console.log(`[${MODE}] DECLINE ${p.label} rfq=${rfq.rfqId} (${d.reason})`);
     await log(p, rfq, null, 'declined');
@@ -140,11 +181,12 @@ async function onRfq(rfq) {
     return;
   }
 
+  // Alert on every match
   const cost = (d.contracts * parseFloat(d.quote.no_bid)).toFixed(0);
-  const sizeNote = d.partial
-    ? `fills your full ${d.cap} hedge (taker wanted ${rfq.contracts} — you take ${d.contracts})`
-    : d.contracts < d.cap
-      ? `PARTIAL hedge: only ${d.contracts} available vs your ${d.cap} even-hedge`
+  const sizeNote = d.trimmedByLimit
+    ? `⚠️ TRIMMED to ceiling: only ${d.contracts} left before your ${d.totalLimit} limit (${d.filledSoFar} already filled)`
+    : d.partial
+      ? `fills to your ${d.cap} hedge (taker wanted ${rfq.contracts} — you take ${d.contracts})`
       : `full even hedge (${d.contracts})`;
 
   await sendAlert(
@@ -152,6 +194,7 @@ async function onRfq(rfq) {
     `taker requested ${rfq.contracts} contracts (rfq ${rfq.rfqId})\n` +
     `➡️ PLACE: sell ${d.contracts} NO @ $${d.quote.no_bid}  ≈ $${cost} to put up\n` +
     `   ${sizeNote}\n` +
+    `   cumulative: ${d.filledSoFar}+${d.contracts} of ${d.totalLimit} limit · ${d.remaining} left after\n` +
     `   your ${sgn(p.fill_american)} net · taker gets ${sgn(d.effTakerOdds)}\n` +
     `${d.locks ? '🔒 LOCKS' : '⚠️ NO-LOCK'}  worst $${d.worst}  (win $${d.hit} / lose $${d.miss})`
   );
@@ -159,39 +202,47 @@ async function onRfq(rfq) {
   if (!d.locks) {
     counts.noLock++;
     console.log(`[${MODE}] NO-LOCK ${p.label} rfq=${rfq.rfqId} worst=$${d.worst}`);
-    await log(p, rfq, d, 'shadow');
-    return;
-  }
-
-  // Conservative size rule
-  if (rfq.contracts > d.cap) {
-    counts.tooBig++;
-    console.log(`[${MODE}] SKIP (RFQ too large) ${p.label} rfq=${rfq.rfqId} wanted=${rfq.contracts} cap=${d.cap}`);
-    await log(p, rfq, d, 'shadow');
-    await sendAlert(
-      `⚠️ RFQ matched but SKIPPED (too large) — ${p.label}\n` +
-      `rfq ${rfq.rfqId} · taker wanted ${rfq.contracts}, your cap ${d.cap}`
-    );
+    await log(p, rfq, d, 'nolock');
     return;
   }
 
   counts.wouldQuote++;
   console.log(
     `[${MODE}] WOULD QUOTE ${engaged ? '(kill-switch engaged) ' : ''}${p.label} ` +
-    `rfq=${rfq.rfqId} post=${JSON.stringify(d.quote)} lock worst=$${d.worst} hit=$${d.hit} miss=$${d.miss}`
+    `rfq=${rfq.rfqId} post=${JSON.stringify(d.quote)} ` +
+    `cumulative=${filledSoFar + d.contracts}/${d.totalLimit} ` +
+    `lock worst=$${d.worst} hit=$${d.hit} miss=$${d.miss}`
   );
 
+  // ─── LIVE POST (only when kill-switch is disarmed) ─────────────────────
   if (!engaged) {
     try {
       const result = await postQuote(rfq, d);
       counts.posted++;
-      console.log(`[${MODE}] QUOTED ${p.label} rfq=${rfq.rfqId} quote_id=${result.id}`);
-      await log(p, rfq, d, 'filled', { quote_id: result.id });
+
+      // Bump the in-memory counter only after a successful POST
+      sessionFilledByParlay[p.id] = (sessionFilledByParlay[p.id] || 0) + d.contracts;
+
+      console.log(
+        `[${MODE}] QUOTED ${p.label} rfq=${rfq.rfqId} quote_id=${result.id} ` +
+        `contracts=${d.contracts} cumulative=${filledSoFar + d.contracts}/${d.totalLimit}`
+      );
+
+      await log(p, rfq, d, 'filled', {
+        quote_id: result.id,
+        is_live: true,
+      });
+
       await sendAlert(
         `✅ LIVE QUOTE POSTED — ${p.label}\n` +
         `quote ${result.id} · rfq ${rfq.rfqId}\n` +
-        `sell ${d.contracts} NO @ $${d.quote.no_bid}`
+        `sell ${d.contracts} NO @ $${d.quote.no_bid}\n` +
+        `cumulative: ${filledSoFar + d.contracts}/${d.totalLimit}`
       );
+
+      if (d.limitReached) {
+        console.log(`[${MODE}] CEILING HIT ${p.label} — reached ${d.totalLimit}; further RFQs will be declined`);
+      }
     } catch (e) {
       counts.postFailed++;
       console.error(`[${MODE}] POST FAILED ${p.label} rfq=${rfq.rfqId}`, e.message);
@@ -199,16 +250,22 @@ async function onRfq(rfq) {
       await sendAlert(`❌ LIVE QUOTE FAILED — ${p.label}\nrfq ${rfq.rfqId}\n${e.message}`);
     }
   } else {
+    // Kill-switch still engaged → pure shadow
     await log(p, rfq, d, 'shadow');
   }
 }
 
 async function main() {
   if (!KEY_ID || !PEM || !process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
-    console.error(`[${MODE}] missing env: need KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY`);
+    console.error(
+      `[${MODE}] missing env: need KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY`
+    );
     process.exit(1);
   }
-  console.log(`[${MODE}] starting — will post real quotes when kill-switch is disarmed and RFQ size ≤ hedge cap.`);
+  console.log(
+    `[${MODE}] starting — will post real quotes when kill-switch is disarmed. ` +
+    `Respects cumulative max_contracts ceiling.`
+  );
   await refresh();
   setInterval(refresh, 30000);
 
