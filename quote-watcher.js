@@ -123,8 +123,7 @@ async function onEvent(env) {
       patch.order_id = m.order_id || m.creator_order_id || m.maker_order_id || null;
     }
     // else quote_created: leave outcome as-is (row already seeded 'posted')
-    const rts = rec.rfq_id && matchedRfqTs.get(rec.rfq_id);
-    if (rts && (type === 'quote_accepted' || type === 'quote_executed')) patch.responded_ms = Date.now() - rts;
+    // (response latency + window are computed authoritatively in reconcileRfq from the RFQ timeline)
     try { await supabase.from('quote_outcomes').update(patch).eq('quote_id', rec.quote_id); }
     catch (e) { console.error('[WATCH] outcome update', e.message); }
   }
@@ -178,29 +177,53 @@ async function fetchRfq(rfqId) {
   return j.rfq || j;
 }
 
-// For each LOST quote, ask the RFQ why: closed via an accepted quote (we were OUTBID) vs
-// cancelled/expired (the taker took NO ONE). Kalshi never reveals the winning price, but
-// open->closed + cancellation status distinguishes those two loss reasons.
-async function reconcileLossReason() {
+// Kalshi timestamps: date-time strings, or unix (sec or ms). Parse to epoch ms defensively.
+function parseTs(v) {
+  if (v == null) return null;
+  if (typeof v === 'number') return v < 1e12 ? v * 1000 : v;   // seconds vs ms
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? t : null;
+}
+
+// For each resolved quote, pull the RFQ's timeline and compute:
+//   responded_ms  = our post time − RFQ created  (how fast WE answered)
+//   rfq_lifetime_ms = RFQ closed − RFQ created   (how long the window was open)
+//   in_time       = did we answer before it closed?
+// Then classify a LOSS: cancelled → no_taker; closed & in-time → outbid (beaten on price);
+// closed & NOT in-time → too_slow (we missed the window). Kalshi never reveals the winner's price.
+async function reconcileRfq() {
   try {
-    const { data: lost } = await supabase.from('quote_outcomes')
-      .select('quote_id,rfq_id').eq('outcome', 'lost').is('loss_reason', null)
-      .not('rfq_id', 'is', null).limit(20);
-    if (!lost || !lost.length) return;
-    for (const o of lost) {
+    const { data: rows } = await supabase.from('quote_outcomes')
+      .select('quote_id,rfq_id,posted_at,outcome')
+      .not('rfq_id', 'is', null).is('rfq_lifetime_ms', null).limit(20);
+    if (!rows || !rows.length) return;
+    for (const o of rows) {
       let rfq; try { rfq = await fetchRfq(o.rfq_id); } catch (_) { continue; }
       if (!rfq || !rfq.status) continue;
-      if (rfq.status === 'open') continue;          // still live — recheck next cycle
+      if (rfq.status === 'open') continue;               // not resolved — recheck next cycle
+      const created = parseTs(rfq.created_ts);
+      const closed = parseTs(rfq.updated_ts) || parseTs(rfq.cancelled_ts) || null;
+      const post = parseTs(o.posted_at);
       const cancelled = !!(rfq.cancelled_ts || rfq.cancellation_reason);
-      const reason = rfq.status === 'closed' ? (cancelled ? 'no_taker' : 'outbid') : 'unknown';
-      await supabase.from('quote_outcomes').update({
+      const respMs = (created != null && post != null) ? Math.max(0, post - created) : null;
+      const lifeMs = (created != null && closed != null) ? Math.max(0, closed - created) : null;
+      const inTime = (respMs != null && lifeMs != null) ? respMs <= lifeMs : null;
+      let reason;
+      if (o.outcome === 'lost') reason = cancelled ? 'no_taker' : (inTime === false ? 'too_slow' : 'outbid');
+      const patch = {
         rfq_status: rfq.status,
         cancellation_reason: rfq.cancellation_reason || null,
-        loss_reason: reason,
+        rfq_created_ts: created != null ? new Date(created).toISOString() : null,
+        rfq_closed_ts: closed != null ? new Date(closed).toISOString() : null,
+        rfq_lifetime_ms: lifeMs,
+        responded_ms: respMs,
+        in_time: inTime,
         updated_at: new Date().toISOString(),
-      }).eq('quote_id', o.quote_id);
+      };
+      if (reason) patch.loss_reason = reason;
+      await supabase.from('quote_outcomes').update(patch).eq('quote_id', o.quote_id);
     }
-  } catch (e) { console.error('[WATCH] reconcileLossReason', e.message); }
+  } catch (e) { console.error('[WATCH] reconcileRfq', e.message); }
 }
 
 async function main() {
@@ -213,7 +236,7 @@ async function main() {
   setInterval(loadState, 30000);
   setInterval(ageLost, 20000);
   setInterval(reconcileFills, 30000);
-  setInterval(reconcileLossReason, 30000);
+  setInterval(reconcileRfq, 30000);
   setInterval(() => console.log('[WATCH] tallies', counts), 60000);
 
   const client = createKalshiWs({
