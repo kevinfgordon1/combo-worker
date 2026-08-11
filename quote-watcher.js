@@ -32,6 +32,10 @@ const LOST_AFTER_MS = 30000;         // no acceptance within this window → mar
 const impliedProb = (a) => (a > 0 ? 100 / (a + 100) : Math.abs(a) / (Math.abs(a) + 100));
 const aToDec = (a) => (a > 0 ? 1 + a / 100 : 1 + 100 / Math.abs(a));
 const r2 = (x) => Math.round(x * 100) / 100;
+// Our quoted price (no_bid) from the fill odds — same net-of-maker-fee math as engine/tab.
+const KFEE = 0.0175;
+const nominalProbFromEff = (sEff) => { const b = 1 - KFEE; return (-b + Math.sqrt(b * b + 4 * KFEE * sEff)) / (2 * KFEE); };
+const noBidFor = (fillAmerican) => (fillAmerican ? r2(1 - nominalProbFromEff(impliedProb(fillAmerican))) : null);
 
 let parlays = [];
 let postedByQuote = {};   // quote_id -> {quote_id, rfq_id, parlay_id, label, posted_at}
@@ -45,7 +49,7 @@ async function loadState() {
     const [{ data: p }, { data: subs }] = await Promise.all([
       supabase.from('combo_parlays').select('*').eq('active', true),
       supabase.from('combo_submissions')
-        .select('parlay_id,label,rfq_id,quote_id,created_at')
+        .select('parlay_id,label,rfq_id,quote_id,created_at,fill_american')
         .not('quote_id', 'is', null)
         .order('created_at', { ascending: false }).limit(200),
     ]);
@@ -55,7 +59,9 @@ async function loadState() {
       if (!s.quote_id) return;
       const rec = { quote_id: s.quote_id, rfq_id: s.rfq_id, parlay_id: s.parlay_id, label: s.label, posted_at: s.created_at };
       bq[s.quote_id] = rec; if (s.rfq_id) br[s.rfq_id] = rec;
-      seed.push({ quote_id: s.quote_id, rfq_id: s.rfq_id, parlay_id: s.parlay_id, label: s.label, posted_at: s.created_at });
+      // record OUR quoted price (no_bid) + fill odds so we can learn win/loss-by-price over time
+      seed.push({ quote_id: s.quote_id, rfq_id: s.rfq_id, parlay_id: s.parlay_id, label: s.label,
+        posted_at: s.created_at, fill_american: s.fill_american, no_bid: noBidFor(s.fill_american) });
     });
     postedByQuote = bq; postedByRfq = br;
     // Seed a 'posted' outcome row for every quote we know about (ignore if already tracked),
@@ -163,6 +169,40 @@ async function reconcileFills() {
   } catch (e) { console.error('[WATCH] reconcileFills', e.message); }
 }
 
+async function fetchRfq(rfqId) {
+  const signPath = `/trade-api/v2/communications/rfqs/${rfqId}`;
+  const headers = authHeaders({ keyId: KEY_ID, pem: PEM, method: 'GET', signPath });
+  const res = await fetch(`${REST}/communications/rfqs/${rfqId}`, { headers });
+  if (!res.ok) throw new Error(`rfq ${res.status}`);
+  const j = await res.json();
+  return j.rfq || j;
+}
+
+// For each LOST quote, ask the RFQ why: closed via an accepted quote (we were OUTBID) vs
+// cancelled/expired (the taker took NO ONE). Kalshi never reveals the winning price, but
+// open->closed + cancellation status distinguishes those two loss reasons.
+async function reconcileLossReason() {
+  try {
+    const { data: lost } = await supabase.from('quote_outcomes')
+      .select('quote_id,rfq_id').eq('outcome', 'lost').is('loss_reason', null)
+      .not('rfq_id', 'is', null).limit(20);
+    if (!lost || !lost.length) return;
+    for (const o of lost) {
+      let rfq; try { rfq = await fetchRfq(o.rfq_id); } catch (_) { continue; }
+      if (!rfq || !rfq.status) continue;
+      if (rfq.status === 'open') continue;          // still live — recheck next cycle
+      const cancelled = !!(rfq.cancelled_ts || rfq.cancellation_reason);
+      const reason = rfq.status === 'closed' ? (cancelled ? 'no_taker' : 'outbid') : 'unknown';
+      await supabase.from('quote_outcomes').update({
+        rfq_status: rfq.status,
+        cancellation_reason: rfq.cancellation_reason || null,
+        loss_reason: reason,
+        updated_at: new Date().toISOString(),
+      }).eq('quote_id', o.quote_id);
+    }
+  } catch (e) { console.error('[WATCH] reconcileLossReason', e.message); }
+}
+
 async function main() {
   if (!KEY_ID || !PEM || !process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
     console.error('[WATCH] missing env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY');
@@ -173,6 +213,7 @@ async function main() {
   setInterval(loadState, 30000);
   setInterval(ageLost, 20000);
   setInterval(reconcileFills, 30000);
+  setInterval(reconcileLossReason, 30000);
   setInterval(() => console.log('[WATCH] tallies', counts), 60000);
 
   const client = createKalshiWs({
