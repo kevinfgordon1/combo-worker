@@ -120,6 +120,9 @@ async function onEvent(env) {
     const rid = m.rfq_id || q.rfq_id || null;
     if (!qid && !rid) return;
     counts.quoteEvents++;
+    // The moment we post, grab the quote from the REST list while it's still OPEN — that's the
+    // only reliable way to read the ACTUAL no_bid_dollars we put on the wire (the WS event omits it).
+    if (type === 'quote_created') reconcileSelfQuotes().catch(() => {});
     const nowIso = new Date().toISOString();
     const numify = (v) => (v == null ? null : (typeof v === 'string' ? parseFloat(v) : Number(v)));
     const subNo = numify(m.no_bid != null ? m.no_bid : q.no_bid);
