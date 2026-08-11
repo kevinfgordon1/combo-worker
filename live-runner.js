@@ -24,6 +24,7 @@ const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
 const { decideAtFill, fillView } = require('./engine');
+const { startHeartbeat } = require('./heartbeat');   // top, with the other requires
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -317,6 +318,7 @@ async function main() {
   );
   await refresh();
   setInterval(refresh, 30000);
+  startHeartbeat(supabase, MODE, counts, () => parlays.length);   // in main(), right after: await refresh();
 
   const client = createKalshiWs({
     keyId: KEY_ID,
