@@ -261,9 +261,15 @@ async function fetchSelfQuotes() {
   const signPath = '/trade-api/v2/communications/quotes';       // signature excludes the query string
   const headers = authHeaders({ keyId: KEY_ID, pem: PEM, method: 'GET', signPath });
   const res = await fetch(`${REST}/communications/quotes?user_filter=self&limit=100`, { headers });
-  if (!res.ok) throw new Error(`self-quotes ${res.status}: ${await res.text()}`);
-  const j = await res.json();
-  return j.quotes || [];
+  const text = await res.text();
+  const dbg = { id: 'self_quotes', ts: new Date().toISOString(), status: res.status, snippet: text.slice(0, 400) };
+  let quotes = [];
+  if (res.ok) {
+    try { const j = JSON.parse(text); quotes = j.quotes || j.data || []; dbg.keys = Object.keys(j).join(','); dbg.cnt = quotes.length; }
+    catch (e) { dbg.error = 'parse: ' + e.message; }
+  } else { dbg.error = 'http ' + res.status; }
+  try { await supabase.from('watcher_debug').upsert(dbg, { onConflict: 'id' }); } catch (_) {}
+  return quotes;
 }
 
 async function reconcileSelfQuotes() {
