@@ -36,6 +36,7 @@ const r2 = (x) => Math.round(x * 100) / 100;
 const KFEE = 0.0175;
 const nominalProbFromEff = (sEff) => { const b = 1 - KFEE; return (-b + Math.sqrt(b * b + 4 * KFEE * sEff)) / (2 * KFEE); };
 const noBidFor = (fillAmerican) => (fillAmerican ? r2(1 - nominalProbFromEff(impliedProb(fillAmerican))) : null);
+const toNum = (v) => (v == null ? null : (typeof v === 'string' ? parseFloat(v) : Number(v)));
 
 let parlays = [];
 let postedByQuote = {};   // quote_id -> {quote_id, rfq_id, parlay_id, label, posted_at}
@@ -145,7 +146,7 @@ async function onEvent(env) {
     try {
       await supabase.from('quote_outcomes').upsert({
         quote_id: qid, rfq_id: rid, label: '(live quote — no submission log)',
-        outcome: 'posted', submitted_no_bid: subNo, submitted_yes_bid: subYes,
+        outcome: 'posted', submitted_no_bid: subNo, submitted_yes_bid: subYes, raw: env,
         posted_at: parseTs(m.created_ts) ? new Date(parseTs(m.created_ts)).toISOString() : nowIso,
       }, { onConflict: 'quote_id', ignoreDuplicates: true });     // create-only; don't clobber a later state
       if (type === 'quote_accepted' || type === 'quote_executed' || subNo != null) {
@@ -252,6 +253,50 @@ async function reconcileRfq() {
   } catch (e) { console.error('[WATCH] reconcileRfq', e.message); }
 }
 
+// Authoritative source of OUR submitted quote prices + status, straight from Kalshi.
+// GET /communications/quotes?user_filter=self returns each of our quotes with the ACTUAL
+// no_bid_dollars/yes_bid_dollars we put on the wire and its status (open/accepted/executed/cancelled).
+// This is how we confirm the true price we offered, independent of the runner's (broken) logging.
+async function fetchSelfQuotes() {
+  const signPath = '/trade-api/v2/communications/quotes';       // signature excludes the query string
+  const headers = authHeaders({ keyId: KEY_ID, pem: PEM, method: 'GET', signPath });
+  const res = await fetch(`${REST}/communications/quotes?user_filter=self&limit=100`, { headers });
+  if (!res.ok) throw new Error(`self-quotes ${res.status}: ${await res.text()}`);
+  const j = await res.json();
+  return j.quotes || [];
+}
+
+async function reconcileSelfQuotes() {
+  try {
+    const quotes = await fetchSelfQuotes();
+    for (const qq of quotes) {
+      const qid = qq.id || qq.quote_id; if (!qid) continue;
+      const st = qq.status;
+      let outcome = null;                                        // only set on a terminal Kalshi status
+      if (st === 'executed' || st === 'confirmed') outcome = 'executed';
+      else if (st === 'accepted') outcome = 'accepted';
+      else if (st === 'cancelled') outcome = 'lost';
+      const patch = {
+        submitted_no_bid: toNum(qq.no_bid_dollars),
+        submitted_yes_bid: toNum(qq.yes_bid_dollars),
+        rfq_id: qq.rfq_id || null,
+        updated_at: new Date().toISOString(),
+      };
+      if (outcome) patch.outcome = outcome;
+      // update existing row (preserve its label/parlay); insert only if brand new
+      const { data: upd } = await supabase.from('quote_outcomes').update(patch).eq('quote_id', qid).select('quote_id');
+      if (!upd || !upd.length) {
+        await supabase.from('quote_outcomes').insert({
+          quote_id: qid, rfq_id: qq.rfq_id || null, label: '(self-quote — from Kalshi)',
+          outcome: outcome || 'posted',
+          submitted_no_bid: toNum(qq.no_bid_dollars), submitted_yes_bid: toNum(qq.yes_bid_dollars),
+          posted_at: parseTs(qq.created_ts) ? new Date(parseTs(qq.created_ts)).toISOString() : new Date().toISOString(),
+        });
+      }
+    }
+  } catch (e) { console.error('[WATCH] reconcileSelfQuotes', e.message); }
+}
+
 async function main() {
   if (!KEY_ID || !PEM || !process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
     console.error('[WATCH] missing env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY');
@@ -263,6 +308,8 @@ async function main() {
   setInterval(ageLost, 20000);
   setInterval(reconcileFills, 30000);
   setInterval(reconcileRfq, 30000);
+  setInterval(reconcileSelfQuotes, 30000);
+  reconcileSelfQuotes();   // immediate — backfill the real prices of quotes already posted today
   setInterval(() => console.log('[WATCH] tallies', counts), 60000);
 
   const client = createKalshiWs({
