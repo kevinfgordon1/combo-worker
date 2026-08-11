@@ -3,13 +3,13 @@
 // matches incoming combo RFQs against the user's active parlays (from Supabase),
 // and (when kill-switch is disarmed) posts a real quote via POST /communications/quotes.
 //
-// IMPORTANT ACCOUNTING RULE (Section 17.2):
-//   A successful POST only means "quote submitted". It does NOT mean the taker
-//   accepted it. We log status 'quoted' on POST success and do NOT bump the
-//   cumulative fill counter. Only a confirmed execution (quote_accepted /
-//   quote_executed or portfolio fill) should ever write status 'filled' and
-//   increment the counter. Until that wiring exists, max_contracts is protected
-//   only by the DB trigger + manual review.
+// ACCOUNTING (Section 17):
+//   Successful POST → status 'quoted'. Does NOT bump the cumulative fill counter.
+//   Only a confirmed execution should write status 'filled' and increment the counter.
+//
+// PARTIAL-FILL MODE (Section 18):
+//   max_contracts is a ceiling. Every matching RFQ with remaining ceiling is posted,
+//   even if the individual fill does not lock on its own (d.locks is informational).
 //
 // Supports both contract-sized and dollar-sized RFQs.
 //
@@ -24,7 +24,7 @@ const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
 const { decideAtFill, fillView } = require('./engine');
-const { startHeartbeat } = require('./heartbeat');   // top, with the other requires
+const { startHeartbeat } = require('./heartbeat');
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -58,7 +58,6 @@ let killByUser = {};
 // Cumulative share-limit tracking
 // filledByParlay        = true executions only (status='filled'), reconciled from DB
 // sessionFilledByParlay = true executions this session (bumped ONLY on confirmed fill)
-// Until execution events are wired, sessionFilledByParlay stays at 0 after POSTs.
 let filledByParlay = {};
 let sessionFilledByParlay = {};
 
@@ -68,9 +67,9 @@ const counts = {
   matched: 0,
   wouldQuote: 0,
   declined: 0,
-  noLock: 0,
+  noLock: 0,        // informational — we still post these in partial-fill mode
   limitReached: 0,
-  posted: 0,       // successful POSTs (quotes submitted)
+  posted: 0,
   postFailed: 0,
   dollarRfqs: 0,
 };
@@ -80,7 +79,7 @@ async function refresh() {
     const [{ data: p }, { data: s }, { data: fills }] = await Promise.all([
       supabase.from('combo_parlays').select('*').eq('active', true),
       supabase.from('combo_settings').select('user_id,kill_switch'),
-      // ONLY true executions. Do NOT include 'quoted' / is_live rows.
+      // ONLY true executions. Do NOT include 'quoted' rows.
       supabase.from('combo_submissions')
         .select('parlay_id,contracts,status')
         .eq('status', 'filled'),
@@ -233,39 +232,45 @@ async function onRfq(rfq) {
     return;
   }
 
+  // Section 18: d.locks is INFORMATIONAL only — still post partials.
+  if (!d.locks) {
+    counts.noLock++;
+    console.log(
+      `[${MODE}] NO-LOCK (still posting — partial-fill mode) ${p.label} rfq=${rfq.rfqId} worst=$${d.worst}`
+    );
+  }
+
   const cost = (d.contracts * parseFloat(d.quote.no_bid)).toFixed(0);
   const sizeNote = d.trimmedByLimit
     ? `⚠️ TRIMMED to ceiling: only ${d.contracts} left before your ${d.totalLimit} limit (${d.filledSoFar} already filled)`
     : d.partial
-      ? `fills to your ${d.cap} hedge (taker wanted ~${size.contracts} — you take ${d.contracts})`
-      : `full even hedge (${d.contracts})`;
+      ? `partial: taker wanted ~${size.contracts} — you take ${d.contracts}`
+      : `full size (${d.contracts})`;
 
   const sourceNote = size.source === 'dollar'
     ? ` (dollar RFQ $${size.targetCost} → ~${size.estimated} contracts)`
     : '';
+
+  const lockNote = d.locks
+    ? `🔒 LOCKS  worst $${d.worst}`
+    : `⚠️ NO-LOCK (partial — interim exposure accepted)  worst $${d.worst}`;
 
   await sendAlert(
     `🎯 Combo RFQ MATCH — ${p.label}\n` +
     `taker requested ~${size.contracts} contracts${sourceNote} (rfq ${rfq.rfqId})\n` +
     `➡️ PLACE: sell ${d.contracts} NO @ $${d.quote.no_bid}  ≈ $${cost} to put up\n` +
     `   ${sizeNote}\n` +
-    `   cumulative (true fills): ${d.filledSoFar}+${d.contracts} of ${d.totalLimit} · ${d.remaining} left after\n` +
+    `   cumulative (true fills): ${d.filledSoFar} of ${d.totalLimit} · ${d.remaining} left after this quote\n` +
     `   your ${sgn(p.fill_american)} net · taker gets ${sgn(d.effTakerOdds)}\n` +
-    `${d.locks ? '🔒 LOCKS' : '⚠️ NO-LOCK'}  worst $${d.worst}  (win $${d.hit} / lose $${d.miss})`
+    `${lockNote}  (win $${d.hit} / lose $${d.miss})`
   );
-
-  if (!d.locks) {
-    counts.noLock++;
-    console.log(`[${MODE}] NO-LOCK ${p.label} rfq=${rfq.rfqId} worst=$${d.worst}`);
-    await log(p, rfq, d, 'nolock');
-    return;
-  }
 
   counts.wouldQuote++;
   console.log(
     `[${MODE}] WOULD QUOTE ${engaged ? '(kill-switch engaged) ' : ''}${p.label} ` +
     `rfq=${rfq.rfqId} post=${JSON.stringify(d.quote)} ` +
-    `trueFills=${filledSoFar}/${d.totalLimit} source=${size.source}`
+    `trueFills=${filledSoFar}/${d.totalLimit} source=${size.source} ` +
+    `locks=${d.locks} worst=$${d.worst}`
   );
 
   // ─── LIVE POST ─────────────────────────────────────────────────────────
@@ -274,13 +279,12 @@ async function onRfq(rfq) {
       const result = await postQuote(rfq, d);
       counts.posted++;
 
-      // CRITICAL: do NOT bump sessionFilledByParlay here.
-      // A successful POST only means the quote was submitted, not that it was taken.
-      // Bump the counter only when a confirmed execution arrives (future work).
+      // CRITICAL (Section 17): do NOT bump sessionFilledByParlay here.
+      // Bump only when a confirmed execution arrives (future work).
 
       console.log(
         `[${MODE}] QUOTED ${p.label} rfq=${rfq.rfqId} quote_id=${result.id} ` +
-        `contracts=${d.contracts} (not yet a fill — waiting for acceptance)`
+        `contracts=${d.contracts} locks=${d.locks} (not yet a fill — waiting for acceptance)`
       );
 
       await log(p, rfq, d, 'quoted', {
@@ -292,7 +296,8 @@ async function onRfq(rfq) {
         `📤 QUOTE POSTED (not yet filled) — ${p.label}\n` +
         `quote ${result.id} · rfq ${rfq.rfqId}\n` +
         `offered ${d.contracts} NO @ $${d.quote.no_bid}\n` +
-        `Waiting for taker acceptance. This does NOT count against the fill ceiling.`
+        `${d.locks ? '🔒 would lock if filled' : '⚠️ partial — interim exposure if filled'}\n` +
+        `Waiting for taker acceptance. Does NOT count against the fill ceiling until executed.`
       );
     } catch (e) {
       counts.postFailed++;
@@ -314,20 +319,21 @@ async function main() {
   }
   console.log(
     `[${MODE}] starting — posts real quotes when kill-switch is disarmed. ` +
-    `POST success = 'quoted' (not a fill). Cumulative ceiling only counts true executions.`
+    `Partial-fill mode: posts even when individual fill does not lock. ` +
+    `POST success = 'quoted' (not a fill). Ceiling only counts true executions.`
   );
   await refresh();
   setInterval(refresh, 30000);
-  startHeartbeat(supabase, MODE, counts, () => parlays.length);   // in main(), right after: await refresh();
+
+  // Heartbeat → combo_worker_stats (observability only)
+  startHeartbeat(supabase, MODE, counts, () => parlays.length);
 
   const client = createKalshiWs({
     keyId: KEY_ID,
     pem: PEM,
     onStatus: (s, i) => console.log(`[${MODE}] ws:${s}`, i || ''),
     onRfqCreated: (rfq) => onRfq(rfq).catch((e) => console.error('onRfq', e)),
-    // Future: add onQuoteAccepted / onQuoteExecuted handlers here to:
-    //   1. log status 'filled' with order_id
-    //   2. sessionFilledByParlay[parlayId] += contracts
+    // Future: onQuoteAccepted / onQuoteExecuted → status 'filled' + bump counter
   });
 
   setInterval(() => console.log(`[${MODE}] tallies`, counts), 60000);
