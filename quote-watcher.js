@@ -265,7 +265,7 @@ async function fetchSelfQuotes() {
   const headers = authHeaders({ keyId: KEY_ID, pem: PEM, method: 'GET', signPath });
   const res = await fetch(`${REST}/communications/quotes?user_filter=self&limit=100`, { headers });
   const text = await res.text();
-  const dbg = { id: 'self_quotes', ts: new Date().toISOString(), status: res.status, snippet: text.slice(0, 400) };
+  const dbg = { id: 'self_quotes', ts: new Date().toISOString(), status: res.status, snippet: text.slice(0, 1800) };
   let quotes = [];
   if (res.ok) {
     try { const j = JSON.parse(text); quotes = j.quotes || j.data || []; dbg.keys = Object.keys(j).join(','); dbg.cnt = quotes.length; }
@@ -306,6 +306,24 @@ async function reconcileSelfQuotes() {
   } catch (e) { console.error('[WATCH] reconcileSelfQuotes', e.message); }
 }
 
+// One-shot eligibility probe: what account/balance is the worker's API key actually on?
+// A maker quote can be accepted (200/open) yet never fill if the account lacks collateral,
+// so we read balance + the exchange/account view to see what this key can actually back.
+async function probeAccount() {
+  const get = async (id, path) => {
+    try {
+      const headers = authHeaders({ keyId: KEY_ID, pem: PEM, method: 'GET', signPath: '/trade-api/v2' + path });
+      const res = await fetch(`${REST}${path}`, { headers });
+      const text = await res.text();
+      await supabase.from('watcher_debug').upsert({ id, ts: new Date().toISOString(), status: res.status, snippet: text.slice(0, 800) }, { onConflict: 'id' });
+    } catch (e) {
+      await supabase.from('watcher_debug').upsert({ id, ts: new Date().toISOString(), error: String(e && e.message || e) }, { onConflict: 'id' }).catch(() => {});
+    }
+  };
+  await get('balance', '/portfolio/balance');
+  await get('positions', '/portfolio/positions');
+}
+
 async function main() {
   if (!KEY_ID || !PEM || !process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
     console.error('[WATCH] missing env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY');
@@ -319,6 +337,7 @@ async function main() {
   setInterval(reconcileRfq, 30000);
   setInterval(reconcileSelfQuotes, 30000);
   reconcileSelfQuotes();   // immediate — backfill the real prices of quotes already posted today
+  probeAccount();          // one-shot: read the worker key's balance + positions (eligibility check)
   setInterval(() => console.log('[WATCH] tallies', counts), 60000);
 
   const client = createKalshiWs({
