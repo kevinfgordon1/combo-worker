@@ -5,7 +5,7 @@
 //
 // ACCOUNTING (Section 17):
 //   Successful POST → status 'quoted'. Does NOT bump the cumulative fill counter.
-//   Only a confirmed execution should write status 'filled' and increment the counter.
+//   Only quote_executed writes status 'filled' and increments the counter.
 //
 // PARTIAL-FILL MODE (Section 18):
 //   max_contracts is a ceiling. Every matching RFQ with remaining ceiling is posted,
@@ -57,9 +57,12 @@ let killByUser = {};
 
 // Cumulative share-limit tracking
 // filledByParlay        = true executions only (status='filled'), reconciled from DB
-// sessionFilledByParlay = true executions this session (bumped ONLY on confirmed fill)
+// sessionFilledByParlay = true executions this session (bumped ONLY on quote_executed)
 let filledByParlay = {};
 let sessionFilledByParlay = {};
+
+// quote_id → { parlayId, userId, contracts, label, rfqId }
+const pendingQuotes = new Map();
 
 const counts = {
   rfqs: 0,
@@ -67,11 +70,12 @@ const counts = {
   matched: 0,
   wouldQuote: 0,
   declined: 0,
-  noLock: 0,        // informational — we still post these in partial-fill mode
+  noLock: 0,
   limitReached: 0,
   posted: 0,
   postFailed: 0,
   dollarRfqs: 0,
+  filled: 0,
 };
 
 async function refresh() {
@@ -174,6 +178,65 @@ function resolveRfqContracts(rfq, fillAmerican) {
   return { contracts: null, source: 'none' };
 }
 
+async function onQuoteExecuted(evt) {
+  const { quoteId, orderId } = evt;
+  if (!quoteId) return;
+
+  const pending = pendingQuotes.get(quoteId);
+  if (!pending) {
+    console.log(`[${MODE}] quote_executed for unknown quote_id=${quoteId} order_id=${orderId}`);
+    return;
+  }
+
+  const contracts = pending.contracts;
+
+  // Mark the submission as a real fill
+  try {
+    const { error } = await supabase
+      .from('combo_submissions')
+      .update({
+        status: 'filled',
+        order_id: orderId || null,
+      })
+      .eq('quote_id', quoteId);
+
+    if (error) {
+      console.error(`[${MODE}] update filled failed, inserting`, error.message);
+      await supabase.from('combo_submissions').insert({
+        user_id: pending.userId,
+        parlay_id: pending.parlayId,
+        rfq_id: pending.rfqId,
+        label: pending.label,
+        contracts,
+        status: 'filled',
+        quote_id: quoteId,
+        order_id: orderId || null,
+        is_live: true,
+      });
+    }
+  } catch (e) {
+    console.error(`[${MODE}] onQuoteExecuted DB error`, e.message);
+  }
+
+  // Bump cumulative counter — ONLY place that should
+  sessionFilledByParlay[pending.parlayId] =
+    (sessionFilledByParlay[pending.parlayId] || 0) + contracts;
+
+  pendingQuotes.delete(quoteId);
+  counts.filled++;
+
+  console.log(
+    `[${MODE}] FILL CONFIRMED ${pending.label} quote_id=${quoteId} order_id=${orderId} ` +
+    `contracts=${contracts} sessionTotal=${sessionFilledByParlay[pending.parlayId]}`
+  );
+
+  await sendAlert(
+    `✅ FILL CONFIRMED — ${pending.label}\n` +
+    `order ${orderId || '(none)'} · quote ${quoteId}\n` +
+    `+${contracts} contracts now count against the ceiling`
+  );
+}
+
 async function onRfq(rfq) {
   counts.rfqs++;
 
@@ -232,7 +295,7 @@ async function onRfq(rfq) {
     return;
   }
 
-  // Section 18: d.locks is INFORMATIONAL only — still post partials.
+  // Section 18: d.locks is INFORMATIONAL only — still post partials
   if (!d.locks) {
     counts.noLock++;
     console.log(
@@ -279,8 +342,14 @@ async function onRfq(rfq) {
       const result = await postQuote(rfq, d);
       counts.posted++;
 
-      // CRITICAL (Section 17): do NOT bump sessionFilledByParlay here.
-      // Bump only when a confirmed execution arrives (future work).
+      // Track until quote_executed
+      pendingQuotes.set(result.id, {
+        parlayId: p.id,
+        userId: p.user_id,
+        contracts: d.contracts,
+        label: p.label,
+        rfqId: rfq.rfqId,
+      });
 
       console.log(
         `[${MODE}] QUOTED ${p.label} rfq=${rfq.rfqId} quote_id=${result.id} ` +
@@ -319,13 +388,11 @@ async function main() {
   }
   console.log(
     `[${MODE}] starting — posts real quotes when kill-switch is disarmed. ` +
-    `Partial-fill mode: posts even when individual fill does not lock. ` +
-    `POST success = 'quoted' (not a fill). Ceiling only counts true executions.`
+    `Partial-fill mode. POST = 'quoted'. Ceiling advances only on quote_executed.`
   );
   await refresh();
   setInterval(refresh, 30000);
 
-  // Heartbeat → combo_worker_stats (observability only)
   startHeartbeat(supabase, MODE, counts, () => parlays.length);
 
   const client = createKalshiWs({
@@ -333,7 +400,7 @@ async function main() {
     pem: PEM,
     onStatus: (s, i) => console.log(`[${MODE}] ws:${s}`, i || ''),
     onRfqCreated: (rfq) => onRfq(rfq).catch((e) => console.error('onRfq', e)),
-    // Future: onQuoteAccepted / onQuoteExecuted → status 'filled' + bump counter
+    onQuoteExecuted: (evt) => onQuoteExecuted(evt).catch((e) => console.error('onQuoteExecuted', e)),
   });
 
   setInterval(() => console.log(`[${MODE}] tallies`, counts), 60000);
