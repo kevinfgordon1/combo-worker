@@ -108,24 +108,50 @@ async function onEvent(env) {
   }
 
   // ── 2. Track outcomes of OUR OWN quotes ─────────────────────────────────
+  // Every quote_* event on the communications channel is PRIVATE to the maker (us),
+  // so any quote event we receive is our own quote — record it whether or not the
+  // runner logged a combo_submissions row. This captures the ACTUAL submitted price
+  // (yes_bid/no_bid straight off the event) and the real fate (accepted/executed/lost).
   if (type.indexOf('quote_') === 0) {
     const m = env.msg || {};
-    const qid = m.id || m.quote_id || null;
-    const rid = m.rfq_id || null;
-    const rec = (qid && postedByQuote[qid]) || (rid && postedByRfq[rid]) || null;
-    if (!rec) return;                 // not one of our quotes — ignore
+    const q = (m.quote && typeof m.quote === 'object') ? m.quote : m;   // some events nest under .quote
+    const qid = m.id || m.quote_id || q.id || null;
+    const rid = m.rfq_id || q.rfq_id || null;
+    if (!qid && !rid) return;
     counts.quoteEvents++;
     const nowIso = new Date().toISOString();
+    const numify = (v) => (v == null ? null : (typeof v === 'string' ? parseFloat(v) : Number(v)));
+    const subNo = numify(m.no_bid != null ? m.no_bid : q.no_bid);
+    const subYes = numify(m.yes_bid != null ? m.yes_bid : q.yes_bid);
+
     const patch = { updated_at: nowIso, raw: env };
+    if (subNo != null) patch.submitted_no_bid = subNo;
+    if (subYes != null) patch.submitted_yes_bid = subYes;
     if (type === 'quote_accepted') { patch.outcome = 'accepted'; patch.accepted_at = nowIso; counts.accepted++; }
     else if (type === 'quote_executed') {
       patch.outcome = 'executed'; patch.executed_at = nowIso; counts.executed++;
-      patch.order_id = m.order_id || m.creator_order_id || m.maker_order_id || null;
+      patch.order_id = m.order_id || m.creator_order_id || m.maker_order_id || q.order_id || null;
     }
-    // else quote_created: leave outcome as-is (row already seeded 'posted')
-    // (response latency + window are computed authoritatively in reconcileRfq from the RFQ timeline)
-    try { await supabase.from('quote_outcomes').update(patch).eq('quote_id', rec.quote_id); }
-    catch (e) { console.error('[WATCH] outcome update', e.message); }
+
+    const rec = (qid && postedByQuote[qid]) || (rid && postedByRfq[rid]) || null;
+    if (rec) {
+      // seeded from combo_submissions — update that row (keeps intended price + parlay label)
+      try { await supabase.from('quote_outcomes').update(patch).eq('quote_id', rec.quote_id); }
+      catch (e) { console.error('[WATCH] outcome update', e.message); }
+      return;
+    }
+    // UN-SEEDED — the runner posted this quote but never logged it. Record it anyway.
+    if (!qid) return;
+    try {
+      await supabase.from('quote_outcomes').upsert({
+        quote_id: qid, rfq_id: rid, label: '(live quote — no submission log)',
+        outcome: 'posted', submitted_no_bid: subNo, submitted_yes_bid: subYes,
+        posted_at: parseTs(m.created_ts) ? new Date(parseTs(m.created_ts)).toISOString() : nowIso,
+      }, { onConflict: 'quote_id', ignoreDuplicates: true });     // create-only; don't clobber a later state
+      if (type === 'quote_accepted' || type === 'quote_executed' || subNo != null) {
+        await supabase.from('quote_outcomes').update(patch).eq('quote_id', qid);
+      }
+    } catch (e) { console.error('[WATCH] outcome upsert', e.message); }
   }
 }
 
