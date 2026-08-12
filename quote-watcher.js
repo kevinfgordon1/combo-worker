@@ -451,15 +451,18 @@ async function reconcileTape() {
         || (o.raw && o.raw.tape && o.raw.tape.alerted_at);
       let alertedAt = null;
       if (!alreadyAlerted) {
-        if (isRecentLoss(o, closed)) {
+        // Only Telegram when we have a clearing price. Bare "outbid / no tape" is noise —
+        // most RFQs expire with no public print.
+        const shouldAlert = isRecentLoss(o, closed) && result && result.match === 'matched';
+        if (shouldAlert) {
           const ourNo = tapeNum(o.submitted_no_bid != null ? o.submitted_no_bid : o.no_bid);
           await sendAlert(formatLostAlert({
             label: o.label, rfqId: o.rfq_id, lossReason: o.loss_reason, tape: result, ourNo,
           }));
           tapeAlerted.add(o.quote_id);
           counts.tapeAlerts++;
+          alertedAt = new Date().toISOString();
         }
-        alertedAt = new Date().toISOString();
       }
       await persistTape(o, result, alertedAt ? { tape_alerted_at: alertedAt } : {});
       if (result.match === 'matched') counts.tapeMatched++;
