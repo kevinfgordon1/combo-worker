@@ -96,4 +96,4 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
     quote: { yes_bid: '0.00', no_bid: v.noBid, rest_remainder: false }, contracts: N,
   };
 }
-module.exports = { decideAtFill, impliedProb, hedgeCap, fillView };
+module.exports = { decideAtFill, impliedProb, hedgeCap, fillView, americanFromProb };

@@ -28,10 +28,11 @@ function normalizeRfq(e) {
     : null;
   return {
     rfqId: m.id || m.rfq_id || null,
+    marketTicker: m.market_ticker || m.ticker || null,
     mveCollection: m.mve_collection_ticker || null,
     legKeys,
     isCombo: !!(m.mve_collection_ticker || (legKeys && legKeys.length > 1)),
-    contracts: parseContracts(m.contracts_fp),
+    contracts: parseContracts(m.contracts_fp != null ? m.contracts_fp : m.contracts),
     targetCostDollars: Number.isFinite(targetCost) && targetCost > 0 ? targetCost : null,
     createdTs: m.created_ts || null,
   };
