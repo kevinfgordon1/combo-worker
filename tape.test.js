@@ -106,12 +106,25 @@ assert.strictEqual(americanFromProb(0.6), -150);
   assert.strictEqual(r.trade.isBlockTrade, true);
 }
 
-// only book prints (flag present, all false) → none, even if size matches
+// only book prints (flag present, all false) → fall back and match by size/time
 {
   const trades = [
     n({ count_fp: '10.00', no_price_dollars: '0.92', yes_price_dollars: '0.08', created_time: '2026-08-12T20:00:02Z', is_block_trade: false }),
   ];
-  assert.strictEqual(matchTapeTrades(trades, { rfqCount: 10, closedMs: closed }).match, 'none');
+  const r = matchTapeTrades(trades, { rfqCount: 10, closedMs: closed });
+  assert.strictEqual(r.match, 'matched');
+  assert.strictEqual(r.noPrice, 0.92);
+}
+
+// $1 combo print shape: ~9.31 count, non-block, near RFQ close
+{
+  const trades = [
+    n({ count_fp: '9.31', no_price_dollars: '0.8990', yes_price_dollars: '0.1010', created_time: '2026-08-12T22:10:01.336863Z', is_block_trade: false }),
+  ];
+  const r = matchTapeTrades(trades, { rfqCount: 9, closedMs: Date.parse('2026-08-12T22:10:01Z') });
+  assert.strictEqual(r.match, 'matched');
+  assert.strictEqual(r.yesPrice, 0.101);
+  assert.strictEqual(r.noPrice, 0.899);
 }
 
 // multiple block prints at the same size but different prices → ambiguous

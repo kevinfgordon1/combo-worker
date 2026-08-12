@@ -117,7 +117,11 @@ const killEngagedFor = (userId) => killByUser[userId] !== false;
 // Live quotes: status=filled + is_live + no order_id → Combo Locks shows "quoted (awaiting)".
 // Executions set order_id. "limitreached" maps to declined.
 function normalizeStatus(status) {
-  if (status === 'quoted') return 'filled';
+  // Posted quotes must NOT use status=filled — that made Combo Locks / any
+  // fill-summing logic treat quotes as real fills and pause the parlay when
+  // quoted size crossed max_contracts. Real executions still write status=filled
+  // with an order_id in onQuoteExecuted.
+  if (status === 'quoted') return 'unfilled';
   if (status === 'limitreached') return 'declined';
   return status;
 }
