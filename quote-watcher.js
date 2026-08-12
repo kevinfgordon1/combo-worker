@@ -28,7 +28,7 @@ const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const REST = process.env.KALSHI_REST_BASE || 'https://api.elections.kalshi.com/trade-api/v2';
-const LOST_AFTER_MS = 30000;         // no acceptance within this window → mark 'lost' (outbid / not taken)
+const LOST_AFTER_MS = 30000;         // no acceptance within this window → mark 'lost' (classify later)
 const TAPE_PAD_MS = 45000;           // RFQ close → public print delay
 const TAPE_LOOKBACK_MS = 24 * 3600 * 1000;
 const ALERT_LOOKBACK_MS = 2 * 3600 * 1000;
@@ -202,7 +202,7 @@ async function onEvent(env) {
   }
 }
 
-// Age un-accepted quotes to 'lost' (outbid, or the taker accepted no one / let it expire).
+// Age un-accepted quotes to 'lost' (later classified no_purchase / outbid / too_slow / no_taker).
 async function ageLost() {
   try {
     const cutoff = new Date(Date.now() - LOST_AFTER_MS).toISOString();
@@ -262,8 +262,9 @@ function parseTs(v) {
 //   responded_ms  = our post time − RFQ created  (how fast WE answered)
 //   rfq_lifetime_ms = RFQ closed − RFQ created   (how long the window was open)
 //   in_time       = did we answer before it closed?
-// Then classify a LOSS: cancelled → no_taker; closed & in-time → outbid (beaten on price);
-// closed & NOT in-time → too_slow (we missed the window). Kalshi never reveals the winner's price.
+// Then classify a LOSS: cancelled → no_taker; closed & NOT in-time → too_slow;
+// closed & in-time → no_purchase for now. reconcileTape upgrades to outbid only when
+// the public tape shows someone else filled (clearing price).
 async function reconcileRfq() {
   try {
     const { data: rows } = await supabase.from('quote_outcomes')
@@ -282,7 +283,8 @@ async function reconcileRfq() {
       const lifeMs = (created != null && closed != null) ? Math.max(0, closed - created) : null;
       const inTime = (respMs != null && lifeMs != null) ? respMs <= lifeMs : null;
       let reason;
-      if (o.outcome === 'lost') reason = cancelled ? 'no_taker' : (inTime === false ? 'too_slow' : 'outbid');
+      // Outbid is proven later by tape match — don't assume a silent close means we lost on price.
+      if (o.outcome === 'lost') reason = cancelled ? 'no_taker' : (inTime === false ? 'too_slow' : 'no_purchase');
       const patch = {
         rfq_status: rfq.status,
         cancellation_reason: rfq.cancellation_reason || null,
@@ -447,17 +449,30 @@ async function reconcileTape() {
       }
 
       tapeAttempted.add(o.quote_id);
+
+      // Tape is ground truth for price competition.
+      // matched → outbid; no/ambiguous print on a non-cancelled RFQ → no_purchase.
+      let lossReason = o.loss_reason || null;
+      if (result.match === 'matched') lossReason = 'outbid';
+      else if (lossReason === 'outbid' || lossReason === 'no_purchase' || !lossReason) {
+        if (result.match === 'none' || result.match === 'ambiguous') lossReason = 'no_purchase';
+      }
+      if (lossReason && lossReason !== o.loss_reason) {
+        const { error: lrErr } = await updateQuoteOutcome(o.quote_id, { loss_reason: lossReason });
+        if (lrErr) console.warn('[WATCH] loss_reason update', lrErr.message);
+        else o.loss_reason = lossReason;
+      }
+
       const alreadyAlerted = tapeAlerted.has(o.quote_id) || o.tape_alerted_at
         || (o.raw && o.raw.tape && o.raw.tape.alerted_at);
       let alertedAt = null;
       if (!alreadyAlerted) {
-        // Only Telegram when we have a clearing price. Bare "outbid / no tape" is noise —
-        // most RFQs expire with no public print.
+        // Telegram only for proven outbids (clearing price on tape).
         const shouldAlert = isRecentLoss(o, closed) && result && result.match === 'matched';
         if (shouldAlert) {
           const ourNo = tapeNum(o.submitted_no_bid != null ? o.submitted_no_bid : o.no_bid);
           await sendAlert(formatLostAlert({
-            label: o.label, rfqId: o.rfq_id, lossReason: o.loss_reason, tape: result, ourNo,
+            label: o.label, rfqId: o.rfq_id, lossReason: 'outbid', tape: result, ourNo,
           }));
           tapeAlerted.add(o.quote_id);
           counts.tapeAlerts++;
@@ -467,7 +482,7 @@ async function reconcileTape() {
       await persistTape(o, result, alertedAt ? { tape_alerted_at: alertedAt } : {});
       if (result.match === 'matched') counts.tapeMatched++;
       else if (result.match === 'ambiguous') counts.tapeAmbiguous++;
-      console.log(`[WATCH] tape ${result.match} quote=${o.quote_id} rfq=${o.rfq_id} ticker=${ticker || '(none)'} reason=${o.loss_reason}`);
+      console.log(`[WATCH] tape ${result.match} quote=${o.quote_id} rfq=${o.rfq_id} ticker=${ticker || '(none)'} reason=${lossReason || o.loss_reason}`);
     }
   } catch (e) { console.error('[WATCH] reconcileTape', e.message); }
 }
