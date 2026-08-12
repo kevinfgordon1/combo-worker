@@ -160,13 +160,18 @@ function confirmPath(rfqId, quoteId) {
 
 async function confirmQuote(rfqId, quoteId) {
   const path = confirmPath(rfqId, quoteId);
+  // Kalshi rejects PUTs without an explicit JSON content-type (400 invalid_content_type),
+  // even when the body is empty — send {} + application/json.
+  const body = '{}';
   const headers = {
+    'Content-Type': 'application/json',
     ...authHeaders({ keyId: KEY_ID, pem: PEM, method: 'PUT', signPath: path }),
   };
   const { statusCode, body: resBody } = await kalshiHttp.request({
     path,
     method: 'PUT',
     headers,
+    body,
   });
   const text = await resBody.text();
   if (statusCode < 200 || statusCode >= 300) {
