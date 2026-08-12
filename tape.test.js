@@ -164,6 +164,12 @@ assert.strictEqual(americanFromProb(0.6), -150);
 {
   const text = formatLostAlert({ label: 'X', rfqId: 'r', lossReason: 'outbid', tape: { match: 'none' }, ourNo: 0.07 });
   assert.ok(text.includes('No clean tape match'));
+
+{
+  const text = formatLostAlert({ label: 'X', rfqId: 'r', lossReason: 'no_purchase', tape: { match: 'none' }, ourNo: 0.07 });
+  assert.ok(text.includes('LOST (no_purchase)'));
+  assert.ok(text.includes('No purchase'));
+}
 }
 
 {

@@ -119,6 +119,8 @@ function formatLostAlert({ label, rfqId, lossReason, tape, ourNo }) {
     const yesBit = yesAm ? ` (~YES ${yesAm})` : '';
     const cnt = tape.count != null ? ` · ${fmtCount(tape.count)} contracts` : '';
     text += `\nTape: NO @ $${Number(tape.noPrice).toFixed(2)}${yesBit}${cnt}`;
+  } else if (reason === 'no_purchase') {
+    text += '\nNo purchase (RFQ closed with no public fill)';
   } else if (reason === 'outbid') {
     text += '\nNo clean tape match';
   }
