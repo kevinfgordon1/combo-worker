@@ -50,7 +50,9 @@ function hedgeCap({ stake, boostAmerican, fillAmerican, mode = '1x' }) {
 //                  this session). The caller supplies this; the engine just respects it.
 //
 // remaining = maxContracts - filledSoFar. When remaining <= 0 the RFQ is DECLINED ('limit_reached').
-// A partial fill trims N to `remaining` so you land exactly on the ceiling, never past it.
+// IMPORTANT: Kalshi maker quotes have NO size — accepting our quote fills the FULL RFQ.
+// So we must DECLINE when rfqContracts > remaining (cannot "partial quote"). Same for
+// rfqContracts > per-fill hedge cap.
 function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican = null, rfqContracts, hedgeMode = '1x', maxContracts = null, filledSoFar = 0 }) {
   if (!(parlayStake > 0) || !parlayAmerican || !fillAmerican || !(rfqContracts > 0)) return { ok: false, reason: 'bad_inputs' };
   const dec = aToDec(parlayAmerican), winReturn = parlayStake * dec, bookHit = winReturn - parlayStake, bookMiss = -parlayStake;
@@ -62,16 +64,28 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
   if (remainingBefore <= 0) {
     return { ok: false, reason: 'limit_reached', cap, totalLimit, filledSoFar: already, remaining: 0 };
   }
-  const N = Math.min(rfqContracts, cap, remainingBefore); // never exceed per-fill cap NOR the remaining ceiling
+  // Full-RFQ-only venue: never quote if the RFQ is larger than we can still sell.
+  if (rfqContracts > remainingBefore) {
+    return {
+      ok: false, reason: 'rfq_too_large', cap, totalLimit, filledSoFar: already,
+      remaining: remainingBefore, rfqContracts,
+    };
+  }
+  if (rfqContracts > cap) {
+    return {
+      ok: false, reason: 'rfq_too_large', cap, totalLimit, filledSoFar: already,
+      remaining: remainingBefore, rfqContracts,
+    };
+  }
+  const N = rfqContracts; // quote size == RFQ size (only path Kalshi supports)
   if (!(N > 0)) return { ok: false, reason: 'zero_cap', cap, totalLimit, filledSoFar: already, remaining: remainingBefore };
   const s = impliedProb(fillAmerican); // already net of your maker fee
   const hit = bookHit + N * s - N, miss = bookMiss + N * s, worst = Math.min(hit, miss);
   const v = fillView(fillAmerican);
   const remainingAfter = remainingBefore - N;
-  const trimmedByLimit = N < Math.min(rfqContracts, cap); // this fill was clipped by the cumulative ceiling
   return {
     ok: true, locks: worst >= 0, hit: r2(hit), miss: r2(miss), worst: r2(worst),
-    partial: rfqContracts > N, trimmedByLimit, cap, hedgeMode,
+    partial: false, trimmedByLimit: false, cap, hedgeMode,
     totalLimit, filledSoFar: already, remaining: remainingAfter, limitReached: remainingAfter <= 0,
     competitive: fairAmerican == null ? null : fillAmerican >= fairAmerican, fillAmerican,
     effTakerOdds: v.effTaker,

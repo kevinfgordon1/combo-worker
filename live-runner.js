@@ -72,9 +72,12 @@ async function refresh() {
     const [{ data: p }, { data: s }, { data: fills }] = await Promise.all([
       supabase.from('combo_parlays').select('*').eq('active', true),
       supabase.from('combo_settings').select('user_id,kill_switch'),
-      supabase.from('combo_submissions')
-        .select('parlay_id,contracts,status')
-        .eq('status', 'filled'),
+      // Ground truth contracts from Kalshi account fills (not our optimistic submission math).
+      supabase.from('combo_fills')
+        .select('parlay_id,count')
+        .eq('is_combo', true)
+        .eq('is_taker', false)
+        .not('parlay_id', 'is', null),
     ]);
     parlays = p || [];
     killByUser = {};
@@ -82,7 +85,7 @@ async function refresh() {
 
     filledByParlay = {};
     (fills || []).forEach((r) => {
-      filledByParlay[r.parlay_id] = (filledByParlay[r.parlay_id] || 0) + Number(r.contracts || 0);
+      filledByParlay[r.parlay_id] = (filledByParlay[r.parlay_id] || 0) + Number(r.count || 0);
     });
 
     // Pre-stage prices (Step 3)
@@ -105,7 +108,9 @@ async function refresh() {
   }
 }
 
-const filledSoFarFor = (id) => (filledByParlay[id] || 0) + (sessionFilledByParlay[id] || 0);
+// Use the larger of DB fills vs session fills so a restart can't under-count,
+// and we don't double-count the same contracts from both sources.
+const filledSoFarFor = (id) => Math.max(filledByParlay[id] || 0, sessionFilledByParlay[id] || 0);
 const killEngagedFor = (userId) => killByUser[userId] !== false;
 
 // DB check constraint allows: shadow | filled | unfilled | declined.
@@ -408,6 +413,12 @@ async function onRfq(rfq) {
       return;
     }
     counts.declined++;
+    if (d.reason === 'rfq_too_large') {
+      console.log(
+        `[${MODE}] SKIP oversized RFQ ${p.label} rfq=${rfq.rfqId} ` +
+        `want=${size.contracts} remaining=${d.remaining}/${d.totalLimit}`
+      );
+    }
     logAsync(p, rfq, null, 'declined');
     return;
   }
