@@ -94,6 +94,47 @@ assert.strictEqual(americanFromProb(0.6), -150);
   assert.strictEqual(r.noPrice, 0.08);
 }
 
+// RFQ block print wins over a same-size ordinary book print at a different price
+{
+  const trades = [
+    n({ count_fp: '10.00', no_price_dollars: '0.50', yes_price_dollars: '0.50', created_time: '2026-08-12T20:00:01Z', is_block_trade: false }),
+    n({ count_fp: '10.00', no_price_dollars: '0.92', yes_price_dollars: '0.08', created_time: '2026-08-12T20:00:03Z', is_block_trade: true }),
+  ];
+  const r = matchTapeTrades(trades, { rfqCount: 10, closedMs: closed });
+  assert.strictEqual(r.match, 'matched');
+  assert.strictEqual(r.noPrice, 0.92);
+  assert.strictEqual(r.trade.isBlockTrade, true);
+}
+
+// only book prints (flag present, all false) → none, even if size matches
+{
+  const trades = [
+    n({ count_fp: '10.00', no_price_dollars: '0.92', yes_price_dollars: '0.08', created_time: '2026-08-12T20:00:02Z', is_block_trade: false }),
+  ];
+  assert.strictEqual(matchTapeTrades(trades, { rfqCount: 10, closedMs: closed }).match, 'none');
+}
+
+// multiple block prints at the same size but different prices → ambiguous
+{
+  const trades = [
+    n({ count_fp: '10.00', no_price_dollars: '0.92', yes_price_dollars: '0.08', created_time: '2026-08-12T20:00:02Z', is_block_trade: true }),
+    n({ count_fp: '10.00', no_price_dollars: '0.91', yes_price_dollars: '0.09', created_time: '2026-08-12T20:00:04Z', is_block_trade: true }),
+    n({ count_fp: '10.00', no_price_dollars: '0.50', yes_price_dollars: '0.50', created_time: '2026-08-12T20:00:03Z', is_block_trade: false }),
+  ];
+  assert.strictEqual(matchTapeTrades(trades, { rfqCount: 10, closedMs: closed }).match, 'ambiguous');
+}
+
+// two block prints at the same price: pick closest to RFQ close
+{
+  const trades = [
+    n({ count_fp: '10.00', no_price_dollars: '0.92', yes_price_dollars: '0.08', created_time: '2026-08-12T19:59:50Z', is_block_trade: true }),
+    n({ count_fp: '10.00', no_price_dollars: '0.92', yes_price_dollars: '0.08', created_time: '2026-08-12T20:00:03Z', is_block_trade: true }),
+  ];
+  const r = matchTapeTrades(trades, { rfqCount: 10, closedMs: closed });
+  assert.strictEqual(r.match, 'matched');
+  assert.strictEqual(r.tradeTs, Date.parse('2026-08-12T20:00:03Z'));
+}
+
 // alert text
 {
   const text = formatLostAlert({

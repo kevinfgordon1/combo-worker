@@ -44,6 +44,13 @@ function priceKey(yes, no) {
   return `${y}|${n}`;
 }
 
+function blockFlag(t) {
+  if (!t) return null;
+  if (typeof t.isBlockTrade === 'boolean') return t.isBlockTrade;
+  if (typeof t.is_block_trade === 'boolean') return t.is_block_trade;
+  return null;
+}
+
 function normalizeTrade(t, parseTs) {
   const count = tradeCount(t);
   let yes = t ? toPriceDollars(t.yes_price_dollars ?? t.yes_price_fixed, t.yes_price) : null;
@@ -51,22 +58,27 @@ function normalizeTrade(t, parseTs) {
   if (yes == null && no != null) yes = Math.round((1 - no) * 100) / 100;
   if (no == null && yes != null) no = Math.round((1 - yes) * 100) / 100;
   const ts = parseTs ? parseTs(t && (t.created_time || t.ts || t.created_ts)) : null;
-  return { count, yes, no, ts, raw: t };
+  return { count, yes, no, ts, isBlockTrade: blockFlag(t), raw: t };
 }
 
-// Only alert on a unique size+time print. 2+ different prices at the same count → ambiguous.
+// RFQ fills show up as is_block_trade=true. Prefer those so ordinary book prints
+// cannot steal the match. Still require unique size+time; 2+ block prices → ambiguous.
 function matchTapeTrades(normalizedTrades, { rfqCount, closedMs } = {}) {
   const trades = (normalizedTrades || []).filter((t) => t && t.count > 0 && (t.yes != null || t.no != null));
   if (!trades.length) return { match: 'none' };
 
+  const flagged = trades.some((t) => t.isBlockTrade === true || t.isBlockTrade === false);
+  const candidates = flagged ? trades.filter((t) => t.isBlockTrade === true) : trades;
+  if (!candidates.length) return { match: 'none' };
+
   let pool;
   if (rfqCount > 0) {
-    const sizeHits = trades.filter((t) => countClose(t.count, rfqCount));
+    const sizeHits = candidates.filter((t) => countClose(t.count, rfqCount));
     if (!sizeHits.length) return { match: 'none' };
     const exact = sizeHits.filter((t) => countExact(t.count, rfqCount));
     pool = exact.length ? exact : sizeHits;
   } else {
-    pool = trades;
+    pool = candidates;
   }
 
   const keys = new Set(pool.map((t) => priceKey(t.yes, t.no)));

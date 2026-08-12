@@ -5,9 +5,8 @@
 //      (accepted / executed / lost, response latency, and real-fill reconcile)
 //
 // After a loss, it also reads Kalshi's PUBLIC trade tape for that combo ticker
-// (GET /markets/trades) and, on a unique size+time print, saves the clearing
-// price and Telegrams once. Maker quotes stay private; the tape is the only
-// public trace of the winning price. It PLACES NOTHING. No order path, ever.
+// (GET /markets/trades?is_block_trade=true) and, on a unique RFQ block print
+// (size≈contracts, time near close), saves the clearing price and Telegrams once.
 //
 // Memory-safe: it INSERTs only on a MATCH (rare — your exact combos) or on one of
 // YOUR OWN quote events (also rare — quote_* events are private to you). It never
@@ -307,17 +306,27 @@ async function reconcileRfq() {
 
 async function fetchTrades(ticker, minTs, maxTs) {
   const signPath = '/trade-api/v2/markets/trades';
-  const qs = new URLSearchParams({
-    ticker: String(ticker),
-    min_ts: String(minTs),
-    max_ts: String(maxTs),
-    limit: '100',
-  });
-  const headers = authHeaders({ keyId: KEY_ID, pem: PEM, method: 'GET', signPath });
-  const res = await fetch(`${REST}/markets/trades?${qs}`, { headers });
-  if (!res.ok) throw new Error(`trades ${res.status}: ${await res.text()}`);
-  const j = await res.json();
-  return j.trades || [];
+  const get = async (extra) => {
+    const qs = new URLSearchParams({
+      ticker: String(ticker),
+      min_ts: String(minTs),
+      max_ts: String(maxTs),
+      limit: '100',
+      ...extra,
+    });
+    const headers = authHeaders({ keyId: KEY_ID, pem: PEM, method: 'GET', signPath });
+    const res = await fetch(`${REST}/markets/trades?${qs}`, { headers });
+    if (!res.ok) throw new Error(`trades ${res.status}: ${await res.text()}`);
+    const j = await res.json();
+    return j.trades || [];
+  };
+  // RFQ / off-book matches are is_block_trade=true — filter at the API when possible.
+  try {
+    return await get({ is_block_trade: 'true' });
+  } catch (e) {
+    console.warn('[WATCH] trades is_block_trade=true failed, retrying unfiltered', e.message);
+    return await get({});
+  }
 }
 
 function tapeDone(row) {
@@ -389,8 +398,8 @@ async function selectLostForTape() {
   return [];
 }
 
-// Public tape: after we lose, prints on the combo ticker are the only view of the
-// winning quote. Conservative — unique size+time match only; never guess a price.
+// Public tape: after we lose, RFQ fills print as is_block_trade=true on the combo
+// ticker. Prefer those (plus size≈RFQ contracts and time near close). Never guess.
 async function reconcileTape() {
   try {
     const rows = await selectLostForTape();
