@@ -53,7 +53,7 @@ const isComboTicker = (t) => !!t && /MVE/i.test(t);
 let activeParlays = [];
 
 async function loadParlays() {
-  const { data } = await supabase.from('combo_parlays').select('id,label,mve_collection').eq('active', true);
+  const { data } = await supabase.from('combo_parlays').select('id,label,mve_collection,active').is('archived_at', null);
   activeParlays = data || [];
 }
 
