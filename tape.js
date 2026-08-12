@@ -30,7 +30,8 @@ function countExact(a, b) {
 function countClose(a, b) {
   if (!(a > 0) || !(b > 0)) return false;
   const abs = Math.abs(a - b);
-  return abs <= 0.01 || abs / b <= 0.01;
+  // Kalshi $ RFQs often print fractional counts (e.g. RFQ 9 → tape 9.31).
+  return abs <= 1 || abs / b <= 0.05;
 }
 
 function formatAmerican(a) {
@@ -68,7 +69,10 @@ function matchTapeTrades(normalizedTrades, { rfqCount, closedMs } = {}) {
   if (!trades.length) return { match: 'none' };
 
   const flagged = trades.some((t) => t.isBlockTrade === true || t.isBlockTrade === false);
-  const candidates = flagged ? trades.filter((t) => t.isBlockTrade === true) : trades;
+  let candidates = flagged ? trades.filter((t) => t.isBlockTrade === true) : trades;
+  // Kalshi sometimes prints RFQ fills with is_block_trade=false (seen on $1 combo).
+  // Prefer block prints when present; otherwise fall back to the full tape.
+  if (!candidates.length) candidates = trades;
   if (!candidates.length) return { match: 'none' };
 
   let pool;
