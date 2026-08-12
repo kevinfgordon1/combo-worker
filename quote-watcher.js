@@ -4,29 +4,37 @@
 //   2. What happened to each quote we posted?       → quote_outcomes
 //      (accepted / executed / lost, response latency, and real-fill reconcile)
 //
-// It PLACES NOTHING. It only listens to the same Kalshi 'communications' feed
-// the worker uses (its own separate WS connection), runs the SAME leg-set match
-// (rfq.js) to count matches, watches YOUR OWN quote lifecycle events, and polls
-// GET /portfolio/fills to confirm real executions. No order path, ever.
+// After a loss, it also reads Kalshi's PUBLIC trade tape for that combo ticker
+// (GET /markets/trades) and, on a unique size+time print, saves the clearing
+// price and Telegrams once. Maker quotes stay private; the tape is the only
+// public trace of the winning price. It PLACES NOTHING. No order path, ever.
 //
 // Memory-safe: it INSERTs only on a MATCH (rare — your exact combos) or on one of
 // YOUR OWN quote events (also rare — quote_* events are private to you). It never
 // stores the firehose. This is nothing like the debug capture that OOM'd.
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key (or KALSHI_PRIVATE_KEY),
-//      SUPABASE_URL, SUPABASE_SERVICE_KEY.  Run as its own process:  node quote-watcher.js
+//      SUPABASE_URL, SUPABASE_SERVICE_KEY,
+//      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional; lost-quote DMs).
+//      Run as its own process:  node quote-watcher.js
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
 const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay, normalizeRfq } = require('./rfq');
+const { toNum: tapeNum, normalizeTrade, matchTapeTrades, formatLostAlert } = require('./tape');
 
 const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const REST = process.env.KALSHI_REST_BASE || 'https://api.elections.kalshi.com/trade-api/v2';
 const LOST_AFTER_MS = 30000;         // no acceptance within this window → mark 'lost' (outbid / not taken)
+const TAPE_PAD_MS = 45000;           // RFQ close → public print delay
+const TAPE_LOOKBACK_MS = 24 * 3600 * 1000;
+const ALERT_LOOKBACK_MS = 2 * 3600 * 1000;
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TG_CHAT = process.env.TELEGRAM_ALERT_CHAT_ID;
 
 // self-contained lock math (mirrors engine.js / ComboLocks — read-only, informational only)
 const impliedProb = (a) => (a > 0 ? 100 / (a + 100) : Math.abs(a) / (Math.abs(a) + 100));
@@ -43,7 +51,43 @@ let postedByQuote = {};   // quote_id -> {quote_id, rfq_id, parlay_id, label, po
 let postedByRfq = {};     // rfq_id   -> same record
 const matchedRfqTs = new Map(); // rfq_id -> ms we saw the matching rfq_created (bounded; matched only)
 
-const counts = { rfqs: 0, matched: 0, quoteEvents: 0, accepted: 0, executed: 0, lost: 0, reconciled: 0 };
+const counts = { rfqs: 0, matched: 0, quoteEvents: 0, accepted: 0, executed: 0, lost: 0, reconciled: 0, tapeMatched: 0, tapeAmbiguous: 0, tapeAlerts: 0 };
+const unknownCols = new Set();
+const tapeAttempted = new Set();
+const tapeAlerted = new Set();
+
+async function sendAlert(text) {
+  if (!TG_TOKEN || !TG_CHAT) {
+    console.log(`[WATCH] ALERT (telegram not configured): ${text.replace(/\n/g, ' | ')}`);
+    return;
+  }
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: TG_CHAT, text }),
+    });
+    if (!r.ok) console.error('[WATCH] telegram send failed', r.status, await r.text());
+  } catch (e) {
+    console.error('[WATCH] telegram error', e.message);
+  }
+}
+
+const COL_ERR = /Could not find the '([^']+)' column/i;
+async function updateQuoteOutcome(quoteId, patch) {
+  const body = { ...patch };
+  for (const c of unknownCols) delete body[c];
+  if (!Object.keys(body).length) return { error: null };
+  const { error } = await supabase.from('quote_outcomes').update(body).eq('quote_id', quoteId);
+  if (!error) return { error: null };
+  const m = String(error.message || '').match(COL_ERR);
+  if (m) {
+    unknownCols.add(m[1]);
+    console.warn(`[WATCH] quote_outcomes missing column ${m[1]} — degrading`);
+    return updateQuoteOutcome(quoteId, patch);
+  }
+  return { error };
+}
 
 async function loadState() {
   try {
@@ -252,8 +296,162 @@ async function reconcileRfq() {
       };
       if (reason) patch.loss_reason = reason;
       await supabase.from('quote_outcomes').update(patch).eq('quote_id', o.quote_id);
+      const ticker = rfq.market_ticker || rfq.ticker || null;
+      if (ticker) {
+        const { error } = await updateQuoteOutcome(o.quote_id, { market_ticker: ticker });
+        if (error) console.warn('[WATCH] market_ticker persist', error.message);
+      }
     }
   } catch (e) { console.error('[WATCH] reconcileRfq', e.message); }
+}
+
+async function fetchTrades(ticker, minTs, maxTs) {
+  const signPath = '/trade-api/v2/markets/trades';
+  const qs = new URLSearchParams({
+    ticker: String(ticker),
+    min_ts: String(minTs),
+    max_ts: String(maxTs),
+    limit: '100',
+  });
+  const headers = authHeaders({ keyId: KEY_ID, pem: PEM, method: 'GET', signPath });
+  const res = await fetch(`${REST}/markets/trades?${qs}`, { headers });
+  if (!res.ok) throw new Error(`trades ${res.status}: ${await res.text()}`);
+  const j = await res.json();
+  return j.trades || [];
+}
+
+function tapeDone(row) {
+  if (!row) return true;
+  if (tapeAttempted.has(row.quote_id)) return true;
+  if (row.tape_match) return true;
+  if (row.tape_alerted_at) return true;
+  const t = row.raw && row.raw.tape;
+  return !!(t && (t.match || t.alerted_at));
+}
+
+function isRecentLoss(o, closedMs) {
+  const t = parseTs(o.posted_at) || parseTs(o.rfq_closed_ts) || closedMs;
+  return t != null && (Date.now() - t) <= ALERT_LOOKBACK_MS;
+}
+
+async function persistTape(row, tape, extra = {}) {
+  const patch = {
+    updated_at: new Date().toISOString(),
+    tape_match: tape.match,
+    tape_yes_price: tape.yesPrice != null ? tape.yesPrice : null,
+    tape_no_price: tape.noPrice != null ? tape.noPrice : null,
+    tape_count: tape.count != null ? tape.count : null,
+    tape_trade_ts: tape.tradeTs != null ? new Date(tape.tradeTs).toISOString() : null,
+    ...extra,
+  };
+  const { error } = await updateQuoteOutcome(row.quote_id, patch);
+  if (error) console.error('[WATCH] persistTape', error.message);
+
+  const tapeCols = ['tape_match', 'tape_yes_price', 'tape_no_price', 'tape_count', 'tape_trade_ts', 'tape_alerted_at'];
+  if (!tapeCols.some((c) => unknownCols.has(c))) return;
+  const raw = (row.raw && typeof row.raw === 'object' && !Array.isArray(row.raw)) ? { ...row.raw } : { prev: row.raw };
+  raw.tape = {
+    match: tape.match,
+    yes_price: tape.yesPrice != null ? tape.yesPrice : null,
+    no_price: tape.noPrice != null ? tape.noPrice : null,
+    count: tape.count != null ? tape.count : null,
+    trade_ts: tape.tradeTs != null ? new Date(tape.tradeTs).toISOString() : null,
+    alerted_at: extra.tape_alerted_at || null,
+  };
+  const { error: rawErr } = await supabase.from('quote_outcomes')
+    .update({ raw, updated_at: new Date().toISOString() })
+    .eq('quote_id', row.quote_id);
+  if (rawErr) console.error('[WATCH] persistTape raw', rawErr.message);
+}
+
+async function selectLostForTape() {
+  const base = 'quote_id,rfq_id,label,posted_at,loss_reason,rfq_created_ts,rfq_closed_ts,submitted_no_bid,no_bid,raw';
+  const attempts = [
+    { sel: `${base},market_ticker,tape_match,tape_alerted_at`, filterTape: true },
+    { sel: `${base},tape_match,tape_alerted_at`, filterTape: true },
+    { sel: base, filterTape: false },
+  ];
+  const cutoff = new Date(Date.now() - TAPE_LOOKBACK_MS).toISOString();
+  for (const a of attempts) {
+    let q = supabase.from('quote_outcomes').select(a.sel)
+      .eq('outcome', 'lost')
+      .not('loss_reason', 'is', null)
+      .gte('posted_at', cutoff)
+      .limit(30);
+    if (a.filterTape) q = q.is('tape_match', null);
+    const { data, error } = await q;
+    if (error) {
+      console.warn('[WATCH] selectLostForTape', error.message);
+      continue;
+    }
+    return (data || []).filter((r) => !tapeDone(r)).slice(0, 20);
+  }
+  return [];
+}
+
+// Public tape: after we lose, prints on the combo ticker are the only view of the
+// winning quote. Conservative — unique size+time match only; never guess a price.
+async function reconcileTape() {
+  try {
+    const rows = await selectLostForTape();
+    if (!rows.length) return;
+    for (const o of rows) {
+      if (tapeDone(o)) continue;
+      let rfq;
+      try { rfq = await fetchRfq(o.rfq_id); } catch (e) {
+        console.error('[WATCH] tape fetchRfq', o.rfq_id, e.message);
+        continue;
+      }
+      if (!rfq) continue;
+      const ticker = o.market_ticker || (rfq && (rfq.market_ticker || rfq.ticker)) || null;
+      if (ticker) {
+        const { error } = await updateQuoteOutcome(o.quote_id, { market_ticker: ticker });
+        if (error) console.warn('[WATCH] market_ticker persist', error.message);
+      }
+      const created = parseTs(rfq && rfq.created_ts) || parseTs(o.rfq_created_ts) || parseTs(o.posted_at);
+      const closed = parseTs(rfq && rfq.updated_ts) || parseTs(rfq && rfq.cancelled_ts)
+        || parseTs(o.rfq_closed_ts) || parseTs(o.posted_at);
+      if (closed != null && Date.now() < closed + TAPE_PAD_MS) continue;
+
+      let result = { match: 'none' };
+      if (ticker) {
+        const minTs = Math.max(0, Math.floor((created || closed || Date.now()) / 1000) - 1);
+        const maxTs = Math.ceil(((closed || Date.now()) + TAPE_PAD_MS) / 1000);
+        let trades;
+        try { trades = await fetchTrades(ticker, minTs, maxTs); }
+        catch (e) {
+          console.error('[WATCH] fetchTrades', ticker, e.message);
+          continue;
+        }
+        const windowStart = created || 0;
+        const windowEnd = (closed || Date.now()) + TAPE_PAD_MS;
+        const normalized = (trades || []).map((t) => normalizeTrade(t, parseTs))
+          .filter((t) => t.ts == null || (t.ts >= windowStart - 1000 && t.ts <= windowEnd + 1000));
+        const rfqCount = tapeNum(rfq && (rfq.contracts_fp != null ? rfq.contracts_fp : rfq.contracts));
+        result = matchTapeTrades(normalized, { rfqCount, closedMs: closed });
+      }
+
+      tapeAttempted.add(o.quote_id);
+      const alreadyAlerted = tapeAlerted.has(o.quote_id) || o.tape_alerted_at
+        || (o.raw && o.raw.tape && o.raw.tape.alerted_at);
+      let alertedAt = null;
+      if (!alreadyAlerted) {
+        if (isRecentLoss(o, closed)) {
+          const ourNo = tapeNum(o.submitted_no_bid != null ? o.submitted_no_bid : o.no_bid);
+          await sendAlert(formatLostAlert({
+            label: o.label, rfqId: o.rfq_id, lossReason: o.loss_reason, tape: result, ourNo,
+          }));
+          tapeAlerted.add(o.quote_id);
+          counts.tapeAlerts++;
+        }
+        alertedAt = new Date().toISOString();
+      }
+      await persistTape(o, result, alertedAt ? { tape_alerted_at: alertedAt } : {});
+      if (result.match === 'matched') counts.tapeMatched++;
+      else if (result.match === 'ambiguous') counts.tapeAmbiguous++;
+      console.log(`[WATCH] tape ${result.match} quote=${o.quote_id} rfq=${o.rfq_id} ticker=${ticker || '(none)'} reason=${o.loss_reason}`);
+    }
+  } catch (e) { console.error('[WATCH] reconcileTape', e.message); }
 }
 
 // Authoritative source of OUR submitted quote prices + status, straight from Kalshi.
@@ -334,9 +532,11 @@ async function main() {
   setInterval(loadState, 30000);
   setInterval(ageLost, 20000);
   setInterval(reconcileFills, 30000);
-  setInterval(reconcileRfq, 30000);
+  const rfqThenTape = () => reconcileRfq().then(() => reconcileTape()).catch((e) => console.error('[WATCH] rfq/tape', e.message));
+  setInterval(rfqThenTape, 30000);
   setInterval(reconcileSelfQuotes, 30000);
   reconcileSelfQuotes();   // immediate — backfill the real prices of quotes already posted today
+  rfqThenTape();           // classify losses, then tape-match recent ones
   probeAccount();          // one-shot: read the worker key's balance + positions (eligibility check)
   setInterval(() => console.log('[WATCH] tallies', counts), 60000);
 

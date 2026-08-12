@@ -5,7 +5,8 @@
   "type": "commonjs",
   "description": "Always-on Kalshi combo RFQ worker for aibetbuilder — posts real quotes when kill-switch is disarmed.",
   "scripts": {
-    "start": "node start-live.js"
+    "start": "node start-live.js",
+    "test": "node tape.test.js"
   },
   "engines": {
     "node": ">=18"
