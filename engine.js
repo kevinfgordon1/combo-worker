@@ -9,6 +9,8 @@ const aToDec = (a) => (a > 0 ? 1 + a / 100 : 1 + 100 / Math.abs(a));
 const impliedProb = (a) => (a > 0 ? 100 / (a + 100) : Math.abs(a) / (Math.abs(a) + 100));
 const americanFromProb = (p) => (!(p > 0 && p < 1) ? null : p < 0.5 ? Math.round((100 * (1 - p)) / p) : -Math.round((100 * p) / (1 - p)));
 const r2 = (x) => Math.round(x * 100) / 100;
+// Floor to the cent — never round NO bid UP past the fill target (we buy NO / sell the parlay).
+const floor2 = (x) => Math.floor(x * 100 + 1e-9) / 100;
 
 // Your fill is net of your maker fee. Recover the nominal exchange price you'd quote, and from it
 // the taker's matched odds (nominal price + their 7% taker fee — worse than yours).
@@ -20,7 +22,9 @@ function fillView(fillAfterFeeAmerican) {
   const sEff = impliedProb(fillAfterFeeAmerican);
   const sNom = nominalProbFromEff(sEff);
   const takerProb = sNom + TAKER_FEE * sNom * (1 - sNom);
-  return { sEff, sNom, effTaker: americanFromProb(takerProb), noBid: r2(1 - sNom).toFixed(2) };
+  // Penny grid: floor no_bid so effective sell odds are never worse than fillAfterFeeAmerican.
+  // (Nearest-cent rounding turned +1100 into no_bid 0.92 ≈ +1170 after fee.)
+  return { sEff, sNom, effTaker: americanFromProb(takerProb), noBid: floor2(1 - sNom).toFixed(2) };
 }
 
 // Contracts cap for a hedge mode. Fill odds already include your maker fee, so no fee term here.
