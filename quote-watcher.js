@@ -5,8 +5,8 @@
 //      (accepted / executed / lost, response latency, and real-fill reconcile)
 //
 // After a loss, it also reads Kalshi's PUBLIC trade tape for that combo ticker
-// (GET /markets/trades?is_block_trade=true) and, on a unique RFQ block print
-// (size≈contracts, time near close), saves the clearing price and Telegrams once.
+// (GET /markets/trades — including non-block RFQ prints) and, on a unique
+// size≈contracts / time-near-close match, saves the clearing price and Telegrams once.
 //
 // Memory-safe: it INSERTs only on a MATCH (rare — your exact combos) or on one of
 // YOUR OWN quote events (also rare — quote_* events are private to you). It never
@@ -320,13 +320,10 @@ async function fetchTrades(ticker, minTs, maxTs) {
     const j = await res.json();
     return j.trades || [];
   };
-  // RFQ / off-book matches are is_block_trade=true — filter at the API when possible.
-  try {
-    return await get({ is_block_trade: 'true' });
-  } catch (e) {
-    console.warn('[WATCH] trades is_block_trade=true failed, retrying unfiltered', e.message);
-    return await get({});
-  }
+  // Combo RFQ fills often print with is_block_trade=false (seen on $1/$2 Chicago).
+  // Fetch the full public tape; matchTapeTrades prefers block prints when present,
+  // otherwise falls back to ordinary size/time matches.
+  return await get({});
 }
 
 function tapeDone(row) {
@@ -436,7 +433,16 @@ async function reconcileTape() {
         const windowEnd = (closed || Date.now()) + TAPE_PAD_MS;
         const normalized = (trades || []).map((t) => normalizeTrade(t, parseTs))
           .filter((t) => t.ts == null || (t.ts >= windowStart - 1000 && t.ts <= windowEnd + 1000));
-        const rfqCount = tapeNum(rfq && (rfq.contracts_fp != null ? rfq.contracts_fp : rfq.contracts));
+        let rfqCount = tapeNum(rfq && (rfq.contracts_fp != null ? rfq.contracts_fp : rfq.contracts));
+        // Dollar RFQs often omit contracts — estimate from target cost + our NO bid.
+        if (!(rfqCount > 0) && rfq) {
+          const cost = tapeNum(rfq.target_cost_dollars != null ? rfq.target_cost_dollars : rfq.target_cost);
+          const ourNo = tapeNum(o.submitted_no_bid != null ? o.submitted_no_bid : o.no_bid);
+          if (cost > 0 && ourNo != null && ourNo < 1) {
+            const yes = Math.max(0.01, 1 - ourNo);
+            rfqCount = Math.floor(cost / yes);
+          }
+        }
         result = matchTapeTrades(normalized, { rfqCount, closedMs: closed });
       }
 
