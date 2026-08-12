@@ -152,6 +152,29 @@ async function postQuote(rfqId, noBid, yesBid, restRemainder) {
   return JSON.parse(text); // { id: quote_id }
 }
 
+// Kalshi RFQ: after quote_accepted the maker must confirm within the window
+// (combos/HVM ≈ 3s) or the trade never executes.
+function confirmPath(rfqId, quoteId) {
+  return `/trade-api/v2/communications/rfqs/${rfqId}/quotes/${quoteId}/confirm`;
+}
+
+async function confirmQuote(rfqId, quoteId) {
+  const path = confirmPath(rfqId, quoteId);
+  const headers = {
+    ...authHeaders({ keyId: KEY_ID, pem: PEM, method: 'PUT', signPath: path }),
+  };
+  const { statusCode, body: resBody } = await kalshiHttp.request({
+    path,
+    method: 'PUT',
+    headers,
+  });
+  const text = await resBody.text();
+  if (statusCode < 200 || statusCode >= 300) {
+    throw new Error(`Kalshi confirm failed ${statusCode}: ${text}`);
+  }
+  return { statusCode };
+}
+
 async function warmConnection() {
   try {
     const headers = {
@@ -187,6 +210,51 @@ function resolveRfqContracts(rfq, fillAmerican, stagedNoBid) {
     };
   }
   return { contracts: null, source: 'none' };
+}
+
+const confirmingQuotes = new Set(); // de-dupe concurrent accept events
+
+async function onQuoteAccepted(evt) {
+  const t0 = performance.now();
+  let quoteId = evt && evt.quoteId;
+  let rfqId = evt && evt.rfqId;
+  const pending = quoteId ? pendingQuotes.get(quoteId) : null;
+  if (!rfqId && pending) rfqId = pending.rfqId;
+  if (!quoteId || !rfqId) {
+    console.error(
+      `[${MODE}] quote_accepted missing ids quote_id=${quoteId || '(none)'} rfq_id=${rfqId || '(none)'}`
+    );
+    return;
+  }
+  if (confirmingQuotes.has(quoteId)) {
+    console.log(`[${MODE}] confirm already in-flight quote_id=${quoteId}`);
+    return;
+  }
+  confirmingQuotes.add(quoteId);
+  try {
+    // Confirm FIRST — HVM confirmation window is ~3s. Log/Telegram after.
+    await confirmQuote(rfqId, quoteId);
+    const ms = (performance.now() - t0).toFixed(1);
+    console.log(
+      `[${MODE}] CONFIRMED quote_id=${quoteId} rfq_id=${rfqId} in ${ms}ms ` +
+      `side=${evt.acceptedSide || '?'} label=${pending ? pending.label : '(unknown)'}`
+    );
+    sendAlert(
+      `✅ QUOTE CONFIRMED — ${pending ? pending.label : quoteId}\n` +
+      `quote ${quoteId} · rfq ${rfqId}\n` +
+      `side ${evt.acceptedSide || '?'} · confirm ${ms}ms\n` +
+      `Waiting for quote_executed / fill.`
+    ).catch(() => {});
+  } catch (e) {
+    console.error(`[${MODE}] CONFIRM FAILED quote_id=${quoteId} rfq_id=${rfqId}`, e.message);
+    sendAlert(
+      `❌ CONFIRM FAILED — ${pending ? pending.label : quoteId}\n` +
+      `quote ${quoteId} · rfq ${rfqId}\n` +
+      `${e.message}`
+    ).catch(() => {});
+  } finally {
+    confirmingQuotes.delete(quoteId);
+  }
 }
 
 async function onQuoteExecuted(evt) {
@@ -378,7 +446,7 @@ async function main() {
   }
   console.log(
     `[${MODE}] starting — latency-optimized. POST first, undici keep-alive, pre-staged prices. ` +
-    `Ceiling advances only on quote_executed.`
+    `Auto-confirms quote_accepted (HVM ~3s window). Ceiling advances only on quote_executed.`
   );
 
   await refresh();
@@ -395,6 +463,7 @@ async function main() {
     pem: PEM,
     onStatus: (s, i) => console.log(`[${MODE}] ws:${s}`, i || ''),
     onRfqCreated: (rfq) => onRfq(rfq).catch((e) => console.error('onRfq', e)),
+    onQuoteAccepted: (evt) => onQuoteAccepted(evt).catch((e) => console.error('onQuoteAccepted', e)),
     onQuoteExecuted: (evt) => onQuoteExecuted(evt).catch((e) => console.error('onQuoteExecuted', e)),
   });
 

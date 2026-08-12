@@ -45,18 +45,19 @@ function createKalshiWs({
         try { onRfqCreated(normalizeRfq(env), env); } catch (e) { console.error('onRfqCreated', e); }
       }
 
-      // Quote accepted (taker chose our quote)
+      // Quote accepted (taker chose our quote) — ids may sit on msg or nested msg.quote
       if (env.type === 'quote_accepted' && onQuoteAccepted) {
         try {
           const m = env.msg || {};
+          const q = (m.quote && typeof m.quote === 'object') ? m.quote : m;
           onQuoteAccepted({
-            quoteId: m.quote_id || null,
-            rfqId: m.rfq_id || null,
-            acceptedSide: m.accepted_side || null,
+            quoteId: m.quote_id || m.id || q.quote_id || q.id || null,
+            rfqId: m.rfq_id || q.rfq_id || null,
+            acceptedSide: m.accepted_side || q.accepted_side || null,
             contractsAccepted: m.contracts_accepted_fp != null
               ? parseFloat(m.contracts_accepted_fp)
-              : null,
-            marketTicker: m.market_ticker || null,
+              : (q.contracts_accepted_fp != null ? parseFloat(q.contracts_accepted_fp) : null),
+            marketTicker: m.market_ticker || q.market_ticker || null,
             raw: m,
           }, env);
         } catch (e) { console.error('onQuoteAccepted', e); }
@@ -66,13 +67,14 @@ function createKalshiWs({
       if (env.type === 'quote_executed' && onQuoteExecuted) {
         try {
           const m = env.msg || {};
+          const q = (m.quote && typeof m.quote === 'object') ? m.quote : m;
           onQuoteExecuted({
-            quoteId: m.quote_id || null,
-            rfqId: m.rfq_id || null,
-            orderId: m.order_id || null,
-            clientOrderId: m.client_order_id || null,
-            marketTicker: m.market_ticker || null,
-            executedTs: m.executed_ts || null,
+            quoteId: m.quote_id || m.id || q.quote_id || q.id || null,
+            rfqId: m.rfq_id || q.rfq_id || null,
+            orderId: m.order_id || m.creator_order_id || m.maker_order_id || q.order_id || null,
+            clientOrderId: m.client_order_id || q.client_order_id || null,
+            marketTicker: m.market_ticker || q.market_ticker || null,
+            executedTs: m.executed_ts || q.executed_ts || null,
             raw: m,
           }, env);
         } catch (e) { console.error('onQuoteExecuted', e); }
