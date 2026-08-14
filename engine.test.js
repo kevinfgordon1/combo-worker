@@ -53,7 +53,7 @@ const dollarRfq = normalizeRfq({
 });
 assert.strictEqual(dollarRfq.contracts, null);
 assert.strictEqual(dollarRfq.targetCostDollars, 25);
-assert.strictEqual(shouldPostQuote({ source: 'dollar', contracts: 43, targetCost: 25 }), false);
+assert.strictEqual(shouldPostQuote({ source: 'dollar', contracts: 43, targetCost: 25 }), true);
 
 const contractRfq = normalizeRfq({
   type: 'rfq_created',
@@ -62,5 +62,43 @@ const contractRfq = normalizeRfq({
 assert.strictEqual(contractRfq.contracts, 10);
 assert.strictEqual(shouldPostQuote({ source: 'contracts', contracts: contractRfq.contracts }), true);
 assert.strictEqual(shouldPostQuote({ source: 'none', contracts: null }), false);
+
+// $10 dollar RFQ at +350 fill → no_bid 0.77 → yes ~0.23 → ~43 contracts. Fits a 116 cap.
+const dollarNoBid = parseFloat(fillView(350).noBid);
+const dollarYes = Math.max(0.01, 1 - dollarNoBid);
+const dollarEst = Math.floor(10 / dollarYes);
+assert.strictEqual(dollarEst, 43);
+assert.strictEqual(shouldPostQuote({ source: 'dollar', contracts: dollarEst, targetCost: 10 }), true);
+
+const dollarFit = decideAtFill({
+  parlayStake: 100,
+  parlayAmerican: 400,
+  fillAmerican: 350,
+  rfqContracts: dollarEst,
+  hedgeMode: '1x',
+  maxContracts: 116,
+});
+assert.ok(dollarFit.ok);
+assert.strictEqual(dollarFit.quote.yes_bid, '0.00');
+assert.notStrictEqual(dollarFit.quote.yes_bid, '0');
+assert.strictEqual(dollarFit.quote.no_bid, fillView(350).noBid);
+assert.strictEqual(dollarFit.contracts, 43);
+
+const dollarPosted = buildQuoteBody('rfq-dollar-fit', dollarFit.quote.no_bid, dollarFit.quote.yes_bid, dollarFit.quote.rest_remainder);
+assert.strictEqual(dollarPosted.yes_bid, '0.00');
+assert.notStrictEqual(dollarPosted.yes_bid, '0');
+assert.strictEqual(dollarPosted.no_bid, dollarFit.quote.no_bid);
+
+const dollarHuge = decideAtFill({
+  parlayStake: 100,
+  parlayAmerican: 400,
+  fillAmerican: 350,
+  rfqContracts: 8000,
+  hedgeMode: '1x',
+  maxContracts: 116,
+});
+assert.strictEqual(dollarHuge.ok, false);
+assert.strictEqual(dollarHuge.reason, 'rfq_too_large');
+assert.ok(!shouldPostQuote({ source: 'dollar', contracts: 0, targetCost: 10 }));
 
 console.log('engine.test.js ok');

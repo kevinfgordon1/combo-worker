@@ -30,10 +30,11 @@ function buildQuoteBody(rfqId, noBid, yesBid, restRemainder) {
   };
 }
 
-// Dollar RFQs (target_cost_dollars, no contracts_fp): Kalshi derives size from quote
-// price. A $0.00 YES bid can explode that size into insufficient_balance. Never post.
+// Post when we have a positive contract count — from contracts_fp, or a dollar-RFQ
+// estimate (target_cost / yesPrice). Oversized RFQs are still declined later by
+// decideAtFill (rfq_too_large). Maker quotes have no size; Kalshi fills the full RFQ.
 function shouldPostQuote(size) {
-  return !!(size && size.source === 'contracts' && size.contracts > 0);
+  return !!(size && size.contracts > 0 && (size.source === 'contracts' || size.source === 'dollar'));
 }
 
 // Your fill is net of your maker fee. Recover the nominal exchange price you'd quote, and from it

@@ -388,10 +388,10 @@ async function onRfq(rfq) {
   if (size.source === 'dollar') counts.dollarRfqs++;
   if (!shouldPostQuote(size)) {
     counts.declined++;
-    if (size.source === 'dollar') {
+    if (size.source === 'dollar' || (size.source === 'none' && rfq.targetCostDollars > 0)) {
       console.log(
         `[${MODE}] SKIP dollar RFQ ${p.label} rfq=${rfq.rfqId} ` +
-        `target=$${size.targetCost} — no contracts_fp`
+        `target=$${size.targetCost != null ? size.targetCost : rfq.targetCostDollars} — unresolvable size`
       );
     }
     logAsync(p, rfq, null, 'declined');
