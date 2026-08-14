@@ -20,6 +20,7 @@ const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
 const { decideAtFill } = require('./engine');
+const { shortId } = require('./short-id');
 
 const MODE = 'SHADOW';
 // Demo read-check: if DEMO_KALSHI_* are present, use them (point KALSHI_WS_URL at the demo WS).
@@ -121,13 +122,13 @@ async function onRfq(rfq) {
       counts.limitReached++;
       console.log(`[${MODE}] LIMIT REACHED ${p.label} rfq=${rfq.rfqId} — filled ${filledSoFar}/${d.totalLimit}, declining`);
       await log(p, rfq, null, 'limitreached');
-      await sendAlert(`🛑 LIMIT REACHED — ${p.label}\nalready at ${filledSoFar}/${d.totalLimit} contracts — new RFQs are being DECLINED\nrfq ${rfq.rfqId} skipped`);
+      await sendAlert(`🛑 LIMIT REACHED — ${p.label}\nalready at ${filledSoFar}/${d.totalLimit} contracts — new RFQs are being DECLINED\nrfq ${shortId(rfq.rfqId)} skipped`);
       return;
     }
     counts.declined++;
     console.log(`[${MODE}] DECLINE ${p.label} rfq=${rfq.rfqId} (${d.reason})`);
     await log(p, rfq, null, 'declined');
-    await sendAlert(`⚠️ RFQ matched but DECLINED — ${p.label}\nrfq ${rfq.rfqId} · reason ${d.reason}`);
+    await sendAlert(`⚠️ RFQ matched but DECLINED — ${p.label}\nrfq ${shortId(rfq.rfqId)} · reason ${d.reason}`);
     return;
   }
   // ALERT on every match (notification only). The order is yours to place.
@@ -139,7 +140,7 @@ async function onRfq(rfq) {
       : `full even hedge (${d.contracts})`;
   await sendAlert(
     `🎯 Combo RFQ MATCH — ${p.label}\n` +
-    `taker requested ${rfq.contracts} contracts (rfq ${rfq.rfqId})\n` +
+    `taker requested ${rfq.contracts} contracts (rfq ${shortId(rfq.rfqId)})\n` +
     `➡️ PLACE: sell ${d.contracts} NO @ $${d.quote.no_bid}  ≈ $${cost} to put up\n` +
     `   ${sizeNote}\n` +
     `   cumulative: ${d.filledSoFar}+${d.contracts} of ${d.totalLimit} limit · ${d.remaining} left after\n` +

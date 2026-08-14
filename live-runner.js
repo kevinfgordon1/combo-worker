@@ -16,6 +16,7 @@ const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
 const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, YES_DECLINE } = require('./engine');
 const { startHeartbeat } = require('./heartbeat');
+const { shortId } = require('./short-id');
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -260,8 +261,8 @@ async function onQuoteAccepted(evt) {
   } catch (e) {
     console.error(`[${MODE}] CONFIRM FAILED quote_id=${quoteId} rfq_id=${rfqId}`, e.message);
     sendAlert(
-      `❌ CONFIRM FAILED — ${pending ? pending.label : quoteId}\n` +
-      `quote ${quoteId} · rfq ${rfqId}\n` +
+      `❌ CONFIRM FAILED — ${pending ? pending.label : shortId(quoteId)}\n` +
+      `quote ${shortId(quoteId)} · rfq ${shortId(rfqId)}\n` +
       `${e.message}`
     ).catch(() => {});
   } finally {
@@ -357,7 +358,7 @@ async function onQuoteExecuted(evt) {
   );
   sendAlert(
     `✅ FILL CONFIRMED — ${pending.label}\n` +
-    `order ${orderId || '(none)'} · quote ${quoteId}\n` +
+    `order ${orderId ? shortId(orderId) : '(none)'} · quote ${shortId(quoteId)}\n` +
     `+${contracts} contracts` +
     (fullyFilled
       ? ` · FULL ${sessionTotal}/${ceiling} — stopped quoting`
@@ -474,7 +475,7 @@ async function onRfq(rfq) {
       logAsync(p, rfq, d, 'quoted', { quote_id: result.id, is_live: true });
       sendAlert(
         `✅ QUOTED — ${p.label}\n` +
-        `rfq ${rfq.rfqId} · quote ${result.id}\n` +
+        `rfq ${shortId(rfq.rfqId)} · quote ${shortId(result.id)}\n` +
         `${d.contracts} contracts · NO @ $${noBid}` +
         (p.fill_american != null ? ` · ${sgn(p.fill_american)}` : '')
       ).catch(() => {});
@@ -488,7 +489,7 @@ async function onRfq(rfq) {
       console.error(`[${MODE}] POST FAILED ${p.label} rfq=${rfq.rfqId}`, e.message);
       logAsync(p, rfq, d, 'unfilled');
       if (!isSilentQuoteFailure(e.message)) {
-        sendAlert(`❌ QUOTE FAILED — ${p.label}\nrfq ${rfq.rfqId}\n${e.message}`).catch(() => {});
+        sendAlert(`❌ QUOTE FAILED — ${p.label}\nrfq ${shortId(rfq.rfqId)}\n${e.message}`).catch(() => {});
       }
     }
     return;
