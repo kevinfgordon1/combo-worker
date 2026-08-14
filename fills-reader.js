@@ -10,9 +10,11 @@
 // alert, distinct from the worker's "quote posted" alert.
 //
 // Attribution note: Kalshi's fills carry no quote/RFQ id, so a fill can't be tied to a
-// specific quote by id. We flag combo (MVE) maker fills and, when exactly one parlay is
-// active, attribute to it; otherwise parlay_id is left null (still recorded). This is
-// best-effort and clearly surfaced in the tab.
+// specific quote by id. We flag combo (MVE) maker fills and best-effort match a parlay
+// by collection prefix (ignoring -R/-S) or, if that misses, a unique active no_bid
+// match via fillView. Otherwise parlay_id is left null (still recorded) — never invent
+// remaining. When attributed, Telegram shows session filled/limit and remaining from
+// the DB sum of combo_fills after this upsert.
 //
 // Env (set on the host — SAME values as the worker; read-only use):
 //   KALSHI_KEY_ID          public Key ID
@@ -27,7 +29,7 @@
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
-const { shortId } = require('./short-id');
+const { attributeParlay, sumFillCounts, formatRealFillAlert } = require('./fills-attr');
 
 const MODE = 'FILLS';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -54,17 +56,24 @@ const isComboTicker = (t) => !!t && /MVE/i.test(t);
 let activeParlays = [];
 
 async function loadParlays() {
-  const { data } = await supabase.from('combo_parlays').select('id,label,mve_collection,active').is('archived_at', null);
+  const { data } = await supabase
+    .from('combo_parlays')
+    .select('id,label,mve_collection,active,max_contracts,fill_american')
+    .is('archived_at', null);
   activeParlays = data || [];
 }
 
-// Best-effort: match a combo ticker to a parlay by its collection prefix; else, if exactly
-// one parlay is active, attribute to it; else leave unattributed.
-function attributeParlay(ticker) {
-  const byCollection = activeParlays.find((p) => p.mve_collection && ticker && ticker.includes(p.mve_collection));
-  if (byCollection) return byCollection;
-  if (activeParlays.length === 1) return activeParlays[0];
-  return null;
+// Ground-truth filled contracts for a parlay (includes the row just upserted).
+async function filledSumForParlay(parlayId) {
+  const { data, error } = await supabase
+    .from('combo_fills')
+    .select('count')
+    .eq('parlay_id', parlayId);
+  if (error) {
+    console.error(`[${MODE}] fill sum failed`, error.message);
+    return null;
+  }
+  return sumFillCounts(data || []);
 }
 
 // Signed READ of the fills endpoint. No query string is signed (Kalshi signs ts+METHOD+path only).
@@ -117,7 +126,9 @@ async function poll() {
       if (!row.fill_id) continue;
       if (raw.ts && raw.ts > maxTs) maxTs = raw.ts;
 
-      const parlay = row.is_combo && !row.is_taker ? attributeParlay(row.ticker) : null;
+      const parlay = row.is_combo && !row.is_taker
+        ? attributeParlay(row.ticker, row, activeParlays)
+        : null;
       row.parlay_id = parlay ? parlay.id : null;
 
       // Upsert — ignore if we've already recorded this fill_id (dedupe across overlapping polls).
@@ -130,11 +141,8 @@ async function poll() {
       // inserted is non-empty only when this was a genuinely NEW fill row.
       if (inserted && inserted.length && row.is_combo && !row.is_taker) {
         console.log(`[${MODE}] NEW REAL FILL ${row.ticker} count=${row.count} ${parlay ? '→ ' + parlay.label : '(unattributed)'}`);
-        await sendAlert(
-          `💰 REAL FILL (from Kalshi account) — ${parlay ? parlay.label : row.ticker}\n` +
-          `${row.action || ''} ${row.count} contracts · ${row.outcome_side || ''} @ $${row.no_price ?? row.yes_price ?? '?'}\n` +
-          `${parlay ? 'parlay ' + parlay.label : 'unattributed combo fill'} · fill ${shortId(row.fill_id)}`
-        );
+        const filled = parlay ? await filledSumForParlay(parlay.id) : null;
+        await sendAlert(formatRealFillAlert({ parlay, row, filled }));
       }
     }
     if (maxTs > lastTs) lastTs = maxTs;
