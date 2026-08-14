@@ -1,6 +1,6 @@
 'use strict';
 const assert = require('assert');
-const { decideAtFill, fillView, buildQuoteBody, yesBidForQuote, shouldPostQuote, YES_DECLINE } = require('./engine');
+const { decideAtFill, fillView, buildQuoteBody, yesBidForQuote, shouldPostQuote, isSilentQuoteFailure, YES_DECLINE } = require('./engine');
 const { normalizeRfq } = require('./rfq');
 
 assert.strictEqual(YES_DECLINE, '0.00');
@@ -100,5 +100,12 @@ const dollarHuge = decideAtFill({
 assert.strictEqual(dollarHuge.ok, false);
 assert.strictEqual(dollarHuge.reason, 'rfq_too_large');
 assert.ok(!shouldPostQuote({ source: 'dollar', contracts: 0, targetCost: 10 }));
+
+assert.ok(isSilentQuoteFailure('Kalshi quote failed 400: {"error":{"code":"insufficient_balance"}}'));
+assert.ok(isSilentQuoteFailure('Kalshi quote failed 400: invalid_yes_bid: invalid dollar precision: 0'));
+assert.ok(isSilentQuoteFailure('Kalshi quote failed 400: invalid_dollar_precision'));
+assert.ok(!isSilentQuoteFailure('Kalshi quote failed 400: RFQ_CLOSED'));
+assert.ok(!isSilentQuoteFailure('fetch failed'));
+assert.ok(!isSilentQuoteFailure('Kalshi quote failed 400: unexpected'));
 
 console.log('engine.test.js ok');

@@ -37,6 +37,13 @@ function shouldPostQuote(size) {
   return !!(size && size.contracts > 0 && (size.source === 'contracts' || size.source === 'dollar'));
 }
 
+// Known Kalshi rejects from dollar-RFQ + yes_bid "0.00" sizing / precision.
+// Still console.error + write unfilled; do not Telegram.
+function isSilentQuoteFailure(message) {
+  const msg = String(message || '');
+  return /insufficient_balance|invalid_yes_bid|invalid_dollar_precision/.test(msg);
+}
+
 // Your fill is net of your maker fee. Recover the nominal exchange price you'd quote, and from it
 // the taker's matched odds (nominal price + their 7% taker fee — worse than yours).
 function nominalProbFromEff(sEff) {
@@ -123,5 +130,5 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
 }
 module.exports = {
   decideAtFill, impliedProb, hedgeCap, fillView, americanFromProb,
-  YES_DECLINE, yesBidForQuote, buildQuoteBody, shouldPostQuote,
+  YES_DECLINE, yesBidForQuote, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure,
 };

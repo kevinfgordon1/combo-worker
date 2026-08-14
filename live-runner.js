@@ -14,7 +14,7 @@ const { Client } = require('undici');
 const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
-const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, YES_DECLINE } = require('./engine');
+const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, YES_DECLINE } = require('./engine');
 const { startHeartbeat } = require('./heartbeat');
 
 const MODE = 'LIVE';
@@ -481,7 +481,9 @@ async function onRfq(rfq) {
       counts.postFailed++;
       console.error(`[${MODE}] POST FAILED ${p.label} rfq=${rfq.rfqId}`, e.message);
       logAsync(p, rfq, d, 'unfilled');
-      sendAlert(`❌ QUOTE FAILED — ${p.label}\nrfq ${rfq.rfqId}\n${e.message}`).catch(() => {});
+      if (!isSilentQuoteFailure(e.message)) {
+        sendAlert(`❌ QUOTE FAILED — ${p.label}\nrfq ${rfq.rfqId}\n${e.message}`).catch(() => {});
+      }
     }
     return;
   }
