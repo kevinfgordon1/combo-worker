@@ -14,7 +14,7 @@ const { Client } = require('undici');
 const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
-const { decideAtFill, fillView } = require('./engine');
+const { decideAtFill, fillView, buildQuoteBody, YES_DECLINE } = require('./engine');
 const { startHeartbeat } = require('./heartbeat');
 
 const MODE = 'LIVE';
@@ -94,7 +94,7 @@ async function refresh() {
       const v = fillView(row.fill_american);
       next[row.id] = {
         noBid: v.noBid,
-        yesBid: '0.00',
+        yesBid: YES_DECLINE,
         rest_remainder: false,
         fillAmerican: row.fill_american,
         effTaker: v.effTaker,
@@ -146,13 +146,8 @@ function logAsync(p, rfq, d, status, extra = {}) {
   }).catch((e) => console.error(`[${MODE}] log insert failed`, e.message));
 }
 
-async function postQuote(rfqId, noBid, yesBid, restRemainder) {
-  const body = JSON.stringify({
-    rfq_id: rfqId,
-    yes_bid: yesBid,
-    no_bid: noBid,
-    rest_remainder: restRemainder,
-  });
+async function postQuote(rfqId, noBid, yesBid = YES_DECLINE, restRemainder) {
+  const body = JSON.stringify(buildQuoteBody(rfqId, noBid, yesBid, restRemainder));
   const headers = {
     'Content-Type': 'application/json',
     ...authHeaders({ keyId: KEY_ID, pem: PEM, method: 'POST', signPath: QUOTE_PATH }),
@@ -438,7 +433,7 @@ async function onRfq(rfq) {
 
   // Prefer pre-staged prices for the body (Step 3)
   const noBid = (st && st.noBid) || d.quote.no_bid;
-  const yesBid = (st && st.yesBid) || d.quote.yes_bid;
+  const yesBid = (st && st.yesBid) || d.quote.yes_bid || YES_DECLINE;
   const restRemainder = (st && st.rest_remainder != null) ? st.rest_remainder : d.quote.rest_remainder;
 
   // ─── LIVE POST first (Step 1) ─────────────────────────────────────────
