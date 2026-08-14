@@ -30,10 +30,18 @@ function buildQuoteBody(rfqId, noBid, yesBid, restRemainder) {
   };
 }
 
-// Dollar RFQs (target_cost_dollars, no contracts_fp): Kalshi derives size from quote
-// price. A $0.00 YES bid can explode that size into insufficient_balance. Never post.
+// Post when we have a positive contract count — from contracts_fp, or a dollar-RFQ
+// estimate (target_cost / yesPrice). Oversized RFQs are still declined later by
+// decideAtFill (rfq_too_large). Maker quotes have no size; Kalshi fills the full RFQ.
 function shouldPostQuote(size) {
-  return !!(size && size.source === 'contracts' && size.contracts > 0);
+  return !!(size && size.contracts > 0 && (size.source === 'contracts' || size.source === 'dollar'));
+}
+
+// Known Kalshi rejects from dollar-RFQ + yes_bid "0.00" sizing / precision.
+// Still console.error + write unfilled; do not Telegram.
+function isSilentQuoteFailure(message) {
+  const msg = String(message || '');
+  return /insufficient_balance|invalid_yes_bid|invalid_dollar_precision/.test(msg);
 }
 
 // Your fill is net of your maker fee. Recover the nominal exchange price you'd quote, and from it
@@ -122,5 +130,5 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
 }
 module.exports = {
   decideAtFill, impliedProb, hedgeCap, fillView, americanFromProb,
-  YES_DECLINE, yesBidForQuote, buildQuoteBody, shouldPostQuote,
+  YES_DECLINE, yesBidForQuote, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure,
 };

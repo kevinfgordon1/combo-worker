@@ -14,7 +14,7 @@ const { Client } = require('undici');
 const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
-const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, YES_DECLINE } = require('./engine');
+const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, YES_DECLINE } = require('./engine');
 const { startHeartbeat } = require('./heartbeat');
 
 const MODE = 'LIVE';
@@ -388,10 +388,10 @@ async function onRfq(rfq) {
   if (size.source === 'dollar') counts.dollarRfqs++;
   if (!shouldPostQuote(size)) {
     counts.declined++;
-    if (size.source === 'dollar') {
+    if (size.source === 'dollar' || (size.source === 'none' && rfq.targetCostDollars > 0)) {
       console.log(
         `[${MODE}] SKIP dollar RFQ ${p.label} rfq=${rfq.rfqId} ` +
-        `target=$${size.targetCost} — no contracts_fp`
+        `target=$${size.targetCost != null ? size.targetCost : rfq.targetCostDollars} — unresolvable size`
       );
     }
     logAsync(p, rfq, null, 'declined');
@@ -472,6 +472,12 @@ async function onRfq(rfq) {
 
       // Fire-and-forget after POST (Step 1)
       logAsync(p, rfq, d, 'quoted', { quote_id: result.id, is_live: true });
+      sendAlert(
+        `✅ QUOTED — ${p.label}\n` +
+        `rfq ${rfq.rfqId} · quote ${result.id}\n` +
+        `${d.contracts} contracts · NO @ $${noBid}` +
+        (p.fill_american != null ? ` · ${sgn(p.fill_american)}` : '')
+      ).catch(() => {});
     } catch (e) {
       const t3 = performance.now();
       console.log(
@@ -481,7 +487,9 @@ async function onRfq(rfq) {
       counts.postFailed++;
       console.error(`[${MODE}] POST FAILED ${p.label} rfq=${rfq.rfqId}`, e.message);
       logAsync(p, rfq, d, 'unfilled');
-      sendAlert(`❌ QUOTE FAILED — ${p.label}\nrfq ${rfq.rfqId}\n${e.message}`).catch(() => {});
+      if (!isSilentQuoteFailure(e.message)) {
+        sendAlert(`❌ QUOTE FAILED — ${p.label}\nrfq ${rfq.rfqId}\n${e.message}`).catch(() => {});
+      }
     }
     return;
   }
