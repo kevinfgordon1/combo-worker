@@ -111,22 +111,87 @@ function fmtCount(n) {
   return Math.abs(n - Math.round(n)) < 1e-9 ? String(Math.round(n)) : String(n);
 }
 
-function formatLostAlert({ label, rfqId, lossReason, tape, ourNo }) {
+function impliedYes(noPrice) {
+  const n = toNum(noPrice);
+  if (n == null) return null;
+  return Math.round((1 - n) * 100) / 100;
+}
+
+function yesAmericanBit(yesPrice) {
+  const yesAm = formatAmerican(americanFromProb(yesPrice));
+  return yesAm ? ` (~YES ${yesAm})` : '';
+}
+
+// theirNo − ourNo. Positive = they paid more for NO (we were too cheap on NO).
+function outbidDelta(ourNo, theirNo) {
+  const ours = toNum(ourNo);
+  const theirs = toNum(theirNo);
+  if (ours == null || theirs == null) return null;
+  return Math.round((theirs - ours) * 100) / 100;
+}
+
+function fmtNo(price) {
+  const n = toNum(price);
+  return n == null ? null : `$${n.toFixed(2)}`;
+}
+
+function fillBit(fillAmerican) {
+  const a = toNum(fillAmerican);
+  if (a == null) return '';
+  const s = formatAmerican(a);
+  return s ? ` · ${s}` : '';
+}
+
+// Recent classified loss → one Telegram. Tape-matched outbid, nobody bought
+// (no_purchase / cancelled no_taker), or we missed the window (too_slow).
+function shouldAlertLost({ recent, lossReason, tapeMatch } = {}) {
+  if (!recent) return false;
+  if (tapeMatch === 'matched') return true;
+  return lossReason === 'no_purchase' || lossReason === 'no_taker'
+    || lossReason === 'too_slow' || lossReason === 'outbid';
+}
+
+function formatLostAlert({ label, rfqId, lossReason, tape, ourNo, fillAmerican }) {
   const reason = lossReason || 'lost';
-  let text = `📉 LOST (${reason}) — ${label || '(unknown)'}\nRFQ ${rfqId || '?'}`;
-  if (tape && tape.match === 'matched' && tape.noPrice != null) {
-    const yesAm = formatAmerican(americanFromProb(tape.yesPrice));
-    const yesBit = yesAm ? ` (~YES ${yesAm})` : '';
+  const name = label || '(unknown)';
+  const rfq = rfqId || '?';
+  const our = fmtNo(ourNo);
+  const ourLine = our ? `Our NO @ ${our}${fillBit(fillAmerican)}` : null;
+  const tapeClean = !!(tape && tape.match === 'matched' && (tape.noPrice != null || tape.yesPrice != null));
+
+  if ((reason === 'no_purchase' || reason === 'no_taker') && !tapeClean) {
+    let text = `📉 NO PURCHASE — ${name}\nRFQ ${rfq}`;
+    if (ourLine) text += `\n${ourLine}`;
+    return text;
+  }
+
+  if (reason === 'too_slow' && !tapeClean) {
+    let text = `📉 TOO SLOW — ${name}\nRFQ ${rfq} · missed the window`;
+    if (ourLine) text += `\n${ourLine}`;
+    return text;
+  }
+
+  if (tapeClean) {
+    const theirNo = toNum(tape.noPrice);
+    const tapeYes = tape.yesPrice != null ? toNum(tape.yesPrice) : impliedYes(theirNo);
+    const ourYes = impliedYes(ourNo);
     const cnt = tape.count != null ? ` · ${fmtCount(tape.count)} contracts` : '';
-    text += `\nTape: NO @ $${Number(tape.noPrice).toFixed(2)}${yesBit}${cnt}`;
-  } else if (reason === 'no_purchase') {
-    text += '\nNo purchase (RFQ closed with no public fill)';
-  } else if (reason === 'outbid') {
-    text += '\nNo clean tape match';
+    let text = `📉 LOST (outbid) — ${name}\nRFQ ${rfq}`;
+    if (our) text += `\nOur NO @ ${our}${yesAmericanBit(ourYes)}`;
+    if (theirNo != null) text += `\nTape NO @ $${theirNo.toFixed(2)}${yesAmericanBit(tapeYes)}${cnt}`;
+    else if (tapeYes != null) text += `\nTape YES @ $${Number(tapeYes).toFixed(2)}${yesAmericanBit(tapeYes)}${cnt}`;
+    const delta = outbidDelta(ourNo, theirNo);
+    if (delta != null && delta > 0) {
+      const ourAm = formatAmerican(americanFromProb(ourYes));
+      const theirAm = formatAmerican(americanFromProb(tapeYes));
+      const gap = (ourAm && theirAm) ? ` (YES ${ourAm} vs ${theirAm})` : '';
+      text += `\nOutbid by $${delta.toFixed(2)} on NO${gap}`;
+    }
+    return text;
   }
-  if (ourNo != null && Number.isFinite(Number(ourNo))) {
-    text += `\nOur quote was NO @ $${Number(ourNo).toFixed(2)}`;
-  }
+
+  let text = `📉 LOST (${reason}) — ${name}\nRFQ ${rfq}\nNo clean tape match`;
+  if (ourLine) text += `\n${ourLine}`;
   return text;
 }
 
@@ -140,5 +205,7 @@ module.exports = {
   normalizeTrade,
   matchTapeTrades,
   formatLostAlert,
+  shouldAlertLost,
+  outbidDelta,
   fmtCount,
 };

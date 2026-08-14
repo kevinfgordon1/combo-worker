@@ -1,6 +1,6 @@
 'use strict';
 const assert = require('assert');
-const { matchTapeTrades, normalizeTrade, formatLostAlert, americanFromProb, formatAmerican, toPriceDollars } = require('./tape');
+const { matchTapeTrades, normalizeTrade, formatLostAlert, shouldAlertLost, outbidDelta, americanFromProb, formatAmerican, toPriceDollars } = require('./tape');
 const { normalizeRfq } = require('./rfq');
 
 function parseTs(v) {
@@ -148,7 +148,27 @@ assert.strictEqual(americanFromProb(0.6), -150);
   assert.strictEqual(r.tradeTs, Date.parse('2026-08-12T20:00:03Z'));
 }
 
-// alert text
+// outbid delta: they paid more for NO
+assert.strictEqual(outbidDelta(0.77, 0.80), 0.03);
+assert.strictEqual(outbidDelta(0.91, 0.92), 0.01);
+assert.strictEqual(outbidDelta(0.80, 0.80), 0);
+assert.strictEqual(outbidDelta(null, 0.80), null);
+
+// alert: proven outbid with dollar + YES American gap
+{
+  const text = formatLostAlert({
+    label: 'BOS/BAL/HOU',
+    rfqId: 'abc',
+    lossReason: 'outbid',
+    tape: { match: 'matched', noPrice: 0.80, yesPrice: 0.20, count: 10 },
+    ourNo: 0.77,
+  });
+  assert.ok(text.includes('LOST (outbid)'));
+  assert.ok(text.includes('Our NO @ $0.77 (~YES +335)'));
+  assert.ok(text.includes('Tape NO @ $0.80 (~YES +400) · 10 contracts'));
+  assert.ok(text.includes('Outbid by $0.03 on NO (YES +335 vs +400)'));
+  assert.ok(!text.includes('No clean tape match'));
+}
 {
   const text = formatLostAlert({
     label: 'BOS/BAL/HOU',
@@ -158,19 +178,56 @@ assert.strictEqual(americanFromProb(0.6), -150);
     ourNo: 0.91,
   });
   assert.ok(text.includes('LOST (outbid)'));
-  assert.ok(text.includes('Tape: NO @ $0.92 (~YES +1150) · 10 contracts'));
-  assert.ok(text.includes('Our quote was NO @ $0.91'));
+  assert.ok(text.includes('Tape NO @ $0.92 (~YES +1150) · 10 contracts'));
+  assert.ok(text.includes('Our NO @ $0.91'));
+  assert.ok(text.includes('Outbid by $0.01 on NO'));
 }
 {
   const text = formatLostAlert({ label: 'X', rfqId: 'r', lossReason: 'outbid', tape: { match: 'none' }, ourNo: 0.07 });
+  assert.ok(text.includes('LOST (outbid)'));
   assert.ok(text.includes('No clean tape match'));
+  assert.ok(text.includes('Our NO @ $0.07'));
+  assert.ok(!text.includes('Outbid by'));
+  assert.ok(!text.includes('Tape NO'));
+}
 
+// no_purchase / cancelled: short, our price + fill, no fake clearing price
 {
-  const text = formatLostAlert({ label: 'X', rfqId: 'r', lossReason: 'no_purchase', tape: { match: 'none' }, ourNo: 0.07 });
-  assert.ok(text.includes('LOST (no_purchase)'));
-  assert.ok(text.includes('No purchase'));
+  const text = formatLostAlert({
+    label: 'BOS/BAL/HOU', rfqId: 'abc', lossReason: 'no_purchase',
+    tape: { match: 'none' }, ourNo: 0.77, fillAmerican: 350,
+  });
+  assert.ok(text.includes('NO PURCHASE — BOS/BAL/HOU'));
+  assert.ok(text.includes('RFQ abc'));
+  assert.ok(text.includes('Our NO @ $0.77 · +350'));
+  assert.ok(!text.includes('Tape'));
+  assert.ok(!text.includes('Outbid by'));
+  assert.ok(!text.includes('$0.80'));
 }
+{
+  const text = formatLostAlert({ label: 'X', rfqId: 'r', lossReason: 'no_taker', tape: { match: 'none' }, ourNo: 0.07 });
+  assert.ok(text.includes('NO PURCHASE — X'));
+  assert.ok(text.includes('Our NO @ $0.07'));
+  assert.ok(!text.includes('Tape'));
 }
+{
+  const text = formatLostAlert({ label: 'X', rfqId: 'r', lossReason: 'too_slow', tape: { match: 'none' }, ourNo: 0.07 });
+  assert.ok(text.includes('TOO SLOW — X'));
+  assert.ok(text.includes('missed the window'));
+  assert.ok(text.includes('Our NO @ $0.07'));
+  assert.ok(!text.includes('Tape'));
+  assert.ok(!text.includes('Outbid by'));
+}
+
+// one Telegram per recent classified loss; stale losses stay quiet
+assert.strictEqual(shouldAlertLost({ recent: true, lossReason: 'no_purchase', tapeMatch: 'none' }), true);
+assert.strictEqual(shouldAlertLost({ recent: true, lossReason: 'no_taker', tapeMatch: 'none' }), true);
+assert.strictEqual(shouldAlertLost({ recent: true, lossReason: 'too_slow', tapeMatch: 'none' }), true);
+assert.strictEqual(shouldAlertLost({ recent: true, lossReason: 'outbid', tapeMatch: 'matched' }), true);
+assert.strictEqual(shouldAlertLost({ recent: true, lossReason: 'outbid', tapeMatch: 'none' }), true);
+assert.strictEqual(shouldAlertLost({ recent: false, lossReason: 'outbid', tapeMatch: 'matched' }), false);
+assert.strictEqual(shouldAlertLost({ recent: false, lossReason: 'no_purchase', tapeMatch: 'none' }), false);
+assert.strictEqual(shouldAlertLost({ recent: true, lossReason: null, tapeMatch: 'none' }), false);
 
 {
   const rfq = normalizeRfq({

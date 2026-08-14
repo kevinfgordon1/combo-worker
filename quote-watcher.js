@@ -6,7 +6,9 @@
 //
 // After a loss, it also reads Kalshi's PUBLIC trade tape for that combo ticker
 // (GET /markets/trades — including non-block RFQ prints) and, on a unique
-// size≈contracts / time-near-close match, saves the clearing price and Telegrams once.
+// size≈contracts / time-near-close match, saves the clearing price. Telegram
+// once per recent loss: no_purchase / no_taker, too_slow, or proven outbid
+// (with how much we were outbid when tape YES/NO is clean).
 //
 // Memory-safe: it INSERTs only on a MATCH (rare — your exact combos) or on one of
 // YOUR OWN quote events (also rare — quote_* events are private to you). It never
@@ -22,7 +24,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay, normalizeRfq } = require('./rfq');
-const { toNum: tapeNum, normalizeTrade, matchTapeTrades, formatLostAlert } = require('./tape');
+const { toNum: tapeNum, normalizeTrade, matchTapeTrades, formatLostAlert, shouldAlertLost } = require('./tape');
 
 const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
@@ -375,8 +377,9 @@ async function persistTape(row, tape, extra = {}) {
 async function selectLostForTape() {
   const base = 'quote_id,rfq_id,label,posted_at,loss_reason,rfq_created_ts,rfq_closed_ts,submitted_no_bid,no_bid,raw';
   const attempts = [
-    { sel: `${base},market_ticker,tape_match,tape_alerted_at`, filterTape: true },
-    { sel: `${base},tape_match,tape_alerted_at`, filterTape: true },
+    { sel: `${base},market_ticker,tape_match,tape_alerted_at,fill_american`, filterTape: true },
+    { sel: `${base},tape_match,tape_alerted_at,fill_american`, filterTape: true },
+    { sel: `${base},fill_american`, filterTape: false },
     { sel: base, filterTape: false },
   ];
   const cutoff = new Date(Date.now() - TAPE_LOOKBACK_MS).toISOString();
@@ -467,13 +470,18 @@ async function reconcileTape() {
         || (o.raw && o.raw.tape && o.raw.tape.alerted_at);
       let alertedAt = null;
       if (!alreadyAlerted) {
-        // Telegram only for proven outbids (clearing price on tape).
-        const shouldAlert = isRecentLoss(o, closed) && result && result.match === 'matched';
+        // One Telegram per recent classified loss (tapeAlerted / tape_alerted_at de-dupe).
+        const shouldAlert = shouldAlertLost({
+          recent: isRecentLoss(o, closed),
+          lossReason,
+          tapeMatch: result && result.match,
+        });
         if (shouldAlert) {
           const ourNo = tapeNum(o.submitted_no_bid != null ? o.submitted_no_bid : o.no_bid);
-          await sendAlert(formatLostAlert({
-            label: o.label, rfqId: o.rfq_id, lossReason: 'outbid', tape: result, ourNo,
-          }));
+          const fillAmerican = tapeNum(o.fill_american);
+          sendAlert(formatLostAlert({
+            label: o.label, rfqId: o.rfq_id, lossReason, tape: result, ourNo, fillAmerican,
+          })).catch(() => {});
           tapeAlerted.add(o.quote_id);
           counts.tapeAlerts++;
           alertedAt = new Date().toISOString();
