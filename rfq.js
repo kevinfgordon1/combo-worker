@@ -31,6 +31,7 @@ function normalizeRfq(e) {
     marketTicker: m.market_ticker || m.ticker || null,
     mveCollection: m.mve_collection_ticker || null,
     legKeys,
+    legs: Array.isArray(legsRaw) ? legsRaw : null,
     isCombo: !!(m.mve_collection_ticker || (legKeys && legKeys.length > 1)),
     contracts: parseContracts(m.contracts_fp != null ? m.contracts_fp : m.contracts),
     targetCostDollars: Number.isFinite(targetCost) && targetCost > 0 ? targetCost : null,
