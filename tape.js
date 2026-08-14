@@ -1,6 +1,7 @@
 // Conservative public-tape match for a lost RFQ. Pure helpers — no I/O, places nothing.
 'use strict';
 const { americanFromProb } = require('./engine');
+const { shortId } = require('./short-id');
 
 function toNum(v) {
   if (v == null || v === '') return null;
@@ -154,7 +155,7 @@ function shouldAlertLost({ recent, lossReason, tapeMatch } = {}) {
 function formatLostAlert({ label, rfqId, lossReason, tape, ourNo, fillAmerican }) {
   const reason = lossReason || 'lost';
   const name = label || '(unknown)';
-  const rfq = rfqId || '?';
+  const rfq = shortId(rfqId);
   const our = fmtNo(ourNo);
   const ourLine = our ? `Our NO @ ${our}${fillBit(fillAmerican)}` : null;
   const tapeClean = !!(tape && tape.match === 'matched' && (tape.noPrice != null || tape.yesPrice != null));
@@ -208,4 +209,5 @@ module.exports = {
   shouldAlertLost,
   outbidDelta,
   fmtCount,
+  shortId,
 };

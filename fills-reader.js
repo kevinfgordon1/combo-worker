@@ -27,6 +27,7 @@
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
+const { shortId } = require('./short-id');
 
 const MODE = 'FILLS';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -132,7 +133,7 @@ async function poll() {
         await sendAlert(
           `💰 REAL FILL (from Kalshi account) — ${parlay ? parlay.label : row.ticker}\n` +
           `${row.action || ''} ${row.count} contracts · ${row.outcome_side || ''} @ $${row.no_price ?? row.yes_price ?? '?'}\n` +
-          `${parlay ? 'parlay ' + parlay.label : 'unattributed combo fill'} · fill ${row.fill_id}`
+          `${parlay ? 'parlay ' + parlay.label : 'unattributed combo fill'} · fill ${shortId(row.fill_id)}`
         );
       }
     }

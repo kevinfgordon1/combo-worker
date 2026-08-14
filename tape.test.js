@@ -1,6 +1,6 @@
 'use strict';
 const assert = require('assert');
-const { matchTapeTrades, normalizeTrade, formatLostAlert, shouldAlertLost, outbidDelta, americanFromProb, formatAmerican, toPriceDollars } = require('./tape');
+const { matchTapeTrades, normalizeTrade, formatLostAlert, shouldAlertLost, outbidDelta, americanFromProb, formatAmerican, toPriceDollars, shortId } = require('./tape');
 const { normalizeRfq } = require('./rfq');
 
 function parseTs(v) {
@@ -148,6 +148,14 @@ assert.strictEqual(americanFromProb(0.6), -150);
   assert.strictEqual(r.tradeTs, Date.parse('2026-08-12T20:00:03Z'));
 }
 
+// Telegram display: last 5 of Kalshi UUIDs; short/null stay as-is or '?'
+assert.strictEqual(shortId('aa8b3c36-c9ec-4d87-bb6d-6a4782b40c72'), '40c72');
+assert.strictEqual(shortId('abc'), 'abc');
+assert.strictEqual(shortId('r'), 'r');
+assert.strictEqual(shortId(null), '?');
+assert.strictEqual(shortId(''), '?');
+assert.strictEqual(shortId(undefined), '?');
+
 // outbid delta: they paid more for NO
 assert.strictEqual(outbidDelta(0.77, 0.80), 0.03);
 assert.strictEqual(outbidDelta(0.91, 0.92), 0.01);
@@ -193,12 +201,14 @@ assert.strictEqual(outbidDelta(null, 0.80), null);
 
 // no_purchase / cancelled: short, our price + fill, no fake clearing price
 {
+  const full = 'aa8b3c36-c9ec-4d87-bb6d-6a4782b40c72';
   const text = formatLostAlert({
-    label: 'BOS/BAL/HOU', rfqId: 'abc', lossReason: 'no_purchase',
+    label: 'BOS/BAL/HOU', rfqId: full, lossReason: 'no_purchase',
     tape: { match: 'none' }, ourNo: 0.77, fillAmerican: 350,
   });
   assert.ok(text.includes('NO PURCHASE — BOS/BAL/HOU'));
-  assert.ok(text.includes('RFQ abc'));
+  assert.ok(text.includes('RFQ 40c72'));
+  assert.ok(!text.includes(full));
   assert.ok(text.includes('Our NO @ $0.77 · +350'));
   assert.ok(!text.includes('Tape'));
   assert.ok(!text.includes('Outbid by'));
