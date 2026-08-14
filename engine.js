@@ -11,13 +11,14 @@ const americanFromProb = (p) => (!(p > 0 && p < 1) ? null : p < 0.5 ? Math.round
 const r2 = (x) => Math.round(x * 100) / 100;
 // Floor to the cent — never round NO bid UP past the fill target (we buy NO / sell the parlay).
 const floor2 = (x) => Math.floor(x * 100 + 1e-9) / 100;
-// Kalshi: yes_bid/no_bid of "0" declines that side. "0.00" is a $0 YES bid (not a decline)
-// and on dollar RFQs can explode derived size into insufficient_balance.
-const YES_DECLINE = '0';
+// Kalshi REST quotes require FixedPointDollars (two decimal places). Bare "0" is
+// invalid_yes_bid / invalid_dollar_precision. We buy NO; YES is "0.00".
+const YES_DECLINE = '0.00';
 
 function yesBidForQuote(yesBid) {
   if (yesBid == null || yesBid === '' || Number(yesBid) === 0) return YES_DECLINE;
-  return String(yesBid);
+  const s = String(yesBid);
+  return s === '0' ? YES_DECLINE : s;
 }
 
 function buildQuoteBody(rfqId, noBid, yesBid, restRemainder) {
@@ -27,6 +28,12 @@ function buildQuoteBody(rfqId, noBid, yesBid, restRemainder) {
     no_bid: noBid,
     rest_remainder: restRemainder,
   };
+}
+
+// Dollar RFQs (target_cost_dollars, no contracts_fp): Kalshi derives size from quote
+// price. A $0.00 YES bid can explode that size into insufficient_balance. Never post.
+function shouldPostQuote(size) {
+  return !!(size && size.source === 'contracts' && size.contracts > 0);
 }
 
 // Your fill is net of your maker fee. Recover the nominal exchange price you'd quote, and from it
@@ -115,5 +122,5 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
 }
 module.exports = {
   decideAtFill, impliedProb, hedgeCap, fillView, americanFromProb,
-  YES_DECLINE, yesBidForQuote, buildQuoteBody,
+  YES_DECLINE, yesBidForQuote, buildQuoteBody, shouldPostQuote,
 };
