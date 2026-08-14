@@ -11,6 +11,23 @@ const americanFromProb = (p) => (!(p > 0 && p < 1) ? null : p < 0.5 ? Math.round
 const r2 = (x) => Math.round(x * 100) / 100;
 // Floor to the cent — never round NO bid UP past the fill target (we buy NO / sell the parlay).
 const floor2 = (x) => Math.floor(x * 100 + 1e-9) / 100;
+// Kalshi: yes_bid/no_bid of "0" declines that side. "0.00" is a $0 YES bid (not a decline)
+// and on dollar RFQs can explode derived size into insufficient_balance.
+const YES_DECLINE = '0';
+
+function yesBidForQuote(yesBid) {
+  if (yesBid == null || yesBid === '' || Number(yesBid) === 0) return YES_DECLINE;
+  return String(yesBid);
+}
+
+function buildQuoteBody(rfqId, noBid, yesBid, restRemainder) {
+  return {
+    rfq_id: rfqId,
+    yes_bid: yesBidForQuote(yesBid),
+    no_bid: noBid,
+    rest_remainder: restRemainder,
+  };
+}
 
 // Your fill is net of your maker fee. Recover the nominal exchange price you'd quote, and from it
 // the taker's matched odds (nominal price + their 7% taker fee — worse than yours).
@@ -93,7 +110,10 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
     totalLimit, filledSoFar: already, remaining: remainingAfter, limitReached: remainingAfter <= 0,
     competitive: fairAmerican == null ? null : fillAmerican >= fairAmerican, fillAmerican,
     effTakerOdds: v.effTaker,
-    quote: { yes_bid: '0.00', no_bid: v.noBid, rest_remainder: false }, contracts: N,
+    quote: { yes_bid: YES_DECLINE, no_bid: v.noBid, rest_remainder: false }, contracts: N,
   };
 }
-module.exports = { decideAtFill, impliedProb, hedgeCap, fillView, americanFromProb };
+module.exports = {
+  decideAtFill, impliedProb, hedgeCap, fillView, americanFromProb,
+  YES_DECLINE, yesBidForQuote, buildQuoteBody,
+};
