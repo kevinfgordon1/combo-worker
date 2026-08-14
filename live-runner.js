@@ -14,7 +14,7 @@ const { Client } = require('undici');
 const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
-const { decideAtFill, fillView, buildQuoteBody, YES_DECLINE } = require('./engine');
+const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, YES_DECLINE } = require('./engine');
 const { startHeartbeat } = require('./heartbeat');
 
 const MODE = 'LIVE';
@@ -385,12 +385,18 @@ async function onRfq(rfq) {
   const st = staged[p.id];
 
   const size = resolveRfqContracts(rfq, p.fill_american, st && st.noBid);
-  if (size.contracts == null || !(size.contracts > 0)) {
+  if (size.source === 'dollar') counts.dollarRfqs++;
+  if (!shouldPostQuote(size)) {
     counts.declined++;
+    if (size.source === 'dollar') {
+      console.log(
+        `[${MODE}] SKIP dollar RFQ ${p.label} rfq=${rfq.rfqId} ` +
+        `target=$${size.targetCost} — no contracts_fp`
+      );
+    }
     logAsync(p, rfq, null, 'declined');
     return;
   }
-  if (size.source === 'dollar') counts.dollarRfqs++;
 
   const d = decideAtFill({
     parlayStake: p.parlay_stake,
