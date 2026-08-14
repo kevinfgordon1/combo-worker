@@ -472,6 +472,12 @@ async function onRfq(rfq) {
 
       // Fire-and-forget after POST (Step 1)
       logAsync(p, rfq, d, 'quoted', { quote_id: result.id, is_live: true });
+      sendAlert(
+        `✅ QUOTED — ${p.label}\n` +
+        `rfq ${rfq.rfqId} · quote ${result.id}\n` +
+        `${d.contracts} contracts · NO @ $${noBid}` +
+        (p.fill_american != null ? ` · ${sgn(p.fill_american)}` : '')
+      ).catch(() => {});
     } catch (e) {
       const t3 = performance.now();
       console.log(
