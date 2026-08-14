@@ -4,6 +4,7 @@
 // ACCOUNTING: POST → 'quoted'. Ceiling advances only on quote_executed.
 // PARTIAL-FILL: d.locks is informational; post while ceiling remains.
 // LATENCY: Steps 0–4 — instrument, POST first, undici keep-alive, pre-stage.
+// START GATE: never quote (and cancel open quotes) once any leg's start <= now.
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
@@ -15,6 +16,7 @@ const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
 const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, YES_DECLINE } = require('./engine');
+const { findStartedEvent } = require('./started');
 const { startHeartbeat } = require('./heartbeat');
 const { shortId } = require('./short-id');
 
@@ -30,6 +32,7 @@ const kalshiHttp = new Client('https://external-api.kalshi.com', {
 });
 const QUOTE_PATH = '/trade-api/v2/communications/quotes';
 const WARM_PATH = '/trade-api/v2/exchange/status';
+const cancelingQuotes = new Set();
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT = process.env.TELEGRAM_ALERT_CHAT_ID;
@@ -104,6 +107,7 @@ async function refresh() {
     staged = next;
 
     console.log(`[${MODE}] refreshed — ${parlays.length} active parlay(s), staged=${Object.keys(staged).length}`);
+    cancelStartedQuotes().catch((e) => console.error(`[${MODE}] cancel-on-start refresh`, e.message));
   } catch (e) {
     console.error(`[${MODE}] refresh failed`, e.message);
   }
@@ -170,6 +174,123 @@ async function postQuote(rfqId, noBid, yesBid = YES_DECLINE, restRemainder) {
 // (combos/HVM ≈ 3s) or the trade never executes.
 function confirmPath(rfqId, quoteId) {
   return `/trade-api/v2/communications/rfqs/${rfqId}/quotes/${quoteId}/confirm`;
+}
+
+function cancelPath(quoteId) {
+  return `/trade-api/v2/communications/quotes/${quoteId}`;
+}
+
+async function cancelQuote(quoteId) {
+  const path = cancelPath(quoteId);
+  const headers = {
+    ...authHeaders({ keyId: KEY_ID, pem: PEM, method: 'DELETE', signPath: path }),
+  };
+  const { statusCode, body: resBody } = await kalshiHttp.request({
+    path,
+    method: 'DELETE',
+    headers,
+  });
+  const text = await resBody.text();
+  // 204 = deleted. 404 = already gone (RFQ closed / already cancelled).
+  if (statusCode === 204 || statusCode === 404) return { statusCode };
+  if (statusCode < 200 || statusCode >= 300) {
+    throw new Error(`Kalshi cancel failed ${statusCode}: ${text}`);
+  }
+  return { statusCode };
+}
+
+function parlayFromPending(pending) {
+  if (!pending) return null;
+  const live = parlays.find((x) => x.id === pending.parlayId);
+  if (live) return live;
+  return {
+    id: pending.parlayId,
+    label: pending.label,
+    starts_at: pending.starts_at,
+    legs: pending.legs,
+    leg_keys: pending.leg_keys,
+  };
+}
+
+function startedForParlay(p, rfq, extra) {
+  return findStartedEvent(rfq || null, p, extra);
+}
+
+async function cancelQuoteAndDrop(quoteId, pending, started) {
+  if (!quoteId || cancelingQuotes.has(quoteId)) return;
+  cancelingQuotes.add(quoteId);
+  const label = (pending && pending.label) || '(unknown)';
+  try {
+    await cancelQuote(quoteId);
+    pendingQuotes.delete(quoteId);
+    console.log(
+      `[${MODE}] CANCEL game started ${label} quote_id=${quoteId}` +
+      (pending && pending.rfqId ? ` rfq=${pending.rfqId}` : '') +
+      ` source=${started.source} at=${started.at}`
+    );
+  } catch (e) {
+    console.error(
+      `[${MODE}] CANCEL FAILED game started ${label} quote_id=${quoteId}`,
+      e.message
+    );
+  } finally {
+    cancelingQuotes.delete(quoteId);
+  }
+}
+
+async function cancelOpenQuotesForParlay(parlayId, started, extras) {
+  const seen = new Set();
+  for (const [quoteId, pending] of pendingQuotes) {
+    if (pending.parlayId !== parlayId) continue;
+    seen.add(quoteId);
+    await cancelQuoteAndDrop(quoteId, pending, started);
+  }
+  for (const row of extras || []) {
+    if (!row || !row.quote_id || seen.has(row.quote_id)) continue;
+    await cancelQuoteAndDrop(row.quote_id, {
+      label: row.label,
+      rfqId: row.rfq_id,
+      parlayId,
+    }, started);
+  }
+}
+
+async function cancelPendingIfStarted() {
+  for (const [quoteId, pending] of pendingQuotes) {
+    const p = parlayFromPending(pending);
+    const started = startedForParlay(p);
+    if (started.started) await cancelQuoteAndDrop(quoteId, pending, started);
+  }
+}
+
+async function cancelStartedQuotes() {
+  await cancelPendingIfStarted();
+
+  const startedParlays = parlays
+    .map((p) => ({ p, started: startedForParlay(p) }))
+    .filter((x) => x.started.started);
+  if (!startedParlays.length) return;
+
+  let extras = [];
+  try {
+    const cutoff = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+    const { data, error } = await supabase
+      .from('combo_submissions')
+      .select('quote_id,parlay_id,label,rfq_id')
+      .eq('is_live', true)
+      .is('order_id', null)
+      .not('quote_id', 'is', null)
+      .gte('created_at', cutoff);
+    if (error) console.error(`[${MODE}] cancel-on-start submissions`, error.message);
+    else extras = data || [];
+  } catch (e) {
+    console.error(`[${MODE}] cancel-on-start submissions`, e.message);
+  }
+
+  for (const { p, started } of startedParlays) {
+    const rows = extras.filter((r) => r.parlay_id === p.id);
+    await cancelOpenQuotesForParlay(p.id, started, rows);
+  }
 }
 
 async function confirmQuote(rfqId, quoteId) {
@@ -251,6 +372,16 @@ async function onQuoteAccepted(evt) {
   }
   confirmingQuotes.add(quoteId);
   try {
+    const parlay = parlayFromPending(pending);
+    const started = parlay ? startedForParlay(parlay) : { started: false };
+    if (started.started) {
+      console.log(
+        `[${MODE}] CONFIRM SKIPPED game started quote_id=${quoteId} rfq_id=${rfqId} ` +
+        `label=${pending ? pending.label : '(unknown)'} source=${started.source} at=${started.at}`
+      );
+      cancelQuoteAndDrop(quoteId, pending, started).catch(() => {});
+      return;
+    }
     // Confirm FIRST — HVM confirmation window is ~3s. Log/Telegram after.
     await confirmQuote(rfqId, quoteId);
     const ms = (performance.now() - t0).toFixed(1);
@@ -366,7 +497,7 @@ async function onQuoteExecuted(evt) {
   ).catch(() => {});
 }
 
-async function onRfq(rfq) {
+async function onRfq(rfq, env) {
   const t0 = performance.now(); // Step 0
   counts.rfqs++;
 
@@ -380,6 +511,20 @@ async function onRfq(rfq) {
   const p = matchParlay(rfq, parlays);
   if (!p) return;
   counts.matched++;
+
+  const started = startedForParlay(p, rfq, env && env.msg ? { msg: env.msg } : null);
+  if (started.started) {
+    counts.declined++;
+    console.log(
+      `[${MODE}] SKIP game started ${p.label} rfq=${rfq.rfqId} ` +
+      `source=${started.source} at=${started.at}`
+    );
+    logAsync(p, rfq, null, 'declined');
+    cancelOpenQuotesForParlay(p.id, started).catch((e) => {
+      console.error(`[${MODE}] cancel-on-start`, e.message);
+    });
+    return;
+  }
 
   const engaged = killEngagedFor(p.user_id);
   const filledSoFar = filledSoFarFor(p.id);
@@ -464,6 +609,9 @@ async function onRfq(rfq) {
         contracts: d.contracts,
         label: p.label,
         rfqId: rfq.rfqId,
+        starts_at: p.starts_at,
+        legs: p.legs,
+        leg_keys: p.leg_keys || p.legKeys,
       });
 
       console.log(
@@ -516,6 +664,9 @@ async function main() {
 
   await refresh();
   setInterval(refresh, 30000);
+  setInterval(() => {
+    cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start tick`, e.message));
+  }, 2000);
 
   // Step 2 — pre-warm + keep warm
   await warmConnection();
@@ -527,7 +678,7 @@ async function main() {
     keyId: KEY_ID,
     pem: PEM,
     onStatus: (s, i) => console.log(`[${MODE}] ws:${s}`, i || ''),
-    onRfqCreated: (rfq) => onRfq(rfq).catch((e) => console.error('onRfq', e)),
+    onRfqCreated: (rfq, env) => onRfq(rfq, env).catch((e) => console.error('onRfq', e)),
     onQuoteAccepted: (evt) => onQuoteAccepted(evt).catch((e) => console.error('onQuoteAccepted', e)),
     onQuoteExecuted: (evt) => onQuoteExecuted(evt).catch((e) => console.error('onQuoteExecuted', e)),
   });
