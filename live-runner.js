@@ -1,10 +1,14 @@
 // ─────────────────────────────────────────────────────────────────────────
 // live-runner.js — LIVE worker (latency-optimized)
 //
-// ACCOUNTING: POST → 'quoted'. Ceiling advances only on quote_executed.
+// ACCOUNTING: POST → 'quoted'. Filled advances on quote_executed.
+// RESERVE: outstanding live quotes (pendingQuotes + in-flight POST) count against
+//   remaining so parallel RFQs cannot all clear the same ceiling.
+//   remaining = max - filled; available = remaining - outstanding.
 // PARTIAL-FILL: d.locks is informational; post while ceiling remains.
 // LATENCY: Steps 0–4 — instrument, POST first, undici keep-alive, pre-stage.
 // START GATE: never quote (and cancel open quotes) once any leg's start <= now.
+//   Started still wins; the cap is a second gate.
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
@@ -17,6 +21,7 @@ const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
 const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, YES_DECLINE } = require('./engine');
 const { findStartedEvent } = require('./started');
+const { sumOutstanding, wouldExceedCap, isCapExhausted, isReserveKey } = require('./reserve');
 const { startHeartbeat } = require('./heartbeat');
 const { shortId } = require('./short-id');
 
@@ -33,6 +38,8 @@ const kalshiHttp = new Client('https://external-api.kalshi.com', {
 const QUOTE_PATH = '/trade-api/v2/communications/quotes';
 const WARM_PATH = '/trade-api/v2/exchange/status';
 const cancelingQuotes = new Set();
+const cancelledQuotes = new Set();
+let reserveSeq = 0;
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT = process.env.TELEGRAM_ALERT_CHAT_ID;
@@ -107,6 +114,7 @@ async function refresh() {
     staged = next;
 
     console.log(`[${MODE}] refreshed — ${parlays.length} active parlay(s), staged=${Object.keys(staged).length}`);
+    seedPendingFromSubmissions().catch((e) => console.error(`[${MODE}] seed outstanding`, e.message));
     cancelStartedQuotes().catch((e) => console.error(`[${MODE}] cancel-on-start refresh`, e.message));
   } catch (e) {
     console.error(`[${MODE}] refresh failed`, e.message);
@@ -216,21 +224,106 @@ function startedForParlay(p, rfq, extra) {
   return findStartedEvent(rfq || null, p, extra);
 }
 
-async function cancelQuoteAndDrop(quoteId, pending, started) {
-  if (!quoteId || cancelingQuotes.has(quoteId)) return;
+function pendingEntry(p, rfq, contracts) {
+  return {
+    parlayId: p.id,
+    userId: p.user_id,
+    contracts,
+    label: p.label,
+    rfqId: rfq && rfq.rfqId,
+    starts_at: p.starts_at,
+    legs: p.legs,
+    leg_keys: p.leg_keys || p.legKeys,
+    maxContracts: p.max_contracts,
+  };
+}
+
+async function loadOpenSubmissionQuotes() {
+  const cutoff = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+  try {
+    const { data, error } = await supabase
+      .from('combo_submissions')
+      .select('quote_id,parlay_id,label,rfq_id,contracts,user_id')
+      .eq('is_live', true)
+      .is('order_id', null)
+      .not('quote_id', 'is', null)
+      .gte('created_at', cutoff);
+    if (error) {
+      console.error(`[${MODE}] open submissions`, error.message);
+      return [];
+    }
+    return data || [];
+  } catch (e) {
+    console.error(`[${MODE}] open submissions`, e.message);
+    return [];
+  }
+}
+
+function seedPendingFromRows(rows) {
+  for (const row of rows || []) {
+    if (!row || !row.quote_id) continue;
+    if (pendingQuotes.has(row.quote_id) || cancelledQuotes.has(row.quote_id)) continue;
+    const live = parlays.find((x) => x.id === row.parlay_id);
+    pendingQuotes.set(row.quote_id, {
+      parlayId: row.parlay_id,
+      userId: row.user_id,
+      contracts: Number(row.contracts || 0),
+      label: row.label,
+      rfqId: row.rfq_id,
+      maxContracts: live ? live.max_contracts : null,
+    });
+  }
+}
+
+async function seedPendingFromSubmissions() {
+  seedPendingFromRows(await loadOpenSubmissionQuotes());
+}
+
+function cancelLogLine(quoteId, pending, reason) {
+  const label = (pending && pending.label) || '(unknown)';
+  const rfqBit = pending && pending.rfqId ? ` rfq=${pending.rfqId}` : '';
+  if (reason && reason.started) {
+    return (
+      `[${MODE}] CANCEL game started ${label} quote_id=${quoteId}` +
+      rfqBit +
+      ` source=${reason.source} at=${reason.at}`
+    );
+  }
+  if (reason && reason.kind === 'cap_full') {
+    return (
+      `[${MODE}] CANCEL leftover ${label} quote_id=${quoteId}` +
+      rfqBit +
+      ` filled=${reason.filled}/${reason.max}`
+    );
+  }
+  if (reason && reason.kind === 'cap_exceeded') {
+    return (
+      `[${MODE}] CANCEL cap exceeded ${label} quote_id=${quoteId}` +
+      rfqBit +
+      ` filled=${reason.filled} reserved=${reason.reserved} want=${reason.want} max=${reason.max}`
+    );
+  }
+  return `[${MODE}] CANCEL ${label} quote_id=${quoteId}` + rfqBit;
+}
+
+async function cancelQuoteAndDrop(quoteId, pending, reason) {
+  if (!quoteId) return;
+  if (isReserveKey(quoteId)) {
+    pendingQuotes.delete(quoteId);
+    return;
+  }
+  if (cancelingQuotes.has(quoteId) || cancelledQuotes.has(quoteId)) return;
   cancelingQuotes.add(quoteId);
   const label = (pending && pending.label) || '(unknown)';
+  const failKind = (reason && reason.started) ? 'game started' : (reason && reason.kind) || '';
   try {
     await cancelQuote(quoteId);
     pendingQuotes.delete(quoteId);
-    console.log(
-      `[${MODE}] CANCEL game started ${label} quote_id=${quoteId}` +
-      (pending && pending.rfqId ? ` rfq=${pending.rfqId}` : '') +
-      ` source=${started.source} at=${started.at}`
-    );
+    cancelledQuotes.add(quoteId);
+    console.log(cancelLogLine(quoteId, pending, reason));
   } catch (e) {
     console.error(
-      `[${MODE}] CANCEL FAILED game started ${label} quote_id=${quoteId}`,
+      `[${MODE}] CANCEL FAILED ${failKind} ${label} quote_id=${quoteId}`,
       e.message
     );
   } finally {
@@ -246,13 +339,18 @@ async function cancelOpenQuotesForParlay(parlayId, started, extras) {
     await cancelQuoteAndDrop(quoteId, pending, started);
   }
   for (const row of extras || []) {
-    if (!row || !row.quote_id || seen.has(row.quote_id)) continue;
+    if (!row || !row.quote_id || seen.has(row.quote_id) || cancelledQuotes.has(row.quote_id)) continue;
     await cancelQuoteAndDrop(row.quote_id, {
       label: row.label,
       rfqId: row.rfq_id,
       parlayId,
     }, started);
   }
+}
+
+async function cancelCapLeftovers(parlayId, info) {
+  const extras = (await loadOpenSubmissionQuotes()).filter((r) => r.parlay_id === parlayId);
+  await cancelOpenQuotesForParlay(parlayId, { kind: 'cap_full', ...info }, extras);
 }
 
 async function cancelPendingIfStarted() {
@@ -271,21 +369,7 @@ async function cancelStartedQuotes() {
     .filter((x) => x.started.started);
   if (!startedParlays.length) return;
 
-  let extras = [];
-  try {
-    const cutoff = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
-    const { data, error } = await supabase
-      .from('combo_submissions')
-      .select('quote_id,parlay_id,label,rfq_id')
-      .eq('is_live', true)
-      .is('order_id', null)
-      .not('quote_id', 'is', null)
-      .gte('created_at', cutoff);
-    if (error) console.error(`[${MODE}] cancel-on-start submissions`, error.message);
-    else extras = data || [];
-  } catch (e) {
-    console.error(`[${MODE}] cancel-on-start submissions`, e.message);
-  }
+  const extras = await loadOpenSubmissionQuotes();
 
   for (const { p, started } of startedParlays) {
     const rows = extras.filter((r) => r.parlay_id === p.id);
@@ -382,6 +466,27 @@ async function onQuoteAccepted(evt) {
       cancelQuoteAndDrop(quoteId, pending, started).catch(() => {});
       return;
     }
+    const maxContracts = (parlay && parlay.max_contracts) || (pending && pending.maxContracts);
+    const filledSoFar = pending ? filledSoFarFor(pending.parlayId) : 0;
+    const outstandingOthers = pending
+      ? sumOutstanding(pendingQuotes, pending.parlayId, quoteId)
+      : 0;
+    const want = pending && pending.contracts;
+    if (pending && wouldExceedCap(maxContracts, filledSoFar, outstandingOthers, want)) {
+      console.log(
+        `[${MODE}] CONFIRM SKIPPED cap exceeded quote_id=${quoteId} rfq_id=${rfqId} ` +
+        `label=${pending.label} filled=${filledSoFar} reserved=${outstandingOthers} ` +
+        `want=${want} max=${maxContracts}`
+      );
+      await cancelQuoteAndDrop(quoteId, pending, {
+        kind: 'cap_exceeded',
+        filled: filledSoFar,
+        reserved: outstandingOthers,
+        want,
+        max: maxContracts,
+      });
+      return;
+    }
     // Confirm FIRST — HVM confirmation window is ~3s. Log/Telegram after.
     await confirmQuote(rfqId, quoteId);
     const ms = (performance.now() - t0).toFixed(1);
@@ -461,8 +566,11 @@ async function onQuoteExecuted(evt) {
 
   const sessionTotal = sessionFilledByParlay[pending.parlayId];
   const parlay = parlays.find((x) => x.id === pending.parlayId);
-  const ceiling = parlay && parlay.max_contracts > 0 ? Number(parlay.max_contracts) : null;
-  const fullyFilled = ceiling != null && sessionTotal >= ceiling;
+  const ceiling = (parlay && parlay.max_contracts > 0)
+    ? Number(parlay.max_contracts)
+    : (pending.maxContracts > 0 ? Number(pending.maxContracts) : null);
+  const filledNow = filledSoFarFor(pending.parlayId);
+  const fullyFilled = isCapExhausted(ceiling, filledNow);
 
   // Full hedge → stop matching this parlay. Combo Locks still lists it; combo_fills moves it to Filled.
   if (fullyFilled) {
@@ -480,6 +588,9 @@ async function onQuoteExecuted(evt) {
     } catch (e) {
       console.error(`[${MODE}] deactivate error`, e.message);
     }
+    cancelCapLeftovers(pending.parlayId, { filled: filledNow, max: ceiling }).catch((e) => {
+      console.error(`[${MODE}] cancel leftover`, e.message);
+    });
   }
 
   console.log(
@@ -528,6 +639,7 @@ async function onRfq(rfq, env) {
 
   const engaged = killEngagedFor(p.user_id);
   const filledSoFar = filledSoFarFor(p.id);
+  const outstanding = sumOutstanding(pendingQuotes, p.id);
   const st = staged[p.id];
 
   const size = resolveRfqContracts(rfq, p.fill_american, st && st.noBid);
@@ -553,21 +665,31 @@ async function onRfq(rfq, env) {
     hedgeMode: p.hedge_mode || '1x',
     maxContracts: p.max_contracts,
     filledSoFar,
+    outstanding,
   });
 
   if (!d.ok) {
     if (d.reason === 'limit_reached') {
       counts.limitReached++;
-      console.log(`[${MODE}] LIMIT REACHED ${p.label} rfq=${rfq.rfqId} — ${filledSoFar}/${d.totalLimit}`);
+      console.log(
+        `[${MODE}] LIMIT REACHED ${p.label} rfq=${rfq.rfqId} — ` +
+        `filled=${filledSoFar} reserved=${outstanding} ${filledSoFar + outstanding}/${d.totalLimit}`
+      );
       logAsync(p, rfq, null, 'limitreached');
       // No Telegram — every post-ceiling RFQ would spam. Console above is enough.
+      if (isCapExhausted(p.max_contracts, filledSoFar)) {
+        cancelCapLeftovers(p.id, { filled: filledSoFar, max: d.totalLimit }).catch((e) => {
+          console.error(`[${MODE}] cancel leftover`, e.message);
+        });
+      }
       return;
     }
     counts.declined++;
     if (d.reason === 'rfq_too_large') {
       console.log(
         `[${MODE}] SKIP oversized RFQ ${p.label} rfq=${rfq.rfqId} ` +
-        `want=${size.contracts} remaining=${d.remaining}/${d.totalLimit}`
+        `want=${size.contracts} remaining=${d.remaining}/${d.totalLimit} ` +
+        `filled=${filledSoFar} reserved=${outstanding}`
       );
     }
     logAsync(p, rfq, null, 'declined');
@@ -590,6 +712,9 @@ async function onRfq(rfq, env) {
 
   // ─── LIVE POST first (Step 1) ─────────────────────────────────────────
   if (!engaged) {
+    // Reserve BEFORE the await so a parallel RFQ sees this size in outstanding.
+    const reserveKey = `reserve:${++reserveSeq}`;
+    pendingQuotes.set(reserveKey, pendingEntry(p, rfq, d.contracts));
     const t2 = performance.now();
     try {
       const result = await postQuote(rfq.rfqId, noBid, yesBid, restRemainder);
@@ -603,20 +728,12 @@ async function onRfq(rfq, env) {
       );
 
       counts.posted++;
-      pendingQuotes.set(result.id, {
-        parlayId: p.id,
-        userId: p.user_id,
-        contracts: d.contracts,
-        label: p.label,
-        rfqId: rfq.rfqId,
-        starts_at: p.starts_at,
-        legs: p.legs,
-        leg_keys: p.leg_keys || p.legKeys,
-      });
+      pendingQuotes.delete(reserveKey);
+      pendingQuotes.set(result.id, pendingEntry(p, rfq, d.contracts));
 
       console.log(
         `[${MODE}] QUOTED ${p.label} rfq=${rfq.rfqId} quote_id=${result.id} ` +
-        `contracts=${d.contracts} locks=${d.locks}`
+        `contracts=${d.contracts} reserved=${outstanding + d.contracts}/${d.totalLimit} locks=${d.locks}`
       );
 
       // Fire-and-forget after POST (Step 1)
@@ -628,6 +745,7 @@ async function onRfq(rfq, env) {
         (p.fill_american != null ? ` · ${sgn(p.fill_american)}` : '')
       ).catch(() => {});
     } catch (e) {
+      pendingQuotes.delete(reserveKey);
       const t3 = performance.now();
       console.log(
         `[LAT] match=${(t1 - t0).toFixed(1)} pre=${(t2 - t1).toFixed(1)} ` +
@@ -659,7 +777,8 @@ async function main() {
   }
   console.log(
     `[${MODE}] starting — latency-optimized. POST first, undici keep-alive, pre-staged prices. ` +
-    `Auto-confirms quote_accepted (HVM ~3s window). Ceiling advances only on quote_executed.`
+    `Auto-confirms quote_accepted (HVM ~3s window). ` +
+    `Remaining = max - filled - outstanding quotes.`
   );
 
   await refresh();
