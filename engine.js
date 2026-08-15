@@ -84,37 +84,42 @@ function hedgeCap({ stake, boostAmerican, fillAmerican, mode = '1x' }) {
 //                  Enforced cumulatively — this is the stop-once-reached ceiling.
 //   filledSoFar  : contracts already filled for this parlay (real fills from the DB + any filled
 //                  this session). The caller supplies this; the engine just respects it.
+//   outstanding  : live unfilled quotes already posted (or reserved pre-POST) for this parlay.
+//                  Counts against remaining so parallel RFQs cannot all clear the same ceiling.
 //
-// remaining = maxContracts - filledSoFar. When remaining <= 0 the RFQ is DECLINED ('limit_reached').
+// remaining = maxContracts - filledSoFar - outstanding.
+// When remaining <= 0 the RFQ is DECLINED ('limit_reached').
 // IMPORTANT: Kalshi maker quotes have NO size — accepting our quote fills the FULL RFQ.
 // So we must DECLINE when rfqContracts > remaining (cannot "partial quote"). Same for
 // rfqContracts > per-fill hedge cap.
-function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican = null, rfqContracts, hedgeMode = '1x', maxContracts = null, filledSoFar = 0 }) {
+function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican = null, rfqContracts, hedgeMode = '1x', maxContracts = null, filledSoFar = 0, outstanding = 0 }) {
   if (!(parlayStake > 0) || !parlayAmerican || !fillAmerican || !(rfqContracts > 0)) return { ok: false, reason: 'bad_inputs' };
   const dec = aToDec(parlayAmerican), winReturn = parlayStake * dec, bookHit = winReturn - parlayStake, bookMiss = -parlayStake;
   const cap = hedgeCap({ stake: parlayStake, boostAmerican: parlayAmerican, fillAmerican, mode: hedgeMode }); // per-fill hedge shape
   // Total ceiling: the persisted limit if set, else fall back to the mode's hedge size.
   const totalLimit = (maxContracts != null && maxContracts > 0) ? maxContracts : cap;
-  const already = filledSoFar > 0 ? filledSoFar : 0;
+  const alreadyFilled = filledSoFar > 0 ? filledSoFar : 0;
+  const reserved = outstanding > 0 ? outstanding : 0;
+  const already = alreadyFilled + reserved;
   const remainingBefore = Math.max(0, totalLimit - already);
   if (remainingBefore <= 0) {
-    return { ok: false, reason: 'limit_reached', cap, totalLimit, filledSoFar: already, remaining: 0 };
+    return { ok: false, reason: 'limit_reached', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved, remaining: 0 };
   }
   // Full-RFQ-only venue: never quote if the RFQ is larger than we can still sell.
   if (rfqContracts > remainingBefore) {
     return {
-      ok: false, reason: 'rfq_too_large', cap, totalLimit, filledSoFar: already,
+      ok: false, reason: 'rfq_too_large', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved,
       remaining: remainingBefore, rfqContracts,
     };
   }
   if (rfqContracts > cap) {
     return {
-      ok: false, reason: 'rfq_too_large', cap, totalLimit, filledSoFar: already,
+      ok: false, reason: 'rfq_too_large', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved,
       remaining: remainingBefore, rfqContracts,
     };
   }
   const N = rfqContracts; // quote size == RFQ size (only path Kalshi supports)
-  if (!(N > 0)) return { ok: false, reason: 'zero_cap', cap, totalLimit, filledSoFar: already, remaining: remainingBefore };
+  if (!(N > 0)) return { ok: false, reason: 'zero_cap', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved, remaining: remainingBefore };
   const s = impliedProb(fillAmerican); // already net of your maker fee
   const hit = bookHit + N * s - N, miss = bookMiss + N * s, worst = Math.min(hit, miss);
   const v = fillView(fillAmerican);
@@ -122,7 +127,7 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
   return {
     ok: true, locks: worst >= 0, hit: r2(hit), miss: r2(miss), worst: r2(worst),
     partial: false, trimmedByLimit: false, cap, hedgeMode,
-    totalLimit, filledSoFar: already, remaining: remainingAfter, limitReached: remainingAfter <= 0,
+    totalLimit, filledSoFar: alreadyFilled, outstanding: reserved, remaining: remainingAfter, limitReached: remainingAfter <= 0,
     competitive: fairAmerican == null ? null : fillAmerican >= fairAmerican, fillAmerican,
     effTakerOdds: v.effTaker,
     quote: { yes_bid: YES_DECLINE, no_bid: v.noBid, rest_remainder: false }, contracts: N,

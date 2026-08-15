@@ -21,6 +21,7 @@ const d = decideAtFill({
   maxContracts: 50,
 });
 assert.ok(d.ok);
+assert.strictEqual(d.outstanding, 0);
 assert.strictEqual(d.quote.yes_bid, '0.00');
 assert.notStrictEqual(d.quote.yes_bid, '0');
 assert.ok(parseFloat(d.quote.no_bid) > 0);
@@ -99,6 +100,30 @@ const dollarHuge = decideAtFill({
 });
 assert.strictEqual(dollarHuge.ok, false);
 assert.strictEqual(dollarHuge.reason, 'rfq_too_large');
+
+// Parallel $10 RFQs: first two 43s fit 116; a third does not (the overfill bug).
+const soxArgs = {
+  parlayStake: 100,
+  parlayAmerican: 400,
+  fillAmerican: 350,
+  rfqContracts: dollarEst,
+  hedgeMode: '1x',
+  maxContracts: 116,
+};
+const q1 = decideAtFill({ ...soxArgs, filledSoFar: 0, outstanding: 0 });
+assert.ok(q1.ok);
+assert.strictEqual(q1.contracts, 43);
+assert.strictEqual(q1.outstanding, 0);
+assert.strictEqual(q1.remaining, 73);
+const q2 = decideAtFill({ ...soxArgs, filledSoFar: 0, outstanding: 43 });
+assert.ok(q2.ok);
+assert.strictEqual(q2.outstanding, 43);
+assert.strictEqual(q2.remaining, 30);
+const q3 = decideAtFill({ ...soxArgs, filledSoFar: 0, outstanding: 86 });
+assert.strictEqual(q3.ok, false);
+assert.strictEqual(q3.reason, 'rfq_too_large');
+assert.strictEqual(q3.remaining, 30);
+assert.strictEqual(q3.outstanding, 86);
 assert.ok(!shouldPostQuote({ source: 'dollar', contracts: 0, targetCost: 10 }));
 
 assert.ok(isSilentQuoteFailure('Kalshi quote failed 400: {"error":{"code":"insufficient_balance"}}'));
