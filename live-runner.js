@@ -19,7 +19,7 @@ const { Client } = require('undici');
 const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
-const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, YES_DECLINE } = require('./engine');
+const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
 const { findStartedEvent } = require('./started');
 const { sumOutstanding, wouldExceedCap, isCapExhausted, isReserveKey } = require('./reserve');
 const { startHeartbeat } = require('./heartbeat');
@@ -70,6 +70,9 @@ const pendingQuotes = new Map();
 
 // Step 3 — pre-staged quote pieces per parlay (rebuilt every refresh)
 // staged[id] = { noBid, yesBid, rest_remainder, fillAmerican, effTaker }
+// yesBid stays YES_DECLINE (contract-count decline). Dollar RFQs pick
+// implied YES at POST time from the no_bid actually sent — do not use this
+// staged 0.00 on that path (Kalshi would derive ~1000 contracts).
 let staged = {};
 
 const counts = {
@@ -224,7 +227,7 @@ function startedForParlay(p, rfq, extra) {
   return findStartedEvent(rfq || null, p, extra);
 }
 
-function pendingEntry(p, rfq, contracts) {
+function pendingEntry(p, rfq, contracts, extra) {
   return {
     parlayId: p.id,
     userId: p.user_id,
@@ -235,6 +238,7 @@ function pendingEntry(p, rfq, contracts) {
     legs: p.legs,
     leg_keys: p.leg_keys || p.legKeys,
     maxContracts: p.max_contracts,
+    yesBid: extra && extra.yesBid != null ? extra.yesBid : undefined,
   };
 }
 
@@ -301,6 +305,13 @@ function cancelLogLine(quoteId, pending, reason) {
       `[${MODE}] CANCEL cap exceeded ${label} quote_id=${quoteId}` +
       rfqBit +
       ` filled=${reason.filled} reserved=${reason.reserved} want=${reason.want} max=${reason.max}`
+    );
+  }
+  if (reason && reason.kind === 'yes_accept') {
+    return (
+      `[${MODE}] CANCEL yes accept ${label} quote_id=${quoteId}` +
+      rfqBit +
+      ` side=${reason.side || 'yes'}`
     );
   }
   return `[${MODE}] CANCEL ${label} quote_id=${quoteId}` + rfqBit;
@@ -424,7 +435,8 @@ function resolveRfqContracts(rfq, fillAmerican, stagedNoBid) {
     const noBid = stagedNoBid != null
       ? parseFloat(stagedNoBid)
       : parseFloat(fillView(fillAmerican).noBid);
-    const yesPrice = Math.max(0.01, 1 - noBid);
+    const implied = impliedYesBid(noBid);
+    const yesPrice = implied ? parseFloat(implied) : Math.max(0.01, 1 - noBid);
     const estimated = Math.floor(rfq.targetCostDollars / yesPrice);
     return {
       contracts: Math.max(1, estimated),
@@ -456,6 +468,20 @@ async function onQuoteAccepted(evt) {
   }
   confirmingQuotes.add(quoteId);
   try {
+    // Two-sided dollar quotes: only confirm NO. YES accept would buy the parlay.
+    // Contract-count quotes send yes_bid "0.00" — YES cannot be accepted; confirm as today.
+    if (pending && !shouldConfirmAccept(pending.yesBid, evt.acceptedSide)) {
+      console.log(
+        `[${MODE}] CONFIRM SKIPPED yes accept quote_id=${quoteId} rfq_id=${rfqId} ` +
+        `side=${evt.acceptedSide || '?'} yes_bid=${pending.yesBid} ` +
+        `label=${pending.label}`
+      );
+      await cancelQuoteAndDrop(quoteId, pending, {
+        kind: 'yes_accept',
+        side: evt.acceptedSide || 'yes',
+      });
+      return;
+    }
     const parlay = parlayFromPending(pending);
     const started = parlay ? startedForParlay(parlay) : { started: false };
     if (started.started) {
@@ -705,20 +731,24 @@ async function onRfq(rfq, env) {
   counts.wouldQuote++;
   const t1 = performance.now(); // after match + price
 
-  // Prefer pre-staged prices for the body (Step 3)
+  // Prefer pre-staged NO price. Dollar yes_bid is implied YES of that NO —
+  // never the staged / decideAtFill "0.00" (Kalshi would size off 1¢ YES).
   const noBid = (st && st.noBid) || d.quote.no_bid;
-  const yesBid = (st && st.yesBid) || d.quote.yes_bid || YES_DECLINE;
+  const yesBid = quoteYesBid(size.source, noBid);
   const restRemainder = (st && st.rest_remainder != null) ? st.rest_remainder : d.quote.rest_remainder;
 
   // ─── LIVE POST first (Step 1) ─────────────────────────────────────────
   if (!engaged) {
     // Reserve BEFORE the await so a parallel RFQ sees this size in outstanding.
     const reserveKey = `reserve:${++reserveSeq}`;
-    pendingQuotes.set(reserveKey, pendingEntry(p, rfq, d.contracts));
+    pendingQuotes.set(reserveKey, pendingEntry(p, rfq, d.contracts, { yesBid }));
     const t2 = performance.now();
     try {
       const result = await postQuote(rfq.rfqId, noBid, yesBid, restRemainder);
       const t3 = performance.now();
+      const reservedContracts = size.source === 'dollar'
+        ? contractsFromQuoteResponse(result, d.contracts)
+        : d.contracts;
 
       // Step 0 — latency log
       console.log(
@@ -729,19 +759,23 @@ async function onRfq(rfq, env) {
 
       counts.posted++;
       pendingQuotes.delete(reserveKey);
-      pendingQuotes.set(result.id, pendingEntry(p, rfq, d.contracts));
+      pendingQuotes.set(result.id, pendingEntry(p, rfq, reservedContracts, { yesBid }));
 
       console.log(
         `[${MODE}] QUOTED ${p.label} rfq=${rfq.rfqId} quote_id=${result.id} ` +
-        `contracts=${d.contracts} reserved=${outstanding + d.contracts}/${d.totalLimit} locks=${d.locks}`
+        `contracts=${reservedContracts} yes_bid=${yesBid} no_bid=${noBid} ` +
+        `reserved=${outstanding + reservedContracts}/${d.totalLimit} locks=${d.locks}`
       );
 
       // Fire-and-forget after POST (Step 1)
-      logAsync(p, rfq, d, 'quoted', { quote_id: result.id, is_live: true });
+      logAsync(p, rfq, d, 'quoted', {
+        quote_id: result.id, is_live: true, contracts: reservedContracts,
+      });
       sendAlert(
         `✅ QUOTED — ${p.label}\n` +
         `rfq ${shortId(rfq.rfqId)} · quote ${shortId(result.id)}\n` +
-        `${d.contracts} contracts · NO @ $${noBid}` +
+        `${reservedContracts} contracts · NO @ $${noBid}` +
+        (size.source === 'dollar' ? ` · YES @ $${yesBid}` : '') +
         (p.fill_american != null ? ` · ${sgn(p.fill_american)}` : '')
       ).catch(() => {});
     } catch (e) {

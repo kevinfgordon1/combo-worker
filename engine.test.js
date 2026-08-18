@@ -1,6 +1,9 @@
 'use strict';
 const assert = require('assert');
-const { decideAtFill, fillView, buildQuoteBody, yesBidForQuote, shouldPostQuote, isSilentQuoteFailure, YES_DECLINE } = require('./engine');
+const {
+  decideAtFill, fillView, buildQuoteBody, yesBidForQuote, shouldPostQuote, isSilentQuoteFailure,
+  YES_DECLINE, impliedYesBid, quoteYesBid, isRealYesBid, shouldConfirmAccept, contractsFromQuoteResponse,
+} = require('./engine');
 const { normalizeRfq } = require('./rfq');
 
 assert.strictEqual(YES_DECLINE, '0.00');
@@ -11,6 +14,14 @@ assert.strictEqual(yesBidForQuote('0'), '0.00');
 assert.strictEqual(yesBidForQuote(0), '0.00');
 assert.strictEqual(yesBidForQuote('0.00'), '0.00');
 assert.notStrictEqual(yesBidForQuote('0'), '0');
+assert.strictEqual(impliedYesBid('0.77'), '0.23');
+assert.strictEqual(impliedYesBid(0.77), '0.23');
+assert.ok(parseFloat(impliedYesBid('0.77')) + 0.77 <= 1);
+assert.strictEqual(quoteYesBid('contracts', '0.77'), YES_DECLINE);
+assert.strictEqual(quoteYesBid('dollar', '0.77'), '0.23');
+assert.ok(isRealYesBid('0.23'));
+assert.ok(!isRealYesBid(YES_DECLINE));
+assert.ok(!isRealYesBid('0'));
 
 const d = decideAtFill({
   parlayStake: 100,
@@ -80,15 +91,42 @@ const dollarFit = decideAtFill({
   maxContracts: 116,
 });
 assert.ok(dollarFit.ok);
-assert.strictEqual(dollarFit.quote.yes_bid, '0.00');
-assert.notStrictEqual(dollarFit.quote.yes_bid, '0');
 assert.strictEqual(dollarFit.quote.no_bid, fillView(350).noBid);
 assert.strictEqual(dollarFit.contracts, 43);
+assert.strictEqual(shouldPostQuote({ source: 'dollar', contracts: dollarFit.contracts, targetCost: 10 }), true);
 
-const dollarPosted = buildQuoteBody('rfq-dollar-fit', dollarFit.quote.no_bid, dollarFit.quote.yes_bid, dollarFit.quote.rest_remainder);
-assert.strictEqual(dollarPosted.yes_bid, '0.00');
+// Dollar wire body: implied YES of the NO bid we send — never "0" / "0.00".
+// Staged / decideAtFill still decline YES; POST must not copy that onto a dollar RFQ.
+const dollarNoStr = dollarFit.quote.no_bid;
+const dollarImpliedYes = impliedYesBid(dollarNoStr);
+assert.strictEqual(dollarImpliedYes, '0.23');
+assert.notStrictEqual(dollarImpliedYes, '0.00');
+assert.notStrictEqual(dollarImpliedYes, '0');
+assert.ok(isRealYesBid(dollarImpliedYes));
+assert.ok(parseFloat(dollarImpliedYes) + parseFloat(dollarNoStr) <= 1);
+assert.strictEqual(quoteYesBid('dollar', dollarNoStr), dollarImpliedYes);
+assert.strictEqual(quoteYesBid('dollar', dollarNoStr), '0.23');
+
+const dollarPosted = buildQuoteBody(
+  'rfq-dollar-fit', dollarNoStr, quoteYesBid('dollar', dollarNoStr), dollarFit.quote.rest_remainder
+);
+assert.strictEqual(dollarPosted.yes_bid, '0.23');
+assert.notStrictEqual(dollarPosted.yes_bid, '0.00');
 assert.notStrictEqual(dollarPosted.yes_bid, '0');
-assert.strictEqual(dollarPosted.no_bid, dollarFit.quote.no_bid);
+assert.strictEqual(dollarPosted.no_bid, dollarNoStr);
+assert.ok(parseFloat(dollarPosted.yes_bid) + parseFloat(dollarPosted.no_bid) <= 1);
+
+// Blindly using staged YES_DECLINE would still blow up dollar sizing.
+const stagedLeak = buildQuoteBody('rfq-dollar-staged', dollarNoStr, YES_DECLINE, false);
+assert.strictEqual(stagedLeak.yes_bid, '0.00');
+assert.notStrictEqual(quoteYesBid('dollar', dollarNoStr), stagedLeak.yes_bid);
+
+// Contract-count path still declines YES with "0.00".
+assert.strictEqual(quoteYesBid('contracts', d.quote.no_bid), YES_DECLINE);
+const contractPosted = buildQuoteBody('rfq-count-wire', d.quote.no_bid, quoteYesBid('contracts', d.quote.no_bid), false);
+assert.strictEqual(contractPosted.yes_bid, '0.00');
+assert.notStrictEqual(contractPosted.yes_bid, '0');
+assert.ok(parseFloat(contractPosted.no_bid) > 0);
 
 const dollarHuge = decideAtFill({
   parlayStake: 100,
@@ -132,5 +170,24 @@ assert.ok(isSilentQuoteFailure('Kalshi quote failed 400: invalid_dollar_precisio
 assert.ok(!isSilentQuoteFailure('Kalshi quote failed 400: RFQ_CLOSED'));
 assert.ok(!isSilentQuoteFailure('fetch failed'));
 assert.ok(!isSilentQuoteFailure('Kalshi quote failed 400: unexpected'));
+
+// Two-sided dollar quote: confirm only the NO side.
+assert.strictEqual(shouldConfirmAccept(YES_DECLINE, 'yes'), true);
+assert.strictEqual(shouldConfirmAccept(YES_DECLINE, 'no'), true);
+assert.strictEqual(shouldConfirmAccept('0.00', 'yes'), true);
+assert.strictEqual(shouldConfirmAccept('0.23', 'no'), true);
+assert.strictEqual(shouldConfirmAccept('0.23', 'NO'), true);
+assert.strictEqual(shouldConfirmAccept('0.23', 'yes'), false);
+assert.strictEqual(shouldConfirmAccept('0.23', 'YES'), false);
+assert.strictEqual(shouldConfirmAccept('0.23', null), false);
+assert.strictEqual(shouldConfirmAccept(undefined, 'yes'), true);
+
+// CreateQuoteResponse is { id } only — keep the estimate. Prefer NO count if present.
+assert.strictEqual(contractsFromQuoteResponse({ id: 'q1' }, 43), 43);
+assert.strictEqual(contractsFromQuoteResponse({ id: 'q1', no_contracts_fp: '43.00' }, 40), 43);
+assert.strictEqual(contractsFromQuoteResponse({ id: 'q1', yes_contracts_fp: '50.00', no_contracts_fp: '43.00' }, 40), 43);
+assert.strictEqual(contractsFromQuoteResponse({ id: 'q1', contracts_fp: '41.00' }, 40), 41);
+assert.strictEqual(contractsFromQuoteResponse({ quote: { no_contracts_fp: '42.00' } }, 40), 42);
+assert.strictEqual(contractsFromQuoteResponse(null, 43), 43);
 
 console.log('engine.test.js ok');
