@@ -12,13 +12,39 @@ const r2 = (x) => Math.round(x * 100) / 100;
 // Floor to the cent — never round NO bid UP past the fill target (we buy NO / sell the parlay).
 const floor2 = (x) => Math.floor(x * 100 + 1e-9) / 100;
 // Kalshi REST quotes require FixedPointDollars (two decimal places). Bare "0" is
-// invalid_yes_bid / invalid_dollar_precision. We buy NO; YES is "0.00".
+// invalid_yes_bid / invalid_dollar_precision. Contract-count RFQs decline YES
+// with "0.00". Dollar RFQs cannot — Kalshi treats 0.00 like 1¢ and explodes size.
 const YES_DECLINE = '0.00';
 
 function yesBidForQuote(yesBid) {
   if (yesBid == null || yesBid === '' || Number(yesBid) === 0) return YES_DECLINE;
   const s = String(yesBid);
   return s === '0' ? YES_DECLINE : s;
+}
+
+// Implied YES of a NO bid, floored to cents so yes_bid + no_bid <= $1.
+// Never returns a decline ("0" / "0.00") — dollar RFQs need a real YES price
+// so Kalshi derives contracts ≈ target / yes_bid.
+function impliedYesBid(noBid) {
+  const no = parseFloat(noBid);
+  if (!Number.isFinite(no)) return null;
+  const yes = floor2(1 - no);
+  if (!(yes >= 0.01)) return null;
+  return yes.toFixed(2);
+}
+
+function isRealYesBid(yesBid) {
+  const n = parseFloat(yesBid);
+  return Number.isFinite(n) && n > 0;
+}
+
+// Contract-count: decline YES. Dollar: real implied YES from the NO bid we send.
+function quoteYesBid(source, noBid) {
+  if (source === 'dollar') {
+    const implied = impliedYesBid(noBid);
+    if (implied && isRealYesBid(implied)) return implied;
+  }
+  return YES_DECLINE;
 }
 
 function buildQuoteBody(rfqId, noBid, yesBid, restRemainder) {
@@ -28,6 +54,33 @@ function buildQuoteBody(rfqId, noBid, yesBid, restRemainder) {
     no_bid: noBid,
     rest_remainder: restRemainder,
   };
+}
+
+// Two-sided dollar quotes can be accepted on YES. Only confirm the NO side.
+// Contract-count quotes send yes_bid "0.00" (YES cannot be accepted) — confirm as today.
+function shouldConfirmAccept(yesBid, acceptedSide) {
+  if (!isRealYesBid(yesBid)) return true;
+  return String(acceptedSide || '').toLowerCase() === 'no';
+}
+
+function parseFpCount(v) {
+  if (v == null || v === '') return null;
+  const n = typeof v === 'string' ? parseFloat(v) : Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// CreateQuoteResponse is documented as { id } only. If Kalshi also returns a
+// derived count, prefer NO (then contracts, then YES) over our estimate.
+function contractsFromQuoteResponse(result, fallback) {
+  if (!result || typeof result !== 'object') return fallback;
+  const q = (result.quote && typeof result.quote === 'object') ? result.quote : result;
+  const no = parseFpCount(q.no_contracts_fp ?? q.no_contracts ?? result.no_contracts_fp);
+  if (no != null) return no;
+  const derived = parseFpCount(q.contracts_fp ?? q.contracts ?? result.contracts_fp ?? result.contracts);
+  if (derived != null) return derived;
+  const yes = parseFpCount(q.yes_contracts_fp ?? q.yes_contracts ?? result.yes_contracts_fp);
+  if (yes != null) return yes;
+  return fallback;
 }
 
 // Post when we have a positive contract count — from contracts_fp, or a dollar-RFQ
@@ -135,5 +188,7 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
 }
 module.exports = {
   decideAtFill, impliedProb, hedgeCap, fillView, americanFromProb,
-  YES_DECLINE, yesBidForQuote, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure,
+  YES_DECLINE, yesBidForQuote, impliedYesBid, quoteYesBid, isRealYesBid,
+  shouldConfirmAccept, contractsFromQuoteResponse,
+  buildQuoteBody, shouldPostQuote, isSilentQuoteFailure,
 };
