@@ -216,7 +216,7 @@ assert.strictEqual(wouldExceedCap(MAX, 116, 0, 1), true);
   assert.strictEqual(ttl.has('q-just'), true);
   assert.strictEqual(sumOutstanding(ttl, P), 61 + 64 + 111);
   assert.strictEqual(dropPendingForRfq(ttl, 'rfq-acc').length, 0); // accepted stays for fill
-}
+
   assert.strictEqual(postedAtMs({ created_at: '2026-08-23T15:59:50Z' }), Date.parse('2026-08-23T15:59:50Z'));
   assert.strictEqual(isFreshOutstanding({
     quote_id: 'old', is_live: true, order_id: null,
