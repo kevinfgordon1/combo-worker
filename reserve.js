@@ -1,11 +1,16 @@
 // Outstanding-quote reservation against a parlay's max_contracts ceiling.
 //
-// remaining = max - filled.
-// available = remaining - outstanding.
-// A new quote (or a confirm) must fit in available. "Outstanding" is live
-// unfilled quoted size we already posted — pendingQuotes and/or combo_submissions
-// with quote_id, is_live, no order_id.
+// remaining = max - filled - outstanding.
+// A new quote (or a confirm) must fit in remaining. "Outstanding" is live
+// unfilled quoted size we already posted — pendingQuotes (plus a brief
+// pre-POST reserve: key). Released on fill, cancel, POST fail, RFQ close
+// (rfq_deleted), or a 20s unaccepted cancel — dead quotes must not pin remaining.
 'use strict';
+
+// User-set: cancel our quote if it is still unaccepted after 20s from POST.
+// Do not change this to 30 (quote-watcher's lost window). HVM confirm is 3s
+// after accept — accepted / confirming quotes are not cancelled.
+const RESERVE_TTL_MS = 20_000;
 
 function num(v) {
   const n = Number(v);
@@ -24,6 +29,79 @@ function quoteIdOf(q, fallbackId) {
 
 function isReserveKey(id) {
   return id != null && String(id).startsWith('reserve:');
+}
+
+function rfqIdOf(q) {
+  if (!q) return null;
+  const id = q.rfqId != null ? q.rfqId : q.rfq_id;
+  return id != null ? String(id) : null;
+}
+
+function postedAtMs(q) {
+  if (!q) return null;
+  const t = q.postedAt != null ? q.postedAt
+    : q.posted_at != null ? q.posted_at
+      : q.created_at != null ? q.created_at
+        : null;
+  if (t == null || t === '') return null;
+  if (typeof t === 'number') {
+    if (!Number.isFinite(t)) return null;
+    return t < 1e12 ? t * 1000 : t;
+  }
+  const n = Date.parse(t);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Seed / restart: only rows young enough that the RFQ could still be open.
+// Hours-old is_live + quote_id + no order_id rows are dead (Cards/Pirates:
+// 14 such rows totaling 1309 pinned remaining at 18 for hours).
+function isFreshOutstanding(q, now = Date.now(), ttlMs = RESERVE_TTL_MS) {
+  const at = postedAtMs(q);
+  if (at == null) return false;
+  return now - at < ttlMs;
+}
+
+function isAcceptedPending(q) {
+  return !!(q && (q.accepted || q.acceptedAt != null || q.accepted_at != null));
+}
+
+function selectSeedableOutstanding(rows, now = Date.now(), ttlMs = RESERVE_TTL_MS) {
+  return (rows || []).filter((row) => row && row.quote_id && isFreshOutstanding(row, now, ttlMs));
+}
+
+// Drop every pendingQuotes entry for this RFQ, including reserve: keys.
+// Does not DELETE the quote — RFQ is already gone (404 is success anyway).
+// Skip accepted / confirming quotes so a close during the 3s HVM window
+// does not drop the fill-accounting entry.
+function dropPendingForRfq(quotes, rfqId, opts = {}) {
+  if (!quotes || rfqId == null || typeof quotes.delete !== 'function') return [];
+  const want = String(rfqId);
+  const confirming = opts.confirming;
+  const dropped = [];
+  quotes.forEach((q, id) => {
+    if (rfqIdOf(q) !== want) return;
+    if (isAcceptedPending(q)) return;
+    if (confirming && confirming.has && confirming.has(id)) return;
+    dropped.push({ id, quote: q });
+  });
+  for (const { id } of dropped) quotes.delete(id);
+  return dropped;
+}
+
+// Quotes that should be DELETE'd via cancelQuoteAndDrop: posted >= TTL ago,
+// still pending, never accepted, not currently confirming. Does not mutate.
+function listStaleUnaccepted(quotes, now = Date.now(), ttlMs = RESERVE_TTL_MS, opts = {}) {
+  if (!quotes || typeof quotes.forEach !== 'function') return [];
+  const confirming = opts.confirming;
+  const stale = [];
+  quotes.forEach((q, id) => {
+    if (isAcceptedPending(q)) return;
+    if (confirming && confirming.has && confirming.has(id)) return;
+    const at = postedAtMs(q);
+    if (at == null) return;
+    if (now - at >= ttlMs) stale.push({ id, quote: q });
+  });
+  return stale;
 }
 
 // Sum live unfilled quoted size for one parlay.
@@ -89,10 +167,17 @@ function isCapExhausted(maxContracts, filledSoFar) {
 }
 
 module.exports = {
+  RESERVE_TTL_MS,
   sumOutstanding,
   mergeOutstanding,
   remainingAfterReserve,
   wouldExceedCap,
   isCapExhausted,
   isReserveKey,
+  postedAtMs,
+  isFreshOutstanding,
+  selectSeedableOutstanding,
+  isAcceptedPending,
+  dropPendingForRfq,
+  listStaleUnaccepted,
 };

@@ -1,10 +1,11 @@
 // Authenticated Kalshi WebSocket client for the 'communications' channel.
 // Reconnects with backoff + keepalive ping.
-// Emits: rfq_created, quote_accepted, quote_executed (and optional onEvent for everything).
+// Emits: rfq_created, rfq_deleted (and other RFQ close types), quote_accepted,
+// quote_executed (and optional onEvent for everything).
 'use strict';
 const WebSocket = require('ws');
 const { authHeaders } = require('./kalshi-auth');
-const { parseEnvelope, isRfqCreated, normalizeRfq } = require('./rfq');
+const { parseEnvelope, isRfqCreated, isRfqClosed, normalizeRfq, normalizeRfqClosed } = require('./rfq');
 
 const WS_URL = process.env.KALSHI_WS_URL || 'wss://external-api-ws.kalshi.com/trade-api/ws/v2';
 const WS_SIGN_PATH = '/trade-api/ws/v2';
@@ -13,6 +14,7 @@ function createKalshiWs({
   keyId,
   pem,
   onRfqCreated,
+  onRfqDeleted,
   onQuoteAccepted,
   onQuoteExecuted,
   onStatus,
@@ -43,6 +45,11 @@ function createKalshiWs({
       // RFQ created → existing path
       if (isRfqCreated(env) && onRfqCreated) {
         try { onRfqCreated(normalizeRfq(env), env); } catch (e) { console.error('onRfqCreated', e); }
+      }
+
+      // RFQ closed (deleted / expired / replaced) — release any reserve for that rfq_id
+      if (isRfqClosed(env) && onRfqDeleted) {
+        try { onRfqDeleted(normalizeRfqClosed(env), env); } catch (e) { console.error('onRfqDeleted', e); }
       }
 
       // Quote accepted (taker chose our quote) — ids may sit on msg or nested msg.quote

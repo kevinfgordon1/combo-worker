@@ -6,6 +6,27 @@ function parseEnvelope(raw) {
   return (e && typeof e === 'object' && typeof e.type === 'string') ? e : null;
 }
 const isRfqCreated = (e) => e && e.type === 'rfq_created';
+// Docs broadcast rfq_deleted to all communications subscribers (expire / delete /
+// replace_existing / execute). Treat nearby close types the same if they appear.
+const isRfqClosed = (e) => e && (
+  e.type === 'rfq_deleted' || e.type === 'rfq_expired' || e.type === 'rfq_closed'
+);
+
+function rfqIdFromMsg(m) {
+  if (!m) return null;
+  return m.id || m.rfq_id || null;
+}
+
+function normalizeRfqClosed(e) {
+  const m = (e && e.msg) || {};
+  const type = e && e.type;
+  return {
+    rfqId: rfqIdFromMsg(m),
+    reason: type === 'rfq_expired' ? 'expired' : 'deleted',
+    deletedTs: m.deleted_ts || m.expired_ts || m.closed_ts || null,
+    raw: m,
+  };
+}
 
 function normalizeLeg(leg) {
   if (leg == null) return null;
@@ -27,7 +48,7 @@ function normalizeRfq(e) {
     ? (typeof m.target_cost_dollars === 'string' ? parseFloat(m.target_cost_dollars) : Number(m.target_cost_dollars))
     : null;
   return {
-    rfqId: m.id || m.rfq_id || null,
+    rfqId: rfqIdFromMsg(m),
     marketTicker: m.market_ticker || m.ticker || null,
     mveCollection: m.mve_collection_ticker || null,
     legKeys,
@@ -56,4 +77,6 @@ function matchParlay(rfq, parlays) {
   }
   return null;
 }
-module.exports = { parseEnvelope, isRfqCreated, normalizeRfq, matchParlay };
+module.exports = {
+  parseEnvelope, isRfqCreated, isRfqClosed, normalizeRfq, normalizeRfqClosed, matchParlay,
+};

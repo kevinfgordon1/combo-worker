@@ -4,7 +4,8 @@
 // ACCOUNTING: POST → 'quoted'. Filled advances on quote_executed.
 // RESERVE: outstanding live quotes (pendingQuotes + in-flight POST) count against
 //   remaining so parallel RFQs cannot all clear the same ceiling.
-//   remaining = max - filled; available = remaining - outstanding.
+//   remaining = max - filled - outstanding.
+//   Released on fill, cancel, POST fail, rfq_deleted, or 20s unaccepted DELETE.
 // PARTIAL-FILL: d.locks is informational; post while ceiling remains.
 // LATENCY: Steps 0–4 — instrument, POST first, undici keep-alive, pre-stage.
 // START GATE: never quote (and cancel open quotes) once any leg's start <= now.
@@ -24,7 +25,15 @@ const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
 const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
 const { findStartedEvent } = require('./started');
-const { sumOutstanding, wouldExceedCap, isCapExhausted, isReserveKey } = require('./reserve');
+const {
+  RESERVE_TTL_MS,
+  sumOutstanding,
+  wouldExceedCap,
+  isCapExhausted,
+  isReserveKey,
+  dropPendingForRfq,
+  listStaleUnaccepted,
+} = require('./reserve');
 const { startHeartbeat } = require('./heartbeat');
 const { shortId } = require('./short-id');
 const {
@@ -48,6 +57,7 @@ const QUOTE_PATH = '/trade-api/v2/communications/quotes';
 const WARM_PATH = '/trade-api/v2/exchange/status';
 const cancelingQuotes = new Set();
 const cancelledQuotes = new Set();
+const confirmingQuotes = new Set(); // de-dupe accept + skip 20s TTL during confirm
 let reserveSeq = 0;
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -134,7 +144,11 @@ async function refresh() {
     staged = next;
 
     console.log(`[${MODE}] refreshed — ${parlays.length} active parlay(s), staged=${Object.keys(staged).length}`);
-    seedPendingFromSubmissions().catch((e) => console.error(`[${MODE}] seed outstanding`, e.message));
+    // Do not seed outstanding from combo_submissions — a 2h is_live re-import
+    // revived 1309 dead contracts on Cards/Pirates every 30s. WS close + 20s
+    // unaccepted DELETE is the reserve clock; unmark stale is_live so a restart
+    // cannot re-pin remaining.
+    clearStaleLiveSubmissions().catch((e) => console.error(`[${MODE}] clear stale is_live`, e.message));
     cancelStartedQuotes().catch((e) => console.error(`[${MODE}] cancel-on-start refresh`, e.message));
     loadPendingSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape load`, e.message));
   } catch (e) {
@@ -305,15 +319,18 @@ function pendingEntry(p, rfq, contracts, extra) {
     leg_keys: p.leg_keys || p.legKeys,
     maxContracts: p.max_contracts,
     yesBid: extra && extra.yesBid != null ? extra.yesBid : undefined,
+    postedAt: extra && extra.postedAt != null ? extra.postedAt : Date.now(),
   };
 }
 
+// Cancel leftovers only — not a reserve seed. Window matches TTL so hours-old
+// is_live rows cannot re-enter the cancel path as if they were still live.
 async function loadOpenSubmissionQuotes() {
-  const cutoff = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+  const cutoff = new Date(Date.now() - RESERVE_TTL_MS).toISOString();
   try {
     const { data, error } = await supabase
       .from('combo_submissions')
-      .select('quote_id,parlay_id,label,rfq_id,contracts,user_id')
+      .select('quote_id,parlay_id,label,rfq_id,contracts,user_id,created_at')
       .eq('is_live', true)
       .is('order_id', null)
       .not('quote_id', 'is', null)
@@ -329,24 +346,30 @@ async function loadOpenSubmissionQuotes() {
   }
 }
 
-function seedPendingFromRows(rows) {
-  for (const row of rows || []) {
-    if (!row || !row.quote_id) continue;
-    if (pendingQuotes.has(row.quote_id) || cancelledQuotes.has(row.quote_id)) continue;
-    const live = parlays.find((x) => x.id === row.parlay_id);
-    pendingQuotes.set(row.quote_id, {
-      parlayId: row.parlay_id,
-      userId: row.user_id,
-      contracts: Number(row.contracts || 0),
-      label: row.label,
-      rfqId: row.rfq_id,
-      maxContracts: live ? live.max_contracts : null,
-    });
+async function clearStaleLiveSubmissions() {
+  const cutoff = new Date(Date.now() - RESERVE_TTL_MS).toISOString();
+  try {
+    const { data, error } = await supabase
+      .from('combo_submissions')
+      .update({ is_live: false })
+      .eq('is_live', true)
+      .is('order_id', null)
+      .not('quote_id', 'is', null)
+      .lte('created_at', cutoff)
+      .select('quote_id,contracts,label');
+    if (error) {
+      console.error(`[${MODE}] clear stale is_live`, error.message);
+      return;
+    }
+    const rows = data || [];
+    if (!rows.length) return;
+    const contracts = rows.reduce((n, r) => n + Number(r.contracts || 0), 0);
+    console.log(
+      `[${MODE}] RESERVE RELEASED stale-db count=${rows.length} contracts=${contracts}`
+    );
+  } catch (e) {
+    console.error(`[${MODE}] clear stale is_live`, e.message);
   }
-}
-
-async function seedPendingFromSubmissions() {
-  seedPendingFromRows(await loadOpenSubmissionQuotes());
 }
 
 function cancelLogLine(quoteId, pending, reason) {
@@ -380,7 +403,59 @@ function cancelLogLine(quoteId, pending, reason) {
       ` side=${reason.side || 'yes'}`
     );
   }
+  if (reason && reason.kind === 'ttl') {
+    return (
+      `[${MODE}] CANCEL unaccepted ${label} quote_id=${quoteId}` +
+      rfqBit +
+      (reason.age != null ? ` age=${reason.age}ms` : '')
+    );
+  }
   return `[${MODE}] CANCEL ${label} quote_id=${quoteId}` + rfqBit;
+}
+
+function markSubmissionNotLive(quoteId) {
+  if (!quoteId || isReserveKey(quoteId)) return;
+  supabase.from('combo_submissions').update({ is_live: false }).eq('quote_id', quoteId)
+    .then(({ error }) => {
+      if (error) console.error(`[${MODE}] clear is_live`, error.message);
+    })
+    .catch((e) => console.error(`[${MODE}] clear is_live`, e.message));
+}
+
+function noteReleased(quoteId, pending, reason) {
+  if (quoteId && !isReserveKey(quoteId)) {
+    cancelledQuotes.add(quoteId);
+    markSubmissionNotLive(quoteId);
+  }
+  const label = (pending && pending.label) || '(unknown)';
+  const rfqBit = pending && pending.rfqId ? ` rfq=${pending.rfqId}` : '';
+  const n = pending && pending.contracts != null ? pending.contracts : '';
+  const age = pending && pending.postedAt != null ? ` age=${Date.now() - pending.postedAt}ms` : '';
+  console.log(
+    `[${MODE}] RESERVE RELEASED ${reason} ${label} quote_id=${quoteId}${rfqBit} contracts=${n}${age}`
+  );
+}
+
+function onRfqDeleted(evt) {
+  const rfqId = evt && evt.rfqId;
+  if (!rfqId) return;
+  const dropped = dropPendingForRfq(pendingQuotes, rfqId, { confirming: confirmingQuotes });
+  for (const { id, quote } of dropped) {
+    noteReleased(id, quote, 'closed');
+  }
+}
+
+async function cancelUnacceptedQuotes(now = Date.now()) {
+  const stale = listStaleUnaccepted(pendingQuotes, now, RESERVE_TTL_MS, {
+    confirming: confirmingQuotes,
+  });
+  for (const { id } of stale) {
+    const live = pendingQuotes.get(id);
+    if (!live || live.accepted || confirmingQuotes.has(id)) continue;
+    const posted = live.postedAt;
+    const age = posted != null ? now - posted : null;
+    await cancelQuoteAndDrop(id, live, { kind: 'ttl', age });
+  }
 }
 
 async function cancelQuoteAndDrop(quoteId, pending, reason) {
@@ -397,6 +472,7 @@ async function cancelQuoteAndDrop(quoteId, pending, reason) {
     await cancelQuote(quoteId);
     pendingQuotes.delete(quoteId);
     cancelledQuotes.add(quoteId);
+    markSubmissionNotLive(quoteId);
     console.log(cancelLogLine(quoteId, pending, reason));
   } catch (e) {
     console.error(
@@ -648,13 +724,12 @@ function resolveRfqContracts(rfq, fillAmerican, stagedNoBid) {
   return { contracts: null, source: 'none' };
 }
 
-const confirmingQuotes = new Set(); // de-dupe concurrent accept events
-
 async function onQuoteAccepted(evt) {
   const t0 = performance.now();
   let quoteId = evt && evt.quoteId;
   let rfqId = evt && evt.rfqId;
   const pending = quoteId ? pendingQuotes.get(quoteId) : null;
+  if (pending) pending.accepted = true; // do not TTL-cancel during the 3s confirm window
   if (!rfqId && pending) rfqId = pending.rfqId;
   if (!quoteId || !rfqId) {
     console.error(
@@ -1015,12 +1090,15 @@ async function main() {
     `[${MODE}] starting — latency-optimized. POST first, undici keep-alive, pre-staged prices. ` +
     `Auto-confirms quote_accepted (HVM ~3s window). ` +
     `Remaining = max - filled - outstanding quotes. ` +
+    `Unaccepted quotes are DELETE'd after ${RESERVE_TTL_MS / 1000}s. ` +
+    `rfq_deleted releases immediately. ` +
     `Skipped oversized/cap RFQs get a targeted tape lookup after close.`
   );
 
   await refresh();
   setInterval(refresh, 30000);
   setInterval(() => {
+    cancelUnacceptedQuotes().catch((e) => console.error(`[${MODE}] cancel-unaccepted tick`, e.message));
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start tick`, e.message));
   }, 2000);
   setInterval(() => {
@@ -1038,6 +1116,7 @@ async function main() {
     pem: PEM,
     onStatus: (s, i) => console.log(`[${MODE}] ws:${s}`, i || ''),
     onRfqCreated: (rfq, env) => onRfq(rfq, env).catch((e) => console.error('onRfq', e)),
+    onRfqDeleted: (evt) => { try { onRfqDeleted(evt); } catch (e) { console.error('onRfqDeleted', e); } },
     onQuoteAccepted: (evt) => onQuoteAccepted(evt).catch((e) => console.error('onQuoteAccepted', e)),
     onQuoteExecuted: (evt) => onQuoteExecuted(evt).catch((e) => console.error('onQuoteExecuted', e)),
   });
