@@ -4,13 +4,13 @@
 // A new quote (or a confirm) must fit in remaining. "Outstanding" is live
 // unfilled quoted size we already posted — pendingQuotes (plus a brief
 // pre-POST reserve: key). Released on fill, cancel, POST fail, RFQ close
-// (rfq_deleted), or TTL — dead quotes must not pin remaining.
+// (rfq_deleted), or a 20s unaccepted cancel — dead quotes must not pin remaining.
 'use strict';
 
-// Combo RFQs recycle ~10s. Long enough that a still-open RFQ is not dropped
-// mid-quote; short enough a 10s no-accept cycle cannot pile reserved size.
-// quote-watcher ages unaccepted quotes to 'lost' at 30s; stay inside that.
-const RESERVE_TTL_MS = 25_000;
+// User-set: cancel our quote if it is still unaccepted after 20s from POST.
+// Do not change this to 30 (quote-watcher's lost window). HVM confirm is 3s
+// after accept — accepted / confirming quotes are not cancelled.
+const RESERVE_TTL_MS = 20_000;
 
 function num(v) {
   const n = Number(v);
@@ -61,34 +61,47 @@ function isFreshOutstanding(q, now = Date.now(), ttlMs = RESERVE_TTL_MS) {
   return now - at < ttlMs;
 }
 
+function isAcceptedPending(q) {
+  return !!(q && (q.accepted || q.acceptedAt != null || q.accepted_at != null));
+}
+
 function selectSeedableOutstanding(rows, now = Date.now(), ttlMs = RESERVE_TTL_MS) {
   return (rows || []).filter((row) => row && row.quote_id && isFreshOutstanding(row, now, ttlMs));
 }
 
 // Drop every pendingQuotes entry for this RFQ, including reserve: keys.
 // Does not DELETE the quote — RFQ is already gone (404 is success anyway).
-function dropPendingForRfq(quotes, rfqId) {
+// Skip accepted / confirming quotes so a close during the 3s HVM window
+// does not drop the fill-accounting entry.
+function dropPendingForRfq(quotes, rfqId, opts = {}) {
   if (!quotes || rfqId == null || typeof quotes.delete !== 'function') return [];
   const want = String(rfqId);
+  const confirming = opts.confirming;
   const dropped = [];
   quotes.forEach((q, id) => {
-    if (rfqIdOf(q) === want) dropped.push({ id, quote: q });
+    if (rfqIdOf(q) !== want) return;
+    if (isAcceptedPending(q)) return;
+    if (confirming && confirming.has && confirming.has(id)) return;
+    dropped.push({ id, quote: q });
   });
   for (const { id } of dropped) quotes.delete(id);
   return dropped;
 }
 
-// Safety net if rfq_deleted is missed. Just-posted quotes (postedAt ≈ now) stay.
-function sweepStalePending(quotes, now = Date.now(), ttlMs = RESERVE_TTL_MS) {
-  if (!quotes || typeof quotes.delete !== 'function') return [];
-  const dropped = [];
+// Quotes that should be DELETE'd via cancelQuoteAndDrop: posted >= TTL ago,
+// still pending, never accepted, not currently confirming. Does not mutate.
+function listStaleUnaccepted(quotes, now = Date.now(), ttlMs = RESERVE_TTL_MS, opts = {}) {
+  if (!quotes || typeof quotes.forEach !== 'function') return [];
+  const confirming = opts.confirming;
+  const stale = [];
   quotes.forEach((q, id) => {
+    if (isAcceptedPending(q)) return;
+    if (confirming && confirming.has && confirming.has(id)) return;
     const at = postedAtMs(q);
     if (at == null) return;
-    if (now - at >= ttlMs) dropped.push({ id, quote: q });
+    if (now - at >= ttlMs) stale.push({ id, quote: q });
   });
-  for (const { id } of dropped) quotes.delete(id);
-  return dropped;
+  return stale;
 }
 
 // Sum live unfilled quoted size for one parlay.
@@ -164,6 +177,7 @@ module.exports = {
   postedAtMs,
   isFreshOutstanding,
   selectSeedableOutstanding,
+  isAcceptedPending,
   dropPendingForRfq,
-  sweepStalePending,
+  listStaleUnaccepted,
 };

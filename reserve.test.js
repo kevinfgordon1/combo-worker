@@ -13,7 +13,7 @@ const {
   isFreshOutstanding,
   selectSeedableOutstanding,
   dropPendingForRfq,
-  sweepStalePending,
+  listStaleUnaccepted,
 } = require('./reserve');
 const { isRfqClosed, normalizeRfqClosed, parseEnvelope } = require('./rfq');
 
@@ -134,11 +134,10 @@ assert.strictEqual(wouldExceedCap(MAX, 116, 0, 1), true);
   assert.strictEqual(sumOutstanding(live, P), 116);
   assert.strictEqual(wouldExceedCap(MAX_LOCK, filled, sumOutstanding(live, P), 55), false);
 
-  // Just-posted quote is not swept immediately.
-  const justSwept = sweepStalePending(live, now, RESERVE_TTL_MS);
-  assert.strictEqual(justSwept.length, 0);
+  // Just-posted quote is not cancelled immediately.
+  assert.strictEqual(listStaleUnaccepted(live, now, RESERVE_TTL_MS).length, 0);
   assert.strictEqual(sumOutstanding(live, P), 116);
-  assert.strictEqual(sweepStalePending(live, now + RESERVE_TTL_MS - 1, RESERVE_TTL_MS).length, 0);
+  assert.strictEqual(listStaleUnaccepted(live, now + RESERVE_TTL_MS - 1, RESERVE_TTL_MS).length, 0);
   assert.strictEqual(sumOutstanding(live, P), 116);
 
   // rfq_deleted drops every entry for that rfq_id, including a pre-POST reserve: key.
@@ -169,16 +168,17 @@ assert.strictEqual(wouldExceedCap(MAX, 116, 0, 1), true);
   assert.strictEqual(sumOutstanding(live, P), 61);
   assert.strictEqual(wouldExceedCap(MAX_LOCK, filled + 55, sumOutstanding(live, P), 61), false);
 
-  // TTL sweep: dead 1298-contract cycle no longer pins remaining=29.
+  // 20s unaccepted cancel: dead 1298-contract cycle no longer pins remaining.
   const leak = new Map();
   leak.set('q-dead', {
-    parlayId: P, contracts: 1298, rfqId: 'rfq-cycle', postedAt: now - 30_000, label: 'Cards/Pirates',
+    parlayId: P, contracts: 1298, rfqId: 'rfq-cycle', postedAt: now - 20_000, label: 'Cards/Pirates',
   });
   leak.set('q-fresh', { parlayId: P, contracts: 64, rfqId: 'rfq-live', postedAt: now });
   assert.strictEqual(wouldExceedCap(MAX_LOCK, filled, sumOutstanding(leak, P), 55), true);
-  const expired = sweepStalePending(leak, now, RESERVE_TTL_MS);
+  const expired = listStaleUnaccepted(leak, now, RESERVE_TTL_MS);
   assert.strictEqual(expired.length, 1);
   assert.strictEqual(expired[0].id, 'q-dead');
+  for (const { id } of expired) leak.delete(id); // cancelQuoteAndDrop on success
   assert.strictEqual(sumOutstanding(leak, P), 64);
   assert.strictEqual(wouldExceedCap(MAX_LOCK, filled, sumOutstanding(leak, P), 55), false);
   const after = decideAtFill({
@@ -196,7 +196,27 @@ assert.strictEqual(wouldExceedCap(MAX, 116, 0, 1), true);
   assert.strictEqual(after.remaining, MAX_LOCK - filled - 64 - 55);
 
   // Restart seed: old combo_submissions rows must not re-pin remaining.
-  assert.strictEqual(RESERVE_TTL_MS, 25_000);
+  assert.strictEqual(RESERVE_TTL_MS, 20_000);
+
+  // Unaccepted at 20s is cancelled and leaves outstanding; accepted at 15s is not.
+  const ttl = new Map();
+  ttl.set('q-unacc', { parlayId: P, contracts: 55, rfqId: 'rfq-ttl', postedAt: now - 20_000 });
+  ttl.set('q-acc', {
+    parlayId: P, contracts: 61, rfqId: 'rfq-acc', postedAt: now - 20_000, accepted: true,
+  });
+  ttl.set('q-conf', { parlayId: P, contracts: 64, rfqId: 'rfq-conf', postedAt: now - 20_000 });
+  ttl.set('q-just', { parlayId: P, contracts: 111, rfqId: 'rfq-just', postedAt: now });
+  const toCancel = listStaleUnaccepted(ttl, now, RESERVE_TTL_MS, {
+    confirming: new Set(['q-conf']),
+  });
+  assert.deepStrictEqual(toCancel.map((x) => x.id), ['q-unacc']);
+  for (const { id } of toCancel) ttl.delete(id);
+  assert.strictEqual(ttl.has('q-acc'), true);
+  assert.strictEqual(ttl.has('q-conf'), true);
+  assert.strictEqual(ttl.has('q-just'), true);
+  assert.strictEqual(sumOutstanding(ttl, P), 61 + 64 + 111);
+  assert.strictEqual(dropPendingForRfq(ttl, 'rfq-acc').length, 0); // accepted stays for fill
+}
   assert.strictEqual(postedAtMs({ created_at: '2026-08-23T15:59:50Z' }), Date.parse('2026-08-23T15:59:50Z'));
   assert.strictEqual(isFreshOutstanding({
     quote_id: 'old', is_live: true, order_id: null,
