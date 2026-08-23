@@ -53,10 +53,16 @@ function postedAtMs(q) {
 }
 
 // Seed / restart: only rows young enough that the RFQ could still be open.
+// Hours-old is_live + quote_id + no order_id rows are dead (Cards/Pirates:
+// 14 such rows totaling 1309 pinned remaining at 18 for hours).
 function isFreshOutstanding(q, now = Date.now(), ttlMs = RESERVE_TTL_MS) {
   const at = postedAtMs(q);
   if (at == null) return false;
   return now - at < ttlMs;
+}
+
+function selectSeedableOutstanding(rows, now = Date.now(), ttlMs = RESERVE_TTL_MS) {
+  return (rows || []).filter((row) => row && row.quote_id && isFreshOutstanding(row, now, ttlMs));
 }
 
 // Drop every pendingQuotes entry for this RFQ, including reserve: keys.
@@ -157,6 +163,7 @@ module.exports = {
   isReserveKey,
   postedAtMs,
   isFreshOutstanding,
+  selectSeedableOutstanding,
   dropPendingForRfq,
   sweepStalePending,
 };

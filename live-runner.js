@@ -31,8 +31,6 @@ const {
   wouldExceedCap,
   isCapExhausted,
   isReserveKey,
-  postedAtMs,
-  isFreshOutstanding,
   dropPendingForRfq,
   sweepStalePending,
 } = require('./reserve');
@@ -145,7 +143,10 @@ async function refresh() {
     staged = next;
 
     console.log(`[${MODE}] refreshed — ${parlays.length} active parlay(s), staged=${Object.keys(staged).length}`);
-    seedPendingFromSubmissions().catch((e) => console.error(`[${MODE}] seed outstanding`, e.message));
+    // Do not seed outstanding from combo_submissions — a 2h is_live re-import
+    // revived 1309 dead contracts on Cards/Pirates every 30s. WS + postedAt TTL
+    // is the reserve clock; just unmark stale is_live so Combo Locks is honest.
+    clearStaleLiveSubmissions().catch((e) => console.error(`[${MODE}] clear stale is_live`, e.message));
     cancelStartedQuotes().catch((e) => console.error(`[${MODE}] cancel-on-start refresh`, e.message));
     loadPendingSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape load`, e.message));
   } catch (e) {
@@ -320,6 +321,8 @@ function pendingEntry(p, rfq, contracts, extra) {
   };
 }
 
+// Cancel leftovers only — not a reserve seed. Window matches TTL so hours-old
+// is_live rows cannot re-enter the cancel path as if they were still live.
 async function loadOpenSubmissionQuotes() {
   const cutoff = new Date(Date.now() - RESERVE_TTL_MS).toISOString();
   try {
@@ -341,27 +344,30 @@ async function loadOpenSubmissionQuotes() {
   }
 }
 
-function seedPendingFromRows(rows) {
-  const now = Date.now();
-  for (const row of rows || []) {
-    if (!row || !row.quote_id) continue;
-    if (pendingQuotes.has(row.quote_id) || cancelledQuotes.has(row.quote_id)) continue;
-    if (!isFreshOutstanding(row, now)) continue;
-    const live = parlays.find((x) => x.id === row.parlay_id);
-    pendingQuotes.set(row.quote_id, {
-      parlayId: row.parlay_id,
-      userId: row.user_id,
-      contracts: Number(row.contracts || 0),
-      label: row.label,
-      rfqId: row.rfq_id,
-      maxContracts: live ? live.max_contracts : null,
-      postedAt: postedAtMs(row) || now,
-    });
+async function clearStaleLiveSubmissions() {
+  const cutoff = new Date(Date.now() - RESERVE_TTL_MS).toISOString();
+  try {
+    const { data, error } = await supabase
+      .from('combo_submissions')
+      .update({ is_live: false })
+      .eq('is_live', true)
+      .is('order_id', null)
+      .not('quote_id', 'is', null)
+      .lte('created_at', cutoff)
+      .select('quote_id,contracts,label');
+    if (error) {
+      console.error(`[${MODE}] clear stale is_live`, error.message);
+      return;
+    }
+    const rows = data || [];
+    if (!rows.length) return;
+    const contracts = rows.reduce((n, r) => n + Number(r.contracts || 0), 0);
+    console.log(
+      `[${MODE}] RESERVE RELEASED stale-db count=${rows.length} contracts=${contracts}`
+    );
+  } catch (e) {
+    console.error(`[${MODE}] clear stale is_live`, e.message);
   }
-}
-
-async function seedPendingFromSubmissions() {
-  seedPendingFromRows(await loadOpenSubmissionQuotes());
 }
 
 function cancelLogLine(quoteId, pending, reason) {

@@ -11,6 +11,7 @@ const {
   isReserveKey,
   postedAtMs,
   isFreshOutstanding,
+  selectSeedableOutstanding,
   dropPendingForRfq,
   sweepStalePending,
 } = require('./reserve');
@@ -206,6 +207,53 @@ assert.strictEqual(wouldExceedCap(MAX, 116, 0, 1), true);
     created_at: new Date(now - 5_000).toISOString(),
   }, now), true);
   assert.strictEqual(isFreshOutstanding({ quote_id: 'undated', is_live: true }, now), false);
+}
+
+// Confirmed live: Cards/Pirates 1af187bd… max 1347, filled 20, 14 is_live
+// rows totaling 1309 (12 quotes in ~24s at 9:40:48am ET + 22 at 11:11 + 11
+// at 11:48). Seeder must not revive them at 12:38pm ET (remaining 18 vs 1327).
+{
+  const CARDS = '1af187bd-6650-4bfb-80cf-0e5c873b5b5d';
+  const asOf = Date.parse('2026-08-23T16:38:00Z'); // ~12:38pm ET
+  const burst = new Date('2026-08-23T13:40:48Z').toISOString(); // 9:40:48am ET
+  const mid = new Date('2026-08-23T15:11:00Z').toISOString();
+  const late = new Date('2026-08-23T15:48:00Z').toISOString();
+  const dead = [];
+  for (let i = 0; i < 11; i++) {
+    dead.push({
+      quote_id: `q-111-${i}`, parlay_id: CARDS, contracts: 111,
+      is_live: true, order_id: null, created_at: burst,
+    });
+  }
+  dead.push({
+    quote_id: 'q-55-burst', parlay_id: CARDS, contracts: 55,
+    is_live: true, order_id: null, created_at: burst,
+  });
+  dead.push({
+    quote_id: 'q-22', parlay_id: CARDS, contracts: 22,
+    is_live: true, order_id: null, created_at: mid,
+  });
+  dead.push({
+    quote_id: 'q-11', parlay_id: CARDS, contracts: 11,
+    is_live: true, order_id: null, created_at: late,
+  });
+  assert.strictEqual(dead.length, 14);
+  assert.strictEqual(sumOutstanding(dead, CARDS), 1309);
+  assert.strictEqual(remainingAfterReserve(1347, 20, 1309), 18);
+
+  const seedable = selectSeedableOutstanding(dead, asOf);
+  assert.strictEqual(seedable.length, 0);
+  assert.strictEqual(sumOutstanding(seedable, CARDS), 0);
+  assert.strictEqual(remainingAfterReserve(1347, 20, 0), 1327);
+  assert.strictEqual(wouldExceedCap(1347, 20, 0, 55), false);
+
+  // A just-posted quote still seeds; the 2-hour lookback does not.
+  const fresh = {
+    quote_id: 'q-just', parlay_id: CARDS, contracts: 55,
+    is_live: true, order_id: null,
+    created_at: new Date(asOf - 5_000).toISOString(),
+  };
+  assert.deepStrictEqual(selectSeedableOutstanding([fresh, ...dead], asOf).map((r) => r.quote_id), ['q-just']);
 }
 
 console.log('reserve.test.js ok');
