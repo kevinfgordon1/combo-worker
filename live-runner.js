@@ -9,6 +9,9 @@
 // LATENCY: Steps 0–4 — instrument, POST first, undici keep-alive, pre-stage.
 // START GATE: never quote (and cancel open quotes) once any leg's start <= now.
 //   Started still wins; the cap is a second gate.
+// SKIP TAPE: oversized / limit_reached skips persist a distinct reason on
+//   combo_submissions, then one RFQ+ticker tape lookup after close (or pad).
+//   Quote-watcher stays parked. We do not write combo_matches or watcher_debug.
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
@@ -24,6 +27,12 @@ const { findStartedEvent } = require('./started');
 const { sumOutstanding, wouldExceedCap, isCapExhausted, isReserveKey } = require('./reserve');
 const { startHeartbeat } = require('./heartbeat');
 const { shortId } = require('./short-id');
+const {
+  classifySkip,
+  skipPersistExtra,
+  isSkipTapeEligible,
+  resolveSkipTape,
+} = require('./skip-tape');
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -79,7 +88,15 @@ const counts = {
   rfqs: 0, combos: 0, matched: 0, wouldQuote: 0,
   declined: 0, noLock: 0, limitReached: 0,
   posted: 0, postFailed: 0, dollarRfqs: 0, filled: 0,
+  tapeMatched: 0, tapeNone: 0,
 };
+
+const pendingSkipTapes = new Map(); // submission id → skip row awaiting tape
+const unknownCols = new Set();
+const COL_ERR = /Could not find the '([^']+)' column/i;
+const SKIP_TAPE_LOOKBACK_MS = 24 * 3600 * 1000;
+const SKIP_TAPE_TICK_MS = 15000;
+const SKIP_TAPE_MAX_PER_TICK = 5;
 
 async function refresh() {
   try {
@@ -119,6 +136,7 @@ async function refresh() {
     console.log(`[${MODE}] refreshed — ${parlays.length} active parlay(s), staged=${Object.keys(staged).length}`);
     seedPendingFromSubmissions().catch((e) => console.error(`[${MODE}] seed outstanding`, e.message));
     cancelStartedQuotes().catch((e) => console.error(`[${MODE}] cancel-on-start refresh`, e.message));
+    loadPendingSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape load`, e.message));
   } catch (e) {
     console.error(`[${MODE}] refresh failed`, e.message);
   }
@@ -142,24 +160,72 @@ function normalizeStatus(status) {
   return status;
 }
 
+function stripUnknown(body) {
+  const out = { ...body };
+  for (const c of unknownCols) delete out[c];
+  return out;
+}
+
 // Fire-and-forget log (Step 1 — never on the critical path before POST)
 function logAsync(p, rfq, d, status, extra = {}) {
   const contracts =
-    d && d.contracts != null ? d.contracts
-      : rfq.contracts != null ? rfq.contracts : null;
-  supabase.from('combo_submissions').insert({
+    extra.contracts != null ? extra.contracts
+      : d && d.contracts != null ? d.contracts
+        : rfq.contracts != null ? rfq.contracts : null;
+  const body = stripUnknown({
     user_id: p.user_id,
     parlay_id: p.id,
     rfq_id: rfq.rfqId,
     label: p.label,
-    fill_american: d ? d.fillAmerican : p.fill_american,
+    fill_american: (d && d.fillAmerican != null) ? d.fillAmerican : p.fill_american,
     contracts,
     worst_lock: d ? d.worst : null,
     status: normalizeStatus(status),
     ...extra,
-  }).then(({ error }) => {
-    if (error) console.error(`[${MODE}] log insert failed`, error.message);
-  }).catch((e) => console.error(`[${MODE}] log insert failed`, e.message));
+  });
+  return supabase.from('combo_submissions').insert(body).select('id').then(({ data, error }) => {
+    if (error) {
+      const m = String(error.message || '').match(COL_ERR);
+      if (m) {
+        unknownCols.add(m[1]);
+        console.warn(`[${MODE}] combo_submissions missing column ${m[1]} — degrading`);
+        return logAsync(p, rfq, d, status, extra);
+      }
+      console.error(`[${MODE}] log insert failed`, error.message);
+      return null;
+    }
+    return (data && data[0]) || null;
+  }).catch((e) => {
+    console.error(`[${MODE}] log insert failed`, e.message);
+    return null;
+  });
+}
+
+function trackSkipTape(row, extra, p, rfq) {
+  if (!row || !row.id || !extra || !extra.skip_reason) return;
+  if (pendingSkipTapes.has(row.id)) return;
+  pendingSkipTapes.set(row.id, {
+    id: row.id,
+    parlay_id: p.id,
+    rfq_id: rfq.rfqId,
+    contracts: extra.contracts != null ? extra.contracts : rfq.contracts,
+    remaining: extra.remaining,
+    skip_reason: extra.skip_reason,
+    market_ticker: extra.market_ticker || rfq.marketTicker || null,
+    created_at: new Date().toISOString(),
+    tape_match: null,
+  });
+}
+
+function logSkip(p, rfq, d, status, size) {
+  const skipReason = classifySkip(d);
+  const extra = skipPersistExtra({
+    skipReason,
+    contracts: size && size.contracts != null ? size.contracts : rfq.contracts,
+    remaining: d && d.remaining != null ? d.remaining : null,
+    marketTicker: rfq.marketTicker,
+  });
+  logAsync(p, rfq, d, status, extra).then((row) => trackSkipTape(row, extra, p, rfq));
 }
 
 async function postQuote(rfqId, noBid, yesBid = YES_DECLINE, restRemainder) {
@@ -424,6 +490,140 @@ async function warmConnection() {
     console.log(`[${MODE}] connection warm ok status=${statusCode}`);
   } catch (e) {
     console.error(`[${MODE}] connection warm failed`, e.message);
+  }
+}
+
+async function kalshiGet(path, query) {
+  const headers = {
+    ...authHeaders({ keyId: KEY_ID, pem: PEM, method: 'GET', signPath: path }),
+  };
+  const fullPath = query ? `${path}?${query}` : path;
+  const { statusCode, body } = await kalshiHttp.request({
+    path: fullPath,
+    method: 'GET',
+    headers,
+  });
+  const text = await body.text();
+  if (statusCode === 404) return { statusCode, json: null };
+  if (statusCode < 200 || statusCode >= 300) {
+    throw new Error(`Kalshi GET ${path} ${statusCode}: ${text}`);
+  }
+  return { statusCode, json: text ? JSON.parse(text) : null };
+}
+
+async function fetchSkipRfq(rfqId) {
+  const { statusCode, json } = await kalshiGet(`/trade-api/v2/communications/rfqs/${rfqId}`);
+  if (statusCode === 404 || !json) return null;
+  return json.rfq || json;
+}
+
+async function fetchSkipTrades(ticker, minTs, maxTs) {
+  const qs = new URLSearchParams({
+    ticker: String(ticker),
+    min_ts: String(minTs),
+    max_ts: String(maxTs),
+    limit: '100',
+  });
+  const { json } = await kalshiGet('/trade-api/v2/markets/trades', qs.toString());
+  return (json && json.trades) || [];
+}
+
+async function persistSkipTape(id, patch) {
+  const body = stripUnknown(patch);
+  if (!Object.keys(body).length) return;
+  const { error } = await supabase.from('combo_submissions').update(body).eq('id', id);
+  if (!error) return;
+  const m = String(error.message || '').match(COL_ERR);
+  if (m) {
+    unknownCols.add(m[1]);
+    console.warn(`[${MODE}] combo_submissions missing column ${m[1]} — degrading`);
+    return persistSkipTape(id, patch);
+  }
+  console.error(`[${MODE}] skip-tape persist`, error.message);
+}
+
+async function loadPendingSkipTapes() {
+  const live = parlays.filter((p) => !startedForParlay(p).started);
+  if (!live.length) return;
+  const cutoff = new Date(Date.now() - SKIP_TAPE_LOOKBACK_MS).toISOString();
+  let q = supabase
+    .from('combo_submissions')
+    .select('id,parlay_id,rfq_id,contracts,remaining,skip_reason,market_ticker,created_at,tape_match')
+    .in('parlay_id', live.map((p) => p.id))
+    .in('skip_reason', ['oversized', 'limit_reached'])
+    .is('tape_match', null)
+    .gte('created_at', cutoff)
+    .limit(50);
+  const { data, error } = await q;
+  if (error) {
+    const m = String(error.message || '').match(COL_ERR);
+    if (m) {
+      unknownCols.add(m[1]);
+      console.warn(`[${MODE}] combo_submissions missing column ${m[1]} — skip-tape idle`);
+      return;
+    }
+    console.error(`[${MODE}] skip-tape load`, error.message);
+    return;
+  }
+  for (const row of data || []) {
+    if (!row || !row.id || pendingSkipTapes.has(row.id)) continue;
+    pendingSkipTapes.set(row.id, row);
+  }
+}
+
+async function reconcileSkipTapes() {
+  if (!pendingSkipTapes.size) return; // idle — no skipped RFQs waiting
+  const now = Date.now();
+  const byId = new Map(parlays.map((p) => [p.id, p]));
+  const live = parlays.filter((p) => !startedForParlay(p).started);
+  if (!live.length) {
+    pendingSkipTapes.clear(); // stop looking; do not guess tape_match=none
+    return;
+  }
+
+  let looked = 0;
+  for (const [id, row] of pendingSkipTapes) {
+    const p = byId.get(row.parlay_id);
+    const started = p ? startedForParlay(p) : { started: true };
+    const eligible = isSkipTapeEligible({
+      skipReason: row.skip_reason,
+      tapeMatch: row.tape_match,
+      parlayActive: !!p,
+      started: started.started,
+      now,
+      startsAt: p && p.starts_at,
+    });
+
+    if (!eligible) {
+      pendingSkipTapes.delete(id);
+      continue;
+    }
+
+    if (looked >= SKIP_TAPE_MAX_PER_TICK) continue;
+    looked++;
+    try {
+      const out = await resolveSkipTape(row, {
+        fetchRfq: fetchSkipRfq, fetchTrades: fetchSkipTrades, now,
+      });
+      if (out.retry) {
+        if (out.error) console.error(`[${MODE}] skip-tape`, row.rfq_id, out.error.message);
+        continue;
+      }
+      await persistSkipTape(id, out.patch);
+      if (out.patch.tape_match === 'matched') counts.tapeMatched++;
+      else counts.tapeNone++;
+      console.log(
+        `[${MODE}] skip-tape ${out.patch.tape_match} rfq=${row.rfq_id} ` +
+        `ticker=${out.patch.market_ticker || row.market_ticker || '(none)'} ` +
+        `reason=${row.skip_reason}` +
+        (out.patch.tape_match === 'matched'
+          ? ` yes=${out.patch.tape_yes_price} no=${out.patch.tape_no_price}`
+          : '')
+      );
+      pendingSkipTapes.delete(id);
+    } catch (e) {
+      console.error(`[${MODE}] skip-tape`, row.rfq_id, e.message);
+    }
   }
 }
 
@@ -701,7 +901,7 @@ async function onRfq(rfq, env) {
         `[${MODE}] LIMIT REACHED ${p.label} rfq=${rfq.rfqId} — ` +
         `filled=${filledSoFar} reserved=${outstanding} ${filledSoFar + outstanding}/${d.totalLimit}`
       );
-      logAsync(p, rfq, null, 'limitreached');
+      logSkip(p, rfq, d, 'limitreached', size);
       // No Telegram — every post-ceiling RFQ would spam. Console above is enough.
       if (isCapExhausted(p.max_contracts, filledSoFar)) {
         cancelCapLeftovers(p.id, { filled: filledSoFar, max: d.totalLimit }).catch((e) => {
@@ -717,6 +917,8 @@ async function onRfq(rfq, env) {
         `want=${size.contracts} remaining=${d.remaining}/${d.totalLimit} ` +
         `filled=${filledSoFar} reserved=${outstanding}`
       );
+      logSkip(p, rfq, d, 'declined', size);
+      return;
     }
     logAsync(p, rfq, null, 'declined');
     return;
@@ -812,7 +1014,8 @@ async function main() {
   console.log(
     `[${MODE}] starting — latency-optimized. POST first, undici keep-alive, pre-staged prices. ` +
     `Auto-confirms quote_accepted (HVM ~3s window). ` +
-    `Remaining = max - filled - outstanding quotes.`
+    `Remaining = max - filled - outstanding quotes. ` +
+    `Skipped oversized/cap RFQs get a targeted tape lookup after close.`
   );
 
   await refresh();
@@ -820,6 +1023,9 @@ async function main() {
   setInterval(() => {
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start tick`, e.message));
   }, 2000);
+  setInterval(() => {
+    reconcileSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape tick`, e.message));
+  }, SKIP_TAPE_TICK_MS);
 
   // Step 2 — pre-warm + keep warm
   await warmConnection();
