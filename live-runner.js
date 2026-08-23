@@ -4,7 +4,8 @@
 // ACCOUNTING: POST → 'quoted'. Filled advances on quote_executed.
 // RESERVE: outstanding live quotes (pendingQuotes + in-flight POST) count against
 //   remaining so parallel RFQs cannot all clear the same ceiling.
-//   remaining = max - filled; available = remaining - outstanding.
+//   remaining = max - filled - outstanding.
+//   Released on fill, cancel, POST fail, rfq_deleted, or TTL (~25s).
 // PARTIAL-FILL: d.locks is informational; post while ceiling remains.
 // LATENCY: Steps 0–4 — instrument, POST first, undici keep-alive, pre-stage.
 // START GATE: never quote (and cancel open quotes) once any leg's start <= now.
@@ -24,7 +25,17 @@ const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
 const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
 const { findStartedEvent } = require('./started');
-const { sumOutstanding, wouldExceedCap, isCapExhausted, isReserveKey } = require('./reserve');
+const {
+  RESERVE_TTL_MS,
+  sumOutstanding,
+  wouldExceedCap,
+  isCapExhausted,
+  isReserveKey,
+  postedAtMs,
+  isFreshOutstanding,
+  dropPendingForRfq,
+  sweepStalePending,
+} = require('./reserve');
 const { startHeartbeat } = require('./heartbeat');
 const { shortId } = require('./short-id');
 const {
@@ -305,15 +316,16 @@ function pendingEntry(p, rfq, contracts, extra) {
     leg_keys: p.leg_keys || p.legKeys,
     maxContracts: p.max_contracts,
     yesBid: extra && extra.yesBid != null ? extra.yesBid : undefined,
+    postedAt: extra && extra.postedAt != null ? extra.postedAt : Date.now(),
   };
 }
 
 async function loadOpenSubmissionQuotes() {
-  const cutoff = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+  const cutoff = new Date(Date.now() - RESERVE_TTL_MS).toISOString();
   try {
     const { data, error } = await supabase
       .from('combo_submissions')
-      .select('quote_id,parlay_id,label,rfq_id,contracts,user_id')
+      .select('quote_id,parlay_id,label,rfq_id,contracts,user_id,created_at')
       .eq('is_live', true)
       .is('order_id', null)
       .not('quote_id', 'is', null)
@@ -330,9 +342,11 @@ async function loadOpenSubmissionQuotes() {
 }
 
 function seedPendingFromRows(rows) {
+  const now = Date.now();
   for (const row of rows || []) {
     if (!row || !row.quote_id) continue;
     if (pendingQuotes.has(row.quote_id) || cancelledQuotes.has(row.quote_id)) continue;
+    if (!isFreshOutstanding(row, now)) continue;
     const live = parlays.find((x) => x.id === row.parlay_id);
     pendingQuotes.set(row.quote_id, {
       parlayId: row.parlay_id,
@@ -341,6 +355,7 @@ function seedPendingFromRows(rows) {
       label: row.label,
       rfqId: row.rfq_id,
       maxContracts: live ? live.max_contracts : null,
+      postedAt: postedAtMs(row) || now,
     });
   }
 }
@@ -381,6 +396,45 @@ function cancelLogLine(quoteId, pending, reason) {
     );
   }
   return `[${MODE}] CANCEL ${label} quote_id=${quoteId}` + rfqBit;
+}
+
+function markSubmissionNotLive(quoteId) {
+  if (!quoteId || isReserveKey(quoteId)) return;
+  supabase.from('combo_submissions').update({ is_live: false }).eq('quote_id', quoteId)
+    .then(({ error }) => {
+      if (error) console.error(`[${MODE}] clear is_live`, error.message);
+    })
+    .catch((e) => console.error(`[${MODE}] clear is_live`, e.message));
+}
+
+function noteReleased(quoteId, pending, reason) {
+  if (quoteId && !isReserveKey(quoteId)) {
+    cancelledQuotes.add(quoteId);
+    markSubmissionNotLive(quoteId);
+  }
+  const label = (pending && pending.label) || '(unknown)';
+  const rfqBit = pending && pending.rfqId ? ` rfq=${pending.rfqId}` : '';
+  const n = pending && pending.contracts != null ? pending.contracts : '';
+  const age = pending && pending.postedAt != null ? ` age=${Date.now() - pending.postedAt}ms` : '';
+  console.log(
+    `[${MODE}] RESERVE RELEASED ${reason} ${label} quote_id=${quoteId}${rfqBit} contracts=${n}${age}`
+  );
+}
+
+function onRfqDeleted(evt) {
+  const rfqId = evt && evt.rfqId;
+  if (!rfqId) return;
+  const dropped = dropPendingForRfq(pendingQuotes, rfqId);
+  for (const { id, quote } of dropped) {
+    noteReleased(id, quote, 'closed');
+  }
+}
+
+function sweepExpiredReserves(now = Date.now()) {
+  const dropped = sweepStalePending(pendingQuotes, now);
+  for (const { id, quote } of dropped) {
+    noteReleased(id, quote, 'expired');
+  }
 }
 
 async function cancelQuoteAndDrop(quoteId, pending, reason) {
@@ -1015,12 +1069,14 @@ async function main() {
     `[${MODE}] starting — latency-optimized. POST first, undici keep-alive, pre-staged prices. ` +
     `Auto-confirms quote_accepted (HVM ~3s window). ` +
     `Remaining = max - filled - outstanding quotes. ` +
+    `Outstanding drops on fill, cancel, rfq_deleted, or ${RESERVE_TTL_MS / 1000}s TTL. ` +
     `Skipped oversized/cap RFQs get a targeted tape lookup after close.`
   );
 
   await refresh();
   setInterval(refresh, 30000);
   setInterval(() => {
+    sweepExpiredReserves();
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start tick`, e.message));
   }, 2000);
   setInterval(() => {
@@ -1038,6 +1094,7 @@ async function main() {
     pem: PEM,
     onStatus: (s, i) => console.log(`[${MODE}] ws:${s}`, i || ''),
     onRfqCreated: (rfq, env) => onRfq(rfq, env).catch((e) => console.error('onRfq', e)),
+    onRfqDeleted: (evt) => { try { onRfqDeleted(evt); } catch (e) { console.error('onRfqDeleted', e); } },
     onQuoteAccepted: (evt) => onQuoteAccepted(evt).catch((e) => console.error('onQuoteAccepted', e)),
     onQuoteExecuted: (evt) => onQuoteExecuted(evt).catch((e) => console.error('onQuoteExecuted', e)),
   });

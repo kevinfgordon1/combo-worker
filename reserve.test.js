@@ -2,13 +2,19 @@
 const assert = require('assert');
 const { decideAtFill, fillView } = require('./engine');
 const {
+  RESERVE_TTL_MS,
   sumOutstanding,
   mergeOutstanding,
   remainingAfterReserve,
   wouldExceedCap,
   isCapExhausted,
   isReserveKey,
+  postedAtMs,
+  isFreshOutstanding,
+  dropPendingForRfq,
+  sweepStalePending,
 } = require('./reserve');
+const { isRfqClosed, normalizeRfqClosed, parseEnvelope } = require('./rfq');
 
 // Tonight: White Sox ML + Pirates ML, max_contracts = 116.
 // $10 dollar RFQ at +350 fill → no_bid 0.77 → yes ~0.23 → 43 contracts.
@@ -113,5 +119,93 @@ assert.strictEqual(wouldExceedCap(MAX, 0, 86, SIZE), true);
 assert.strictEqual(wouldExceedCap(MAX, 0, 43, SIZE), false);
 assert.strictEqual(wouldExceedCap(MAX, 0, 0, SIZE), false);
 assert.strictEqual(wouldExceedCap(MAX, 116, 0, 1), true);
+
+// ── rfq_deleted / TTL release (the Cardinals/Pirates leak) ─────────────
+{
+  const MAX_LOCK = 1347;
+  const filled = 20;
+  const now = Date.parse('2026-08-23T16:00:00Z');
+  const live = new Map();
+
+  // Two overlapping live quotes still reserve both.
+  live.set('q-55', { parlayId: P, contracts: 55, rfqId: 'rfq-a', postedAt: now });
+  live.set('q-61', { parlayId: P, contracts: 61, rfqId: 'rfq-b', postedAt: now });
+  assert.strictEqual(sumOutstanding(live, P), 116);
+  assert.strictEqual(wouldExceedCap(MAX_LOCK, filled, sumOutstanding(live, P), 55), false);
+
+  // Just-posted quote is not swept immediately.
+  const justSwept = sweepStalePending(live, now, RESERVE_TTL_MS);
+  assert.strictEqual(justSwept.length, 0);
+  assert.strictEqual(sumOutstanding(live, P), 116);
+  assert.strictEqual(sweepStalePending(live, now + RESERVE_TTL_MS - 1, RESERVE_TTL_MS).length, 0);
+  assert.strictEqual(sumOutstanding(live, P), 116);
+
+  // rfq_deleted drops every entry for that rfq_id, including a pre-POST reserve: key.
+  live.set('reserve:in-flight', { parlayId: P, contracts: 64, rfqId: 'rfq-c', postedAt: now });
+  live.set('q-64', { parlayId: P, contracts: 64, rfqId: 'rfq-c', postedAt: now });
+  assert.strictEqual(isReserveKey('reserve:in-flight'), true);
+  assert.strictEqual(sumOutstanding(live, P), 116 + 64 + 64);
+  const closedEnv = parseEnvelope(JSON.stringify({
+    type: 'rfq_deleted',
+    sid: 15,
+    msg: { id: 'rfq-c', deleted_ts: '2026-08-23T16:00:08Z' },
+  }));
+  assert.strictEqual(isRfqClosed(closedEnv), true);
+  assert.strictEqual(isRfqClosed({ type: 'rfq_created', msg: { id: 'rfq-c' } }), false);
+  assert.strictEqual(isRfqClosed({ type: 'rfq_expired', msg: { id: 'rfq-c' } }), true);
+  const closed = normalizeRfqClosed(closedEnv);
+  assert.strictEqual(closed.rfqId, 'rfq-c');
+  const droppedClosed = dropPendingForRfq(live, closed.rfqId);
+  assert.strictEqual(droppedClosed.length, 2);
+  assert.ok(droppedClosed.some((d) => d.id === 'reserve:in-flight'));
+  assert.ok(droppedClosed.some((d) => d.id === 'q-64'));
+  assert.strictEqual(live.has('q-55'), true);
+  assert.strictEqual(live.has('q-61'), true);
+  assert.strictEqual(sumOutstanding(live, P), 116);
+
+  // Fill still deletes (quote_executed path) — the other live quote stays reserved.
+  live.delete('q-55');
+  assert.strictEqual(sumOutstanding(live, P), 61);
+  assert.strictEqual(wouldExceedCap(MAX_LOCK, filled + 55, sumOutstanding(live, P), 61), false);
+
+  // TTL sweep: dead 1298-contract cycle no longer pins remaining=29.
+  const leak = new Map();
+  leak.set('q-dead', {
+    parlayId: P, contracts: 1298, rfqId: 'rfq-cycle', postedAt: now - 30_000, label: 'Cards/Pirates',
+  });
+  leak.set('q-fresh', { parlayId: P, contracts: 64, rfqId: 'rfq-live', postedAt: now });
+  assert.strictEqual(wouldExceedCap(MAX_LOCK, filled, sumOutstanding(leak, P), 55), true);
+  const expired = sweepStalePending(leak, now, RESERVE_TTL_MS);
+  assert.strictEqual(expired.length, 1);
+  assert.strictEqual(expired[0].id, 'q-dead');
+  assert.strictEqual(sumOutstanding(leak, P), 64);
+  assert.strictEqual(wouldExceedCap(MAX_LOCK, filled, sumOutstanding(leak, P), 55), false);
+  const after = decideAtFill({
+    parlayStake: 100,
+    parlayAmerican: 400,
+    fillAmerican: 350,
+    rfqContracts: 55,
+    hedgeMode: '1x',
+    maxContracts: MAX_LOCK,
+    filledSoFar: filled,
+    outstanding: sumOutstanding(leak, P),
+  });
+  assert.ok(after.ok);
+  assert.strictEqual(after.contracts, 55);
+  assert.strictEqual(after.remaining, MAX_LOCK - filled - 64 - 55);
+
+  // Restart seed: old combo_submissions rows must not re-pin remaining.
+  assert.strictEqual(RESERVE_TTL_MS, 25_000);
+  assert.strictEqual(postedAtMs({ created_at: '2026-08-23T15:59:50Z' }), Date.parse('2026-08-23T15:59:50Z'));
+  assert.strictEqual(isFreshOutstanding({
+    quote_id: 'old', is_live: true, order_id: null,
+    created_at: new Date(now - 2 * 3600 * 1000).toISOString(),
+  }, now), false);
+  assert.strictEqual(isFreshOutstanding({
+    quote_id: 'fresh', is_live: true, order_id: null,
+    created_at: new Date(now - 5_000).toISOString(),
+  }, now), true);
+  assert.strictEqual(isFreshOutstanding({ quote_id: 'undated', is_live: true }, now), false);
+}
 
 console.log('reserve.test.js ok');

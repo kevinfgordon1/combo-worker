@@ -1,11 +1,16 @@
 // Outstanding-quote reservation against a parlay's max_contracts ceiling.
 //
-// remaining = max - filled.
-// available = remaining - outstanding.
-// A new quote (or a confirm) must fit in available. "Outstanding" is live
-// unfilled quoted size we already posted — pendingQuotes and/or combo_submissions
-// with quote_id, is_live, no order_id.
+// remaining = max - filled - outstanding.
+// A new quote (or a confirm) must fit in remaining. "Outstanding" is live
+// unfilled quoted size we already posted — pendingQuotes (plus a brief
+// pre-POST reserve: key). Released on fill, cancel, POST fail, RFQ close
+// (rfq_deleted), or TTL — dead quotes must not pin remaining.
 'use strict';
+
+// Combo RFQs recycle ~10s. Long enough that a still-open RFQ is not dropped
+// mid-quote; short enough a 10s no-accept cycle cannot pile reserved size.
+// quote-watcher ages unaccepted quotes to 'lost' at 30s; stay inside that.
+const RESERVE_TTL_MS = 25_000;
 
 function num(v) {
   const n = Number(v);
@@ -24,6 +29,60 @@ function quoteIdOf(q, fallbackId) {
 
 function isReserveKey(id) {
   return id != null && String(id).startsWith('reserve:');
+}
+
+function rfqIdOf(q) {
+  if (!q) return null;
+  const id = q.rfqId != null ? q.rfqId : q.rfq_id;
+  return id != null ? String(id) : null;
+}
+
+function postedAtMs(q) {
+  if (!q) return null;
+  const t = q.postedAt != null ? q.postedAt
+    : q.posted_at != null ? q.posted_at
+      : q.created_at != null ? q.created_at
+        : null;
+  if (t == null || t === '') return null;
+  if (typeof t === 'number') {
+    if (!Number.isFinite(t)) return null;
+    return t < 1e12 ? t * 1000 : t;
+  }
+  const n = Date.parse(t);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Seed / restart: only rows young enough that the RFQ could still be open.
+function isFreshOutstanding(q, now = Date.now(), ttlMs = RESERVE_TTL_MS) {
+  const at = postedAtMs(q);
+  if (at == null) return false;
+  return now - at < ttlMs;
+}
+
+// Drop every pendingQuotes entry for this RFQ, including reserve: keys.
+// Does not DELETE the quote — RFQ is already gone (404 is success anyway).
+function dropPendingForRfq(quotes, rfqId) {
+  if (!quotes || rfqId == null || typeof quotes.delete !== 'function') return [];
+  const want = String(rfqId);
+  const dropped = [];
+  quotes.forEach((q, id) => {
+    if (rfqIdOf(q) === want) dropped.push({ id, quote: q });
+  });
+  for (const { id } of dropped) quotes.delete(id);
+  return dropped;
+}
+
+// Safety net if rfq_deleted is missed. Just-posted quotes (postedAt ≈ now) stay.
+function sweepStalePending(quotes, now = Date.now(), ttlMs = RESERVE_TTL_MS) {
+  if (!quotes || typeof quotes.delete !== 'function') return [];
+  const dropped = [];
+  quotes.forEach((q, id) => {
+    const at = postedAtMs(q);
+    if (at == null) return;
+    if (now - at >= ttlMs) dropped.push({ id, quote: q });
+  });
+  for (const { id } of dropped) quotes.delete(id);
+  return dropped;
 }
 
 // Sum live unfilled quoted size for one parlay.
@@ -89,10 +148,15 @@ function isCapExhausted(maxContracts, filledSoFar) {
 }
 
 module.exports = {
+  RESERVE_TTL_MS,
   sumOutstanding,
   mergeOutstanding,
   remainingAfterReserve,
   wouldExceedCap,
   isCapExhausted,
   isReserveKey,
+  postedAtMs,
+  isFreshOutstanding,
+  dropPendingForRfq,
+  sweepStalePending,
 };
