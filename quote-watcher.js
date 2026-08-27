@@ -42,7 +42,7 @@ const impliedProb = (a) => (a > 0 ? 100 / (a + 100) : Math.abs(a) / (Math.abs(a)
 const aToDec = (a) => (a > 0 ? 1 + a / 100 : 1 + 100 / Math.abs(a));
 const r2 = (x) => Math.round(x * 100) / 100;
 // Our quoted price (no_bid) from the fill odds — same net-of-maker-fee math as engine/tab.
-const KFEE = 0.0175;
+const KFEE = 0.035; // combo RFQ maker: 0.5 × taker 0.07 quadratic
 const nominalProbFromEff = (sEff) => { const b = 1 - KFEE; return (-b + Math.sqrt(b * b + 4 * KFEE * sEff)) / (2 * KFEE); };
 const noBidFor = (fillAmerican) => (fillAmerican ? r2(1 - nominalProbFromEff(impliedProb(fillAmerican))) : null);
 const toNum = (v) => (v == null ? null : (typeof v === 'string' ? parseFloat(v) : Number(v)));

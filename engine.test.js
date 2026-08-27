@@ -1,7 +1,8 @@
 'use strict';
 const assert = require('assert');
 const {
-  decideAtFill, fillView, buildQuoteBody, yesBidForQuote, shouldPostQuote, isSilentQuoteFailure,
+  decideAtFill, fillView, impliedProb, americanFromProb,
+  buildQuoteBody, yesBidForQuote, shouldPostQuote, isSilentQuoteFailure,
   YES_DECLINE, impliedYesBid, quoteYesBid, isRealYesBid, shouldConfirmAccept, contractsFromQuoteResponse,
 } = require('./engine');
 const { normalizeRfq } = require('./rfq');
@@ -38,6 +39,26 @@ assert.notStrictEqual(d.quote.yes_bid, '0');
 assert.ok(parseFloat(d.quote.no_bid) > 0);
 assert.strictEqual(d.quote.no_bid, fillView(1100).noBid);
 assert.match(d.quote.no_bid, /^\d+\.\d{2}$/);
+
+// Combo RFQ maker 0.035: fillView posts the after-fee conservative no_bid.
+// At 0.0175, floor2 ate the haircut so +500/+1600 matched fee-ignored 0.83/0.94.
+const COMBO_MAKER_KFEE = 0.035;
+const afterFeeEff = (noBid) => {
+  const sNom = 1 - parseFloat(noBid);
+  return sNom - COMBO_MAKER_KFEE * sNom * (1 - sNom);
+};
+const fillNoBids = { 500: '0.82', 1000: '0.90', 1100: '0.91', 1600: '0.93', 2000: '0.95' };
+for (const [fillStr, noBid] of Object.entries(fillNoBids)) {
+  const fill = Number(fillStr);
+  const v = fillView(fill);
+  assert.strictEqual(v.noBid, noBid);
+  const sEffQuoted = afterFeeEff(v.noBid);
+  // Posted no_bid, after the 0.035 maker fee, never sells YES cheaper than the typed fill.
+  assert.ok(sEffQuoted + 1e-12 >= impliedProb(fill));
+  const effAm = americanFromProb(sEffQuoted);
+  // Conservative floor can improve the plus (e.g. +1600 → ~+1377). Never a worse (higher) plus.
+  assert.ok(effAm <= fill, `fill +${fill}: after-fee ${effAm} worse than typed`);
+}
 
 const posted = buildQuoteBody('rfq-sox-pirates', d.quote.no_bid, d.quote.yes_bid, d.quote.rest_remainder);
 assert.strictEqual(posted.yes_bid, '0.00');
