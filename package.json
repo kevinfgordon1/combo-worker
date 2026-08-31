@@ -6,7 +6,7 @@
   "description": "Always-on Kalshi combo RFQ worker for aibetbuilder — posts real quotes when kill-switch is disarmed.",
   "scripts": {
     "start": "node start-live.js",
-    "test": "node tape.test.js && node engine.test.js && node fills-reader.test.js && node started.test.js && node reserve.test.js && node polymarket-quote.test.js && node skip-tape.test.js && node polymarket-rfq.test.js"
+    "test": "node tape.test.js && node engine.test.js && node fills-reader.test.js && node started.test.js && node reserve.test.js && node polymarket-quote.test.js && node skip-tape.test.js && node polymarket-rfq.test.js && node leg-identity.test.js"
   },
   "engines": {
     "node": ">=18"

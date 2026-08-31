@@ -23,6 +23,12 @@ const {
 } = require('./polymarket-quote');
 const { isPolymarketRfqLive } = require('./polymarket-auth');
 const { createPolymarketHttp, createPolymarketRfqWs } = require('./polymarket-client');
+const { createMarketCache } = require('./polymarket-market-cache');
+const {
+  identitiesFromParlay,
+  identitiesFromPolymarketLegs,
+  sameIdentitySet,
+} = require('./leg-identity');
 
 const MODE = 'POLY';
 const RECONCILE_MS = 3000;
@@ -105,29 +111,66 @@ function upperKeys(arr) {
   });
 }
 
-function matchPolymarketParlay(rfq, parlays) {
-  if (!rfq || !rfq.legKeys || !rfq.legKeys.length || !Array.isArray(parlays)) return null;
-  const asRfq = { ...rfq, legKeys: upperKeys(rfq.legKeys) };
-
-  const withUpper = parlays.map((p) => {
-    const lk = upperKeys(p.leg_keys || p.legKeys);
-    return { ...p, leg_keys: lk, legKeys: lk };
-  });
-  const direct = matchParlay(asRfq, withUpper);
-  if (direct) return parlays.find((x) => x.id === direct.id) || direct;
-
-  const rewritten = [];
-  for (const p of parlays) {
-    const keys = [];
-    for (const leg of p.legs || []) {
-      const key = polymarketLegKey(leg);
-      if (key) keys.push(key);
-    }
-    if (keys.length) rewritten.push({ ...p, leg_keys: keys, legKeys: keys });
+function matchPolymarketParlayDetailed(rfq, parlays, opts = {}) {
+  if (!rfq || !Array.isArray(parlays)) {
+    return { parlay: null, reason: 'unmatched', identityKeys: [] };
   }
-  const viaLegs = rewritten.length ? matchParlay(asRfq, rewritten) : null;
-  if (viaLegs) return parlays.find((x) => x.id === viaLegs.id) || viaLegs;
-  return null;
+  if (rfq.legKeys && rfq.legKeys.length) {
+    const asRfq = { ...rfq, legKeys: upperKeys(rfq.legKeys) };
+    const withUpper = parlays.map((p) => {
+      const lk = upperKeys(p.leg_keys || p.legKeys);
+      return { ...p, leg_keys: lk, legKeys: lk };
+    });
+    const direct = matchParlay(asRfq, withUpper);
+    if (direct) {
+      return {
+        parlay: parlays.find((x) => x.id === direct.id) || direct,
+        reason: null,
+        identityKeys: [],
+      };
+    }
+
+    const rewritten = [];
+    for (const p of parlays) {
+      const keys = [];
+      for (const leg of p.legs || []) {
+        const key = polymarketLegKey(leg);
+        if (key) keys.push(key);
+      }
+      if (keys.length) rewritten.push({ ...p, leg_keys: keys, legKeys: keys });
+    }
+    const viaLegs = rewritten.length ? matchParlay(asRfq, rewritten) : null;
+    if (viaLegs) {
+      return {
+        parlay: parlays.find((x) => x.id === viaLegs.id) || viaLegs,
+        reason: null,
+        identityKeys: [],
+      };
+    }
+  }
+
+  const pm = identitiesFromPolymarketLegs(rfq.comboLegs || rfq.legs, opts.markets);
+  if (!pm.ok) {
+    return { parlay: null, reason: pm.reason || 'unmatched', identityKeys: pm.keys || [] };
+  }
+
+  const hits = [];
+  for (const p of parlays) {
+    const lock = identitiesFromParlay(p);
+    if (!lock.ok) continue;
+    if (sameIdentitySet(pm.keys, lock.keys)) hits.push(p);
+  }
+  if (hits.length === 1) {
+    return { parlay: hits[0], reason: null, identityKeys: pm.keys };
+  }
+  if (hits.length > 1) {
+    return { parlay: null, reason: 'ambiguous', identityKeys: pm.keys };
+  }
+  return { parlay: null, reason: 'unmatched', identityKeys: pm.keys };
+}
+
+function matchPolymarketParlay(rfq, parlays, opts) {
+  return matchPolymarketParlayDetailed(rfq, parlays, opts).parlay;
 }
 
 function evaluatePolymarketRfq({
@@ -138,6 +181,7 @@ function evaluatePolymarketRfq({
   now,
   startedFor,
   killEngaged,
+  markets,
 } = {}) {
   const rfq = raw && raw.map ? raw : normalizePolymarketRfq(raw);
   if (!rfq || !rfq.rfqId) return { action: 'skip', reason: 'bad_rfq' };
@@ -152,8 +196,16 @@ function evaluatePolymarketRfq({
     };
   }
 
-  const parlay = matchPolymarketParlay(rfq, parlays || []);
-  if (!parlay) return { action: 'skip', reason: 'unmatched', rfq };
+  const hit = matchPolymarketParlayDetailed(rfq, parlays || [], { markets });
+  const parlay = hit.parlay;
+  if (!parlay) {
+    return {
+      action: 'skip',
+      reason: hit.reason || 'unmatched',
+      rfq,
+      identityKeys: hit.identityKeys,
+    };
+  }
 
   const started = startedFor
     ? startedFor(parlay, rfq)
@@ -271,8 +323,15 @@ function logSkip(evaluation, extra) {
   const bits = [
     `[${MODE}] SKIP ${evaluation.reason} ${label} rfq=${rfq.rfqId || '?'}`,
   ];
-  if (evaluation.reason === 'unmatched' || evaluation.reason === 'unmatched_leg' || evaluation.reason === 'no_legs') {
+  if (
+    evaluation.reason === 'unmatched' || evaluation.reason === 'unmatched_leg'
+    || evaluation.reason === 'no_legs' || evaluation.reason === 'missing_metadata'
+    || evaluation.reason === 'not_priceable' || evaluation.reason === 'ambiguous'
+  ) {
     bits.push(`legs=${symbols || '(none)'} keys=${(rfq.legKeys || []).join('|') || '(none)'}`);
+    if (evaluation.identityKeys && evaluation.identityKeys.length) {
+      bits.push(`id=${evaluation.identityKeys.join(',')}`);
+    }
   }
   if (evaluation.decision) {
     bits.push(`want=${evaluation.quote && evaluation.quote.estimatedContracts} remaining=${evaluation.decision.remaining}/${evaluation.decision.totalLimit}`);
@@ -337,6 +396,9 @@ function startPolymarketRfqLoop(ctx = {}) {
   let stopped = false;
 
   const http = ctx.http || createPolymarketHttp({ keyId, secretKey, requestFn: ctx.requestFn });
+  const marketCache = ctx.marketCache || createMarketCache({
+    fetchMarket: ctx.fetchMarket || ((slug) => http.getMarketBySlug(slug)),
+  });
 
   console.log(
     `[${MODE}] starting — live=${live}. ` +
@@ -383,10 +445,13 @@ function startPolymarketRfqLoop(ctx = {}) {
     seenRfqs.add(rfq.rfqId);
     bump('polyRfqs');
 
-    const matched = matchPolymarketParlay(rfq, parlays());
+    const symbols = (rfq.comboLegs || []).map(polymarketLegSymbol).filter(Boolean);
+    const markets = await marketCache.getMany(symbols);
+    const matched = matchPolymarketParlay(rfq, parlays(), { markets });
     const evaluation = evaluatePolymarketRfq({
       rfq,
       parlays: parlays(),
+      markets,
       filledSoFar: matched ? filledSoFarFor(matched.id) : 0,
       outstanding: matched ? outstandingFor(matched.id) : 0,
       startedFor,
@@ -665,6 +730,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     onWsEvent,
     pendingQuotes,
     live,
+    marketCache,
   };
 }
 
@@ -676,6 +742,7 @@ module.exports = {
   mapComboLegs,
   normalizePolymarketRfq,
   matchPolymarketParlay,
+  matchPolymarketParlayDetailed,
   evaluatePolymarketRfq,
   shouldPostNow,
   shouldConfirmNow,

@@ -17,6 +17,7 @@ const {
   mapComboLegs,
   normalizePolymarketRfq,
   matchPolymarketParlay,
+  matchPolymarketParlayDetailed,
   evaluatePolymarketRfq,
   shouldPostNow,
   shouldConfirmNow,
@@ -123,8 +124,101 @@ const pmRfq = {
 
 const skipped = evaluatePolymarketRfq({ rfq: pmRfq, parlays: [kalshiParlay] });
 assert.strictEqual(skipped.action, 'skip');
-assert.strictEqual(skipped.reason, 'unmatched');
+assert.strictEqual(skipped.reason, 'missing_metadata');
 assert.strictEqual(matchPolymarketParlay(normalizePolymarketRfq(pmRfq), [kalshiParlay]), null);
+
+const cwsMeta = {
+  metadata: {
+    event_id: 'mlb-cws-det-2026-08-14',
+    event_start_time: '2026-08-14T22:40:00Z',
+    event_subcategory: 'BASEBALL',
+    market_sport_type: 'baseball_team_full_game_winner',
+    outcome_strike: '0.0',
+    long_participant_id: 'mlb-cws',
+    short_participant_id: 'mlb-det',
+  },
+};
+const pitMeta = {
+  metadata: {
+    event_id: 'mlb-bos-pit-2026-08-14',
+    event_start_time: '2026-08-14T22:40:00Z',
+    event_subcategory: 'BASEBALL',
+    market_sport_type: 'baseball_team_full_game_winner',
+    outcome_strike: '0.0',
+    long_participant_id: 'mlb-pit',
+    short_participant_id: 'mlb-bos',
+  },
+};
+const lockMarkets = new Map([
+  ['aec-mlb-cws-det-2026-08-14-cws', cwsMeta],
+  ['aec-mlb-bos-pit-2026-08-14-pit', pitMeta],
+]);
+
+const BEFORE_PITCH = Date.parse('2026-08-14T20:00:00Z');
+const lockMatch = evaluatePolymarketRfq({
+  rfq: pmRfq,
+  parlays: [kalshiParlay],
+  markets: lockMarkets,
+  now: BEFORE_PITCH,
+});
+assert.strictEqual(lockMatch.action, 'quoteable');
+assert.strictEqual(lockMatch.parlay.id, P);
+assert.strictEqual(lockMatch.quote.buyPrice, '0.222');
+assert.strictEqual(
+  matchPolymarketParlay(normalizePolymarketRfq(pmRfq), [kalshiParlay], { markets: lockMarkets }).id,
+  P
+);
+
+const sellRfq = {
+  ...pmRfq,
+  id: 'rfq_sell',
+  comboLegs: [
+    { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'SIDE_SELL' },
+    { symbol: 'aec-mlb-bos-pit-2026-08-14-pit', side: 'SIDE_SELL' },
+  ],
+};
+const sellSkip = evaluatePolymarketRfq({
+  rfq: sellRfq,
+  parlays: [kalshiParlay],
+  markets: lockMarkets,
+});
+assert.strictEqual(sellSkip.action, 'skip');
+assert.strictEqual(sellSkip.reason, 'unmatched');
+
+const wrongDateMarkets = new Map([
+  ['aec-mlb-cws-det-2026-08-14-cws', {
+    metadata: { ...cwsMeta.metadata, event_start_time: '2026-08-15T22:40:00Z' },
+  }],
+  ['aec-mlb-bos-pit-2026-08-14-pit', pitMeta],
+]);
+assert.strictEqual(evaluatePolymarketRfq({
+  rfq: pmRfq, parlays: [kalshiParlay], markets: wrongDateMarkets,
+}).reason, 'unmatched');
+
+const spreadMarkets = new Map([
+  ['aec-mlb-cws-det-2026-08-14-cws', {
+    metadata: { ...cwsMeta.metadata, market_sport_type: 'baseball_team_full_game_spread', outcome_strike: '1.5' },
+  }],
+  ['aec-mlb-bos-pit-2026-08-14-pit', pitMeta],
+]);
+assert.strictEqual(evaluatePolymarketRfq({
+  rfq: pmRfq, parlays: [kalshiParlay], markets: spreadMarkets,
+}).reason, 'not_priceable');
+
+const twin = { ...kalshiParlay, id: 'twin-lock', label: 'Twin' };
+assert.strictEqual(
+  matchPolymarketParlayDetailed(
+    normalizePolymarketRfq(pmRfq),
+    [kalshiParlay, twin],
+    { markets: lockMarkets }
+  ).reason,
+  'ambiguous'
+);
+assert.strictEqual(evaluatePolymarketRfq({
+  rfq: { ...pmRfq, id: 'rfq_amb' },
+  parlays: [kalshiParlay, twin],
+  markets: lockMarkets,
+}).reason, 'ambiguous');
 
 const noSymbolRfq = {
   id: 'rfq_bad_leg',
@@ -186,7 +280,7 @@ assert.ok(!('account' in quoteBodyFromEval(quoteable)));
 
 assert.deepStrictEqual(shouldPostNow(quoteable, { live: false }), { post: false, reason: 'live_off' });
 assert.deepStrictEqual(shouldPostNow(quoteable, { live: true }), { post: true, reason: null });
-assert.deepStrictEqual(shouldPostNow(skipped, { live: true }), { post: false, reason: 'unmatched' });
+assert.deepStrictEqual(shouldPostNow(skipped, { live: true }), { post: false, reason: 'missing_metadata' });
 
 assert.strictEqual(shouldConfirmPolymarketAccept('SIDE_BUY'), true);
 assert.strictEqual(shouldConfirmPolymarketAccept('SIDE_SELL'), false);
@@ -321,6 +415,30 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.strictEqual(confirms.length, 0);
 
   loopOff.stop();
+
+  const lockLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'false',
+    },
+    http: fakeHttp,
+    startWs: false,
+    getParlays: () => [kalshiParlay],
+    fetchMarket: async (slug) => lockMarkets.get(slug) || null,
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+  });
+  const lockOut = await lockLoop.handleRfq({ ...pmRfq, id: 'rfq_lock_map' });
+  assert.strictEqual(lockOut.action, 'quoteable');
+  assert.strictEqual(lockOut.parlay.id, P);
+  assert.strictEqual(lockOut.post, false);
+  assert.strictEqual(lockOut.reason, 'live_off');
+  assert.strictEqual(posts.length, 0);
+  lockLoop.stop();
 
   const livePending = new Map();
   const loopOn = startPolymarketRfqLoop({

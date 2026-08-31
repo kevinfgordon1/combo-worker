@@ -75,6 +75,16 @@ function createPolymarketHttp({
     listRfqs: (query) => getJson('/v1/rfqs', query),
     listQuotes: (query) => getJson('/v1/rfqs/quotes', query),
     getCombo: (symbol) => getJson('/v1/combos', { symbol }),
+    getMarketBySlug: async (slug) => {
+      const path = `/v1/market/slug/${encodeURIComponent(slug)}`;
+      const res = await request('GET', path);
+      if (res.statusCode === 404) return null;
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        throw new Error(`Polymarket GET ${path} ${res.statusCode}`);
+      }
+      const j = res.json;
+      return (j && j.market) || j;
+    },
     async createQuote(body) {
       const res = await request('POST', '/v1/rfqs/quotes', { body });
       if (res.statusCode < 200 || res.statusCode >= 300) {
