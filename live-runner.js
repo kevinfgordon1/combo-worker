@@ -5,6 +5,8 @@
 // RESERVE: outstanding live quotes (pendingQuotes + in-flight POST) count against
 //   remaining so parallel RFQs cannot all clear the same ceiling.
 //   remaining = max - filled - outstanding.
+//   Polymarket Retail RFQ (polymarket-rfq.js) shares this ceiling via
+//   polyPendingQuotes + outstandingFor — Kalshi yes_bid / dollar RFQ math is unchanged.
 //   Released on fill, cancel, POST fail, rfq_deleted, or 20s unaccepted DELETE.
 // PARTIAL-FILL: d.locks is informational; post while ceiling remains.
 // LATENCY: Steps 0–4 — instrument, POST first, undici keep-alive, pre-stage.
@@ -35,6 +37,7 @@ const {
   listStaleUnaccepted,
 } = require('./reserve');
 const { startHeartbeat } = require('./heartbeat');
+const { startPolymarketRfqLoop } = require('./polymarket-rfq');
 const { shortId } = require('./short-id');
 const {
   classifySkip,
@@ -86,6 +89,12 @@ let killByUser = {};
 let filledByParlay = {};
 let sessionFilledByParlay = {};
 const pendingQuotes = new Map();
+const polyPendingQuotes = new Map();
+
+function outstandingFor(parlayId, excludeQuoteId) {
+  return sumOutstanding(pendingQuotes, parlayId, excludeQuoteId)
+    + sumOutstanding(polyPendingQuotes, parlayId, excludeQuoteId);
+}
 
 // Step 3 — pre-staged quote pieces per parlay (rebuilt every refresh)
 // staged[id] = { noBid, yesBid, rest_remainder, fillAmerican, effTaker }
@@ -770,7 +779,7 @@ async function onQuoteAccepted(evt) {
     const maxContracts = (parlay && parlay.max_contracts) || (pending && pending.maxContracts);
     const filledSoFar = pending ? filledSoFarFor(pending.parlayId) : 0;
     const outstandingOthers = pending
-      ? sumOutstanding(pendingQuotes, pending.parlayId, quoteId)
+      ? outstandingFor(pending.parlayId, quoteId)
       : 0;
     const want = pending && pending.contracts;
     if (pending && wouldExceedCap(maxContracts, filledSoFar, outstandingOthers, want)) {
@@ -940,7 +949,7 @@ async function onRfq(rfq, env) {
 
   const engaged = killEngagedFor(p.user_id);
   const filledSoFar = filledSoFarFor(p.id);
-  const outstanding = sumOutstanding(pendingQuotes, p.id);
+  const outstanding = outstandingFor(p.id);
   const st = staged[p.id];
 
   const size = resolveRfqContracts(rfq, p.fill_american, st && st.noBid);
@@ -1089,7 +1098,7 @@ async function main() {
   console.log(
     `[${MODE}] starting — latency-optimized. POST first, undici keep-alive, pre-staged prices. ` +
     `Auto-confirms quote_accepted (HVM ~3s window). ` +
-    `Remaining = max - filled - outstanding quotes. ` +
+    `Remaining = max - filled - outstanding quotes (Kalshi + Polymarket). ` +
     `Unaccepted quotes are DELETE'd after ${RESERVE_TTL_MS / 1000}s. ` +
     `rfq_deleted releases immediately. ` +
     `Skipped oversized/cap RFQs get a targeted tape lookup after close.`
@@ -1111,6 +1120,22 @@ async function main() {
 
   startHeartbeat(supabase, MODE, counts, () => parlays.length);
 
+  const poly = startPolymarketRfqLoop({
+    pendingQuotes: polyPendingQuotes,
+    kalshiPendingQuotes: pendingQuotes,
+    getOutstanding: outstandingFor,
+    getParlays: () => parlays,
+    filledSoFarFor,
+    killEngagedFor,
+    startedFor: startedForParlay,
+    logAsync,
+    sendAlert,
+    counts,
+    sessionFilledByParlay,
+    supabase,
+    env: process.env,
+  });
+
   const client = createKalshiWs({
     keyId: KEY_ID,
     pem: PEM,
@@ -1124,6 +1149,7 @@ async function main() {
   setInterval(() => console.log(`[${MODE}] tallies`, counts), 60000);
   process.on('SIGINT', () => {
     client.stop();
+    try { poly && poly.stop && poly.stop(); } catch (_) {}
     try { kalshiHttp.close(); } catch (_) {}
     console.log(`[${MODE}] final`, counts);
     process.exit(0);
