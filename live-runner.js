@@ -39,6 +39,7 @@ const {
 const { startHeartbeat } = require('./heartbeat');
 const { startPolymarketRfqLoop } = require('./polymarket-rfq');
 const { shortId } = require('./short-id');
+const { formatVenueAlert } = require('./venue-alert');
 const {
   classifySkip,
   skipPersistExtra,
@@ -807,9 +808,12 @@ async function onQuoteAccepted(evt) {
   } catch (e) {
     console.error(`[${MODE}] CONFIRM FAILED quote_id=${quoteId} rfq_id=${rfqId}`, e.message);
     sendAlert(
-      `❌ CONFIRM FAILED — ${pending ? pending.label : shortId(quoteId)}\n` +
-      `quote ${shortId(quoteId)} · rfq ${shortId(rfqId)}\n` +
-      `${e.message}`
+      formatVenueAlert(
+        'Kalshi',
+        `❌ CONFIRM FAILED — ${pending ? pending.label : shortId(quoteId)}\n` +
+        `quote ${shortId(quoteId)} · rfq ${shortId(rfqId)}\n` +
+        `${e.message}`
+      )
     ).catch(() => {});
   } finally {
     confirmingQuotes.delete(quoteId);
@@ -909,12 +913,15 @@ async function onQuoteExecuted(evt) {
     (fullyFilled ? ' FULL' : '')
   );
   sendAlert(
-    `✅ FILL CONFIRMED — ${pending.label}\n` +
-    `order ${orderId ? shortId(orderId) : '(none)'} · quote ${shortId(quoteId)}\n` +
-    `+${contracts} contracts` +
-    (fullyFilled
-      ? ` · FULL ${sessionTotal}/${ceiling} — stopped quoting`
-      : ` · session ${sessionTotal}${ceiling != null ? '/' + ceiling : ''}`)
+    formatVenueAlert(
+      'Kalshi',
+      `✅ FILL CONFIRMED — ${pending.label}\n` +
+      `order ${orderId ? shortId(orderId) : '(none)'} · quote ${shortId(quoteId)}\n` +
+      `+${contracts} contracts` +
+      (fullyFilled
+        ? ` · FULL ${sessionTotal}/${ceiling} — stopped quoting`
+        : ` · session ${sessionTotal}${ceiling != null ? '/' + ceiling : ''}`)
+    )
   ).catch(() => {});
 }
 
@@ -1058,11 +1065,14 @@ async function onRfq(rfq, env) {
         quote_id: result.id, is_live: true, contracts: reservedContracts,
       });
       sendAlert(
-        `✅ QUOTED — ${p.label}\n` +
-        `rfq ${shortId(rfq.rfqId)} · quote ${shortId(result.id)}\n` +
-        `${reservedContracts} contracts · NO @ $${noBid}` +
-        (size.source === 'dollar' ? ` · YES @ $${yesBid}` : '') +
-        (p.fill_american != null ? ` · ${sgn(p.fill_american)}` : '')
+        formatVenueAlert(
+          'Kalshi',
+          `✅ QUOTED — ${p.label}\n` +
+          `rfq ${shortId(rfq.rfqId)} · quote ${shortId(result.id)}\n` +
+          `${reservedContracts} contracts · NO @ $${noBid}` +
+          (size.source === 'dollar' ? ` · YES @ $${yesBid}` : '') +
+          (p.fill_american != null ? ` · ${sgn(p.fill_american)}` : '')
+        )
       ).catch(() => {});
     } catch (e) {
       pendingQuotes.delete(reserveKey);
@@ -1075,7 +1085,12 @@ async function onRfq(rfq, env) {
       console.error(`[${MODE}] POST FAILED ${p.label} rfq=${rfq.rfqId}`, e.message);
       logAsync(p, rfq, d, 'unfilled');
       if (!isSilentQuoteFailure(e.message)) {
-        sendAlert(`❌ QUOTE FAILED — ${p.label}\nrfq ${shortId(rfq.rfqId)}\n${e.message}`).catch(() => {});
+        sendAlert(
+          formatVenueAlert(
+            'Kalshi',
+            `❌ QUOTE FAILED — ${p.label}\nrfq ${shortId(rfq.rfqId)}\n${e.message}`
+          )
+        ).catch(() => {});
       }
     }
     return;

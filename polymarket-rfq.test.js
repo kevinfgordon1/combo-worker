@@ -24,6 +24,7 @@ const {
   quoteBodyFromEval,
   startPolymarketRfqLoop,
 } = require('./polymarket-rfq');
+const { formatVenueAlert } = require('./venue-alert');
 
 // Fixed seed / timestamp / path — do not rotate these; they are the signing fixture.
 const SEED_B64 = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
@@ -377,6 +378,7 @@ const fakeHttp = {
   close() {},
 };
 
+const alertsOff = [];
 const loopOff = startPolymarketRfqLoop({
   env: {
     POLYMARKET_KEY_ID: 'key-id-fixture',
@@ -390,6 +392,7 @@ const loopOff = startPolymarketRfqLoop({
   getOutstanding: (id) => sumOutstanding(kalshiPending, id) + sumOutstanding(polyPending, id),
   pendingQuotes: polyPending,
   kalshiPendingQuotes: kalshiPending,
+  sendAlert: async (text) => { alertsOff.push(text); },
   reconcileMs: 60 * 60 * 1000,
 });
 assert.strictEqual(loopOff.live, false);
@@ -399,6 +402,7 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.strictEqual(out.reason, 'live_off');
   assert.strictEqual(posts.length, 0);
   assert.strictEqual(polyPending.size, 0);
+  assert.strictEqual(alertsOff.length, 0);
 
   const accSell = await loopOff.handleQuoteAccepted({
     quote: { id: 'quote_x', rfqId: 'rfq_open_1', acceptedSide: 'SIDE_SELL' },
@@ -416,6 +420,7 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
 
   loopOff.stop();
 
+  const alertsLock = [];
   const lockLoop = startPolymarketRfqLoop({
     env: {
       POLYMARKET_KEY_ID: 'key-id-fixture',
@@ -430,6 +435,7 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     filledSoFarFor: () => 0,
     getOutstanding: () => 0,
     pendingQuotes: new Map(),
+    sendAlert: async (text) => { alertsLock.push(text); },
     reconcileMs: 60 * 60 * 1000,
   });
   const lockOut = await lockLoop.handleRfq({ ...pmRfq, id: 'rfq_lock_map' });
@@ -438,9 +444,37 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.strictEqual(lockOut.post, false);
   assert.strictEqual(lockOut.reason, 'live_off');
   assert.strictEqual(posts.length, 0);
+  assert.strictEqual(alertsLock.length, 0);
   lockLoop.stop();
 
+  const alertsSkip = [];
+  const skipLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    http: fakeHttp,
+    startWs: false,
+    getParlays: () => [kalshiParlay],
+    fetchMarket: async () => null,
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    sendAlert: async (text) => { alertsSkip.push(text); },
+    reconcileMs: 60 * 60 * 1000,
+  });
+  const skipOut = await skipLoop.handleRfq({ ...pmRfq, id: 'rfq_skip_meta' });
+  assert.strictEqual(skipOut.action, 'skip');
+  assert.ok(
+    skipOut.reason === 'missing_metadata' || skipOut.reason === 'unmatched' || skipOut.reason === 'unmatched_leg'
+  );
+  assert.strictEqual(alertsSkip.length, 0);
+  skipLoop.stop();
+
   const livePending = new Map();
+  const alertsOn = [];
+  const sessionFilled = {};
   const loopOn = startPolymarketRfqLoop({
     env: {
       POLYMARKET_KEY_ID: 'key-id-fixture',
@@ -454,6 +488,8 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     getOutstanding: (id, ex) => sumOutstanding(kalshiPending, id, ex) + sumOutstanding(livePending, id, ex),
     pendingQuotes: livePending,
     kalshiPendingQuotes: kalshiPending,
+    sendAlert: async (text) => { alertsOn.push(text); },
+    sessionFilledByParlay: sessionFilled,
     reconcileMs: 60 * 60 * 1000,
   });
   assert.strictEqual(loopOn.live, true);
@@ -470,6 +506,13 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     sumOutstanding(kalshiPending, 'pm-parlay') + sumOutstanding(livePending, 'pm-parlay'),
     SIZE * 2 + 10
   );
+  assert.strictEqual(alertsOn.length, 1);
+  assert.ok(alertsOn[0].startsWith('Polymarket · ✅ QUOTED — PM Sox/Pirates'));
+  assert.ok(!alertsOn[0].startsWith('Kalshi ·'));
+  assert.strictEqual(
+    formatVenueAlert('Kalshi', '✅ QUOTED — PM Sox/Pirates').startsWith('Kalshi ·'),
+    true
+  );
 
   const sellLive = await loopOn.handleQuoteAccepted({
     quote: { id: 'quote_posted', rfqId: 'rfq_live_1', acceptedSide: 'SIDE_SELL' },
@@ -477,6 +520,7 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.strictEqual(sellLive.confirmed, false);
   assert.strictEqual(sellLive.reason, 'side_not_buy');
   assert.strictEqual(confirms.length, 0);
+  assert.strictEqual(alertsOn.length, 1);
 
   livePending.set('quote_posted', {
     ...livePending.get('quote_posted'),
@@ -485,6 +529,7 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     maxContracts: 116,
     rfqId: 'rfq_live_1',
     label: 'PM Sox/Pirates',
+    creatorOrderId: 'ord_pm_1',
   });
   const buyLive = await loopOn.handleQuoteAccepted({
     quote: { id: 'quote_posted', rfqId: 'rfq_live_1', acceptedSide: 'SIDE_BUY' },
@@ -492,8 +537,70 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.strictEqual(buyLive.confirmed, true);
   assert.strictEqual(confirms.length, 1);
   assert.deepStrictEqual(confirms[0], { rfqId: 'rfq_live_1', quoteId: 'quote_posted' });
+  assert.strictEqual(alertsOn.length, 1);
+
+  loopOn.handleOrderExecution({
+    type: 'EXECUTION_TYPE_FILL',
+    order: { id: 'ord_pm_1' },
+    lastShares: '10',
+  });
+  assert.strictEqual(alertsOn.length, 2);
+  assert.ok(alertsOn[1].startsWith('Polymarket · ✅ FILL CONFIRMED — PM Sox/Pirates'));
+  assert.ok(alertsOn[1].includes('+10 contracts'));
 
   loopOn.stop();
+
+  const failPosts = [];
+  const alertsFail = [];
+  const failHttp = {
+    ...fakeHttp,
+    async createQuote() {
+      failPosts.push(true);
+      throw new Error('venue rejected quote');
+    },
+    async confirmQuote() {
+      throw new Error('confirm window closed');
+    },
+  };
+  const failPending = new Map();
+  const loopFail = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    http: failHttp,
+    startWs: false,
+    getParlays: () => [pmParlay],
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: failPending,
+    sendAlert: async (text) => { alertsFail.push(text); },
+    reconcileMs: 60 * 60 * 1000,
+  });
+  const failed = await loopFail.handleRfq({ ...pmRfq, id: 'rfq_fail_1' });
+  assert.strictEqual(failed.post, false);
+  assert.strictEqual(failed.reason, 'post_failed');
+  assert.strictEqual(alertsFail.length, 1);
+  assert.ok(alertsFail[0].startsWith('Polymarket · ❌ QUOTE FAILED — PM Sox/Pirates'));
+  assert.ok(alertsFail[0].includes('venue rejected quote'));
+
+  failPending.set('quote_fail', {
+    parlayId: 'pm-parlay',
+    contracts: 10,
+    maxContracts: 116,
+    rfqId: 'rfq_fail_1',
+    label: 'PM Sox/Pirates',
+  });
+  const confirmFail = await loopFail.handleQuoteAccepted({
+    quote: { id: 'quote_fail', rfqId: 'rfq_fail_1', acceptedSide: 'SIDE_BUY' },
+  });
+  assert.strictEqual(confirmFail.confirmed, false);
+  assert.strictEqual(confirmFail.reason, 'confirm_failed');
+  assert.strictEqual(alertsFail.length, 2);
+  assert.ok(alertsFail[1].startsWith('Polymarket · ❌ CONFIRM FAILED — PM Sox/Pirates'));
+  assert.ok(alertsFail[1].includes('confirm window closed'));
+  loopFail.stop();
 
   const parsed = parsePrivateMessage(JSON.stringify({
     requestId: 'rfq-sub-1',
