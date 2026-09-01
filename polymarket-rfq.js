@@ -29,6 +29,10 @@ const {
   identitiesFromPolymarketLegs,
   sameIdentitySet,
 } = require('./leg-identity');
+const { shortId } = require('./short-id');
+const { formatVenueAlert } = require('./venue-alert');
+
+const sgn = (n) => (n > 0 ? '+' + n : '' + n);
 
 const MODE = 'POLY';
 const RECONCILE_MS = 3000;
@@ -438,6 +442,11 @@ function startPolymarketRfqLoop(ctx = {}) {
     if (ctx.counts && key in ctx.counts) ctx.counts[key] += 1;
   }
 
+  function sendAlert(text) {
+    if (typeof ctx.sendAlert !== 'function') return;
+    Promise.resolve(ctx.sendAlert(text)).catch(() => {});
+  }
+
   async function handleRfq(raw) {
     const rfq = await hydrateRfq(http, raw);
     if (!rfq || !rfq.rfqId) return { action: 'skip', reason: 'bad_rfq' };
@@ -501,11 +510,22 @@ function startPolymarketRfqLoop(ctx = {}) {
           quote_id: quoteId, is_live: true, contracts: d.contracts,
         });
       }
+      sendAlert(formatVenueAlert(
+        'Polymarket',
+        `✅ QUOTED — ${p.label}\n` +
+        `rfq ${shortId(rfq.rfqId)} · quote ${shortId(quoteId)}\n` +
+        `${d.contracts} contracts · BUY @ ${q.buyPrice}` +
+        (p.fill_american != null ? ` · ${sgn(p.fill_american)}` : '')
+      ));
       return { ...evaluation, post: true, quoteId };
     } catch (e) {
       pendingQuotes.delete(reserveKey);
       console.error(`[${MODE}] POST FAILED ${p.label} rfq=${rfq.rfqId}`, e.message);
       if (ctx.logAsync) ctx.logAsync(p, { rfqId: rfq.rfqId, contracts: d.contracts }, d, 'unfilled');
+      sendAlert(formatVenueAlert(
+        'Polymarket',
+        `❌ QUOTE FAILED — ${p.label}\nrfq ${shortId(rfq.rfqId)}\n${e.message}`
+      ));
       return { ...evaluation, post: false, reason: 'post_failed', error: e.message };
     }
   }
@@ -550,6 +570,7 @@ function startPolymarketRfqLoop(ctx = {}) {
           return { confirmed: false, reason: 'cap_exceeded' };
         }
       }
+      // Confirm FIRST — last look ~3s. Telegram after, same as Kalshi.
       await http.confirmQuote(rfqId, quoteId);
       console.log(
         `[${MODE}] CONFIRMED quote_id=${quoteId} rfq_id=${rfqId} side=${acceptedSide} ` +
@@ -558,6 +579,12 @@ function startPolymarketRfqLoop(ctx = {}) {
       return { confirmed: true };
     } catch (e) {
       console.error(`[${MODE}] CONFIRM FAILED quote_id=${quoteId} rfq_id=${rfqId}`, e.message);
+      sendAlert(formatVenueAlert(
+        'Polymarket',
+        `❌ CONFIRM FAILED — ${pending ? pending.label : shortId(quoteId)}\n` +
+        `quote ${shortId(quoteId)} · rfq ${shortId(rfqId)}\n` +
+        `${e.message}`
+      ));
       return { confirmed: false, reason: 'confirm_failed', error: e.message };
     } finally {
       confirmingQuotes.delete(quoteId);
@@ -618,6 +645,17 @@ function startPolymarketRfqLoop(ctx = {}) {
       console.log(
         `[${MODE}] ORDER FILL ${pending.label} order_id=${orderId} contracts=${contracts}`
       );
+      const sessionTotal = ctx.sessionFilledByParlay
+        ? (ctx.sessionFilledByParlay[pending.parlayId] || contracts)
+        : contracts;
+      const ceiling = pending.maxContracts > 0 ? Number(pending.maxContracts) : null;
+      sendAlert(formatVenueAlert(
+        'Polymarket',
+        `✅ FILL CONFIRMED — ${pending.label}\n` +
+        `order ${orderId ? shortId(orderId) : '(none)'} · quote ${shortId(pendingId)}\n` +
+        `+${contracts} contracts` +
+        (ceiling != null ? ` · session ${sessionTotal}/${ceiling}` : ` · session ${sessionTotal}`)
+      ));
       return;
     }
     if (
