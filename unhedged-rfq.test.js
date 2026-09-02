@@ -3,12 +3,15 @@ const assert = require('assert');
 const { normalizeRfq } = require('./rfq');
 const {
   isUnhedgedRfqShadow,
+  isUnhedgedRfqLive,
   classifyUnhedgedRfq,
   considerUnhedgedRfq,
   maybePersistUnhedged,
   parseKalshiUnhedgedTicker,
   parsePmUnhedgedSlug,
 } = require('./unhedged-rfq');
+const { createUnhedgedPriceCache } = require('./unhedged-price-cache');
+const { americanFromProb } = require('./engine');
 
 assert.strictEqual(isUnhedgedRfqShadow({}), true);
 assert.strictEqual(isUnhedgedRfqShadow({ UNHEDGED_RFQ_SHADOW: '' }), true);
@@ -17,6 +20,8 @@ assert.strictEqual(isUnhedgedRfqShadow({ UNHEDGED_RFQ_SHADOW: '1' }), true);
 assert.strictEqual(isUnhedgedRfqShadow({ UNHEDGED_RFQ_SHADOW: 'false' }), false);
 assert.strictEqual(isUnhedgedRfqShadow({ UNHEDGED_RFQ_SHADOW: '0' }), false);
 assert.strictEqual(isUnhedgedRfqShadow({ UNHEDGED_RFQ_SHADOW: 'off' }), false);
+assert.strictEqual(isUnhedgedRfqLive({}), false);
+assert.strictEqual(isUnhedgedRfqLive({ UNHEDGED_RFQ_LIVE: 'true' }), true);
 
 const mlbCws = parseKalshiUnhedgedTicker('KXMLBGAME-26AUG141840CWSDET-CWS:yes');
 assert.ok(mlbCws);
@@ -293,6 +298,83 @@ function pmRfq(id, symbols, extra = {}) {
     });
     assert.strictEqual(tennisOut.persist, false);
     assert.strictEqual(rows.length, 1);
+
+    // Cache prices every ML leg → persist fair + would-quote. Missing price → both null.
+    const nflCache = createUnhedgedPriceCache({
+      seed: {
+        kalshi: {
+          'KXNFLGAME-26SEP071330BUFKC-KC': 0.5,
+          'KXNFLGAME-26SEP071330DALPHI-PHI': 0.5,
+        },
+      },
+    });
+    const nflRfq = kalshiRfq('rfq-nfl-priced', [
+      'KXNFLGAME-26SEP071330BUFKC-KC:yes',
+      'KXNFLGAME-26SEP071330DALPHI-PHI:yes',
+    ]);
+    const nflOut = await maybePersistUnhedged(nflRfq, {
+      venue: 'kalshi',
+      priceCache: nflCache,
+      now: Date.parse('2026-09-01T12:00:00Z'),
+      persist: async (row) => { rows.push(row); },
+    });
+    assert.strictEqual(nflOut.persist, true);
+    assert.strictEqual(nflOut.our_fair_american, americanFromProb(0.25));
+    assert.strictEqual(nflOut.our_quote_american, americanFromProb(0.20));
+    assert.strictEqual(rows[rows.length - 1].our_quote_american, americanFromProb(0.20));
+
+    const mlbCache = createUnhedgedPriceCache({
+      seed: {
+        kalshi: {
+          'KXMLBGAME-26AUG141840CWSDET-CWS': 0.5,
+          'KXMLBGAME-26AUG141840BOSPIT-PIT': 0.5,
+        },
+      },
+    });
+    const mlbPriced = classifyUnhedgedRfq(kalshiRfq('rfq-mlb-priced', [
+      'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+      'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
+    ]), {
+      venue: 'kalshi',
+      priceCache: mlbCache,
+      now: Date.parse('2026-08-14T20:00:00Z'),
+    });
+    assert.strictEqual(mlbPriced.our_fair_american, americanFromProb(0.25));
+    assert.strictEqual(mlbPriced.our_quote_american, americanFromProb(0.19));
+    assert.ok(mlbPriced.our_quote_american > nflOut.our_quote_american);
+
+    const polyCache = createUnhedgedPriceCache({
+      seed: {
+        polymarket: {
+          'aec-mlb-cws-det-2026-08-14-cws': 0.5,
+          'aec-mlb-bos-pit-2026-08-14-pit': 0.5,
+        },
+      },
+    });
+    const polyPriced = classifyUnhedgedRfq(pmRfq('rfq-pm-priced', [
+      'aec-mlb-cws-det-2026-08-14-cws',
+      'aec-mlb-bos-pit-2026-08-14-pit',
+    ]), {
+      venue: 'polymarket',
+      priceCache: polyCache,
+      now: Date.parse('2026-08-14T20:00:00Z'),
+    });
+    assert.strictEqual(polyPriced.our_quote_american, americanFromProb(0.20));
+
+    const halfCache = createUnhedgedPriceCache({
+      seed: { kalshi: { 'KXMLBGAME-26AUG141840CWSDET-CWS': 0.5 } },
+    });
+    const missingPx = classifyUnhedgedRfq(kalshiRfq('rfq-missing-px', [
+      'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+      'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
+    ]), {
+      venue: 'kalshi',
+      priceCache: halfCache,
+      now: Date.parse('2026-08-14T20:00:00Z'),
+    });
+    assert.strictEqual(missingPx.persist, true);
+    assert.strictEqual(missingPx.our_fair_american, null);
+    assert.strictEqual(missingPx.our_quote_american, null);
 
     console.log('unhedged-rfq.test.js ok');
   }).catch((e) => {

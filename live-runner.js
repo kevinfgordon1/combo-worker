@@ -19,7 +19,9 @@
 //   Quote-watcher stays parked. We do not write combo_matches or watcher_debug.
 // UNHEDGED SHADOW: unmatched in-scope MLB/NFL/NCAAF ML combos persist to
 //   unhedged_rfqs (UNHEDGED_RFQ_SHADOW, default on). Never POSTs. Combo Locks
-//   match / reserve / quote path is unchanged.
+//   match / reserve / quote path is unchanged. Fair/would-quote Americans
+//   come from an in-memory ML cache (Kalshi series + PM aec-* slugs), not
+//   per-RFQ HTTP and not The Odds API. UNHEDGED_RFQ_LIVE stays off.
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
@@ -50,7 +52,8 @@ const {
   isSkipTapeEligible,
   resolveSkipTape,
 } = require('./skip-tape');
-const { isUnhedgedRfqShadow, shadowUnhedgedMiss } = require('./unhedged-rfq');
+const { isUnhedgedRfqShadow, isUnhedgedRfqLive, shadowUnhedgedMiss } = require('./unhedged-rfq');
+const { createUnhedgedPriceCache } = require('./unhedged-price-cache');
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -97,6 +100,7 @@ let sessionFilledByParlay = {};
 const pendingQuotes = new Map();
 const polyPendingQuotes = new Map();
 let polyLoop = null;
+let unhedgedPrices = null;
 
 function outstandingFor(parlayId, excludeQuoteId) {
   return sumOutstanding(pendingQuotes, parlayId, excludeQuoteId)
@@ -947,6 +951,7 @@ async function onRfq(rfq, env) {
       extra: env && env.msg ? { msg: env.msg } : null,
       supabase,
       env: process.env,
+      priceCache: unhedgedPrices,
     });
     return;
   }
@@ -1121,9 +1126,24 @@ async function main() {
     `Unaccepted quotes are DELETE'd after ${RESERVE_TTL_MS / 1000}s. ` +
     `rfq_deleted releases immediately. ` +
     `Skipped oversized/cap RFQs get a targeted tape lookup after close. ` +
-    `Unhedged RFQ shadow (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(process.env) ? 'on' : 'off'}) ` +
+    `Unhedged RFQ shadow (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(process.env) ? 'on' : 'off'}, ` +
+    `UNHEDGED_RFQ_LIVE=${isUnhedgedRfqLive(process.env) ? 'on' : 'off'}) ` +
     `persists in-scope unmatched MLB/NFL/NCAAF ML combos — never posts.`
   );
+
+  unhedgedPrices = createUnhedgedPriceCache({
+    env: process.env,
+    fetchKalshiMarkets: async (series, cursor) => {
+      const qs = new URLSearchParams({
+        series_ticker: series,
+        status: 'open',
+        limit: String(200),
+      });
+      if (cursor) qs.set('cursor', String(cursor));
+      return kalshiGet('/trade-api/v2/markets', qs.toString());
+    },
+  });
+  unhedgedPrices.start();
 
   await refresh();
   setInterval(refresh, 30000);
@@ -1155,6 +1175,7 @@ async function main() {
     sessionFilledByParlay,
     supabase,
     env: process.env,
+    unhedgedPrices,
   });
   polyLoop = poly;
 
@@ -1172,6 +1193,7 @@ async function main() {
   process.on('SIGINT', () => {
     client.stop();
     try { poly && poly.stop && poly.stop(); } catch (_) {}
+    try { unhedgedPrices && unhedgedPrices.stop && unhedgedPrices.stop(); } catch (_) {}
     try { kalshiHttp.close(); } catch (_) {}
     console.log(`[${MODE}] final`, counts);
     process.exit(0);

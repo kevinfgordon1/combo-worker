@@ -6,14 +6,22 @@
 // independent events (distinct games AND distinct teams). No SGP / spreads /
 // totals / props. Tennis / LoL / CS2 are a silent skip (no insert).
 //
-// Fair/quote Americans stay null unless already present on the RFQ — this
-// worker has no odds feed for unmatched parlays. Do not invent prices.
+// Fair/quote Americans are set on insert when every leg maps to a cached
+// full-game ML price (same venue as the RFQ). Otherwise both stay null.
+// Pricing is sync from the in-memory cache — never a per-RFQ HTTP call.
+// Do not invent prices. Do not POST / confirm / fill.
 //
 // Env: UNHEDGED_RFQ_SHADOW default ON (collect tape). Set 0/false/off to idle.
+//      UNHEDGED_RFQ_LIVE default OFF — posting is not wired on this path.
 'use strict';
 const { parseKalshiTicker } = require('./leg-identity');
 const { findStartedEvent } = require('./started');
 const { americanFromProb } = require('./engine');
+const {
+  isUnhedgedRfqLive,
+  cushionYesFromEnv,
+  priceUnhedgedCombo,
+} = require('./unhedged-quote');
 
 const SCOPE_LEAGUES = new Set(['mlb', 'nfl', 'ncaaf']);
 const SILENT_SKIP = new Set(['tennis', 'lol', 'cs2']);
@@ -422,6 +430,14 @@ function classifyUnhedgedRfq(rfq, opts = {}) {
   }));
 
   const status = started && started.started ? 'started' : 'seen';
+  const priced = priceClassified({
+    venue,
+    legs: legsJson,
+    priceCache: opts.priceCache,
+    getYesProb: opts.getYesProb,
+    env: opts.env,
+    cushion: opts.cushion,
+  });
   return {
     persist: true,
     inScope: true,
@@ -431,10 +447,34 @@ function classifyUnhedgedRfq(rfq, opts = {}) {
     legs: legsJson,
     size,
     taker,
-    our_fair_american: null,
-    our_quote_american: null,
+    our_fair_american: priced.our_fair_american,
+    our_quote_american: priced.our_quote_american,
     venue,
     rfqId: rfq.rfqId || rfq.id || null,
+  };
+}
+
+function priceClassified({ venue, legs, priceCache, getYesProb, env, cushion }) {
+  const empty = { our_fair_american: null, our_quote_american: null };
+  if (priceCache && typeof priceCache.watch === 'function') {
+    priceCache.watch(venue, legs);
+  }
+  const lookup = typeof getYesProb === 'function'
+    ? getYesProb
+    : (priceCache && typeof priceCache.getYesProb === 'function'
+      ? (v, key) => priceCache.getYesProb(v, key)
+      : null);
+  if (!lookup) return empty;
+  const pad = cushion != null ? cushion : cushionYesFromEnv(env);
+  const priced = priceUnhedgedCombo({
+    venue,
+    legs,
+    getYesProb: lookup,
+    cushion: pad,
+  });
+  return {
+    our_fair_american: priced.our_fair_american,
+    our_quote_american: priced.our_quote_american,
   };
 }
 
@@ -498,6 +538,7 @@ function shadowUnhedgedMiss(rfq, opts = {}) {
       console.log(
         `[UNHEDGED] ${out.status} ${opts.venue || out.venue} rfq=${out.row.rfq_id} ` +
         `legs=${(out.row.legs || []).length}` +
+        (out.row.our_quote_american != null ? ` quote=${out.row.our_quote_american}` : ' quote=null') +
         (out.reason ? ` reason=${out.reason}` : '')
       );
     }
@@ -509,6 +550,7 @@ function shadowUnhedgedMiss(rfq, opts = {}) {
 module.exports = {
   SCOPE_LEAGUES,
   isUnhedgedRfqShadow,
+  isUnhedgedRfqLive,
   classifyUnhedgedRfq,
   buildUnhedgedRow,
   considerUnhedgedRfq,
@@ -517,4 +559,5 @@ module.exports = {
   shadowUnhedgedMiss,
   parseKalshiUnhedgedTicker,
   parsePmUnhedgedSlug,
+  priceClassified,
 };
