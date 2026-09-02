@@ -10,8 +10,13 @@
 // refresh — not a per-RFQ fetch). If any leg has no cached full-game ML
 // price, both stay null. Do not invent prices. Never POST / confirm / fill.
 //
+// Would-quote YES = 1.05 × net_cost, floored to the penny like fillView (we
+// sell YES — quote is ABOVE fair, never fair minus a cushion). net_cost is
+// fair YES plus Kalshi combo 0.035*p*(1-p), except independent NFL-only and
+// Polymarket (maker cost 0; no 0.0125 rebate).
+//
 // Env: UNHEDGED_RFQ_SHADOW default ON (collect tape). Set 0/false/off to idle.
-//      UNHEDGED_YES_CUSHION default 0.05 (YES probability). Posting stays off.
+//      Posting stays off.
 'use strict';
 const { parseKalshiTicker } = require('./leg-identity');
 const { findStartedEvent } = require('./started');

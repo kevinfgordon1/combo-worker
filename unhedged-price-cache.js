@@ -11,8 +11,7 @@ const { americanFromProb } = require('./engine');
 
 const KALSHI_ML_SERIES = ['KXMLBGAME', 'KXNFLGAME', 'KXNCAAFGAME'];
 const KALSHI_COMBO_MAKER = 0.035; // 0.5 × taker 0.07. Unhedged only — not engine.js KFEE.
-const POLY_MAKER_REBATE = 0.0125; // maker is paid 0.0125 * p * (1-p); not a charge.
-const DEFAULT_CUSHION = 0.05;
+const YES_MARGIN = 1.05; // Kevin: quote YES = 1.05 × net_cost. We sell YES — never fair minus.
 const DEFAULT_INTERVAL_MS = 30000;
 const DEFAULT_MAX_PM_SLUGS = 128;
 const KALSHI_PAGE_LIMIT = 200;
@@ -30,13 +29,6 @@ function numOrNull(v) {
   return Number.isFinite(n) ? n : null;
 }
 
-function yesCushion(env = process.env) {
-  const v = env && env.UNHEDGED_YES_CUSHION;
-  if (v == null || String(v).trim() === '') return DEFAULT_CUSHION;
-  const n = Number(v);
-  return Number.isFinite(n) && n >= 0 && n < 0.5 ? n : DEFAULT_CUSHION;
-}
-
 function refreshIntervalMs(env = process.env) {
   const v = env && env.UNHEDGED_PRICE_REFRESH_MS;
   if (v == null || String(v).trim() === '') return DEFAULT_INTERVAL_MS;
@@ -49,8 +41,8 @@ function isKalshiNflIndependent(legs) {
 }
 
 // Kalshi independent NFL-only: maker fee 0.
-// Other Kalshi combos (MLB, mixed, NCAAF): combo maker 0.035.
-// Polymarket US: do not charge a maker fee (rebate is optional extra net).
+// Other Kalshi combos (MLB, mixed, NCAAF): combo maker 0.035 on fair p.
+// Polymarket US: maker cost is 0 — do not apply the 0.0125 rebate in net_cost.
 function makerFeeCoeff(venue, legs) {
   if (venue === 'kalshi') {
     return isKalshiNflIndependent(legs) ? 0 : KALSHI_COMBO_MAKER;
@@ -72,45 +64,41 @@ function fairYesProb(yesProbs, sides) {
   return p > 0 && p < 1 ? p : null;
 }
 
-// Invert net = p - k*p*(1-p) so posted YES still has the cushion after the fee.
-function nominalFromNet(sEff, k) {
-  if (!(sEff > 0 && sEff < 1)) return null;
-  if (!(k > 0)) return sEff;
-  const disc = (1 - k) * (1 - k) + 4 * k * sEff;
-  if (disc < 0) return null;
-  const p = (-(1 - k) + Math.sqrt(disc)) / (2 * k);
-  return p > 0 && p < 1 ? p : null;
-}
-
-function wouldQuoteYesProb(fairP, { venue, legs, cushion = DEFAULT_CUSHION } = {}) {
+function netCostYes(fairP, venue, legs) {
   if (!(fairP > 0 && fairP < 1)) return null;
-  const edge = Number.isFinite(cushion) && cushion >= 0 ? cushion : DEFAULT_CUSHION;
-  const target = fairP - edge;
-  if (!(target > 0 && target < 1)) return null;
   const k = makerFeeCoeff(venue, legs);
-  return nominalFromNet(target, k);
+  return Math.round((fairP + k * fairP * (1 - fairP)) * 1e12) / 1e12;
 }
 
-function polyNetYes(quotedP) {
-  if (!(quotedP > 0 && quotedP < 1)) return null;
-  return quotedP + POLY_MAKER_REBATE * quotedP * (1 - quotedP);
+// Floor NO like fillView so posted YES is never below 1.05×net (we sell YES).
+function postedYesFromRaw(raw) {
+  if (!(raw > 0 && raw < 1)) return null;
+  const yes = Math.round((1 - floor2(1 - raw)) * 100) / 100;
+  return yes > 0 && yes < 1 ? yes : null;
 }
 
-function quoteUnhedged(venue, legs, yesProbs, sides, env) {
+function wouldQuoteYesRaw(fairP, { venue, legs } = {}) {
+  const net = netCostYes(fairP, venue, legs);
+  if (net == null) return null;
+  const raw = Math.round(YES_MARGIN * net * 1e12) / 1e12;
+  return raw > 0 && raw < 1 ? raw : null;
+}
+
+function wouldQuoteYesProb(fairP, opts = {}) {
+  return postedYesFromRaw(wouldQuoteYesRaw(fairP, opts));
+}
+
+function quoteUnhedged(venue, legs, yesProbs, sides) {
   const fairP = fairYesProb(yesProbs, sides);
   if (fairP == null) return { fairAmerican: null, quoteAmerican: null, fairP: null, quoteP: null };
   const fairAmerican = americanFromProb(fairP);
-  const quoteP = wouldQuoteYesProb(fairP, { venue, legs, cushion: yesCushion(env) });
+  const quoteP = wouldQuoteYesProb(fairP, { venue, legs });
   if (quoteP == null) return { fairAmerican, quoteAmerican: null, fairP, quoteP: null };
-  const yesPosted = floor2(quoteP);
-  if (!(yesPosted > 0 && yesPosted < 1)) {
-    return { fairAmerican, quoteAmerican: null, fairP, quoteP };
-  }
   return {
     fairAmerican,
-    quoteAmerican: americanFromProb(yesPosted),
+    quoteAmerican: americanFromProb(quoteP),
     fairP,
-    quoteP: yesPosted,
+    quoteP,
   };
 }
 
@@ -230,7 +218,7 @@ function createUnhedgedPriceCache(opts = {}) {
       yesProbs.push(yp);
       sides.push(leg.side);
     }
-    return quoteUnhedged(venue, legs, yesProbs, sides, env);
+    return quoteUnhedged(venue, legs, yesProbs, sides);
   }
 
   function seed(venue, key, yesProb) {
@@ -326,15 +314,13 @@ function createUnhedgedPriceCache(opts = {}) {
 module.exports = {
   KALSHI_ML_SERIES,
   KALSHI_COMBO_MAKER,
-  POLY_MAKER_REBATE,
-  DEFAULT_CUSHION,
+  YES_MARGIN,
   DEFAULT_INTERVAL_MS,
-  yesCushion,
   makerFeeCoeff,
   fairYesProb,
+  netCostYes,
+  wouldQuoteYesRaw,
   wouldQuoteYesProb,
-  nominalFromNet,
-  polyNetYes,
   quoteUnhedged,
   yesProbFromKalshiMarket,
   yesProbFromPmMarket,

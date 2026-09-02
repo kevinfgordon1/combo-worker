@@ -1077,6 +1077,7 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.ok(pricedRow);
   assert.ok(pricedRow.our_fair_american != null);
   assert.ok(pricedRow.our_quote_american != null);
+  assert.ok(pricedRow.our_quote_american < pricedRow.our_fair_american);
   pricedLoop.stop();
 
   const parsed = parsePrivateMessage(JSON.stringify({

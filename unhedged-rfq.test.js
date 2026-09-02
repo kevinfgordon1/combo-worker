@@ -9,7 +9,7 @@ const {
   parseKalshiUnhedgedTicker,
   parsePmUnhedgedSlug,
 } = require('./unhedged-rfq');
-const { createUnhedgedPriceCache, wouldQuoteYesProb, makerFeeCoeff } = require('./unhedged-price-cache');
+const { createUnhedgedPriceCache, wouldQuoteYesRaw, wouldQuoteYesProb, makerFeeCoeff } = require('./unhedged-price-cache');
 
 assert.strictEqual(isUnhedgedRfqShadow({}), true);
 assert.strictEqual(isUnhedgedRfqShadow({ UNHEDGED_RFQ_SHADOW: '' }), true);
@@ -264,7 +264,7 @@ function pmRfq(id, symbols, extra = {}) {
   assert.strictEqual(out.reason, 'flag_off');
 }
 
-// Seeded cache: NFL 0-fee quote is longer than MLB 0.035 for the same p's.
+// Seeded cache: sell YES above fair. MLB 0.035 raises net vs NFL 0; Poly = NFL.
 {
   const cache = createUnhedgedPriceCache();
   cache.seed('kalshi', 'KXNFLGAME-26SEP071330BUFKC-KC', 0.40);
@@ -284,16 +284,19 @@ function pmRfq(id, symbols, extra = {}) {
   assert.ok(nfl.our_fair_american != null);
   assert.strictEqual(nfl.our_fair_american, mlb.our_fair_american);
   assert.ok(nfl.our_quote_american != null && mlb.our_quote_american != null);
+  assert.ok(nfl.our_quote_american < nfl.our_fair_american, 'quote worse American than fair');
   assert.strictEqual(makerFeeCoeff('kalshi', nfl.legs), 0);
   assert.strictEqual(makerFeeCoeff('kalshi', mlb.legs), 0.035);
   const fairP = 0.16;
-  const nflP = wouldQuoteYesProb(fairP, { venue: 'kalshi', legs: nfl.legs, cushion: 0.05 });
-  const mlbP = wouldQuoteYesProb(fairP, { venue: 'kalshi', legs: mlb.legs, cushion: 0.05 });
-  assert.ok(mlbP > nflP);
-  assert.ok(nfl.our_quote_american >= mlb.our_quote_american, 'NFL 0-fee is the longer (or equal after penny) quote');
+  const nflRaw = wouldQuoteYesRaw(fairP, { venue: 'kalshi', legs: nfl.legs });
+  const mlbRaw = wouldQuoteYesRaw(fairP, { venue: 'kalshi', legs: mlb.legs });
+  assert.ok(mlbRaw > nflRaw);
+  assert.ok(nflRaw > fairP && mlbRaw > fairP);
+  assert.strictEqual(wouldQuoteYesProb(0.10, { venue: 'kalshi', legs: nfl.legs }), 0.11);
+  assert.strictEqual(wouldQuoteYesProb(0.10, { venue: 'kalshi', legs: mlb.legs }), 0.11);
 }
 
-// Poly rebate path via cache: priced, not fair, still no invent on a missing slug.
+// Poly maker cost 0 (same as NFL). Priced, above fair, no invent on a missing slug.
 {
   const cache = createUnhedgedPriceCache();
   cache.seed('polymarket', 'aec-mlb-cws-det-2026-08-14-cws', 0.40);
@@ -305,7 +308,11 @@ function pmRfq(id, symbols, extra = {}) {
   assert.strictEqual(hit.persist, true);
   assert.ok(hit.our_fair_american != null);
   assert.ok(hit.our_quote_american != null);
-  assert.ok(hit.our_quote_american !== hit.our_fair_american);
+  assert.ok(hit.our_quote_american < hit.our_fair_american);
+  assert.strictEqual(
+    wouldQuoteYesRaw(0.10, { venue: 'polymarket', legs: hit.legs }),
+    0.105
+  );
 
   const miss = classifyUnhedgedRfq(pmRfq('rfq-pm-miss-price', [
     'aec-mlb-cws-det-2026-08-14-cws',

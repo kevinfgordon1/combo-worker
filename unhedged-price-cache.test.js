@@ -2,13 +2,12 @@
 const assert = require('assert');
 const {
   KALSHI_COMBO_MAKER,
-  POLY_MAKER_REBATE,
-  DEFAULT_CUSHION,
-  yesCushion,
+  YES_MARGIN,
   makerFeeCoeff,
   fairYesProb,
+  netCostYes,
+  wouldQuoteYesRaw,
   wouldQuoteYesProb,
-  polyNetYes,
   quoteUnhedged,
   yesProbFromKalshiMarket,
   yesProbFromPmMarket,
@@ -16,10 +15,7 @@ const {
 } = require('./unhedged-price-cache');
 
 assert.strictEqual(KALSHI_COMBO_MAKER, 0.035);
-assert.strictEqual(POLY_MAKER_REBATE, 0.0125);
-assert.strictEqual(DEFAULT_CUSHION, 0.05);
-assert.strictEqual(yesCushion({}), 0.05);
-assert.strictEqual(yesCushion({ UNHEDGED_YES_CUSHION: '0.03' }), 0.03);
+assert.strictEqual(YES_MARGIN, 1.05);
 
 const nflLegs = [
   { league: 'nfl', ticker: 'KXNFLGAME-A-BUF', side: 'yes' },
@@ -47,27 +43,41 @@ assert.strictEqual(makerFeeCoeff('polymarket', pmLegs), 0);
 assert.strictEqual(fairYesProb([0.4, 0.5], ['yes', 'yes']), 0.2);
 assert.ok(Math.abs(fairYesProb([0.7, 0.7], ['yes', 'no']) - 0.21) < 1e-12);
 
-// NFL 0 fee vs MLB 0.035: same fair, MLB posts a higher YES so net keeps the cushion.
+// MLB fair 0.10 → net ~0.10315 → raw ~0.108 → penny 0.11 (above fair).
 {
-  const fairP = 0.16;
-  const cushion = 0.05;
-  const nfl = wouldQuoteYesProb(fairP, { venue: 'kalshi', legs: nflLegs, cushion });
-  const mlb = wouldQuoteYesProb(fairP, { venue: 'kalshi', legs: mlbLegs, cushion });
-  assert.strictEqual(nfl, 0.11);
-  assert.ok(mlb > nfl, 'MLB bakes 0.035 so posted YES > NFL');
-  const mlbNet = mlb - 0.035 * mlb * (1 - mlb);
-  assert.ok(Math.abs(mlbNet - 0.11) < 1e-12, 'MLB net after 0.035 still has the 5¢ cushion');
+  const fairP = 0.10;
+  const net = netCostYes(fairP, 'kalshi', mlbLegs);
+  assert.ok(Math.abs(net - 0.10315) < 1e-12);
+  const raw = wouldQuoteYesRaw(fairP, { venue: 'kalshi', legs: mlbLegs });
+  assert.ok(Math.abs(raw - 1.05 * 0.10315) < 1e-12);
+  assert.ok(raw > fairP);
+  assert.strictEqual(wouldQuoteYesProb(fairP, { venue: 'kalshi', legs: mlbLegs }), 0.11);
 }
 
-// Poly rebate path: no maker fee charged; rebate can slightly improve net.
+// NFL independent 0.10 → net 0.10 → 0.105 → 0.11. Same as Poly (maker cost 0).
+{
+  const fairP = 0.10;
+  assert.strictEqual(netCostYes(fairP, 'kalshi', nflLegs), 0.10);
+  assert.strictEqual(wouldQuoteYesRaw(fairP, { venue: 'kalshi', legs: nflLegs }), 0.105);
+  assert.strictEqual(wouldQuoteYesProb(fairP, { venue: 'kalshi', legs: nflLegs }), 0.11);
+
+  const polyRaw = wouldQuoteYesRaw(fairP, { venue: 'polymarket', legs: pmLegs });
+  const nflRaw = wouldQuoteYesRaw(fairP, { venue: 'kalshi', legs: nflLegs });
+  assert.strictEqual(polyRaw, nflRaw);
+  assert.ok(polyRaw < 1.05 * 0.10315, 'Poly has no 0.035 and no rebate — same as NFL, below MLB raw');
+  assert.strictEqual(wouldQuoteYesProb(fairP, { venue: 'polymarket', legs: pmLegs }), 0.11);
+}
+
+// Wrong sign is gone: quote YES is never fair minus a cushion.
 {
   const fairP = 0.16;
-  const poly = wouldQuoteYesProb(fairP, { venue: 'polymarket', legs: pmLegs, cushion: 0.05 });
-  assert.strictEqual(poly, 0.11);
-  assert.strictEqual(poly, wouldQuoteYesProb(fairP, { venue: 'kalshi', legs: nflLegs, cushion: 0.05 }));
-  const net = polyNetYes(poly);
-  assert.ok(net > poly, 'rebate improves net vs posted YES');
-  assert.ok(net < fairP, 'still not quoting fair');
+  const mlb = wouldQuoteYesRaw(fairP, { venue: 'kalshi', legs: mlbLegs });
+  const nfl = wouldQuoteYesRaw(fairP, { venue: 'kalshi', legs: nflLegs });
+  const poly = wouldQuoteYesRaw(fairP, { venue: 'polymarket', legs: pmLegs });
+  assert.ok(mlb > nfl);
+  assert.strictEqual(poly, nfl);
+  assert.ok(mlb > fairP && nfl > fairP && poly > fairP);
+  assert.ok(nfl !== fairP - 0.05);
 }
 
 // Missing / invalid leg price → no fair (do not invent).
@@ -75,10 +85,11 @@ assert.strictEqual(fairYesProb([0.4, null], ['yes', 'yes']), null);
 assert.strictEqual(quoteUnhedged('kalshi', mlbLegs, [0.4, null], ['yes', 'yes']).fairAmerican, null);
 
 {
-  const priced = quoteUnhedged('kalshi', nflLegs, [0.4, 0.4], ['yes', 'yes'], { UNHEDGED_YES_CUSHION: '0.05' });
+  const priced = quoteUnhedged('kalshi', nflLegs, [0.4, 0.4], ['yes', 'yes']);
   assert.ok(priced.fairAmerican != null);
   assert.ok(priced.quoteAmerican != null);
-  assert.ok(priced.quoteAmerican > priced.fairAmerican, 'would-quote is longer than fair');
+  assert.ok(priced.quoteP > priced.fairP, 'sell YES above fair');
+  assert.ok(priced.quoteAmerican < priced.fairAmerican, 'worse American for the taker');
 }
 
 assert.strictEqual(yesProbFromKalshiMarket({
@@ -136,6 +147,7 @@ assert.strictEqual(yesProbFromPmMarket({
     ]);
     assert.ok(hit.fairAmerican != null);
     assert.ok(hit.quoteAmerican != null);
+    assert.ok(hit.quoteP > hit.fairP);
 
     const miss = cache.price('kalshi', [
       { league: 'mlb', ticker: 'KXMLBGAME-26AUG141840CWSDET-CWS', side: 'yes' },
@@ -151,8 +163,8 @@ assert.strictEqual(yesProbFromPmMarket({
     const pm = cache.price('polymarket', pmLegs);
     assert.ok(pm.fairAmerican != null);
     assert.ok(pm.quoteAmerican != null);
-    const net = polyNetYes(pm.quoteP);
-    assert.ok(net > pm.quoteP);
+    assert.ok(pm.quoteP > pm.fairP);
+    assert.strictEqual(pm.quoteP, wouldQuoteYesProb(pm.fairP, { venue: 'polymarket', legs: pmLegs }));
 
     console.log('unhedged-price-cache.test.js ok');
   }).catch((e) => {
