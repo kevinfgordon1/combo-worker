@@ -158,6 +158,7 @@ const lockMarkets = new Map([
 ]);
 
 const BEFORE_PITCH = Date.parse('2026-08-14T20:00:00Z');
+const AFTER_PITCH = Date.parse('2026-08-14T23:44:00Z');
 const lockMatch = evaluatePolymarketRfq({
   rfq: pmRfq,
   parlays: [kalshiParlay],
@@ -167,6 +168,17 @@ const lockMatch = evaluatePolymarketRfq({
 assert.strictEqual(lockMatch.action, 'quoteable');
 assert.strictEqual(lockMatch.parlay.id, P);
 assert.strictEqual(lockMatch.quote.buyPrice, '0.222');
+
+// After first pitch (Kalshi ticker HHMM on the lock): skip — do not quote.
+const startedLock = evaluatePolymarketRfq({
+  rfq: pmRfq,
+  parlays: [kalshiParlay],
+  markets: lockMarkets,
+  now: AFTER_PITCH,
+});
+assert.strictEqual(startedLock.action, 'skip');
+assert.strictEqual(startedLock.reason, 'game_started');
+assert.ok(startedLock.started && startedLock.started.started);
 assert.strictEqual(
   matchPolymarketParlay(normalizePolymarketRfq(pmRfq), [kalshiParlay], { markets: lockMarkets }).id,
   P
@@ -410,6 +422,42 @@ assert.deepStrictEqual(shouldConfirmNow('SIDE_BUY', { live: false }), { confirm:
 assert.deepStrictEqual(shouldConfirmNow('SIDE_BUY', { live: true }), { confirm: true, reason: null });
 assert.deepStrictEqual(shouldConfirmNow('SIDE_SELL', { live: true }), { confirm: false, reason: 'side_not_buy' });
 assert.deepStrictEqual(shouldConfirmNow('sell', { live: true }), { confirm: false, reason: 'side_not_buy' });
+assert.deepStrictEqual(
+  shouldConfirmNow('SIDE_BUY', { live: true, started: { started: true } }),
+  { confirm: false, reason: 'game_started' }
+);
+assert.deepStrictEqual(
+  shouldConfirmNow('SIDE_BUY', { live: true, started: { started: false } }),
+  { confirm: true, reason: null }
+);
+
+// Date-only PM slugs must not count as midnight starts; starts_at still gates.
+assert.strictEqual(evaluatePolymarketRfq({
+  rfq: pmRfq,
+  parlays: [pmParlay],
+  now: AFTER_PITCH,
+}).action, 'quoteable');
+assert.strictEqual(evaluatePolymarketRfq({
+  rfq: pmRfq,
+  parlays: [{ ...pmParlay, starts_at: '2026-08-14T22:41:00.000Z' }],
+  now: BEFORE_PITCH,
+}).action, 'quoteable');
+assert.strictEqual(evaluatePolymarketRfq({
+  rfq: pmRfq,
+  parlays: [{ ...pmParlay, starts_at: '2026-08-14T22:41:00.000Z' }],
+  now: AFTER_PITCH,
+}).reason, 'game_started');
+assert.strictEqual(evaluatePolymarketRfq({
+  rfq: pmRfq,
+  parlays: [{
+    ...pmParlay,
+    legs: [
+      { ...pmParlay.legs[0], commence_time: '2026-08-14T22:40:00.000Z' },
+      pmParlay.legs[1],
+    ],
+  }],
+  now: AFTER_PITCH,
+}).reason, 'game_started');
 
 // Shared remaining: Kalshi 43 + another 43 leaves 30; a $10 cash PM RFQ is 45 and must skip.
 const SIZE = 43;
@@ -616,6 +664,138 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.deepStrictEqual(confirms[0], { rfqId: 'rfq_live_1', quoteId: 'quote_posted' });
 
   loopOn.stop();
+
+  // Confirm-after-start: BUY accept must not confirm; quote is deleted.
+  const startedDeletes = [];
+  const startedConfirms = [];
+  const startedHttp = {
+    async getUserId() { return { rfqUserId: 'rfquser_test' }; },
+    async listRfqs() { return { rfqs: [] }; },
+    async listQuotes() { return { quotes: [] }; },
+    async getCombo() { return { combos: [] }; },
+    async createQuote() { return { quoteId: 'quote_started' }; },
+    async confirmQuote(rfqId, quoteId) {
+      startedConfirms.push({ rfqId, quoteId });
+      return {};
+    },
+    async deleteQuote(rfqId, quoteId) {
+      startedDeletes.push({ rfqId, quoteId });
+      return { statusCode: 200 };
+    },
+    close() {},
+  };
+  const startedPending = new Map();
+  const startedHit = {
+    started: true,
+    reason: 'game_started',
+    source: 'parlay.starts_at',
+    at: '2026-08-14T22:41:00.000Z',
+  };
+  startedPending.set('quote_started', {
+    parlayId: 'pm-parlay',
+    contracts: 10,
+    maxContracts: 116,
+    rfqId: 'rfq_started',
+    label: 'PM Sox/Pirates',
+    starts_at: '2026-08-14T22:41:00.000Z',
+    legs: pmParlay.legs,
+    leg_keys: pmParlay.leg_keys,
+  });
+  const loopStarted = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    http: startedHttp,
+    startWs: false,
+    getParlays: () => [{ ...pmParlay, starts_at: '2026-08-14T22:41:00.000Z' }],
+    startedFor: () => startedHit,
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: startedPending,
+    reconcileMs: 60 * 60 * 1000,
+  });
+  const accStarted = await loopStarted.handleQuoteAccepted({
+    quote: { id: 'quote_started', rfqId: 'rfq_started', acceptedSide: 'SIDE_BUY' },
+  });
+  assert.strictEqual(accStarted.confirmed, false);
+  assert.strictEqual(accStarted.reason, 'game_started');
+  assert.strictEqual(startedConfirms.length, 0);
+  assert.deepStrictEqual(startedDeletes, [{ rfqId: 'rfq_started', quoteId: 'quote_started' }]);
+  assert.ok(!startedPending.has('quote_started'));
+  loopStarted.stop();
+
+  // Cancel-on-start: resting quote for a started lock is deleted (Kalshi analog).
+  const cancelDeletes = [];
+  const cancelHttp = {
+    async getUserId() { return { rfqUserId: 'rfquser_test' }; },
+    async listRfqs() { return { rfqs: [] }; },
+    async listQuotes() { return { quotes: [] }; },
+    async getCombo() { return { combos: [] }; },
+    async createQuote() { return { quoteId: 'quote_rest' }; },
+    async confirmQuote() { return {}; },
+    async deleteQuote(rfqId, quoteId) {
+      cancelDeletes.push({ rfqId, quoteId });
+      return { statusCode: 200 };
+    },
+    close() {},
+  };
+  const resting = new Map();
+  resting.set('quote_rest', {
+    parlayId: 'pm-parlay',
+    contracts: 10,
+    maxContracts: 116,
+    rfqId: 'rfq_rest',
+    label: 'PM Sox/Pirates',
+    starts_at: '2026-08-14T22:41:00.000Z',
+  });
+  resting.set('quote_other', {
+    parlayId: 'other-lock',
+    contracts: 5,
+    maxContracts: 50,
+    rfqId: 'rfq_other',
+    label: 'Still pregame',
+  });
+  const loopCancel = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    http: cancelHttp,
+    startWs: false,
+    getParlays: () => [
+      { ...pmParlay, starts_at: '2026-08-14T22:41:00.000Z' },
+      { id: 'other-lock', label: 'Still pregame' },
+    ],
+    startedFor: (p) => (p && p.id === 'pm-parlay' ? startedHit : { started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: resting,
+    reconcileMs: 60 * 60 * 1000,
+  });
+  await loopCancel.cancelStartedQuotes();
+  assert.deepStrictEqual(cancelDeletes, [{ rfqId: 'rfq_rest', quoteId: 'quote_rest' }]);
+  assert.ok(!resting.has('quote_rest'));
+  assert.ok(resting.has('quote_other'));
+
+  // New RFQ for a started lock also cancels that lock's resting quotes.
+  resting.set('quote_rest2', {
+    parlayId: 'pm-parlay',
+    contracts: 10,
+    maxContracts: 116,
+    rfqId: 'rfq_rest2',
+    label: 'PM Sox/Pirates',
+    starts_at: '2026-08-14T22:41:00.000Z',
+  });
+  const skipStarted = await loopCancel.handleRfq({ ...pmRfq, id: 'rfq_after_start' });
+  assert.strictEqual(skipStarted.action, 'skip');
+  assert.strictEqual(skipStarted.reason, 'game_started');
+  assert.ok(cancelDeletes.some((d) => d.quoteId === 'quote_rest2'));
+  assert.ok(!resting.has('quote_rest2'));
+  assert.ok(resting.has('quote_other'));
+  loopCancel.stop();
 
   const lru = createMarketCache({
     maxEntries: 2,

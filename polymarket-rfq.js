@@ -7,6 +7,11 @@
 // Unmatched firehose RFQs are a cheap no-op — no seenRfqs / market-cache growth.
 // Live POSTs (create quote, confirm) require POLYMARKET_RFQ_LIVE to be truthy.
 // quoteExecuted means paired orders were submitted — not a fill.
+// START GATE: never quote or confirm once any lock leg has started (first pitch
+// / kickoff <= now). Resting quotes for that lock are DELETE'd the same way
+// Kalshi cancelStartedQuotes works. Date-only Polymarket slugs are not starts —
+// findStartedEvent still uses combo_parlays.starts_at, per-leg start fields,
+// and Kalshi ticker HHMM in leg_keys.
 'use strict';
 const { matchParlay } = require('./rfq');
 const { decideAtFill } = require('./engine');
@@ -390,12 +395,26 @@ function shouldPostNow(evaluation, { live } = {}) {
   return { post: true, reason: null };
 }
 
-function shouldConfirmNow(acceptedSide, { live } = {}) {
+function shouldConfirmNow(acceptedSide, { live, started } = {}) {
   if (!shouldConfirmPolymarketAccept(acceptedSide)) {
     return { confirm: false, reason: 'side_not_buy' };
   }
   if (!live) return { confirm: false, reason: 'live_off' };
+  if (started && started.started) return { confirm: false, reason: 'game_started' };
   return { confirm: true, reason: null };
+}
+
+function parlayFromPending(pending, locks) {
+  if (!pending) return null;
+  const live = Array.isArray(locks) ? locks.find((x) => x.id === pending.parlayId) : null;
+  if (live) return live;
+  return {
+    id: pending.parlayId,
+    label: pending.label,
+    starts_at: pending.starts_at,
+    legs: pending.legs,
+    leg_keys: pending.leg_keys,
+  };
 }
 
 function quoteBodyFromEval(evaluation) {
@@ -459,6 +478,9 @@ function logSkip(evaluation, extra) {
   }
   if (evaluation.decision) {
     bits.push(`want=${evaluation.quote && evaluation.quote.estimatedContracts} remaining=${evaluation.decision.remaining}/${evaluation.decision.totalLimit}`);
+  }
+  if (evaluation.reason === 'game_started' && evaluation.started) {
+    bits.push(`source=${evaluation.started.source} at=${evaluation.started.at}`);
   }
   if (extra) bits.push(extra);
   console.log(bits.join(' '));
@@ -608,6 +630,13 @@ function startPolymarketRfqLoop(ctx = {}) {
 
     if (evaluation.action !== 'quoteable') {
       logSkip(evaluation);
+      if (evaluation.reason === 'game_started' && evaluation.parlay) {
+        try {
+          await cancelOpenQuotesForParlay(evaluation.parlay.id, evaluation.started);
+        } catch (e) {
+          console.error(`[${MODE}] cancel-on-start`, e.message);
+        }
+      }
       if (evaluation.parlay && ctx.logAsync) {
         ctx.logAsync(evaluation.parlay, { rfqId: rfq.rfqId, contracts: evaluation.quote && evaluation.quote.estimatedContracts }, evaluation.decision, 'declined');
       }
@@ -658,24 +687,83 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
   }
 
+  function parlayOfPending(pending) {
+    return parlayFromPending(pending, parlays());
+  }
+
+  async function deleteQuoteAndDrop(quoteId, pending, reason) {
+    if (!quoteId) return;
+    if (isReserveKey(quoteId)) {
+      pendingQuotes.delete(quoteId);
+      return;
+    }
+    const rfqId = pending && pending.rfqId;
+    try {
+      if (live && rfqId) await http.deleteQuote(rfqId, quoteId);
+    } catch (e) {
+      const failKind = (reason && reason.started) ? 'game started' : (reason && reason.kind) || '';
+      console.error(
+        `[${MODE}] CANCEL FAILED ${failKind} ${(pending && pending.label) || '(unknown)'} quote_id=${quoteId}`,
+        e.message
+      );
+    }
+    pendingQuotes.delete(quoteId);
+    if (reason && reason.started) {
+      console.log(
+        `[${MODE}] CANCEL game started ${(pending && pending.label) || '(unknown)'} quote_id=${quoteId}` +
+        (rfqId ? ` rfq=${rfqId}` : '') +
+        ` source=${reason.source} at=${reason.at}`
+      );
+    }
+  }
+
+  async function cancelOpenQuotesForParlay(parlayId, started) {
+    for (const [quoteId, pending] of pendingQuotes) {
+      if (!pending || pending.parlayId !== parlayId) continue;
+      await deleteQuoteAndDrop(quoteId, pending, started);
+    }
+  }
+
+  async function cancelPendingIfStarted() {
+    for (const [quoteId, pending] of pendingQuotes) {
+      const p = parlayOfPending(pending);
+      const started = startedFor(p);
+      if (started && started.started) await deleteQuoteAndDrop(quoteId, pending, started);
+    }
+  }
+
+  async function cancelStartedQuotes() {
+    await cancelPendingIfStarted();
+  }
+
   async function handleQuoteAccepted(evt) {
     const acc = acceptedFromEvent(evt);
     const { quoteId, rfqId, acceptedSide } = acc;
     const pending = quoteId ? pendingQuotes.get(quoteId) : null;
     if (pending) pending.accepted = true;
-    const gate = shouldConfirmNow(acceptedSide, { live });
+    const parlay = parlayOfPending(pending);
+    const started = parlay ? startedFor(parlay) : { started: false };
+    const gate = shouldConfirmNow(acceptedSide, { live, started });
     if (!gate.confirm) {
-      console.log(
-        `[${MODE}] CONFIRM SKIPPED ${gate.reason} quote_id=${quoteId || '?'} ` +
-        `rfq_id=${rfqId || '?'} side=${acceptedSide || '?'}`
-      );
-      if (quoteId && pending && live && gate.reason === 'side_not_buy') {
+      if (gate.reason === 'game_started') {
+        console.log(
+          `[${MODE}] CONFIRM SKIPPED game started quote_id=${quoteId || '?'} ` +
+          `rfq_id=${rfqId || '?'} label=${pending ? pending.label : '(unknown)'} ` +
+          `source=${started.source} at=${started.at}`
+        );
+      } else {
+        console.log(
+          `[${MODE}] CONFIRM SKIPPED ${gate.reason} quote_id=${quoteId || '?'} ` +
+          `rfq_id=${rfqId || '?'} side=${acceptedSide || '?'}`
+        );
+      }
+      if (quoteId && pending && live && (gate.reason === 'side_not_buy' || gate.reason === 'game_started')) {
         try { await http.deleteQuote(rfqId, quoteId); } catch (e) {
           console.error(`[${MODE}] decline delete failed`, e.message);
         }
         pendingQuotes.delete(quoteId);
       }
-      return { confirmed: false, reason: gate.reason };
+      return { confirmed: false, reason: gate.reason, started: gate.reason === 'game_started' ? started : undefined };
     }
     if (!quoteId || !rfqId) {
       console.error(`[${MODE}] quoteAccepted missing ids`);
@@ -860,6 +948,7 @@ function startPolymarketRfqLoop(ctx = {}) {
   }, ctx.reconcileMs != null ? ctx.reconcileMs : RECONCILE_MS);
   const ttlTimer = setInterval(() => {
     cancelUnaccepted().catch((e) => console.error(`[${MODE}] ttl`, e.message));
+    cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start`, e.message));
   }, 2000);
   if (reconcileTimer.unref) reconcileTimer.unref();
   if (ttlTimer.unref) ttlTimer.unref();
@@ -878,6 +967,8 @@ function startPolymarketRfqLoop(ctx = {}) {
     handleQuoteExecuted,
     handleOrderExecution,
     onWsEvent,
+    cancelStartedQuotes,
+    cancelPendingIfStarted,
     pendingQuotes,
     seenRfqs,
     live,
@@ -900,6 +991,7 @@ module.exports = {
   evaluatePolymarketRfq,
   shouldPostNow,
   shouldConfirmNow,
+  parlayFromPending,
   quoteBodyFromEval,
   acceptedFromEvent,
   startPolymarketRfqLoop,
