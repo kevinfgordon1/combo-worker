@@ -11,6 +11,8 @@
 // Combo WRAP (unchanged, Combos row is separate): NFL-only maker 0;
 // MLB/NCAAF/mixed 0.035*p*(1-p). Polymarket maker 0, no rebate. Then
 // 1.05 * net_cost, first penny up.
+// annotateLegOdds writes per-leg blotter fields from opponentQuotes:
+// fair_american (invert), kalshi/poly/best opponent Americans. Null if missing.
 'use strict';
 const { americanFromProb } = require('./engine');
 
@@ -220,6 +222,45 @@ function ourTrueFromOpponents(quotes) {
   return am == null ? null : ourTrueProb(am);
 }
 
+// Best fee-included opponent American per venue. Missing venue → null (never invent).
+function venueOpponentAmericans(quotes) {
+  let kalshi = null;
+  let poly = null;
+  for (const q of quotes || []) {
+    const am = opponentAmericanFromQuote(q);
+    if (am == null) continue;
+    const venue = q && q.venue;
+    if (venue === 'kalshi') {
+      if (kalshi == null || am > kalshi) kalshi = am;
+    } else if (venue === 'polymarket') {
+      if (poly == null || am > poly) poly = am;
+    }
+  }
+  const best = bestOpponentAmerican(quotes);
+  return {
+    kalshi_opponent_american: kalshi,
+    poly_opponent_american: poly,
+    best_opponent_american: best,
+  };
+}
+
+// Persist fields for the blotter: venue opponent Americans + invert Fair.
+// fair_american is ourTrue for THIS pick (sign-flip of best opponent American).
+function annotateLegOdds(leg, quotes) {
+  const venues = venueOpponentAmericans(quotes);
+  const best = venues.best_opponent_american;
+  const ourYes = best == null ? null : ourTrueProb(best);
+  const p = sideProb(ourYes, leg && leg.side);
+  return {
+    ...(leg && typeof leg === 'object' ? leg : {}),
+    fair_yes: p,
+    fair_american: p == null ? null : americanFromProb(p),
+    kalshi_opponent_american: venues.kalshi_opponent_american,
+    poly_opponent_american: venues.poly_opponent_american,
+    best_opponent_american: best,
+  };
+}
+
 function priceUnhedgedCombo({ venue, legs, getOurTrue, getYesProb, margin = DEFAULT_QUOTE_MULT } = {}) {
   const empty = { our_fair_american: null, our_quote_american: null, fairYes: null, quoteYes: null };
   if (!venue || !Array.isArray(legs) || !legs.length) return empty;
@@ -294,6 +335,8 @@ module.exports = {
   bestOpponentAmerican,
   bestOpponentEff,
   ourTrueFromOpponents,
+  venueOpponentAmericans,
+  annotateLegOdds,
   priceUnhedgedCombo,
   validProb,
   floor2,

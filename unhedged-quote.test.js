@@ -29,6 +29,8 @@ const {
   ourTrueFromOpponents,
   ourTrueProb,
   trueProb,
+  venueOpponentAmericans,
+  annotateLegOdds,
 } = require('./unhedged-quote');
 
 assert.strictEqual(isUnhedgedRfqLive({}), false);
@@ -281,6 +283,62 @@ function lookup(_venue, key) {
   assert.notStrictEqual(americanFromProb(soxTrue), -114);
   assert.notStrictEqual(americanFromProb(soxTrue), invertAmerican(soxLast.american));
   assert.strictEqual(invertAmerican(bestOpponentAmerican([marinersKalshi])), -118);
+}
+
+// Per-leg blotter odds: MLB GAME θ=0.035 vs NFL 0.07; missing venue → null;
+// fair_american = invert of best opponent American.
+{
+  const mariners = 0.45;
+  const mlbAm = feeIncludedAmerican(mariners, KALSHI_MLB_TAKER_THETA);
+  const nflAm = feeIncludedAmerican(mariners, KALSHI_TAKER_THETA);
+  const polyAm = feeIncludedAmerican(0.50, POLY_TAKER_THETA);
+  assert.strictEqual(mlbAm, 118);
+  assert.strictEqual(nflAm, 114);
+  assert.notStrictEqual(mlbAm, nflAm);
+
+  const mlbOnly = venueOpponentAmericans([
+    { venue: 'kalshi', yesProb: mariners, key: 'KXMLBGAME-SEA' },
+  ]);
+  assert.strictEqual(mlbOnly.kalshi_opponent_american, 118);
+  assert.strictEqual(mlbOnly.poly_opponent_american, null);
+  assert.strictEqual(mlbOnly.best_opponent_american, 118);
+
+  const nflOnly = venueOpponentAmericans([
+    { venue: 'kalshi', yesProb: mariners, key: 'KXNFLGAME-SEA' },
+  ]);
+  assert.strictEqual(nflOnly.kalshi_opponent_american, 114);
+  assert.strictEqual(nflOnly.poly_opponent_american, null);
+  assert.strictEqual(nflOnly.best_opponent_american, 114);
+
+  const polyOnly = venueOpponentAmericans([
+    { venue: 'polymarket', yesProb: 0.50 },
+  ]);
+  assert.strictEqual(polyOnly.kalshi_opponent_american, null);
+  assert.strictEqual(polyOnly.poly_opponent_american, polyAm);
+  assert.strictEqual(polyOnly.best_opponent_american, polyAm);
+
+  const none = venueOpponentAmericans([]);
+  assert.strictEqual(none.kalshi_opponent_american, null);
+  assert.strictEqual(none.poly_opponent_american, null);
+  assert.strictEqual(none.best_opponent_american, null);
+
+  const both = annotateLegOdds({ selection: 'bos', side: 'yes' }, [
+    { venue: 'kalshi', yesProb: mariners, key: 'KXMLBGAME-SEA' },
+    { venue: 'polymarket', yesProb: 0.50 },
+  ]);
+  assert.strictEqual(both.kalshi_opponent_american, 118);
+  assert.strictEqual(both.poly_opponent_american, polyAm);
+  assert.strictEqual(both.best_opponent_american, 118);
+  assert.strictEqual(both.fair_american, invertAmerican(both.best_opponent_american));
+  assert.strictEqual(both.fair_american, -118);
+  assert.strictEqual(both.fair_yes, ourTrueProb(118));
+
+  const missing = annotateLegOdds({ ticker: 'KXMLBGAME-A-CWS', side: 'yes' }, []);
+  assert.strictEqual(missing.fair_american, null);
+  assert.strictEqual(missing.fair_yes, null);
+  assert.strictEqual(missing.kalshi_opponent_american, null);
+  assert.strictEqual(missing.poly_opponent_american, null);
+  assert.strictEqual(missing.best_opponent_american, null);
 }
 
 // Inverse: WSH fair = sign-flip of fee-included ATL American, not WSH last.

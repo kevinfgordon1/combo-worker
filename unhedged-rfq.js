@@ -17,6 +17,11 @@
 // Kalshi vs Polymarket, then sign-flip. Do not use same-side last.
 // RFQ venue only selects the combo maker-fee wrap. Missing opponent → both
 // Americans stay null.
+// Each persisted leg also stores (null if missing, never invent, no backfill):
+//   fair_american — invert of best fee-included opponent American (UI Fair)
+//   kalshi_opponent_american / poly_opponent_american — venue opponent Americans
+//   best_opponent_american — max of the two (more plus / less minus)
+// Lookups reuse price-cache opponentQuotes. Do not bump RAM.
 // Pricing is sync from the in-memory cache — never a per-RFQ HTTP call.
 // Do not invent prices. Do not POST / confirm / fill.
 //
@@ -31,6 +36,7 @@ const {
   isUnhedgedRfqLive,
   quoteMultFromEnv,
   priceUnhedgedCombo,
+  annotateLegOdds,
 } = require('./unhedged-quote');
 
 const SCOPE_LEAGUES = new Set(['mlb', 'nfl']);
@@ -451,13 +457,14 @@ function classifyUnhedgedRfq(rfq, opts = {}) {
     env: opts.env,
     margin: opts.margin,
   });
+  const legs = Array.isArray(priced.legs) ? priced.legs : legsJson;
   return {
     persist: true,
     inScope: true,
     reason: status === 'started' ? 'game_started' : null,
     status,
     started: started && started.started ? started : null,
-    legs: legsJson,
+    legs,
     size,
     taker,
     our_fair_american: priced.our_fair_american,
@@ -467,11 +474,20 @@ function classifyUnhedgedRfq(rfq, opts = {}) {
   };
 }
 
+function annotatePersistedLegs(legs, priceCache) {
+  if (!Array.isArray(legs)) return [];
+  const quotesFn = priceCache && typeof priceCache.opponentQuotes === 'function'
+    ? (leg) => priceCache.opponentQuotes(leg)
+    : () => [];
+  return legs.map((leg) => annotateLegOdds(leg, quotesFn(leg)));
+}
+
 function priceClassified({ venue, legs, priceCache, getOurTrue, getYesProb, env, margin }) {
-  const empty = { our_fair_american: null, our_quote_american: null };
   if (priceCache && typeof priceCache.watch === 'function') {
     priceCache.watch(venue, legs);
   }
+  const annotated = annotatePersistedLegs(legs, priceCache);
+  const empty = { our_fair_american: null, our_quote_american: null, legs: annotated };
   const ourTrueFn = typeof getOurTrue === 'function'
     ? getOurTrue
     : (priceCache && typeof priceCache.getOurTrue === 'function'
@@ -494,6 +510,7 @@ function priceClassified({ venue, legs, priceCache, getOurTrue, getYesProb, env,
   return {
     our_fair_american: priced.our_fair_american,
     our_quote_american: priced.our_quote_american,
+    legs: annotated,
   };
 }
 

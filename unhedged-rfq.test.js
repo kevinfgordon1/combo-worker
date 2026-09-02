@@ -28,6 +28,7 @@ const {
   bestOpponentAmerican,
   quoteYesFromFair,
   productFair,
+  feeIncludedAmerican,
   KALSHI_MLB_TAKER_THETA,
   KALSHI_TAKER_THETA,
   POLY_TAKER_THETA,
@@ -101,6 +102,24 @@ function kalshiRfq(id, tickers, extra = {}) {
   });
 }
 
+function findLeg(legs, needle) {
+  const n = String(needle).toLowerCase();
+  return (legs || []).find((l) => {
+    const t = String(l.ticker || l.symbol || '').toLowerCase();
+    const s = String(l.selection || '').toLowerCase();
+    return t.includes(n) || s === n;
+  });
+}
+
+function assertNullLegOdds(leg) {
+  assert.ok(leg);
+  assert.strictEqual(leg.fair_american, null);
+  assert.strictEqual(leg.fair_yes, null);
+  assert.strictEqual(leg.kalshi_opponent_american, null);
+  assert.strictEqual(leg.poly_opponent_american, null);
+  assert.strictEqual(leg.best_opponent_american, null);
+}
+
 function pmRfq(id, symbols, extra = {}) {
   const comboLegs = symbols.map((s) => ({ symbol: s, side: 'SIDE_BUY' }));
   return {
@@ -130,6 +149,10 @@ function pmRfq(id, symbols, extra = {}) {
   assert.strictEqual(out.size.contracts, 10);
   assert.strictEqual(out.our_fair_american, null);
   assert.strictEqual(out.our_quote_american, null);
+  assert.strictEqual(out.legs[0].fair_american, null);
+  assert.strictEqual(out.legs[1].fair_american, null);
+  assert.strictEqual(out.legs[2].fair_american, null);
+  assertNullLegOdds(out.legs[0]);
 }
 
 // 3-leg MLB ML pass (Polymarket slugs — cheap, no metadata)
@@ -353,6 +376,10 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(rows[0].rfq_id, 'rfq-persist-pass');
     assert.strictEqual(rows[0].status, 'seen');
     assert.strictEqual(rows[0].our_fair_american, null);
+    assert.strictEqual(rows[0].legs.length, 3);
+    assertNullLegOdds(rows[0].legs[0]);
+    assertNullLegOdds(rows[0].legs[1]);
+    assertNullLegOdds(rows[0].legs[2]);
 
     const tennis = pmRfq('rfq-persist-tennis', [
       'aec-atp-djokovic-alcaraz-2026-08-14-djokovic',
@@ -404,6 +431,23 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(mlbPriced.our_fair_american, americanFromProb(mlbFair));
     assert.strictEqual(mlbPriced.our_quote_american, americanFromProb(mlbQuoteYes));
     assert.ok(mlbPriced.our_fair_american !== americanFromProb(0.60 * 0.55));
+    const wshLeg = findLeg(mlbPriced.legs, 'WSH');
+    const cwsLeg = findLeg(mlbPriced.legs, 'CWS');
+    assert.ok(wshLeg && cwsLeg);
+    const wshKalshiAm = feeIncludedAmerican(0.42, KALSHI_MLB_TAKER_THETA);
+    const cwsKalshiAm = feeIncludedAmerican(0.50, KALSHI_MLB_TAKER_THETA);
+    assert.strictEqual(wshLeg.kalshi_opponent_american, wshKalshiAm);
+    assert.strictEqual(wshLeg.poly_opponent_american, null);
+    assert.strictEqual(wshLeg.best_opponent_american, wshKalshiAm);
+    assert.strictEqual(wshLeg.fair_american, invertAmerican(wshKalshiAm));
+    assert.strictEqual(wshLeg.fair_american, americanFromProb(wshOur));
+    assert.strictEqual(wshLeg.fair_yes, wshOur);
+    assert.strictEqual(cwsLeg.kalshi_opponent_american, cwsKalshiAm);
+    assert.strictEqual(cwsLeg.poly_opponent_american, null);
+    assert.strictEqual(cwsLeg.best_opponent_american, cwsKalshiAm);
+    assert.strictEqual(cwsLeg.fair_american, invertAmerican(cwsKalshiAm));
+    assert.strictEqual(cwsLeg.fair_yes, cwsOur);
+    assert.ok(mlbPriced.our_fair_american !== wshLeg.fair_american);
 
     const nflOurA = ourTrueFromOpponentYes(0.50, KALSHI_TAKER_THETA);
     const nflOurB = ourTrueFromOpponentYes(0.50, KALSHI_TAKER_THETA);
@@ -432,6 +476,21 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(nflOut.persist, true);
     assert.strictEqual(nflOut.our_fair_american, americanFromProb(nflFair));
     assert.strictEqual(nflOut.our_quote_american, americanFromProb(nflQuoteYes));
+    const nflKc = findLeg(nflOut.row.legs, 'KC');
+    const nflPhi = findLeg(nflOut.row.legs, 'PHI');
+    assert.ok(nflKc && nflPhi);
+    const nflOppAm = feeIncludedAmerican(0.50, KALSHI_TAKER_THETA);
+    assert.notStrictEqual(
+      feeIncludedAmerican(0.50, KALSHI_MLB_TAKER_THETA),
+      nflOppAm,
+      'NFL GAME uses θ=0.07, not MLB 0.035'
+    );
+    assert.strictEqual(nflKc.kalshi_opponent_american, nflOppAm);
+    assert.strictEqual(nflKc.poly_opponent_american, null);
+    assert.strictEqual(nflKc.best_opponent_american, nflOppAm);
+    assert.strictEqual(nflKc.fair_american, invertAmerican(nflOppAm));
+    assert.strictEqual(nflKc.fair_american, americanFromProb(nflOurA));
+    assert.strictEqual(nflPhi.fair_american, americanFromProb(nflOurB));
 
     // Same inverse fair: NFL maker 0 vs MLB 0.035 still changes net / quote.
     const sameFairNfl = quoteYesFromFair(0.25, { feeRate: 0 });
@@ -466,6 +525,17 @@ function pmRfq(id, symbols, extra = {}) {
     });
     assert.strictEqual(polyPriced.our_fair_american, americanFromProb(polyFair));
     assert.strictEqual(polyPriced.our_quote_american, americanFromProb(polyQuoteYes));
+    const polyCws = findLeg(polyPriced.legs, 'cws');
+    const polyPit = findLeg(polyPriced.legs, 'pit');
+    assert.ok(polyCws && polyPit);
+    const polyOppAm = feeIncludedAmerican(0.50, POLY_TAKER_THETA);
+    assert.strictEqual(polyCws.kalshi_opponent_american, null, 'missing Kalshi venue → null');
+    assert.strictEqual(polyCws.poly_opponent_american, polyOppAm);
+    assert.strictEqual(polyCws.best_opponent_american, polyOppAm);
+    assert.strictEqual(polyCws.fair_american, invertAmerican(polyOppAm));
+    assert.strictEqual(polyCws.fair_american, americanFromProb(polyOurA));
+    assert.strictEqual(polyPit.fair_american, americanFromProb(polyOurB));
+    assert.strictEqual(polyPit.kalshi_opponent_american, null);
 
     const bestCache = createUnhedgedPriceCache({
       seed: {
@@ -492,6 +562,82 @@ function pmRfq(id, symbols, extra = {}) {
     const bestFair = productFair([bestWsh, cwsOur]);
     assert.strictEqual(bestPriced.our_fair_american, americanFromProb(bestFair));
     assert.ok(bestPriced.our_fair_american !== mlbPriced.our_fair_american);
+    const bestWshLeg = findLeg(bestPriced.legs, 'WSH');
+    const bestCwsLeg = findLeg(bestPriced.legs, 'CWS');
+    assert.ok(bestWshLeg && bestCwsLeg);
+    const bestKalshiAm = feeIncludedAmerican(0.50, KALSHI_MLB_TAKER_THETA);
+    const bestPolyAm = feeIncludedAmerican(0.40, POLY_TAKER_THETA);
+    assert.ok(bestPolyAm > bestKalshiAm);
+    assert.strictEqual(bestWshLeg.kalshi_opponent_american, bestKalshiAm);
+    assert.strictEqual(bestWshLeg.poly_opponent_american, bestPolyAm);
+    assert.strictEqual(bestWshLeg.best_opponent_american, bestPolyAm);
+    assert.strictEqual(bestWshLeg.fair_american, invertAmerican(bestPolyAm));
+    assert.strictEqual(bestWshLeg.fair_american, americanFromProb(bestWsh));
+    assert.strictEqual(bestCwsLeg.kalshi_opponent_american, cwsKalshiAm);
+    assert.strictEqual(bestCwsLeg.poly_opponent_american, null);
+    assert.strictEqual(bestCwsLeg.best_opponent_american, cwsKalshiAm);
+    assert.strictEqual(bestCwsLeg.fair_american, invertAmerican(cwsKalshiAm));
+
+    // 3-leg insert: each legs jsonb object stores invert + venue opponent Americans.
+    const detOpp = 0.45;
+    const bosOpp = 0.42;
+    const balOpp = 0.50;
+    const cwsLegOur = ourTrueFromOpponentYes(detOpp, KALSHI_MLB_TAKER_THETA);
+    const pitLegOur = ourTrueFromOpponentYes(bosOpp, KALSHI_MLB_TAKER_THETA);
+    const nyyLegOur = ourTrueFromOpponentYes(balOpp, KALSHI_MLB_TAKER_THETA);
+    const threeFair = productFair([cwsLegOur, pitLegOur, nyyLegOur]);
+    const threeQuoteYes = quoteYesFromFair(threeFair, { feeRate: 0.035 });
+    const threeCache = createUnhedgedPriceCache({
+      seed: {
+        kalshi: {
+          'KXMLBGAME-26AUG141840CWSDET-CWS': 0.55,
+          'KXMLBGAME-26AUG141840CWSDET-DET': detOpp,
+          'KXMLBGAME-26AUG141840BOSPIT-PIT': 0.60,
+          'KXMLBGAME-26AUG141840BOSPIT-BOS': bosOpp,
+          'KXMLBGAME-26AUG141840NYYBAL-NYY': 0.58,
+          'KXMLBGAME-26AUG141840NYYBAL-BAL': balOpp,
+        },
+      },
+    });
+    const threeRfq = kalshiRfq('rfq-mlb-3-leg-fair', [
+      'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+      'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
+      'KXMLBGAME-26AUG141840NYYBAL-NYY:yes',
+    ]);
+    const threeOut = await maybePersistUnhedged(threeRfq, {
+      venue: 'kalshi',
+      priceCache: threeCache,
+      now: Date.parse('2026-08-14T20:00:00Z'),
+      persist: async (row) => { rows.push(row); },
+    });
+    assert.strictEqual(threeOut.persist, true);
+    const threeRow = threeOut.row;
+    assert.strictEqual(threeRow.legs.length, 3);
+    const threeCws = findLeg(threeRow.legs, 'CWS');
+    const threePit = findLeg(threeRow.legs, 'PIT');
+    const threeNyy = findLeg(threeRow.legs, 'NYY');
+    assert.ok(threeCws && threePit && threeNyy);
+    const threeCwsOpp = feeIncludedAmerican(detOpp, KALSHI_MLB_TAKER_THETA);
+    const threePitOpp = feeIncludedAmerican(bosOpp, KALSHI_MLB_TAKER_THETA);
+    const threeNyyOpp = feeIncludedAmerican(balOpp, KALSHI_MLB_TAKER_THETA);
+    assert.strictEqual(threeCwsOpp, 118);
+    assert.notStrictEqual(feeIncludedAmerican(detOpp, KALSHI_TAKER_THETA), 118);
+    assert.strictEqual(threeCws.kalshi_opponent_american, threeCwsOpp);
+    assert.strictEqual(threeCws.poly_opponent_american, null);
+    assert.strictEqual(threeCws.best_opponent_american, threeCwsOpp);
+    assert.strictEqual(threeCws.fair_american, invertAmerican(threeCwsOpp));
+    assert.strictEqual(threeCws.fair_american, americanFromProb(cwsLegOur));
+    assert.strictEqual(threeCws.fair_yes, cwsLegOur);
+    assert.strictEqual(threePit.fair_american, invertAmerican(threePitOpp));
+    assert.strictEqual(threePit.fair_american, americanFromProb(pitLegOur));
+    assert.strictEqual(threePit.fair_yes, pitLegOur);
+    assert.strictEqual(threeNyy.fair_american, invertAmerican(threeNyyOpp));
+    assert.strictEqual(threeNyy.fair_american, americanFromProb(nyyLegOur));
+    assert.strictEqual(threeNyy.fair_yes, nyyLegOur);
+    assert.strictEqual(threeRow.our_fair_american, americanFromProb(threeFair));
+    assert.strictEqual(threeRow.our_quote_american, americanFromProb(threeQuoteYes));
+    assert.ok(threeRow.our_fair_american !== threeCws.fair_american);
+    assert.ok(threeRow.our_fair_american !== americanFromProb(0.55 * 0.60 * 0.58));
 
     const halfCache = createUnhedgedPriceCache({
       seed: { kalshi: { 'KXMLBGAME-26AUG141840CWSDET-CWS': 0.5 } },
@@ -507,6 +653,36 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(missingPx.persist, true);
     assert.strictEqual(missingPx.our_fair_american, null);
     assert.strictEqual(missingPx.our_quote_american, null);
+    assertNullLegOdds(missingPx.legs[0]);
+    assertNullLegOdds(missingPx.legs[1]);
+
+    const halfOppCache = createUnhedgedPriceCache({
+      seed: {
+        kalshi: {
+          'KXMLBGAME-26AUG141840CWSDET-CWS': 0.55,
+          'KXMLBGAME-26AUG141840CWSDET-DET': 0.45,
+        },
+      },
+    });
+    const halfOpp = classifyUnhedgedRfq(kalshiRfq('rfq-half-opp', [
+      'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+      'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
+    ]), {
+      venue: 'kalshi',
+      priceCache: halfOppCache,
+      now: Date.parse('2026-08-14T20:00:00Z'),
+    });
+    assert.strictEqual(halfOpp.persist, true);
+    assert.strictEqual(halfOpp.our_fair_american, null);
+    assert.strictEqual(halfOpp.our_quote_american, null);
+    const halfCws = findLeg(halfOpp.legs, 'CWS');
+    const halfPit = findLeg(halfOpp.legs, 'PIT');
+    const halfCwsOpp = feeIncludedAmerican(0.45, KALSHI_MLB_TAKER_THETA);
+    assert.strictEqual(halfCws.kalshi_opponent_american, halfCwsOpp);
+    assert.strictEqual(halfCws.poly_opponent_american, null);
+    assert.strictEqual(halfCws.best_opponent_american, halfCwsOpp);
+    assert.strictEqual(halfCws.fair_american, invertAmerican(halfCwsOpp));
+    assertNullLegOdds(halfPit);
 
     const sameSideOnly = createUnhedgedPriceCache({
       seed: {
@@ -527,6 +703,8 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(noOpp.persist, true);
     assert.strictEqual(noOpp.our_fair_american, null);
     assert.strictEqual(noOpp.our_quote_american, null);
+    assertNullLegOdds(noOpp.legs[0]);
+    assertNullLegOdds(noOpp.legs[1]);
 
     // Insert seen, then a later fill updates the same row (taker_* stays).
     const store = new Map();

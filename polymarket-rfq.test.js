@@ -1097,6 +1097,8 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     ourTrueFromOpponentYes,
     quoteYesFromFair,
     productFair,
+    invertAmerican,
+    feeIncludedAmerican,
     POLY_TAKER_THETA,
   } = require('./unhedged-quote');
   const pricedRows = [];
@@ -1164,6 +1166,18 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   const polyQuoteYes = quoteYesFromFair(polyFair, { feeRate: 0 });
   assert.strictEqual(priced.our_quote_american, americanFromProb(polyQuoteYes));
   assert.ok(priced.our_fair_american !== americanFromProb(0.61 * 0.62 * 0.63));
+  assert.strictEqual(priced.legs.length, 3);
+  const polyLegAm = invertAmerican(feeIncludedAmerican(0.5, POLY_TAKER_THETA));
+  const polyOppAm = feeIncludedAmerican(0.5, POLY_TAKER_THETA);
+  assert.strictEqual(priced.legs[0].fair_american, polyLegAm);
+  assert.strictEqual(priced.legs[1].fair_american, polyLegAm);
+  assert.strictEqual(priced.legs[2].fair_american, polyLegAm);
+  assert.strictEqual(priced.legs[0].fair_yes, polyLegOur);
+  assert.strictEqual(priced.legs[0].kalshi_opponent_american, null);
+  assert.strictEqual(priced.legs[0].poly_opponent_american, polyOppAm);
+  assert.strictEqual(priced.legs[0].best_opponent_american, polyOppAm);
+  assert.strictEqual(priced.legs[0].fair_american, invertAmerican(priced.legs[0].best_opponent_american));
+  assert.ok(priced.our_fair_american !== polyLegAm);
   pricedLoop.stop();
 
   const parsed = parsePrivateMessage(JSON.stringify({
