@@ -4,7 +4,10 @@ const {
   createUnhedgedPriceCache,
   kalshiYesProb,
   pmYesProb,
+  pmTeamYesProbs,
   isPmFullGameMl,
+  isPmGameSlug,
+  pmGameSlugOf,
   pmMlSlugsFromKalshiLeg,
 } = require('./unhedged-price-cache');
 const { classifyUnhedgedRfq } = require('./unhedged-rfq');
@@ -31,6 +34,8 @@ assert.strictEqual(kalshiYesProb({}), null);
 // Inverse of parsePmUnhedgedSlug: codes + both orders, never spoken names.
 {
   const cws = pmMlSlugsFromKalshiLeg({ ticker: 'KXMLBGAME-26AUG141840CWSDET-CWS' });
+  assert.ok(cws.includes('aec-mlb-cws-det-2026-08-14'));
+  assert.ok(cws.includes('aec-mlb-det-cws-2026-08-14'));
   assert.ok(cws.includes('aec-mlb-cws-det-2026-08-14-cws'));
   assert.ok(cws.includes('aec-mlb-cws-det-2026-08-14-det'));
   assert.ok(cws.includes('aec-mlb-det-cws-2026-08-14-cws'));
@@ -38,11 +43,14 @@ assert.strictEqual(kalshiYesProb({}), null);
   assert.ok(!cws.some((s) => /white.?sox|tigers|reds/i.test(s)));
 
   const wsh = pmMlSlugsFromKalshiLeg({ ticker: 'KXMLBGAME-26AUG141840WSHATL-WSH' });
+  assert.ok(wsh.includes('aec-mlb-wsh-atl-2026-08-14'));
   assert.ok(wsh.includes('aec-mlb-wsh-atl-2026-08-14-wsh'));
   assert.ok(wsh.includes('aec-mlb-wsh-atl-2026-08-14-atl'));
   assert.ok(!wsh.some((s) => /nationals|braves/i.test(s)));
 
   const cin = pmMlSlugsFromKalshiLeg({ ticker: 'KXMLBGAME-26SEP021840CINCHC-CIN' });
+  assert.ok(cin.includes('aec-mlb-cin-chc-2026-09-02'));
+  assert.ok(cin.includes('aec-mlb-chc-cin-2026-09-02'));
   assert.ok(cin.includes('aec-mlb-cin-chc-2026-09-02-cin'));
   assert.ok(cin.includes('aec-mlb-cin-chc-2026-09-02-chc'));
   assert.ok(cin.includes('aec-mlb-chc-cin-2026-09-02-cin'));
@@ -50,6 +58,8 @@ assert.strictEqual(kalshiYesProb({}), null);
   assert.ok(!cin.some((s) => /reds|cubs/i.test(s)));
 
   const nfl = pmMlSlugsFromKalshiLeg({ ticker: 'KXNFLGAME-26SEP071330BUFKC-KC' });
+  assert.ok(nfl.includes('aec-nfl-buf-kc-2026-09-07'));
+  assert.ok(nfl.includes('aec-nfl-kc-buf-2026-09-07'));
   assert.ok(nfl.includes('aec-nfl-buf-kc-2026-09-07-kc'));
   assert.ok(nfl.includes('aec-nfl-buf-kc-2026-09-07-buf'));
   assert.ok(nfl.includes('aec-nfl-kc-buf-2026-09-07-kc'));
@@ -59,10 +69,17 @@ assert.strictEqual(kalshiYesProb({}), null);
 }
 
 assert.ok(isPmFullGameMl({ slug: 'aec-mlb-cws-det-2026-08-14-cws' }, 'aec-mlb-cws-det-2026-08-14-cws'));
+assert.ok(isPmFullGameMl({ slug: 'aec-mlb-bos-nyy-2026-08-30' }, 'aec-mlb-bos-nyy-2026-08-30'));
 assert.ok(!isPmFullGameMl({
   slug: 'asc-mlb-cws-det-2026-08-14-cws',
   sportsMarketType: 'SPORTS_MARKET_TYPE_SPREAD',
 }, 'asc-mlb-cws-det-2026-08-14-cws'));
+
+assert.ok(isPmGameSlug('aec-mlb-cin-chc-2026-09-02'));
+assert.ok(isPmGameSlug('aec-mlb-bos-nyy-2026-08-30'));
+assert.ok(!isPmGameSlug('aec-mlb-cin-chc-2026-09-02-cin'));
+assert.strictEqual(pmGameSlugOf('aec-mlb-cin-chc-2026-09-02-cin'), 'aec-mlb-cin-chc-2026-09-02');
+assert.strictEqual(pmGameSlugOf('aec-mlb-cin-chc-2026-09-02'), 'aec-mlb-cin-chc-2026-09-02');
 
 assert.strictEqual(pmYesProb({
   bestBidQuote: { value: '0.41', currency: 'USD' },
@@ -72,6 +89,42 @@ assert.strictEqual(pmYesProb({
   marketSides: [{ long: true, price: '0.61' }],
 }), 0.61);
 assert.strictEqual(pmYesProb({ outcomePrices: '["0.33","0.67"]' }), 0.33);
+
+{
+  const two = pmTeamYesProbs({
+    slug: 'aec-mlb-cin-chc-2026-09-02',
+    metadata: {
+      market_sport_type: 'baseball_team_full_game_winner',
+      event_start_time: '2026-09-02T22:40:00Z',
+      long_participant_id: 'mlb-cin',
+      short_participant_id: 'mlb-chc',
+    },
+    marketSides: [
+      { long: true, team: { abbreviation: 'CIN', league: 'mlb' }, price: '0.46' },
+      { long: false, team: { abbreviation: 'CHC', league: 'mlb' }, price: '0.53' },
+    ],
+    outcomePrices: '["0.46","0.53"]',
+  }, 'aec-mlb-cin-chc-2026-09-02');
+  assert.ok(two && two.length >= 2);
+  const cinYes = two.find((r) => r.team === 'cin');
+  const chcYes = two.find((r) => r.team === 'chc');
+  assert.strictEqual(cinYes.yesProb, 0.46);
+  assert.strictEqual(chcYes.yesProb, 0.53);
+  assert.ok(Math.abs((cinYes.yesProb + chcYes.yesProb) - 1) > 1e-9, 'must not invent 1-p');
+
+  const viaOutcomes = pmTeamYesProbs({
+    slug: 'aec-mlb-cin-chc-2026-09-02',
+    metadata: {
+      market_sport_type: 'baseball_team_full_game_winner',
+      event_start_time: '2026-09-02T22:40:00Z',
+      long_participant_id: 'mlb-cin',
+      short_participant_id: 'mlb-chc',
+    },
+    outcomePrices: '["0.46","0.53"]',
+  }, 'aec-mlb-cin-chc-2026-09-02');
+  assert.strictEqual(viaOutcomes.find((r) => r.team === 'cin').yesProb, 0.46);
+  assert.strictEqual(viaOutcomes.find((r) => r.team === 'chc').yesProb, 0.53);
+}
 
 const cache = createUnhedgedPriceCache({
   seed: {
@@ -125,7 +178,7 @@ live.watch('polymarket', [{ symbol: 'aec-mlb-cws-det-2026-08-14-cws' }]);
 
 return live.refresh().then(async () => {
   assert.ok(kalshiCalls >= 2, 'one GET per in-scope Kalshi ML series (MLB/NFL)');
-  assert.strictEqual(pmCalls, 2, 'watch RFQ slug + derived opponent aec-*');
+  assert.strictEqual(pmCalls, 3, 'watch RFQ slug + opponent + game slug');
   assert.strictEqual(live.getYesProb('kalshi', 'KXMLBGAME-26AUG141840CWSDET-CWS'), 0.58);
   assert.strictEqual(live.getYesProb('kalshi', 'KXNFLGAME-26SEP071330BUFKC-KC'), 0.61);
   assert.strictEqual(live.getYesProb('polymarket', 'aec-mlb-cws-det-2026-08-14-cws'), 0.45);
@@ -425,11 +478,13 @@ return live.refresh().then(async () => {
     { symbol: 'aec-mlb-bos-pit-2026-08-14-pit' },
   ]);
   await polyOnly.refresh();
-  assert.strictEqual(polyOnlyCalls, 4, 'each Poly slug + derived opponent');
+  assert.strictEqual(polyOnlyCalls, 6, 'each Poly slug + opponent + game slug');
   assert.ok(polyOnly._pmWatch.has('aec-mlb-cws-det-2026-08-14-cws'));
   assert.ok(polyOnly._pmWatch.has('aec-mlb-cws-det-2026-08-14-det'));
+  assert.ok(polyOnly._pmWatch.has('aec-mlb-cws-det-2026-08-14'));
   assert.ok(polyOnly._pmWatch.has('aec-mlb-bos-pit-2026-08-14-pit'));
   assert.ok(polyOnly._pmWatch.has('aec-mlb-bos-pit-2026-08-14-bos'));
+  assert.ok(polyOnly._pmWatch.has('aec-mlb-bos-pit-2026-08-14'));
   const polyQuotes = polyOnly.opponentQuotes({
     symbol: 'aec-mlb-cws-det-2026-08-14-cws',
     league: 'mlb',
@@ -455,10 +510,109 @@ return live.refresh().then(async () => {
   await cinCache.refresh();
   const cinWatch = [...cinCache._pmWatch];
   assert.deepStrictEqual([...cinFetched].sort(), cinWatch.sort());
+  assert.ok(cinWatch.includes('aec-mlb-cin-chc-2026-09-02'));
+  assert.ok(cinWatch.includes('aec-mlb-chc-cin-2026-09-02'));
   assert.ok(cinWatch.includes('aec-mlb-cin-chc-2026-09-02-cin'));
   assert.ok(cinWatch.includes('aec-mlb-chc-cin-2026-09-02-cin'));
   assert.ok(!cinWatch.some((s) => /reds|cubs/i.test(s)));
   cinCache.stop();
+
+  function twoOutcomeGame(slug, longTeam, shortTeam, longYes, shortYes) {
+    return {
+      slug,
+      metadata: {
+        market_sport_type: 'baseball_team_full_game_winner',
+        event_start_time: '2026-09-02T22:40:00Z',
+        long_participant_id: `mlb-${longTeam}`,
+        short_participant_id: `mlb-${shortTeam}`,
+      },
+      marketSides: [
+        { long: true, team: { abbreviation: longTeam, league: 'mlb' }, price: String(longYes) },
+        { long: false, team: { abbreviation: shortTeam, league: 'mlb' }, price: String(shortYes) },
+      ],
+      outcomePrices: JSON.stringify([String(longYes), String(shortYes)]),
+    };
+  }
+
+  const cinKalshiLeg = {
+    ticker: 'KXMLBGAME-26SEP021840CINCHC-CIN',
+    league: 'mlb',
+    selection: 'cin',
+    teams: ['cin', 'chc'],
+    date: '2026-09-02',
+    side: 'yes',
+  };
+
+  // Suffixed 404 + production game slug hit → per-team YES, Poly opponent set.
+  const gameFetched = [];
+  const gameHit = createUnhedgedPriceCache({
+    intervalMs: 60 * 60 * 1000,
+    seed: {
+      kalshi: {
+        'KXMLBGAME-26SEP021840CINCHC-CIN': 0.47,
+        'KXMLBGAME-26SEP021840CINCHC-CHC': 0.51,
+      },
+    },
+    fetchPmMarket: async (slug) => {
+      gameFetched.push(slug);
+      if (slug === 'aec-mlb-cin-chc-2026-09-02') {
+        return twoOutcomeGame(slug, 'cin', 'chc', 0.46, 0.53);
+      }
+      return null;
+    },
+  });
+  gameHit.watch('kalshi', [{ ticker: 'KXMLBGAME-26SEP021840CINCHC-CIN', side: 'yes' }]);
+  assert.ok(gameHit._pmWatch.has('aec-mlb-cin-chc-2026-09-02'));
+  assert.ok(gameHit._pmWatch.has('aec-mlb-chc-cin-2026-09-02'));
+  const gameRefresh = await gameHit.refresh();
+  assert.ok(gameRefresh.pmMiss > 0);
+  assert.ok(gameFetched.includes('aec-mlb-cin-chc-2026-09-02'));
+  assert.ok(gameFetched.some((s) => s.endsWith('-cin')), 'still probes suffixed candidates');
+  const gameQuotes = gameHit.opponentQuotes(cinKalshiLeg);
+  assert.ok(gameQuotes.some((q) => q.venue === 'polymarket' && q.yesProb === 0.53 && q.theta === POLY_TAKER_THETA));
+  assert.ok(!gameQuotes.some((q) => q.venue === 'polymarket' && q.yesProb === 0.46), 'CIN last is not opponent');
+  const gameOdds = annotateLegOdds(cinKalshiLeg, gameQuotes);
+  assert.strictEqual(gameOdds.poly_opponent_american, feeIncludedAmerican(0.53, POLY_TAKER_THETA));
+  assert.strictEqual(gameOdds.kalshi_opponent_american, feeIncludedAmerican(0.51, KALSHI_MLB_TAKER_THETA));
+  const pricedGame = classifyUnhedgedRfq(normalizeRfq({
+    type: 'rfq_created',
+    msg: {
+      id: 'rfq-cin-game-slug',
+      contracts_fp: '10.00',
+      mve_collection_ticker: 'KXMVE-X',
+      mve_selected_legs: [
+        { side: 'yes', market_ticker: 'KXMLBGAME-26SEP021840CINCHC-CIN' },
+        { side: 'yes', market_ticker: 'KXMLBGAME-26SEP021840ATLPHI-ATL' },
+      ],
+    },
+  }), {
+    venue: 'kalshi',
+    priceCache: gameHit,
+    now: Date.parse('2026-09-02T20:00:00Z'),
+  });
+  const cinRow = pricedGame.legs && pricedGame.legs.find((l) => /CIN$/i.test(l.ticker));
+  assert.ok(cinRow);
+  assert.strictEqual(cinRow.poly_opponent_american, gameOdds.poly_opponent_american);
+  gameHit.stop();
+
+  // Total miss stays null (no invent).
+  const allMiss = createUnhedgedPriceCache({
+    intervalMs: 60 * 60 * 1000,
+    seed: {
+      kalshi: {
+        'KXMLBGAME-26SEP021840CINCHC-CIN': 0.47,
+        'KXMLBGAME-26SEP021840CINCHC-CHC': 0.51,
+      },
+    },
+    fetchPmMarket: async () => null,
+  });
+  allMiss.watch('kalshi', [{ ticker: 'KXMLBGAME-26SEP021840CINCHC-CIN', side: 'yes' }]);
+  const missRefresh = await allMiss.refresh();
+  assert.ok(missRefresh.pmMiss > 0);
+  const missOdds = annotateLegOdds(cinKalshiLeg, allMiss.opponentQuotes(cinKalshiLeg));
+  assert.strictEqual(missOdds.poly_opponent_american, null);
+  assert.strictEqual(missOdds.kalshi_opponent_american, feeIncludedAmerican(0.51, KALSHI_MLB_TAKER_THETA));
+  allMiss.stop();
 
   console.log('unhedged-price-cache.test.js ok');
 }).catch((e) => {

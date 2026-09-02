@@ -3,18 +3,29 @@
 // RFQ path. Kalshi: signed GET /markets for KXMLBGAME / KXNFLGAME (NCAAF is
 // out of unhedged scope). Polymarket: getMarketBySlug for watched aec-* slugs.
 // Poly RFQ legs add their symbol; Kalshi MLB/NFL ML legs also watch synthesized
-// aec slugs for both teams (pick + opponent, both team orders). Watch-list
-// only — do not crawl the Poly RFQ firehose.
+// game slugs aec-{mlb|nfl}-{t1}-{t2}-{YYYY-MM-DD} (both team orders) plus
+// suffixed aec-…-{pick} variants if US lists them. Watch-list only — do not
+// crawl the Poly RFQ firehose.
+// Production US full-game ML is one slug with two team outcomes
+// (long_participant_id = which YES pays). Ingest splits those into per-team
+// YES — never one mid-market price. Suffixed 1-team slugs stay as-is.
 // The Odds API is not the quote clock.
 //
 // Fair lookups use the *opponent* YES (other ticker in the same Kalshi event;
-// other aec-* ML in the same Polymarket game). Hitting that ask is taker:
+// other team's Poly YES in the same game). Hitting that ask is taker:
 // convert raw YES with the series taker coeff (MLB 0.035, NFL 0.07,
-// Poly 0.06). ourTrue is the sign-flip of the best Kalshi/Poly fee-included
-// opponent American. Same-side last is never fair.
+// Poly 0.06, no rebate). ourTrue is the sign-flip of the best Kalshi/Poly
+// fee-included opponent American. Same-side last is never fair.
 'use strict';
 
-const { normTeam, kalshiTickerPieces } = require('./leg-identity');
+const {
+  normTeam,
+  kalshiTickerPieces,
+  identityFromMarket,
+  participantCode,
+  teamsFromRetailSides,
+  unwrapMarket,
+} = require('./leg-identity');
 const { parseKalshiUnhedgedTicker, parsePmUnhedgedSlug } = require('./unhedged-rfq');
 const { ourTrueFromOpponents, takerThetaForVenue } = require('./unhedged-quote');
 
@@ -109,6 +120,92 @@ function pmYesProb(market) {
   );
 }
 
+function sideTeamCode(side) {
+  if (!side || typeof side !== 'object') return '';
+  const team = side.team || {};
+  return String(team.abbreviation || team.displayAbbreviation || side.identifier || '').trim().toLowerCase();
+}
+
+function sideYesProb(side) {
+  if (!side || typeof side !== 'object') return null;
+  return pickYesProb(
+    amountValue(side.bestBidQuote) != null ? amountValue(side.bestBidQuote) : (side.bestBid != null ? side.bestBid : side.bid),
+    amountValue(side.bestAskQuote) != null ? amountValue(side.bestAskQuote) : (side.bestAsk != null ? side.bestAsk : side.ask),
+    side.lastTradePrice != null ? side.lastTradePrice : side.last,
+    [
+      amountValue(side.quote) != null ? amountValue(side.quote) : side.price,
+    ]
+  );
+}
+
+// Production US full-game ML: one slug, two team outcomes. long_participant_id
+// (and marketSides[].long) is the team whose YES is outcomes[0] / the book.
+// Reuses identityFromMarket / teamsFromRetailSides — same Retail payload as
+// getMarketBySlug. Do not invent 1-p for the other team.
+function pmTeamYesProbs(market, slug) {
+  if (!market || typeof market !== 'object') return null;
+  const raw = unwrapMarket(market) || market;
+  const sides = Array.isArray(raw.marketSides)
+    ? raw.marketSides
+    : (Array.isArray(raw.market_sides) ? raw.market_sides : []);
+  const outcomes = parseOutcomePrices(raw.outcomePrices);
+  const meta = raw.metadata && typeof raw.metadata === 'object' ? raw.metadata : {};
+  const got = identityFromMarket(raw, 'yes');
+  const id = got && got.identity;
+  const retail = teamsFromRetailSides(raw);
+  const slugParsed = parsePmUnhedgedSlug(slug || raw.slug, 'yes');
+  const league = (id && id.league)
+    || retail.league
+    || (slugParsed && slugParsed.league);
+  const date = (id && id.date) || (slugParsed && slugParsed.date);
+  const longId = meta.long_participant_id || raw.long_participant_id;
+  const shortId = meta.short_participant_id || raw.short_participant_id;
+  const longTeam = (id && id.selection) || participantCode(longId) || retail.long;
+  const shortFromId = id && Array.isArray(id.teams)
+    ? id.teams.find((t) => normTeam(league, t) !== normTeam(league, longTeam))
+    : '';
+  const shortFromRetail = (retail.teams || []).find((t) => (
+    normTeam(league, t) !== normTeam(league, longTeam)
+  ));
+  const shortTeam = participantCode(shortId) || shortFromId || shortFromRetail;
+  const teamsForKey = (id && id.teams)
+    || [...new Set([longTeam, shortTeam].filter(Boolean).map((t) => String(t).toLowerCase()))];
+
+  const rows = [];
+  const seen = new Set();
+  function addRow(team, yesProb) {
+    const t = String(team || '').trim().toLowerCase();
+    const p = asProb(yesProb);
+    if (!t || /^\d+$/.test(t) || p == null) return;
+    const norm = league ? normTeam(league, t) : t;
+    if (!norm || seen.has(norm)) return;
+    seen.add(norm);
+    rows.push({ team: t, yesProb: p, league, date, teams: teamsForKey });
+  }
+
+  if (sides.length >= 2) {
+    for (const s of sides) {
+      let team = sideTeamCode(s);
+      if (!team && s && s.long) team = longTeam;
+      if (!team && s && !s.long) team = shortTeam;
+      let yes = sideYesProb(s);
+      if (yes == null && s && s.long) {
+        yes = asProb(outcomes[0]) != null ? asProb(outcomes[0]) : pmYesProb(raw);
+      }
+      if (yes == null && s && !s.long) yes = asProb(outcomes[1]);
+      addRow(team, yes);
+    }
+  }
+  if (rows.length >= 2) return rows;
+
+  if (longTeam && shortTeam && normTeam(league, longTeam) !== normTeam(league, shortTeam)) {
+    const longYes = asProb(outcomes[0]) != null ? asProb(outcomes[0]) : pmYesProb(raw);
+    addRow(longTeam, longYes);
+    addRow(shortTeam, asProb(outcomes[1]));
+  }
+  return rows.length >= 2 ? rows : null;
+}
+
 function refreshMsFromEnv(env = process.env) {
   const n = numOrNull(env && env.UNHEDGED_PRICE_REFRESH_MS);
   if (n == null) return DEFAULT_REFRESH_MS;
@@ -143,6 +240,30 @@ function pmGamePrefix(slug) {
   return i > 0 ? key.slice(0, i) : key;
 }
 
+// Production US ML slug is pair+date (no pick). Last token is a team only on
+// the suffixed test / RFQ shape. Date fragments (02) are not teams.
+function isPmGameSlug(slug) {
+  const key = normPmKey(slug);
+  if (!key.startsWith(PM_ML_PREFIX)) return false;
+  const parsed = parsePmUnhedgedSlug(key, 'yes');
+  if (!parsed || parsed.skip) return false;
+  const i = key.lastIndexOf('-');
+  if (i <= 0) return true;
+  const last = key.slice(i + 1);
+  if (!last || /^\d+$/.test(last)) return true;
+  const league = String(parsed.league || '').toLowerCase();
+  const lastNorm = normTeam(league, last);
+  return !(parsed.teams || []).some((t) => t === last || normTeam(league, t) === lastNorm);
+}
+
+function pmGameSlugOf(slug) {
+  const key = normPmKey(slug);
+  if (!key.startsWith(PM_ML_PREFIX)) return null;
+  if (isPmGameSlug(key)) return key;
+  const i = key.lastIndexOf('-');
+  return i > 0 ? key.slice(0, i) : key;
+}
+
 function gameKeyFromParsed(parsed) {
   if (!parsed || !parsed.league || !parsed.date) return null;
   const league = String(parsed.league).toLowerCase();
@@ -162,10 +283,11 @@ function opponentTeamOf(parsed) {
   return others.length === 1 ? others[0] : null;
 }
 
-// Inverse of parsePmUnhedgedSlug for US sports ML: aec-{league}-{t1}-{t2}-{date}-{pick}.
-// Codes (cin), not spoken names (reds). Team order is not in the ticker identity
-// (teams are sorted), so watch both orders. Also watch the identity-normalized
-// pair (chw→cws) when it differs from the raw ticker codes.
+// Inverse of parsePmUnhedgedSlug for US sports ML.
+// Production: aec-{league}-{t1}-{t2}-{YYYY-MM-DD} (no pick). Suffixed
+// aec-…-{pick} stay as extra candidates. Codes (cin), not spoken names.
+// Team order is not in the ticker identity, so watch both orders. Also
+// watch the identity-normalized pair (chw→cws) when it differs from raw codes.
 function addPmMlPairSlugs(out, league, date, teamA, teamB) {
   const a = String(teamA || '').toLowerCase();
   const b = String(teamB || '').toLowerCase();
@@ -173,8 +295,11 @@ function addPmMlPairSlugs(out, league, date, teamA, teamB) {
   const dt = String(date || '');
   if (!a || !b || a === b || (lg !== 'mlb' && lg !== 'nfl') || !/^\d{4}-\d{2}-\d{2}$/.test(dt)) return;
   for (const [left, right] of [[a, b], [b, a]]) {
+    const game = `aec-${lg}-${left}-${right}-${dt}`;
+    const parsedGame = parsePmUnhedgedSlug(game, 'yes');
+    if (parsedGame && !parsedGame.skip) out.add(game);
     for (const pick of [left, right]) {
-      const slug = `aec-${lg}-${left}-${right}-${dt}-${pick}`;
+      const slug = `${game}-${pick}`;
       const parsed = parsePmUnhedgedSlug(slug, 'yes');
       if (parsed && !parsed.skip) out.add(slug);
     }
@@ -328,7 +453,7 @@ function createUnhedgedPriceCache({
     addToSetMap(kalshiGames, entry.gameKey, key);
   }
 
-  function writePm(slug, yesProb) {
+  function writePm(slug, yesProb, extra) {
     const key = normPmKey(slug);
     if (!key) return;
     const prev = polymarket.get(key);
@@ -339,17 +464,20 @@ function createUnhedgedPriceCache({
       return;
     }
     const parsed = parsePmUnhedgedSlug(key, 'yes');
-    const league = parsed && parsed.league;
+    const league = (extra && extra.league) || (parsed && parsed.league);
+    const date = (extra && extra.date) || (parsed && parsed.date);
+    const teams = (extra && extra.teams) || (parsed && parsed.teams);
+    const selection = (extra && extra.selection) || (parsed && parsed.selection);
     const entry = {
       yesProb: p,
       at: now(),
-      gamePrefix: pmGamePrefix(key),
-      gameKey: parsed ? gameKeyFromParsed(parsed) : null,
-      selection: parsed && parsed.selection,
-      selectionNorm: parsed && league ? normTeam(league, parsed.selection) : null,
+      gamePrefix: isPmGameSlug(key) ? key : pmGamePrefix(key),
+      gameKey: gameKeyFromParsed({ league, date, teams, selection }),
+      selection,
+      selectionNorm: league && selection ? normTeam(league, selection) : null,
       league,
-      date: parsed && parsed.date,
-      teams: parsed && parsed.teams,
+      date,
+      teams,
     };
     polymarket.set(key, entry);
     addToSetMap(pmByPrefix, entry.gamePrefix, key);
@@ -380,9 +508,30 @@ function createUnhedgedPriceCache({
   }
 
   function ingestPmMarket(slug, market) {
-    const key = normPmKey(slug || (market && market.slug));
+    const requested = normPmKey(slug);
+    const fromMarket = normPmKey(market && market.slug);
+    const key = (fromMarket && fromMarket.startsWith(PM_ML_PREFIX)) ? fromMarket : requested;
     if (!key || !key.startsWith(PM_ML_PREFIX)) return false;
     if (!isPmFullGameMl(market, key)) return false;
+    const gameSlug = pmGameSlugOf(key);
+    // Game slug (no pick): two team outcomes → store each team's YES.
+    // Suffixed RFQ/test slugs stay one write via pmYesProb.
+    if (gameSlug && gameSlug === key) {
+      const teamRows = pmTeamYesProbs(market, key);
+      if (!teamRows || teamRows.length < 2) return false;
+      let n = 0;
+      for (const row of teamRows) {
+        if (!row.team || row.yesProb == null) continue;
+        writePm(`${gameSlug}-${row.team}`, row.yesProb, {
+          selection: row.team,
+          league: row.league,
+          date: row.date,
+          teams: row.teams,
+        });
+        n += 1;
+      }
+      return n >= 2;
+    }
     const p = pmYesProb(market);
     if (p == null) return false;
     writePm(key, p);
@@ -502,6 +651,8 @@ function createUnhedgedPriceCache({
       const pmKey = normPmKey(leg && (leg.symbol || (venue === 'polymarket' ? leg.ticker : '')));
       if (pmKey) {
         addWatch(pmKey);
+        const game = pmGameSlugOf(pmKey);
+        if (game) addWatch(game);
         const opp = derivePmOpponentSlug(pmKey, leg);
         if (opp) addWatch(opp);
         const prefix = pmGamePrefix(pmKey);
@@ -523,8 +674,8 @@ function createUnhedgedPriceCache({
         }
       }
       // Kalshi RFQ legs have ticker (KXMLBGAME-…-CIN), not symbol. Synthesize
-      // aec-* ML slugs for both teams so refreshPm fills polymarket + pmGames.
-      // Do not crawl the Poly firehose — only these per-leg candidates.
+      // game slugs (both orders) plus suffixed pick variants so refreshPm
+      // fills per-team YES. Do not crawl the Poly firehose.
       for (const s of pmMlSlugsFromKalshiLeg(leg)) addWatch(s);
     }
     if (added && timer) scheduleSoon();
@@ -557,28 +708,34 @@ function createUnhedgedPriceCache({
   }
 
   async function refreshPm() {
-    if (typeof pmFetch !== 'function' || !pmWatch.size) return;
+    if (typeof pmFetch !== 'function' || !pmWatch.size) return 0;
     const slugs = [...pmWatch];
+    let misses = 0;
     await Promise.all(slugs.map(async (slug) => {
       try {
         const market = await pmFetch(slug);
-        if (market) ingestPmMarket(slug, market);
+        if (!market || !ingestPmMarket(slug, market)) misses += 1;
       } catch (e) {
+        misses += 1;
         console.error('[UNHEDGED] pm market', slug, e && e.message);
       }
     }));
+    return misses;
   }
 
   async function refresh() {
     if (refreshing) return { skipped: true };
     refreshing = true;
     try {
-      await Promise.all([refreshKalshi(), refreshPm()]);
+      const [, pmMiss] = await Promise.all([refreshKalshi(), refreshPm()]);
+      const missCount = pmMiss || 0;
+      if (missCount) console.log(`[UNHEDGED] pm miss ${missCount}`);
       return {
         skipped: false,
         kalshi: kalshi.size,
         polymarket: polymarket.size,
         watching: pmWatch.size,
+        pmMiss: missCount,
       };
     } finally {
       refreshing = false;
@@ -644,4 +801,7 @@ module.exports = {
   gameKeyFromParsed,
   opponentTeamOf,
   pmMlSlugsFromKalshiLeg,
+  pmTeamYesProbs,
+  isPmGameSlug,
+  pmGameSlugOf,
 };
