@@ -1079,7 +1079,8 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   const priced = pricedRows.find((r) => r.rfq_id === 'rfq_unhedged_priced');
   assert.ok(priced);
   assert.strictEqual(priced.our_fair_american, americanFromProb(0.125));
-  const polyQuoteYes = Math.floor((0.125 - ((-0.0125) * 0.125 * 0.875) - 0.05) * 100 + 1e-9) / 100;
+  const polyNet = 0.125 - (0.0125 * 0.125 * 0.875);
+  const polyQuoteYes = Math.ceil(1.05 * polyNet * 100 - 1e-9) / 100;
   assert.strictEqual(priced.our_quote_american, americanFromProb(polyQuoteYes));
   pricedLoop.stop();
 

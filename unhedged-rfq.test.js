@@ -320,8 +320,8 @@ function pmRfq(id, symbols, extra = {}) {
     });
     assert.strictEqual(nflOut.persist, true);
     assert.strictEqual(nflOut.our_fair_american, americanFromProb(0.25));
-    assert.strictEqual(nflOut.our_quote_american, americanFromProb(0.20));
-    assert.strictEqual(rows[rows.length - 1].our_quote_american, americanFromProb(0.20));
+    assert.strictEqual(nflOut.our_quote_american, americanFromProb(0.27));
+    assert.strictEqual(rows[rows.length - 1].our_quote_american, americanFromProb(0.27));
 
     const mlbCache = createUnhedgedPriceCache({
       seed: {
@@ -340,8 +340,7 @@ function pmRfq(id, symbols, extra = {}) {
       now: Date.parse('2026-08-14T20:00:00Z'),
     });
     assert.strictEqual(mlbPriced.our_fair_american, americanFromProb(0.25));
-    assert.strictEqual(mlbPriced.our_quote_american, americanFromProb(0.19));
-    assert.ok(mlbPriced.our_quote_american > nflOut.our_quote_american);
+    assert.strictEqual(mlbPriced.our_quote_american, americanFromProb(0.27));
 
     const polyCache = createUnhedgedPriceCache({
       seed: {
@@ -359,7 +358,7 @@ function pmRfq(id, symbols, extra = {}) {
       priceCache: polyCache,
       now: Date.parse('2026-08-14T20:00:00Z'),
     });
-    assert.strictEqual(polyPriced.our_quote_american, americanFromProb(0.20));
+    assert.strictEqual(polyPriced.our_quote_american, americanFromProb(0.27));
 
     const halfCache = createUnhedgedPriceCache({
       seed: { kalshi: { 'KXMLBGAME-26AUG141840CWSDET-CWS': 0.5 } },

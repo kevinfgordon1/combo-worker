@@ -19,7 +19,7 @@ const { findStartedEvent } = require('./started');
 const { americanFromProb } = require('./engine');
 const {
   isUnhedgedRfqLive,
-  cushionYesFromEnv,
+  quoteMultFromEnv,
   priceUnhedgedCombo,
 } = require('./unhedged-quote');
 
@@ -436,7 +436,7 @@ function classifyUnhedgedRfq(rfq, opts = {}) {
     priceCache: opts.priceCache,
     getYesProb: opts.getYesProb,
     env: opts.env,
-    cushion: opts.cushion,
+    margin: opts.margin,
   });
   return {
     persist: true,
@@ -454,7 +454,7 @@ function classifyUnhedgedRfq(rfq, opts = {}) {
   };
 }
 
-function priceClassified({ venue, legs, priceCache, getYesProb, env, cushion }) {
+function priceClassified({ venue, legs, priceCache, getYesProb, env, margin }) {
   const empty = { our_fair_american: null, our_quote_american: null };
   if (priceCache && typeof priceCache.watch === 'function') {
     priceCache.watch(venue, legs);
@@ -465,12 +465,12 @@ function priceClassified({ venue, legs, priceCache, getYesProb, env, cushion }) 
       ? (v, key) => priceCache.getYesProb(v, key)
       : null);
   if (!lookup) return empty;
-  const pad = cushion != null ? cushion : cushionYesFromEnv(env);
+  const mult = margin != null ? margin : quoteMultFromEnv(env);
   const priced = priceUnhedgedCombo({
     venue,
     legs,
     getYesProb: lookup,
-    cushion: pad,
+    margin: mult,
   });
   return {
     our_fair_american: priced.our_fair_american,
