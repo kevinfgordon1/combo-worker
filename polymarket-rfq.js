@@ -2,6 +2,9 @@
 //
 // Maker only: subscribe / poll open RFQs, map comboLegs onto matchParlay,
 // price from Combo Locks fill odds, share remaining with Kalshi via reserve.js.
+// Like Kalshi, only RFQs that could match the current parlays() snapshot
+// hydrate extra HTTP, fetch market metadata, quote, or write verbose skip logs.
+// Unmatched firehose RFQs are a cheap no-op — no seenRfqs / market-cache growth.
 // Live POSTs (create quote, confirm) require POLYMARKET_RFQ_LIVE to be truthy.
 // quoteExecuted means paired orders were submitted — not a fill.
 'use strict';
@@ -28,10 +31,20 @@ const {
   identitiesFromParlay,
   identitiesFromPolymarketLegs,
   sameIdentitySet,
+  TEAM_ALIASES,
 } = require('./leg-identity');
 
 const MODE = 'POLY';
 const RECONCILE_MS = 3000;
+const SEEN_RFQS_MAX = 256;
+
+const LEAGUE_SLUG_TOKENS = {
+  mlb: ['mlb', 'baseball'],
+  nfl: ['nfl', 'football', 'ncaaf', 'cfb'],
+  nba: ['nba', 'basketball'],
+  nhl: ['nhl', 'hockey'],
+  ncaaf: ['ncaaf', 'cfb', 'football'],
+};
 
 function normalizePolymarketSide(side) {
   const raw = String(side == null ? '' : side).trim().toLowerCase();
@@ -111,42 +124,153 @@ function upperKeys(arr) {
   });
 }
 
+function splitLegKey(key) {
+  const s = String(key || '');
+  const i = s.lastIndexOf(':');
+  if (i === -1) return { symbol: s, side: '' };
+  return { symbol: s.slice(0, i), side: s.slice(i + 1).toLowerCase() };
+}
+
+function slugTokens(symbol) {
+  const s = String(symbol || '').toLowerCase();
+  const tokens = new Set();
+  for (const p of s.split(/[-_./]/)) {
+    if (p) tokens.add(p);
+  }
+  const m = s.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (m) tokens.add(`${m[1]}-${m[2]}-${m[3]}`);
+  return tokens;
+}
+
+function rfqSlugTokenSet(rfq) {
+  const tokens = new Set();
+  const legs = (rfq && (rfq.comboLegs || rfq.legs)) || [];
+  for (const leg of legs) {
+    const sym = polymarketLegSymbol(leg);
+    if (!sym) continue;
+    for (const t of slugTokens(sym)) tokens.add(t);
+  }
+  for (const key of (rfq && rfq.legKeys) || []) {
+    const { symbol } = splitLegKey(key);
+    if (!symbol) continue;
+    for (const t of slugTokens(symbol)) tokens.add(t);
+  }
+  return tokens;
+}
+
+function tokensHaveDate(tokens, date) {
+  if (!date) return false;
+  const d = String(date);
+  if (tokens.has(d)) return true;
+  const parts = d.split('-');
+  if (parts.length === 3 && parts.every((p) => tokens.has(p))) return true;
+  if (parts.length === 3 && tokens.has(parts.join(''))) return true;
+  return false;
+}
+
+function teamInTokens(league, team, tokens) {
+  const raw = String(team || '').toLowerCase();
+  if (!raw) return false;
+  if (tokens.has(raw)) return true;
+  const aliases = TEAM_ALIASES[league] || {};
+  for (const [from, to] of Object.entries(aliases)) {
+    if (to === raw && tokens.has(from)) return true;
+    if (from === raw && tokens.has(to)) return true;
+  }
+  return false;
+}
+
+function identityHitsTokens(id, tokens) {
+  if (!id) return false;
+  const leagueTokens = LEAGUE_SLUG_TOKENS[id.league] || (id.league ? [id.league] : []);
+  if (!leagueTokens.some((t) => tokens.has(t))) return false;
+  if (!tokensHaveDate(tokens, id.date)) return false;
+  const teams = [id.selection, ...(id.teams || [])];
+  return teams.some((team) => teamInTokens(id.league, team, tokens));
+}
+
+function rfqSides(rfq) {
+  return ((rfq && rfq.legKeys) || [])
+    .map((k) => splitLegKey(k).side)
+    .filter((s) => s === 'yes' || s === 'no')
+    .sort();
+}
+
+function identitySides(identities) {
+  return (identities || []).map((id) => id.side).filter(Boolean).sort();
+}
+
+function sameSides(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  return a.every((x, i) => x === b[i]);
+}
+
+function cheapDirectMatch(rfq, parlays) {
+  if (!rfq || !rfq.legKeys || !rfq.legKeys.length || !Array.isArray(parlays)) return null;
+  const asRfq = { ...rfq, legKeys: upperKeys(rfq.legKeys) };
+  const withUpper = parlays.map((p) => {
+    const lk = upperKeys(p.leg_keys || p.legKeys);
+    return { ...p, leg_keys: lk, legKeys: lk };
+  });
+  const direct = matchParlay(asRfq, withUpper);
+  if (direct) return parlays.find((x) => x.id === direct.id) || direct;
+
+  const rewritten = [];
+  for (const p of parlays) {
+    const keys = [];
+    for (const leg of p.legs || []) {
+      const key = polymarketLegKey(leg);
+      if (key) keys.push(key);
+    }
+    if (keys.length) rewritten.push({ ...p, leg_keys: keys, legKeys: keys });
+  }
+  if (!rewritten.length) return null;
+  const viaLegs = matchParlay(asRfq, rewritten);
+  if (!viaLegs) return null;
+  return parlays.find((x) => x.id === viaLegs.id) || viaLegs;
+}
+
+// Cheap over-approximation of evaluate/match: no HTTP, no metadata.
+// True = this RFQ could be one of the current Combo Locks (exact PM keys
+// or slug tokens covering each lock identity). False = firehose no-op.
+function couldMatchActiveLocks(rfq, parlays, { partial = false } = {}) {
+  if (!rfq || !Array.isArray(parlays) || !parlays.length) return false;
+  const keys = rfq.legKeys || [];
+  if (!keys.length && !partial) return false;
+  if (keys.length && cheapDirectMatch(rfq, parlays)) return true;
+
+  const tokens = rfqSlugTokenSet(rfq);
+  if (!tokens.size) return false;
+  const sides = rfqSides(rfq);
+
+  for (const p of parlays) {
+    const lock = identitiesFromParlay(p);
+    if (!lock.ok || !lock.identities.length) continue;
+    if (!partial && keys.length && keys.length !== lock.identities.length) continue;
+    if (!partial && sides.length && !sameSides(sides, identitySides(lock.identities))) continue;
+    const hits = partial
+      ? lock.identities.some((id) => identityHitsTokens(id, tokens))
+      : lock.identities.every((id) => identityHitsTokens(id, tokens));
+    if (hits) return true;
+  }
+  return false;
+}
+
+function needsHydrate(rfq, parlays) {
+  if (!rfq || (rfq.map && rfq.map.ok)) return false;
+  if (!Array.isArray(parlays) || !parlays.length) return false;
+  const keys = rfq.legKeys || [];
+  if (!keys.length) return true;
+  return couldMatchActiveLocks(rfq, parlays, { partial: true });
+}
+
 function matchPolymarketParlayDetailed(rfq, parlays, opts = {}) {
   if (!rfq || !Array.isArray(parlays)) {
     return { parlay: null, reason: 'unmatched', identityKeys: [] };
   }
-  if (rfq.legKeys && rfq.legKeys.length) {
-    const asRfq = { ...rfq, legKeys: upperKeys(rfq.legKeys) };
-    const withUpper = parlays.map((p) => {
-      const lk = upperKeys(p.leg_keys || p.legKeys);
-      return { ...p, leg_keys: lk, legKeys: lk };
-    });
-    const direct = matchParlay(asRfq, withUpper);
-    if (direct) {
-      return {
-        parlay: parlays.find((x) => x.id === direct.id) || direct,
-        reason: null,
-        identityKeys: [],
-      };
-    }
-
-    const rewritten = [];
-    for (const p of parlays) {
-      const keys = [];
-      for (const leg of p.legs || []) {
-        const key = polymarketLegKey(leg);
-        if (key) keys.push(key);
-      }
-      if (keys.length) rewritten.push({ ...p, leg_keys: keys, legKeys: keys });
-    }
-    const viaLegs = rewritten.length ? matchParlay(asRfq, rewritten) : null;
-    if (viaLegs) {
-      return {
-        parlay: parlays.find((x) => x.id === viaLegs.id) || viaLegs,
-        reason: null,
-        identityKeys: [],
-      };
-    }
+  const direct = cheapDirectMatch(rfq, parlays);
+  if (direct) {
+    return { parlay: direct, reason: null, identityKeys: [] };
   }
 
   const pm = identitiesFromPolymarketLegs(rfq.comboLegs || rfq.legs, opts.markets);
@@ -391,7 +515,7 @@ function startPolymarketRfqLoop(ctx = {}) {
   const live = isPolymarketRfqLive(env);
   const pendingQuotes = ctx.pendingQuotes || new Map();
   const confirmingQuotes = ctx.confirmingQuotes || new Set();
-  const seenRfqs = new Set();
+  const seenRfqs = new Map();
   let reserveSeq = 0;
   let stopped = false;
 
@@ -438,15 +562,39 @@ function startPolymarketRfqLoop(ctx = {}) {
     if (ctx.counts && key in ctx.counts) ctx.counts[key] += 1;
   }
 
+  function rememberSeen(rfqId) {
+    if (!rfqId) return;
+    if (seenRfqs.has(rfqId)) seenRfqs.delete(rfqId);
+    seenRfqs.set(rfqId, Date.now());
+    while (seenRfqs.size > SEEN_RFQS_MAX) {
+      const oldest = seenRfqs.keys().next().value;
+      if (oldest == null) break;
+      seenRfqs.delete(oldest);
+    }
+  }
+
   async function handleRfq(raw) {
-    const rfq = await hydrateRfq(http, raw);
+    const locks = parlays();
+    let rfq = normalizePolymarketRfq(raw);
     if (!rfq || !rfq.rfqId) return { action: 'skip', reason: 'bad_rfq' };
+    if (!locks.length) return { action: 'skip', reason: 'no_locks' };
+
+    if (needsHydrate(rfq, locks)) {
+      rfq = (await hydrateRfq(http, raw)) || rfq;
+      if (!rfq || !rfq.rfqId) return { action: 'skip', reason: 'bad_rfq' };
+    }
+
+    if (!couldMatchActiveLocks(rfq, locks)) {
+      return { action: 'skip', reason: 'no_lock_overlap' };
+    }
+
     if (seenRfqs.has(rfq.rfqId)) return { action: 'skip', reason: 'seen' };
-    seenRfqs.add(rfq.rfqId);
+    rememberSeen(rfq.rfqId);
     bump('polyRfqs');
 
+    const direct = cheapDirectMatch(rfq, locks);
     const symbols = (rfq.comboLegs || []).map(polymarketLegSymbol).filter(Boolean);
-    const markets = await marketCache.getMany(symbols);
+    const markets = direct ? new Map() : await marketCache.getMany(symbols);
     const matched = matchPolymarketParlay(rfq, parlays(), { markets });
     const evaluation = evaluatePolymarketRfq({
       rfq,
@@ -568,6 +716,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     const rfq = (evt && evt.rfq) || {};
     const rfqId = rfq.id || rfq.rfqId || (evt && evt.rfqId);
     if (!rfqId) return;
+    seenRfqs.delete(rfqId);
     const dropped = dropPendingForRfq(pendingQuotes, rfqId, { confirming: confirmingQuotes });
     for (const { id, quote } of dropped) {
       console.log(
@@ -631,6 +780,7 @@ function startPolymarketRfqLoop(ctx = {}) {
   }
 
   async function reconcileOpenRfqs() {
+    if (!parlays().length) return;
     try {
       const listed = await http.listRfqs({ status: 'RFQ_STATUS_OPEN', limit: 100 });
       const rows = (listed && listed.rfqs) || [];
@@ -729,6 +879,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     handleOrderExecution,
     onWsEvent,
     pendingQuotes,
+    seenRfqs,
     live,
     marketCache,
   };
@@ -736,11 +887,14 @@ function startPolymarketRfqLoop(ctx = {}) {
 
 module.exports = {
   MODE,
+  SEEN_RFQS_MAX,
   normalizePolymarketSide,
   polymarketLegSymbol,
   polymarketLegKey,
   mapComboLegs,
   normalizePolymarketRfq,
+  cheapDirectMatch,
+  couldMatchActiveLocks,
   matchPolymarketParlay,
   matchPolymarketParlayDetailed,
   evaluatePolymarketRfq,
