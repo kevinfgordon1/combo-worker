@@ -10,8 +10,10 @@
 // status filled/executed/accepted, or Polymarket confirm/fill), UPDATE that
 // row to status=filled. Keep taker_* as the original RFQ. Do not insert
 // out-of-scope firehose just to count fills. No public-tape crawl of open RFQs.
-// blotter filled_at is venue filled/executed/tradeTs, else RFQ created/closed,
-// else null — never Date.now() (restart would stamp the whole tape).
+// blotter filled_at is venue filled/executed/tradeTs when the patch has one
+// (later tape print wins over a stale restart/created stamp). If the patch
+// has no timestamp: keep existing, else RFQ created/closed, else null.
+// Never Date.now() (restart would stamp the whole tape).
 // Re-see of an already-filled RFQ must not flip status back to seen/started.
 //
 // Fair is inverse-bet ourTrue (Promo Builder / EV): convert opponent YES to
@@ -842,8 +844,21 @@ function coalesceFillPrice(next, prev) {
   return next != null ? next : (prev != null ? prev : null);
 }
 
-// filled_at = COALESCE(existing, patch). Fill prices keep existing unless the
-// new ones are non-null.
+function coalesceFilledAt(next, prev) {
+  if (next && next.filled_at) return next.filled_at;
+  if (prev && prev.filled_at) return prev.filled_at;
+  return firstIsoTs(prev, RFQ_CLOSED_TS_KEYS)
+    || firstIsoTs(prev, RFQ_CREATED_TS_KEYS)
+    || firstIsoTs(prev, ['created_at', 'closed_at'])
+    || firstIsoTs(next, RFQ_CLOSED_TS_KEYS)
+    || firstIsoTs(next, RFQ_CREATED_TS_KEYS)
+    || firstIsoTs(next, ['created_at', 'closed_at'])
+    || null;
+}
+
+// Venue/tradeTs filled_at on the patch wins (later tape print). If the patch
+// has no timestamp, keep existing, else created/closed, else null.
+// Never Date.now(). Null fill prices do not clobber.
 function mergeUnhedgedFillPatch(existing, patch) {
   const prev = existing || {};
   const next = patch || {};
@@ -852,7 +867,7 @@ function mergeUnhedgedFillPatch(existing, patch) {
     fill_yes_price: coalesceFillPrice(next.fill_yes_price, prev.fill_yes_price),
     fill_no_price: coalesceFillPrice(next.fill_no_price, prev.fill_no_price),
     fill_american: coalesceFillPrice(next.fill_american, prev.fill_american),
-    filled_at: prev.filled_at || next.filled_at || null,
+    filled_at: coalesceFilledAt(next, prev),
   };
 }
 
@@ -862,7 +877,7 @@ async function persistUnhedgedFill(supabase, patch) {
   }
   const { data: existingRows, error: lookupError } = await supabase
     .from('unhedged_rfqs')
-    .select('filled_at,fill_yes_price,fill_no_price,fill_american')
+    .select('filled_at,fill_yes_price,fill_no_price,fill_american,created_at')
     .eq('venue', patch.venue)
     .eq('rfq_id', patch.rfq_id)
     .limit(1);
