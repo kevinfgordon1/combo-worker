@@ -6,10 +6,10 @@
 // independent events (distinct games AND distinct teams). No SGP / spreads /
 // totals / props. Tennis / LoL / CS2 are a silent skip (no insert).
 //
-// Fair is inverse-bet ourTrue (Promo Builder / EV): convert each venue's
-// opponent YES (taker ask / last on the book) to American as-is — no Kalshi
-// 0.07 or Poly 0.05/0.06 taker theta on singles. Best opponent American
-// across Kalshi vs Polymarket, then sign-flip. Do not use same-side last.
+// Fair is inverse-bet ourTrue (Promo Builder / EV): convert opponent YES to
+// a fee-included American with the series taker coeff (KXMLBGAME 0.035,
+// KXNFLGAME/KXNCAAFGAME 0.07, Poly US 0.06). Best opponent American across
+// Kalshi vs Polymarket, then sign-flip. Do not use same-side last.
 // RFQ venue only selects the combo maker-fee wrap. Missing opponent → both
 // Americans stay null.
 // Pricing is sync from the in-memory cache — never a per-RFQ HTTP call.

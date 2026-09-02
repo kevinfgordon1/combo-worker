@@ -10,9 +10,11 @@ const { classifyUnhedgedRfq } = require('./unhedged-rfq');
 const { normalizeRfq } = require('./rfq');
 const {
   invertAmerican,
-  postedAmericanFromYes,
+  feeIncludedAmerican,
   ourTrueFromOpponentYes,
   ourTrueProb,
+  KALSHI_MLB_TAKER_THETA,
+  POLY_TAKER_THETA,
 } = require('./unhedged-quote');
 const { americanFromProb } = require('./engine');
 
@@ -119,7 +121,7 @@ return live.refresh().then(async () => {
 
   live.stop();
 
-  // Inverse on a two-way: WSH ourTrue = sign-flip of posted ATL American, not WSH last.
+  // Inverse on a two-way: WSH ourTrue = sign-flip of fee-included ATL, not WSH last.
   const wshCache = createUnhedgedPriceCache({
     seed: {
       kalshi: {
@@ -137,12 +139,12 @@ return live.refresh().then(async () => {
     side: 'yes',
   };
   const wshOur = wshCache.getOurTrue(wshLeg);
-  const expectWsh = ourTrueFromOpponentYes(0.42);
+  const expectWsh = ourTrueFromOpponentYes(0.42, KALSHI_MLB_TAKER_THETA);
   assert.ok(Math.abs(wshOur - expectWsh) < 1e-12);
   assert.ok(Math.abs(wshOur - 0.60) > 1e-6);
   assert.strictEqual(wshCache.getYesProb('kalshi', 'KXMLBGAME-26AUG141840WSHATL-WSH'), 0.60);
 
-  // Best-of-two venues: posted opponent American as-is (more plus), then flip.
+  // Best-of-two venues: cheaper/better opponent American after taker fee, then flip.
   const bothVenues = createUnhedgedPriceCache({
     seed: {
       kalshi: {
@@ -156,8 +158,8 @@ return live.refresh().then(async () => {
     },
   });
   const cheapOur = bothVenues.getOurTrue(wshLeg);
-  const polyAm = postedAmericanFromYes(0.40);
-  const kalshiAm = postedAmericanFromYes(0.50);
+  const polyAm = feeIncludedAmerican(0.40, POLY_TAKER_THETA);
+  const kalshiAm = feeIncludedAmerican(0.50, KALSHI_MLB_TAKER_THETA);
   assert.ok(polyAm > kalshiAm);
   assert.ok(Math.abs(cheapOur - ourTrueProb(polyAm)) < 1e-12);
   assert.strictEqual(americanFromProb(cheapOur), invertAmerican(polyAm));
@@ -174,10 +176,9 @@ return live.refresh().then(async () => {
     },
   });
   const kOur = kalshiCheaper.getOurTrue(wshLeg);
-  assert.ok(Math.abs(kOur - ourTrueFromOpponentYes(0.35)) < 1e-12);
+  assert.ok(Math.abs(kOur - ourTrueFromOpponentYes(0.35, KALSHI_MLB_TAKER_THETA)) < 1e-12);
 
-  // Kevin: Sox true = invert(best posted Mariners). Kalshi Mariners as-is
-  // vs a worse Poly Mariners — pick Kalshi, sign-flip. Sox last is not fair.
+  // Kevin: 0.45 MLB Mariners → +118, invert Sox −118. NFL 0.45 uses 0.07 not 0.035.
   const soxLeg = {
     ticker: 'KXMLBGAME-26AUG141840BOSSEA-BOS',
     symbol: 'aec-mlb-bos-sea-2026-08-14-bos',
@@ -191,23 +192,43 @@ return live.refresh().then(async () => {
     seed: {
       kalshi: {
         'KXMLBGAME-26AUG141840BOSSEA-BOS': 0.60,
-        'KXMLBGAME-26AUG141840BOSSEA-SEA': 0.35,
+        'KXMLBGAME-26AUG141840BOSSEA-SEA': 0.45,
       },
       polymarket: {
         'aec-mlb-bos-sea-2026-08-14-bos': 0.59,
-        'aec-mlb-bos-sea-2026-08-14-sea': 0.40,
+        'aec-mlb-bos-sea-2026-08-14-sea': 0.50,
       },
     },
   });
-  const seaKalshiAm = postedAmericanFromYes(0.35);
-  const seaPolyAm = postedAmericanFromYes(0.40);
-  assert.ok(seaKalshiAm > seaPolyAm, 'Kalshi Mariners is the better opponent American');
+  const seaKalshiAm = feeIncludedAmerican(0.45, KALSHI_MLB_TAKER_THETA);
+  assert.strictEqual(seaKalshiAm, 118);
+  assert.notStrictEqual(feeIncludedAmerican(0.45, 0.07), 118);
   const soxOur = soxSea.getOurTrue(soxLeg);
   assert.ok(Math.abs(soxOur - ourTrueProb(seaKalshiAm)) < 1e-12);
-  assert.strictEqual(americanFromProb(soxOur), invertAmerican(seaKalshiAm));
+  assert.strictEqual(americanFromProb(soxOur), -118);
   assert.ok(Math.abs(soxOur - 0.60) > 1e-6, 'must not use same-side Sox last');
   const soxQuotes = soxSea.opponentQuotes(soxLeg);
   assert.ok(soxQuotes.every((q) => !/BOS$|-bos$/i.test(q.key)), 'opponent quotes exclude Sox last');
+  assert.ok(soxQuotes.some((q) => q.venue === 'kalshi' && q.theta === 0.035));
+
+  const nflOpp = createUnhedgedPriceCache({
+    seed: {
+      kalshi: {
+        'KXNFLGAME-26SEP071330BUFKC-KC': 0.55,
+        'KXNFLGAME-26SEP071330BUFKC-BUF': 0.45,
+      },
+    },
+  });
+  const kcOur = nflOpp.getOurTrue({
+    ticker: 'KXNFLGAME-26SEP071330BUFKC-KC',
+    league: 'nfl',
+    selection: 'kc',
+    teams: ['buf', 'kc'],
+    date: '2026-09-07',
+    side: 'yes',
+  });
+  assert.strictEqual(americanFromProb(kcOur), -114);
+  assert.notStrictEqual(americanFromProb(kcOur), -118);
 
   // Ingest by event_ticker pairs the other Kalshi ticker.
   const eventCache = createUnhedgedPriceCache();
