@@ -16,6 +16,8 @@ const {
   polymarketLegKey,
   mapComboLegs,
   normalizePolymarketRfq,
+  couldMatchActiveLocks,
+  cheapDirectMatch,
   matchPolymarketParlay,
   matchPolymarketParlayDetailed,
   evaluatePolymarketRfq,
@@ -24,6 +26,7 @@ const {
   quoteBodyFromEval,
   startPolymarketRfqLoop,
 } = require('./polymarket-rfq');
+const { createMarketCache } = require('./polymarket-market-cache');
 
 // Fixed seed / timestamp / path — do not rotate these; they are the signing fixture.
 const SEED_B64 = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
@@ -257,6 +260,125 @@ const viaLegsOnly = matchPolymarketParlay(
 );
 assert.ok(viaLegsOnly);
 assert.strictEqual(viaLegsOnly.id, 'pm-parlay');
+
+const tennisRfq = {
+  id: 'rfq_tennis_1',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'aec-atp-djokovic-alcaraz-2026-08-14-djokovic', side: 'SIDE_BUY' },
+    { symbol: 'aec-atp-sinner-medvedev-2026-08-14-sinner', side: 'SIDE_BUY' },
+  ],
+};
+const lolRfq = {
+  id: 'rfq_lol_1',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'aec-lol-t1-geng-2026-08-14-t1', side: 'SIDE_BUY' },
+    { symbol: 'aec-lol-hlei-blg-2026-08-14-hlei', side: 'SIDE_BUY' },
+  ],
+};
+const soccerRfq = {
+  id: 'rfq_soccer_1',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'aec-epl-ars-che-2026-08-14-ars', side: 'SIDE_BUY' },
+    { symbol: 'aec-mls-mia-nyc-2026-08-14-mia', side: 'SIDE_BUY' },
+  ],
+};
+const cs2Rfq = {
+  id: 'rfq_cs2_1',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'aec-cs2-navi-faze-2026-08-14-navi', side: 'SIDE_BUY' },
+    { symbol: 'aec-cs2-vitality-mouz-2026-08-14-vitality', side: 'SIDE_BUY' },
+  ],
+};
+
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(pmRfq), [kalshiParlay]), true);
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(pmRfq), [pmParlay]), true);
+assert.ok(cheapDirectMatch(normalizePolymarketRfq(pmRfq), [pmParlay]));
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(pmRfq), []), false);
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(sellRfq), [kalshiParlay]), false);
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(tennisRfq), [kalshiParlay]), false);
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(lolRfq), [kalshiParlay]), false);
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(soccerRfq), [kalshiParlay]), false);
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(cs2Rfq), [kalshiParlay]), false);
+assert.strictEqual(
+  couldMatchActiveLocks(normalizePolymarketRfq({
+    ...pmRfq,
+    id: 'rfq_other_mlb',
+    comboLegs: [
+      { symbol: 'aec-mlb-nyy-bos-2026-08-14-nyy', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-lad-sd-2026-08-14-lad', side: 'SIDE_BUY' },
+    ],
+  }), [kalshiParlay]),
+  false
+);
+
+const nflLock = {
+  id: 'nfl-lock',
+  user_id: 'u1',
+  label: 'Chiefs ML + Lions ML',
+  parlay_stake: 100,
+  parlay_american: 400,
+  fill_american: 350,
+  hedge_mode: '1x',
+  max_contracts: 116,
+  leg_keys: [
+    'KXNFLGAME-26SEP071330BUFKC-KC:yes',
+    'KXNFLGAME-26SEP071330DETMIA-DET:yes',
+  ],
+  legs: [],
+};
+const nflRfq = {
+  id: 'rfq_nfl_1',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'aec-nfl-buf-kc-2026-09-07-kc', side: 'SIDE_BUY' },
+    { symbol: 'aec-nfl-det-mia-2026-09-07-det', side: 'SIDE_BUY' },
+  ],
+};
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(nflRfq), [nflLock]), true);
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(pmRfq), [nflLock]), false);
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(tennisRfq), [nflLock]), false);
+
+const ncaafRfq = {
+  id: 'rfq_ncaaf_1',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'aec-ncaaf-ala-uga-2026-09-07-ala', side: 'SIDE_BUY' },
+    { symbol: 'aec-ncaaf-osu-mich-2026-09-07-osu', side: 'SIDE_BUY' },
+  ],
+};
+const ncaafPmLock = {
+  id: 'ncaaf-pm',
+  user_id: 'u1',
+  label: 'Bama + OSU',
+  parlay_stake: 100,
+  parlay_american: 400,
+  fill_american: 350,
+  hedge_mode: '1x',
+  max_contracts: 50,
+  leg_keys: [
+    'AEC-NCAAF-ALA-UGA-2026-09-07-ALA:yes',
+    'AEC-NCAAF-OSU-MICH-2026-09-07-OSU:yes',
+  ],
+  legs: [
+    { symbol: 'aec-ncaaf-ala-uga-2026-09-07-ala', side: 'SIDE_BUY' },
+    { symbol: 'aec-ncaaf-osu-mich-2026-09-07-osu', side: 'SIDE_BUY' },
+  ],
+};
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(ncaafRfq), [ncaafPmLock]), true);
+assert.strictEqual(
+  evaluatePolymarketRfq({ rfq: ncaafRfq, parlays: [ncaafPmLock] }).action,
+  'quoteable'
+);
 
 const quoteable = evaluatePolymarketRfq({
   rfq: pmRfq,
@@ -494,6 +616,169 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.deepStrictEqual(confirms[0], { rfqId: 'rfq_live_1', quoteId: 'quote_posted' });
 
   loopOn.stop();
+
+  const lru = createMarketCache({
+    maxEntries: 2,
+    fetchMarket: async (slug) => ({ slug }),
+  });
+  await lru.get('a');
+  await lru.get('b');
+  await lru.get('c');
+  assert.strictEqual(lru._map.size, 2);
+  assert.ok(!lru.peek('a'));
+  assert.ok(lru.peek('b'));
+  assert.ok(lru.peek('c'));
+
+  let firehoseFetches = 0;
+  let firehoseList = 0;
+  let firehoseCombo = 0;
+  const firehoseHttp = {
+    async getUserId() { return { rfqUserId: 'rfquser_test' }; },
+    async listRfqs() { firehoseList += 1; return { rfqs: [] }; },
+    async listQuotes() { return { quotes: [] }; },
+    async getCombo() { firehoseCombo += 1; return { combos: [] }; },
+    async createQuote(body) {
+      posts.push(body);
+      return { quoteId: 'quote_posted' };
+    },
+    async confirmQuote() { return {}; },
+    async deleteQuote() { return { statusCode: 200 }; },
+    close() {},
+  };
+  let currentLocks = [];
+  const firehoseLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'false',
+    },
+    http: firehoseHttp,
+    startWs: false,
+    getParlays: () => currentLocks,
+    fetchMarket: async (slug) => {
+      firehoseFetches += 1;
+      return lockMarkets.get(slug) || null;
+    },
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+  });
+  const listAfterStart = firehoseList;
+
+  const logs = [];
+  const origLog = console.log;
+  console.log = (...args) => { logs.push(args.join(' ')); origLog(...args); };
+  try {
+    currentLocks = [kalshiParlay];
+    const skipTennis = await firehoseLoop.handleRfq(tennisRfq);
+    const skipLol = await firehoseLoop.handleRfq(lolRfq);
+    const skipSoccer = await firehoseLoop.handleRfq(soccerRfq);
+    const skipCs2 = await firehoseLoop.handleRfq(cs2Rfq);
+    for (let i = 0; i < 40; i += 1) {
+      await firehoseLoop.handleRfq({
+        ...tennisRfq,
+        id: `rfq_tennis_wall_${i}`,
+      });
+    }
+    assert.strictEqual(skipTennis.reason, 'no_lock_overlap');
+    assert.strictEqual(skipLol.reason, 'no_lock_overlap');
+    assert.strictEqual(skipSoccer.reason, 'no_lock_overlap');
+    assert.strictEqual(skipCs2.reason, 'no_lock_overlap');
+    assert.strictEqual(firehoseFetches, 0);
+    assert.strictEqual(firehoseCombo, 0);
+    assert.strictEqual(firehoseList, listAfterStart);
+    assert.strictEqual(firehoseLoop.marketCache._map.size, 0);
+    assert.strictEqual(firehoseLoop.seenRfqs.size, 0);
+    assert.ok(!logs.some((l) => l.includes('SKIP unmatched') && l.includes('legs=')));
+
+    currentLocks = [];
+    const noLocks = await firehoseLoop.handleRfq({ ...pmRfq, id: 'rfq_later_lock' });
+    assert.strictEqual(noLocks.reason, 'no_locks');
+    assert.strictEqual(firehoseFetches, 0);
+    assert.strictEqual(firehoseLoop.seenRfqs.size, 0);
+
+    currentLocks = [kalshiParlay];
+    const later = await firehoseLoop.handleRfq({ ...pmRfq, id: 'rfq_later_lock' });
+    assert.strictEqual(later.action, 'quoteable');
+    assert.strictEqual(later.parlay.id, P);
+    assert.ok(firehoseFetches >= 2);
+    assert.ok(firehoseLoop.seenRfqs.has('rfq_later_lock'));
+    assert.ok(firehoseLoop.seenRfqs.size <= 8);
+
+    const again = await firehoseLoop.handleRfq({ ...pmRfq, id: 'rfq_later_lock' });
+    assert.strictEqual(again.reason, 'seen');
+
+    firehoseLoop.handleRfqClosed({ rfq: { id: 'rfq_later_lock' } });
+    assert.ok(!firehoseLoop.seenRfqs.has('rfq_later_lock'));
+  } finally {
+    console.log = origLog;
+    firehoseLoop.stop();
+  }
+
+  let hydrateList = 0;
+  const hydrateHttp = {
+    async getUserId() { return { rfqUserId: 'rfquser_test' }; },
+    async listRfqs(query) {
+      hydrateList += 1;
+      if (query && query.rfqId === 'rfq_ws_bare') {
+        return { rfqs: [{ ...pmRfq, id: 'rfq_ws_bare' }] };
+      }
+      if (query && query.rfqId === 'rfq_ws_tennis') {
+        return { rfqs: [{ ...tennisRfq, id: 'rfq_ws_tennis' }] };
+      }
+      return { rfqs: [] };
+    },
+    async listQuotes() { return { quotes: [] }; },
+    async getCombo() { throw new Error('getCombo should not run after listRfqs fills legs'); },
+    async createQuote() { return { quoteId: 'x' }; },
+    async confirmQuote() { return {}; },
+    async deleteQuote() { return { statusCode: 200 }; },
+    close() {},
+  };
+  let hydrateFetches = 0;
+  const hydrateLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'false',
+    },
+    http: hydrateHttp,
+    startWs: false,
+    getParlays: () => [kalshiParlay],
+    fetchMarket: async (slug) => {
+      hydrateFetches += 1;
+      return lockMarkets.get(slug) || null;
+    },
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+  });
+  const listBeforeBare = hydrateList;
+  const bareOut = await hydrateLoop.handleRfq({
+    id: 'rfq_ws_bare',
+    symbol: 'caoc-x',
+    status: 'RFQ_STATUS_OPEN',
+  });
+  assert.strictEqual(bareOut.action, 'quoteable');
+  assert.strictEqual(bareOut.parlay.id, P);
+  assert.ok(hydrateList > listBeforeBare);
+  assert.ok(hydrateFetches >= 2);
+
+  const tennisBareFetches = hydrateFetches;
+  const tennisBareList = hydrateList;
+  const tennisBare = await hydrateLoop.handleRfq({
+    id: 'rfq_ws_tennis',
+    symbol: 'caoc-tennis',
+    status: 'RFQ_STATUS_OPEN',
+  });
+  assert.strictEqual(tennisBare.reason, 'no_lock_overlap');
+  assert.ok(hydrateList > tennisBareList);
+  assert.strictEqual(hydrateFetches, tennisBareFetches);
+  hydrateLoop.stop();
 
   const parsed = parsePrivateMessage(JSON.stringify({
     requestId: 'rfq-sub-1',

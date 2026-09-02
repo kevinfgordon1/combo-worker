@@ -181,6 +181,19 @@ const cache = createMarketCache({
   assert.ok(await cache.get('aec-mlb-cws-det-2026-08-14-cws'));
   assert.ok(await cache.get('aec-mlb-cws-det-2026-08-14-cws'));
   assert.strictEqual(fetches, 1);
+
+  const lru = require('./polymarket-market-cache').createMarketCache({
+    maxEntries: 2,
+    fetchMarket: async (slug) => ({ slug }),
+  });
+  await lru.get('one');
+  await lru.get('two');
+  await lru.get('three');
+  assert.strictEqual(lru._map.size, 2);
+  assert.ok(!lru.peek('one'));
+  assert.ok(lru.peek('two'));
+  assert.ok(lru.peek('three'));
+
   console.log('leg-identity.test.js ok');
 })().catch((e) => {
   console.error(e);

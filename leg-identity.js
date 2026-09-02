@@ -414,6 +414,7 @@ function sameIdentitySet(a, b) {
 module.exports = {
   SERIES,
   PRICEABLE_SPORT_TYPES,
+  TEAM_ALIASES,
   normTeam,
   identityKey,
   makeIdentity,
