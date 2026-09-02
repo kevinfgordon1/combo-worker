@@ -5,7 +5,9 @@
 // The Odds API is not the quote clock.
 //
 // Fair lookups use the *opponent* YES (other ticker in the same Kalshi event;
-// other aec-* ML in the same Polymarket game), then inverse-bet ourTrue.
+// other aec-* ML in the same Polymarket game). Theta converts that raw YES
+// to a fee-included American once; ourTrue is the sign-flip of the best
+// Kalshi/Poly opponent American. Same-side last is never fair.
 'use strict';
 
 const { normTeam } = require('./leg-identity');

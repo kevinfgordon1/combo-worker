@@ -6,11 +6,13 @@
 // independent events (distinct games AND distinct teams). No SGP / spreads /
 // totals / props. Tennis / LoL / CS2 are a silent skip (no insert).
 //
-// Fair is inverse-bet ourTrue (Promo Builder / EV): 1 minus the fee-adjusted
-// YES of the cheapest Kalshi+Polymarket opponent ML. Do not use same-side
-// last. RFQ venue only selects the maker-fee wrap. Missing opponent → both
-// Americans stay null. Pricing is sync from the in-memory cache — never a
-// per-RFQ HTTP call. Do not invent prices. Do not POST / confirm / fill.
+// Fair is inverse-bet ourTrue (Promo Builder / EV): sign-flip of the best
+// fee-included Kalshi+Polymarket opponent American. Theta (0.07 / 0.05) is
+// applied once when converting raw YES cents to that American. Invert does
+// not apply a second taker fee. Do not use same-side last. RFQ venue only
+// selects the maker-fee wrap. Missing opponent → both Americans stay null.
+// Pricing is sync from the in-memory cache — never a per-RFQ HTTP call.
+// Do not invent prices. Do not POST / confirm / fill.
 //
 // Env: UNHEDGED_RFQ_SHADOW default ON (collect tape). Set 0/false/off to idle.
 //      UNHEDGED_RFQ_LIVE default OFF — posting is not wired on this path.
@@ -466,7 +468,7 @@ function priceClassified({ venue, legs, priceCache, getOurTrue, getYesProb, env,
       ? (leg) => priceCache.getOurTrue(leg)
       : null);
   // Inverse-bet path only. Do not fall back to same-side getYesProb from the
-  // cache — that would quote the RFQ team's last instead of 1 − opponent.
+  // cache — that would quote the RFQ team's last instead of the opponent invert.
   const yesFn = ourTrueFn
     ? null
     : (typeof getYesProb === 'function' ? getYesProb : null);

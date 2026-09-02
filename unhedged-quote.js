@@ -1,7 +1,9 @@
 // Unhedged RFQ shadow quote math — independent of Combo Locks / engine KFEE.
 // Do not POST from this module. Fair is the product of independent ourTrue
-// probs (honor yes/no). ourTrue is inverse-bet: 1 minus the fee-adjusted
-// implied of the cheapest Kalshi/Poly opponent YES (Promo Builder / EV).
+// probs (honor yes/no). ourTrue is the sign-flip of the best fee-included
+// Kalshi/Poly opponent American (Promo Builder / EV). Theta is applied once
+// when turning a raw YES cent price into that American. Invert does not
+// apply Kalshi 0.07 / Poly 0.05 a second time.
 //
 // Would-quote YES = margin × net_cost, then the first penny at or above that
 // (Kevin: fair 0.10 MLB → fee 0.00315 → net 0.10315 → 0.1083 → 0.11).
@@ -104,7 +106,8 @@ function productFair(probs) {
   return validProb(acc);
 }
 
-// Promo Builder / EV: trueProb(bestOpponentOdds) then ourTrue = 1 - that.
+// Promo Builder / EV: trueProb is implied of an already-fee-included American.
+// ourTrue = 1 − that = sign-flip of the American. No extra theta at invert.
 // Missing opponent is null here (do not invent 0.5).
 function trueProb(bestOpponentOdds) {
   if (bestOpponentOdds == null || bestOpponentOdds === '') return null;
@@ -119,7 +122,16 @@ function ourTrueProb(bestOpponentOdds) {
   return tp == null ? null : validProb(1 - tp);
 }
 
+// Sign-flip of a fee-included American: +118 → -118, -140 → +140.
+function invertAmerican(american) {
+  if (american == null || american === '') return null;
+  const n = Number(american);
+  if (!Number.isFinite(n) || n === 0) return null;
+  return -n;
+}
+
 // odds-shared.js: p_eff = p * (1 + θ·(1−p)). Kalshi θ=0.07, Poly US θ=0.05.
+// Theta belongs only on this raw-cents → fee-included-American conversion.
 function applyTakerFeeToProb(p, theta) {
   const raw = validProb(p);
   if (raw == null) return null;
@@ -127,9 +139,25 @@ function applyTakerFeeToProb(p, theta) {
   return validProb(raw * (1 + t * (1 - raw)));
 }
 
+function feeIncludedAmerican(rawYes, theta) {
+  return americanFromProb(applyTakerFeeToProb(rawYes, theta));
+}
+
+function opponentAmericanFromQuote(q) {
+  if (!q) return null;
+  if (q.american != null && q.american !== '') {
+    const n = Number(q.american);
+    return Number.isFinite(n) && n !== 0 ? n : null;
+  }
+  const theta = q.theta != null ? q.theta : takerThetaForVenue(q.venue);
+  if (theta == null) return null;
+  const raw = q.yesProb != null ? q.yesProb : q.p;
+  return feeIncludedAmerican(raw, theta);
+}
+
 function ourTrueFromOpponentYes(rawYes, theta) {
-  const eff = applyTakerFeeToProb(rawYes, theta);
-  return eff == null ? null : validProb(1 - eff);
+  const am = feeIncludedAmerican(rawYes, theta);
+  return am == null ? null : ourTrueProb(am);
 }
 
 function takerThetaForVenue(venue) {
@@ -138,24 +166,26 @@ function takerThetaForVenue(venue) {
   return null;
 }
 
-// Cheapest opponent YES for a taker = lowest fee-adjusted YES / best American.
-function bestOpponentEff(quotes) {
+// Best opponent American for someone betting the opponent: more plus / less minus.
+function bestOpponentAmerican(quotes) {
   let best = null;
   for (const q of quotes || []) {
-    if (!q) continue;
-    const theta = q.theta != null ? q.theta : takerThetaForVenue(q.venue);
-    if (theta == null) continue;
-    const raw = q.yesProb != null ? q.yesProb : q.p;
-    const eff = applyTakerFeeToProb(raw, theta);
-    if (eff == null) continue;
-    if (best == null || eff < best) best = eff;
+    const am = opponentAmericanFromQuote(q);
+    if (am == null) continue;
+    if (best == null || am > best) best = am;
   }
   return best;
 }
 
+// Lowest fee-included YES implied by the best opponent American (no 2nd theta).
+function bestOpponentEff(quotes) {
+  const am = bestOpponentAmerican(quotes);
+  return am == null ? null : trueProb(am);
+}
+
 function ourTrueFromOpponents(quotes) {
-  const eff = bestOpponentEff(quotes);
-  return eff == null ? null : validProb(1 - eff);
+  const am = bestOpponentAmerican(quotes);
+  return am == null ? null : ourTrueProb(am);
 }
 
 function priceUnhedgedCombo({ venue, legs, getOurTrue, getYesProb, margin = DEFAULT_QUOTE_MULT } = {}) {
@@ -218,9 +248,13 @@ module.exports = {
   productFair,
   trueProb,
   ourTrueProb,
+  invertAmerican,
   applyTakerFeeToProb,
+  feeIncludedAmerican,
+  opponentAmericanFromQuote,
   ourTrueFromOpponentYes,
   takerThetaForVenue,
+  bestOpponentAmerican,
   bestOpponentEff,
   ourTrueFromOpponents,
   priceUnhedgedCombo,
