@@ -6,6 +6,8 @@ const {
   KALSHI_NFL_MAKER,
   POLY_MAKER_RATE,
   DEFAULT_QUOTE_MULT,
+  KALSHI_TAKER_THETA,
+  POLY_TAKER_THETA,
   isUnhedgedRfqLive,
   makerFee,
   isKalshiNflOnly,
@@ -15,6 +17,11 @@ const {
   quoteYesFromFair,
   ceil2,
   priceUnhedgedCombo,
+  applyTakerFeeToProb,
+  ourTrueFromOpponentYes,
+  ourTrueFromOpponents,
+  ourTrueProb,
+  trueProb,
 } = require('./unhedged-quote');
 
 assert.strictEqual(isUnhedgedRfqLive({}), false);
@@ -25,6 +32,8 @@ assert.strictEqual(DEFAULT_QUOTE_MULT, 1.05);
 assert.strictEqual(KALSHI_NFL_MAKER, 0);
 assert.strictEqual(KALSHI_COMBO_MAKER, 0.035);
 assert.strictEqual(POLY_MAKER_RATE, 0);
+assert.strictEqual(KALSHI_TAKER_THETA, 0.07);
+assert.strictEqual(POLY_TAKER_THETA, 0.05);
 
 const nflLegs = [
   { league: 'nfl', ticker: 'KXNFLGAME-A-KC', side: 'yes' },
@@ -174,6 +183,104 @@ function lookup(_venue, key) {
   const noLookup = priceUnhedgedCombo({ venue: 'kalshi', legs: mlbLegs });
   assert.strictEqual(noLookup.our_fair_american, null);
   assert.strictEqual(noLookup.our_quote_american, null);
+}
+
+// Inverse: WSH fair = 1 − fee-adjusted ATL, not WSH last.
+{
+  const atl = 0.42;
+  const wshLast = 0.60;
+  const atlEff = applyTakerFeeToProb(atl, KALSHI_TAKER_THETA);
+  assert.ok(Math.abs(atlEff - (0.42 * (1 + 0.07 * 0.58))) < 1e-12);
+  const wshOur = ourTrueFromOpponentYes(atl, KALSHI_TAKER_THETA);
+  assert.ok(Math.abs(wshOur - (1 - atlEff)) < 1e-12);
+  assert.ok(Math.abs(wshOur - (1 - wshLast)) > 1e-6, 'must not use 1-WSH last');
+  assert.ok(Math.abs(wshOur - wshLast) > 1e-6, 'must not use WSH last as fair');
+  assert.ok(Math.abs(ourTrueProb(americanFromProb(atlEff)) - wshOur) < 1e-3);
+  assert.ok(trueProb(-150) > 0.59 && trueProb(-150) < 0.61);
+}
+
+// Best-of-two venues: cheaper taker opponent (lowest fee-adjusted YES) wins.
+{
+  const kalshiAtl = 0.50;
+  const polyAtl = 0.40;
+  const kalshiEff = applyTakerFeeToProb(kalshiAtl, KALSHI_TAKER_THETA);
+  const polyEff = applyTakerFeeToProb(polyAtl, POLY_TAKER_THETA);
+  assert.ok(polyEff < kalshiEff, 'poly 0.40 after 5% is cheaper than kalshi 0.50 after 7%');
+  const our = ourTrueFromOpponents([
+    { venue: 'kalshi', yesProb: kalshiAtl },
+    { venue: 'polymarket', yesProb: polyAtl },
+  ]);
+  assert.ok(Math.abs(our - (1 - polyEff)) < 1e-12);
+  assert.ok(Math.abs(our - (1 - kalshiEff)) > 1e-6);
+}
+
+{
+  const kalshiAtl = 0.35;
+  const polyAtl = 0.40;
+  const kalshiEff = applyTakerFeeToProb(kalshiAtl, KALSHI_TAKER_THETA);
+  const polyEff = applyTakerFeeToProb(polyAtl, POLY_TAKER_THETA);
+  assert.ok(kalshiEff < polyEff);
+  const our = ourTrueFromOpponents([
+    { venue: 'kalshi', yesProb: kalshiAtl },
+    { venue: 'polymarket', yesProb: polyAtl },
+  ]);
+  assert.ok(Math.abs(our - (1 - kalshiEff)) < 1e-12);
+}
+
+{
+  const wshOur = ourTrueFromOpponentYes(0.42, KALSHI_TAKER_THETA);
+  const cwsOur = ourTrueFromOpponentYes(0.50, KALSHI_TAKER_THETA);
+  const inverse = priceUnhedgedCombo({
+    venue: 'kalshi',
+    legs: [
+      { league: 'mlb', ticker: 'KXMLBGAME-WSHATL-WSH', side: 'yes' },
+      { league: 'mlb', ticker: 'KXMLBGAME-CWSDET-CWS', side: 'yes' },
+    ],
+    getOurTrue: (leg) => (String(leg.ticker).includes('WSH') ? wshOur : cwsOur),
+  });
+  const fair = wshOur * cwsOur;
+  assert.ok(Math.abs(inverse.fairYes - fair) < 1e-12);
+  assert.strictEqual(inverse.feeRate, 0.035);
+  assert.ok(inverse.netCost > inverse.fairYes);
+
+  const nflInv = priceUnhedgedCombo({
+    venue: 'kalshi',
+    legs: nflLegs,
+    getOurTrue: () => 0.5,
+  });
+  assert.strictEqual(nflInv.feeRate, 0);
+  assert.strictEqual(nflInv.netCost, 0.25);
+
+  const polyInv = priceUnhedgedCombo({
+    venue: 'polymarket',
+    legs: [
+      { league: 'mlb', symbol: 'aec-mlb-wsh-atl-2026-08-14-wsh', side: 'yes' },
+      { league: 'mlb', symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'yes' },
+    ],
+    getOurTrue: () => 0.5,
+  });
+  assert.strictEqual(polyInv.netCost, polyInv.fairYes);
+  assert.ok(polyInv.netCost !== 0.25 - (0.0125 * 0.25 * 0.75));
+
+  const noSideInv = priceUnhedgedCombo({
+    venue: 'kalshi',
+    legs: [
+      { league: 'mlb', ticker: 'KXMLBGAME-WSHATL-WSH', side: 'no' },
+      { league: 'mlb', ticker: 'KXMLBGAME-CWSDET-CWS', side: 'yes' },
+    ],
+    getOurTrue: (leg) => (String(leg.ticker).includes('WSH') ? wshOur : cwsOur),
+  });
+  assert.ok(Math.abs(noSideInv.fairYes - ((1 - wshOur) * cwsOur)) < 1e-12);
+}
+
+{
+  const missingOpp = priceUnhedgedCombo({
+    venue: 'kalshi',
+    legs: mlbLegs,
+    getOurTrue: () => null,
+  });
+  assert.strictEqual(missingOpp.our_fair_american, null);
+  assert.strictEqual(missingOpp.our_quote_american, null);
 }
 
 console.log('unhedged-quote.test.js ok');

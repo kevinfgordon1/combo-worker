@@ -3,7 +3,18 @@
 // RFQ path. Kalshi: signed GET /markets for KXMLBGAME / KXNFLGAME / KXNCAAFGAME.
 // Polymarket: getMarketBySlug for watched aec-* slugs only.
 // The Odds API is not the quote clock.
+//
+// Fair lookups use the *opponent* YES (other ticker in the same Kalshi event;
+// other aec-* ML in the same Polymarket game), then inverse-bet ourTrue.
 'use strict';
+
+const { normTeam } = require('./leg-identity');
+const { parseKalshiUnhedgedTicker, parsePmUnhedgedSlug } = require('./unhedged-rfq');
+const {
+  ourTrueFromOpponents,
+  KALSHI_TAKER_THETA,
+  POLY_TAKER_THETA,
+} = require('./unhedged-quote');
 
 const KALSHI_ML_SERIES = ['KXMLBGAME', 'KXNFLGAME', 'KXNCAAFGAME'];
 const DEFAULT_REFRESH_MS = 4000;
@@ -118,6 +129,97 @@ function normPmKey(key) {
   return slug.toLowerCase();
 }
 
+function kalshiEventKeyFromTicker(ticker) {
+  const key = normKalshiKey(ticker);
+  const i = key.lastIndexOf('-');
+  return i > 0 ? key.slice(0, i) : key;
+}
+
+function pmGamePrefix(slug) {
+  const key = normPmKey(slug);
+  const i = key.lastIndexOf('-');
+  return i > 0 ? key.slice(0, i) : key;
+}
+
+function gameKeyFromParsed(parsed) {
+  if (!parsed || !parsed.league || !parsed.date) return null;
+  const league = String(parsed.league).toLowerCase();
+  const teams = (parsed.teams || []).map((t) => normTeam(league, t)).filter(Boolean);
+  const uniq = [...new Set(teams)].sort();
+  if (uniq.length < 2) return null;
+  return `${league}|${parsed.date}|${uniq.join('+')}`;
+}
+
+function opponentTeamOf(parsed) {
+  if (!parsed) return null;
+  const league = String(parsed.league || '').toLowerCase();
+  const sel = normTeam(league, parsed.selection);
+  if (!sel) return null;
+  const teams = (parsed.teams || []).map((t) => normTeam(league, t)).filter(Boolean);
+  const others = [...new Set(teams)].filter((t) => t !== sel);
+  return others.length === 1 ? others[0] : null;
+}
+
+function parseLeg(leg) {
+  if (!leg || typeof leg !== 'object') return null;
+  if (leg.ticker) {
+    const p = parseKalshiUnhedgedTicker(leg.ticker, leg.side || 'yes');
+    if (p && !p.skip) {
+      return {
+        ...p,
+        teams: Array.isArray(leg.teams) && leg.teams.length ? leg.teams : p.teams,
+        selection: leg.selection || p.selection,
+        date: leg.date || p.date,
+        league: leg.league || p.league,
+        ticker: p.ticker || leg.ticker,
+        symbol: leg.symbol || p.symbol,
+      };
+    }
+  }
+  if (leg.symbol) {
+    const p = parsePmUnhedgedSlug(leg.symbol, leg.side || 'yes');
+    if (p && !p.skip) {
+      return {
+        ...p,
+        teams: Array.isArray(leg.teams) && leg.teams.length ? leg.teams : p.teams,
+        selection: leg.selection || p.selection,
+        date: leg.date || p.date,
+        league: leg.league || p.league,
+        ticker: leg.ticker || p.ticker,
+        symbol: p.symbol || leg.symbol,
+      };
+    }
+  }
+  if (leg.league && (leg.selection || (leg.teams && leg.teams.length))) {
+    return {
+      league: leg.league,
+      date: leg.date,
+      teams: leg.teams,
+      selection: leg.selection,
+      ticker: leg.ticker,
+      symbol: leg.symbol,
+    };
+  }
+  return null;
+}
+
+function addToSetMap(map, key, value) {
+  if (!key || !value) return;
+  let set = map.get(key);
+  if (!set) {
+    set = new Set();
+    map.set(key, set);
+  }
+  set.add(value);
+}
+
+function removeFromSetMap(map, key, value) {
+  if (!key || !value || !map.has(key)) return;
+  const set = map.get(key);
+  set.delete(value);
+  if (!set.size) map.delete(key);
+}
+
 function createUnhedgedPriceCache({
   fetchKalshiMarkets,
   fetchPmMarket,
@@ -128,32 +230,86 @@ function createUnhedgedPriceCache({
 } = {}) {
   const kalshi = new Map();
   const polymarket = new Map();
+  const kalshiEvents = new Map();
+  const kalshiGames = new Map();
+  const pmByPrefix = new Map();
+  const pmGames = new Map();
   const pmWatch = new Set();
   let timer = null;
   let refreshing = false;
   let pmFetch = fetchPmMarket;
   const refreshEvery = intervalMs != null ? intervalMs : refreshMsFromEnv(env);
 
-  function writeKalshi(ticker, yesProb) {
+  function unindexKalshi(key, entry) {
+    if (!entry) return;
+    removeFromSetMap(kalshiEvents, entry.eventKey, key);
+    removeFromSetMap(kalshiGames, entry.gameKey, key);
+  }
+
+  function unindexPm(key, entry) {
+    if (!entry) return;
+    removeFromSetMap(pmByPrefix, entry.gamePrefix, key);
+    removeFromSetMap(pmGames, entry.gameKey, key);
+  }
+
+  function writeKalshi(ticker, yesProb, market) {
     const key = normKalshiKey(ticker);
     if (!key) return;
+    const prev = kalshi.get(key);
+    if (prev) unindexKalshi(key, prev);
     const p = asProb(yesProb);
     if (p == null) {
       kalshi.delete(key);
       return;
     }
-    kalshi.set(key, { yesProb: p, at: now() });
+    const parsed = parseKalshiUnhedgedTicker(key, 'yes');
+    const eventFromMarket = market && (market.event_ticker || market.eventTicker);
+    const eventKey = eventFromMarket
+      ? String(eventFromMarket).trim().toUpperCase()
+      : kalshiEventKeyFromTicker(key);
+    const league = parsed && parsed.league;
+    const entry = {
+      yesProb: p,
+      at: now(),
+      eventKey,
+      gameKey: parsed ? gameKeyFromParsed(parsed) : null,
+      selection: parsed && parsed.selection,
+      selectionNorm: parsed && league ? normTeam(league, parsed.selection) : null,
+      league,
+      date: parsed && parsed.date,
+      teams: parsed && parsed.teams,
+    };
+    kalshi.set(key, entry);
+    addToSetMap(kalshiEvents, entry.eventKey, key);
+    addToSetMap(kalshiGames, entry.gameKey, key);
   }
 
   function writePm(slug, yesProb) {
     const key = normPmKey(slug);
     if (!key) return;
+    const prev = polymarket.get(key);
+    if (prev) unindexPm(key, prev);
     const p = asProb(yesProb);
     if (p == null) {
       polymarket.delete(key);
       return;
     }
-    polymarket.set(key, { yesProb: p, at: now() });
+    const parsed = parsePmUnhedgedSlug(key, 'yes');
+    const league = parsed && parsed.league;
+    const entry = {
+      yesProb: p,
+      at: now(),
+      gamePrefix: pmGamePrefix(key),
+      gameKey: parsed ? gameKeyFromParsed(parsed) : null,
+      selection: parsed && parsed.selection,
+      selectionNorm: parsed && league ? normTeam(league, parsed.selection) : null,
+      league,
+      date: parsed && parsed.date,
+      teams: parsed && parsed.teams,
+    };
+    polymarket.set(key, entry);
+    addToSetMap(pmByPrefix, entry.gamePrefix, key);
+    addToSetMap(pmGames, entry.gameKey, key);
   }
 
   if (seed && seed.kalshi) {
@@ -173,7 +329,7 @@ function createUnhedgedPriceCache({
       if (!KALSHI_ML_SERIES.includes(series)) continue;
       const p = kalshiYesProb(m);
       if (p == null) continue;
-      writeKalshi(ticker, p);
+      writeKalshi(ticker, p, m);
       n += 1;
     }
     return n;
@@ -201,15 +357,127 @@ function createUnhedgedPriceCache({
     return null;
   }
 
+  function addQuote(quotes, seen, venue, yesProb, key) {
+    const p = asProb(yesProb);
+    if (p == null || !key) return;
+    const id = `${venue}:${key}`;
+    if (seen.has(id)) return;
+    seen.add(id);
+    const theta = venue === 'kalshi' ? KALSHI_TAKER_THETA : POLY_TAKER_THETA;
+    quotes.push({ venue, yesProb: p, theta, key });
+  }
+
+  function opponentQuotes(leg) {
+    const quotes = [];
+    const seen = new Set();
+    const parsed = parseLeg(leg);
+
+    const kTicker = normKalshiKey(leg && (leg.ticker || (parsed && parsed.ticker)));
+    if (kTicker) {
+      const hit = kalshi.get(kTicker);
+      const eventKey = (hit && hit.eventKey) || kalshiEventKeyFromTicker(kTicker);
+      const members = kalshiEvents.get(eventKey);
+      if (members) {
+        for (const t of members) {
+          if (t === kTicker) continue;
+          const other = kalshi.get(t);
+          if (other) addQuote(quotes, seen, 'kalshi', other.yesProb, t);
+        }
+      }
+    }
+
+    const pmSlug = normPmKey(leg && (leg.symbol || (parsed && parsed.symbol)));
+    if (pmSlug) {
+      const hit = polymarket.get(pmSlug);
+      const prefix = (hit && hit.gamePrefix) || pmGamePrefix(pmSlug);
+      const members = pmByPrefix.get(prefix);
+      if (members) {
+        for (const s of members) {
+          if (s === pmSlug) continue;
+          const other = polymarket.get(s);
+          if (other) addQuote(quotes, seen, 'polymarket', other.yesProb, s);
+        }
+      }
+    }
+
+    if (parsed) {
+      const gk = gameKeyFromParsed(parsed);
+      const opp = opponentTeamOf(parsed);
+      if (gk && opp) {
+        const kMembers = kalshiGames.get(gk);
+        if (kMembers) {
+          for (const t of kMembers) {
+            const other = kalshi.get(t);
+            if (!other) continue;
+            if (other.selectionNorm === opp) addQuote(quotes, seen, 'kalshi', other.yesProb, t);
+          }
+        }
+        const pMembers = pmGames.get(gk);
+        if (pMembers) {
+          for (const s of pMembers) {
+            const other = polymarket.get(s);
+            if (!other) continue;
+            if (other.selectionNorm === opp) addQuote(quotes, seen, 'polymarket', other.yesProb, s);
+          }
+        }
+      }
+    }
+
+    return quotes;
+  }
+
+  function getOurTrue(leg) {
+    return ourTrueFromOpponents(opponentQuotes(leg));
+  }
+
+  function derivePmOpponentSlug(slug, leg) {
+    const key = normPmKey(slug);
+    if (!key || !key.startsWith(PM_ML_PREFIX)) return null;
+    const parsed = parsePmUnhedgedSlug(key, 'yes') || parseLeg(leg);
+    const opp = opponentTeamOf(parsed);
+    if (!opp || !parsed) return null;
+    const i = key.lastIndexOf('-');
+    if (i <= 0) return null;
+    const rawTeams = parsed.teams || [];
+    const league = String(parsed.league || '').toLowerCase();
+    const rawOpp = rawTeams.find((t) => normTeam(league, t) === opp) || opp;
+    return `${key.slice(0, i)}-${rawOpp}`;
+  }
+
   function watch(venue, legs) {
-    if (venue !== 'polymarket' || !Array.isArray(legs)) return;
+    if (!Array.isArray(legs)) return;
     let added = false;
-    for (const leg of legs) {
-      const key = normPmKey(leg && (leg.symbol || leg.ticker));
-      if (!key || !key.startsWith(PM_ML_PREFIX)) continue;
-      if (!pmWatch.has(key)) {
-        pmWatch.add(key);
+    function addWatch(key) {
+      const k = normPmKey(key);
+      if (!k || !k.startsWith(PM_ML_PREFIX)) return;
+      if (!pmWatch.has(k)) {
+        pmWatch.add(k);
         added = true;
+      }
+    }
+    for (const leg of legs) {
+      const pmKey = normPmKey(leg && (leg.symbol || (venue === 'polymarket' ? leg.ticker : '')));
+      if (pmKey) {
+        addWatch(pmKey);
+        const opp = derivePmOpponentSlug(pmKey, leg);
+        if (opp) addWatch(opp);
+        const prefix = pmGamePrefix(pmKey);
+        const members = pmByPrefix.get(prefix);
+        if (members) {
+          for (const s of members) addWatch(s);
+        }
+      }
+      const parsed = parseLeg(leg);
+      const gk = parsed && gameKeyFromParsed(parsed);
+      if (gk) {
+        const slugs = pmGames.get(gk);
+        if (slugs) {
+          for (const s of slugs) {
+            addWatch(s);
+            const opp = derivePmOpponentSlug(s, null);
+            if (opp) addWatch(opp);
+          }
+        }
       }
     }
     if (added && timer) scheduleSoon();
@@ -298,6 +566,8 @@ function createUnhedgedPriceCache({
 
   return {
     getYesProb,
+    getOurTrue,
+    opponentQuotes,
     watch,
     setPmFetch,
     ingestKalshiMarkets,
@@ -315,10 +585,15 @@ function createUnhedgedPriceCache({
 module.exports = {
   KALSHI_ML_SERIES,
   DEFAULT_REFRESH_MS,
+  KALSHI_PAGE_LIMIT,
   createUnhedgedPriceCache,
   kalshiYesProb,
   pmYesProb,
   isPmFullGameMl,
   asProb,
   refreshMsFromEnv,
+  kalshiEventKeyFromTicker,
+  pmGamePrefix,
+  gameKeyFromParsed,
+  opponentTeamOf,
 };
