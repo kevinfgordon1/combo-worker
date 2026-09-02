@@ -1,23 +1,22 @@
 // Unhedged RFQ shadow quote math — independent of Combo Locks / engine KFEE.
 // Do not POST from this module. Fair is the product of independent ourTrue
-// probs (honor yes/no). ourTrue is the sign-flip of the best fee-included
-// Kalshi/Poly opponent American (Promo Builder / EV). Theta is applied once
-// when turning a raw YES cent price into that American. Invert does not
-// apply Kalshi 0.07 / Poly 0.05 a second time.
+// probs (honor yes/no). Inverse (opponent MLs): convert each venue's opponent
+// YES (taker ask / last already on the book) to American as-is — do NOT apply
+// Kalshi 0.07 or Poly 0.05/0.06 taker theta to singles. Best opponent American
+// across Kalshi vs Polymarket (more plus / less minus), then sign-flip for
+// our side. Posted Mariners +118 → Sox -118.
 //
-// Would-quote YES = margin × net_cost, then the first penny at or above that
-// (Kevin: fair 0.10 MLB → fee 0.00315 → net 0.10315 → 0.1083 → 0.11).
-// net_cost = fair YES + Kalshi combo maker fee (if any). Polymarket maker
-// cost is 0 — rebates are ignored and never baked into the quote.
+// Combo wrap (the real fee, unchanged): Kalshi independent NFL-only maker 0;
+// MLB/NCAAF/mixed 0.035*p*(1-p) = 50% of Kalshi taker 0.07*p*(1-p) per their
+// Combos row. Polymarket maker 0, no rebate. Then 1.05 * net_cost, first
+// penny up. (Kevin: fair 0.10 MLB → fee 0.00315 → net 0.10315 → 0.1083 → 0.11).
 'use strict';
 const { americanFromProb } = require('./engine');
 
-const KALSHI_COMBO_MAKER = 0.035;
+const KALSHI_COMBO_MAKER = 0.035; // 50% of Kalshi taker 0.07; Combos row
 const KALSHI_NFL_MAKER = 0;
 const POLY_MAKER_RATE = 0; // rebates ignored; never bake rebate income into the quote
 const DEFAULT_QUOTE_MULT = 1.05;
-const KALSHI_TAKER_THETA = 0.07;
-const POLY_TAKER_THETA = 0.05;
 
 function numOrNull(v) {
   if (v == null || v === '') return null;
@@ -106,8 +105,8 @@ function productFair(probs) {
   return validProb(acc);
 }
 
-// Promo Builder / EV: trueProb is implied of an already-fee-included American.
-// ourTrue = 1 − that = sign-flip of the American. No extra theta at invert.
+// Promo Builder / EV: trueProb is implied of the posted opponent American
+// (as-is, no singles taker theta). ourTrue = 1 − that = sign-flip.
 // Missing opponent is null here (do not invent 0.5).
 function trueProb(bestOpponentOdds) {
   if (bestOpponentOdds == null || bestOpponentOdds === '') return null;
@@ -122,7 +121,7 @@ function ourTrueProb(bestOpponentOdds) {
   return tp == null ? null : validProb(1 - tp);
 }
 
-// Sign-flip of a fee-included American: +118 → -118, -140 → +140.
+// Sign-flip of posted opponent American: +118 → -118, -140 → +140.
 function invertAmerican(american) {
   if (american == null || american === '') return null;
   const n = Number(american);
@@ -130,17 +129,8 @@ function invertAmerican(american) {
   return -n;
 }
 
-// odds-shared.js: p_eff = p * (1 + θ·(1−p)). Kalshi θ=0.07, Poly US θ=0.05.
-// Theta belongs only on this raw-cents → fee-included-American conversion.
-function applyTakerFeeToProb(p, theta) {
-  const raw = validProb(p);
-  if (raw == null) return null;
-  const t = Number.isFinite(theta) ? theta : 0;
-  return validProb(raw * (1 + t * (1 - raw)));
-}
-
-function feeIncludedAmerican(rawYes, theta) {
-  return americanFromProb(applyTakerFeeToProb(rawYes, theta));
+function postedAmericanFromYes(rawYes) {
+  return americanFromProb(validProb(rawYes));
 }
 
 function opponentAmericanFromQuote(q) {
@@ -149,21 +139,13 @@ function opponentAmericanFromQuote(q) {
     const n = Number(q.american);
     return Number.isFinite(n) && n !== 0 ? n : null;
   }
-  const theta = q.theta != null ? q.theta : takerThetaForVenue(q.venue);
-  if (theta == null) return null;
   const raw = q.yesProb != null ? q.yesProb : q.p;
-  return feeIncludedAmerican(raw, theta);
+  return postedAmericanFromYes(raw);
 }
 
-function ourTrueFromOpponentYes(rawYes, theta) {
-  const am = feeIncludedAmerican(rawYes, theta);
+function ourTrueFromOpponentYes(rawYes) {
+  const am = postedAmericanFromYes(rawYes);
   return am == null ? null : ourTrueProb(am);
-}
-
-function takerThetaForVenue(venue) {
-  if (venue === 'kalshi') return KALSHI_TAKER_THETA;
-  if (venue === 'polymarket') return POLY_TAKER_THETA;
-  return null;
 }
 
 // Best opponent American for someone betting the opponent: more plus / less minus.
@@ -177,7 +159,7 @@ function bestOpponentAmerican(quotes) {
   return best;
 }
 
-// Lowest fee-included YES implied by the best opponent American (no 2nd theta).
+// Posted YES implied by the best opponent American (as-is, no taker theta).
 function bestOpponentEff(quotes) {
   const am = bestOpponentAmerican(quotes);
   return am == null ? null : trueProb(am);
@@ -234,8 +216,6 @@ module.exports = {
   KALSHI_NFL_MAKER,
   POLY_MAKER_RATE,
   DEFAULT_QUOTE_MULT,
-  KALSHI_TAKER_THETA,
-  POLY_TAKER_THETA,
   isUnhedgedRfqLive,
   quoteMultFromEnv,
   makerFee,
@@ -249,11 +229,9 @@ module.exports = {
   trueProb,
   ourTrueProb,
   invertAmerican,
-  applyTakerFeeToProb,
-  feeIncludedAmerican,
+  postedAmericanFromYes,
   opponentAmericanFromQuote,
   ourTrueFromOpponentYes,
-  takerThetaForVenue,
   bestOpponentAmerican,
   bestOpponentEff,
   ourTrueFromOpponents,

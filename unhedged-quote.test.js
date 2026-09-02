@@ -6,8 +6,6 @@ const {
   KALSHI_NFL_MAKER,
   POLY_MAKER_RATE,
   DEFAULT_QUOTE_MULT,
-  KALSHI_TAKER_THETA,
-  POLY_TAKER_THETA,
   isUnhedgedRfqLive,
   makerFee,
   isKalshiNflOnly,
@@ -17,9 +15,8 @@ const {
   quoteYesFromFair,
   ceil2,
   priceUnhedgedCombo,
-  applyTakerFeeToProb,
-  feeIncludedAmerican,
   invertAmerican,
+  postedAmericanFromYes,
   bestOpponentAmerican,
   ourTrueFromOpponentYes,
   ourTrueFromOpponents,
@@ -35,8 +32,6 @@ assert.strictEqual(DEFAULT_QUOTE_MULT, 1.05);
 assert.strictEqual(KALSHI_NFL_MAKER, 0);
 assert.strictEqual(KALSHI_COMBO_MAKER, 0.035);
 assert.strictEqual(POLY_MAKER_RATE, 0);
-assert.strictEqual(KALSHI_TAKER_THETA, 0.07);
-assert.strictEqual(POLY_TAKER_THETA, 0.05);
 
 const nflLegs = [
   { league: 'nfl', ticker: 'KXNFLGAME-A-KC', side: 'yes' },
@@ -188,7 +183,7 @@ function lookup(_venue, key) {
   assert.strictEqual(noLookup.our_quote_american, null);
 }
 
-// Kevin: opponent +118 → our -118 (not -114). Opponent -140 → our +140.
+// Invert is sign-flip of posted opponent American. +118 → -118, not a 7% haircut to +114.
 {
   assert.strictEqual(invertAmerican(118), -118);
   assert.notStrictEqual(invertAmerican(118), -114);
@@ -201,9 +196,15 @@ function lookup(_venue, key) {
   assert.strictEqual(americanFromProb(fromPlus), -118);
   assert.notStrictEqual(americanFromProb(fromPlus), -114);
   assert.strictEqual(americanFromProb(fromMinus), 140);
+
+  const postedPlus118 = 100 / (118 + 100);
+  assert.strictEqual(americanFromProb(postedPlus118), 118);
+  assert.strictEqual(postedAmericanFromYes(postedPlus118), 118);
+  assert.strictEqual(americanFromProb(ourTrueFromOpponentYes(postedPlus118)), -118);
+  assert.notStrictEqual(americanFromProb(ourTrueFromOpponentYes(postedPlus118)), -114);
 }
 
-// Best-of-two already-fee-included Americans: more plus / less minus, then flip.
+// Best-of-two posted Americans: more plus / less minus, then flip.
 {
   assert.strictEqual(bestOpponentAmerican([{ american: 118 }, { american: -140 }]), 118);
   assert.strictEqual(invertAmerican(118), -118);
@@ -217,7 +218,7 @@ function lookup(_venue, key) {
   assert.strictEqual(invertAmerican(-110), 110);
 }
 
-// Kevin: fee-included Mariners +118 (Kalshi) vs Poly Mariners +105 — pick +118, invert to Sox -118.
+// Kevin: posted Mariners +118 (Kalshi) vs Poly Mariners +105 — pick +118, invert to Sox -118.
 // Same-side Sox last is not an opponent quote and must not win the pick.
 {
   const marinersKalshi = { venue: 'kalshi', american: 118 };
@@ -231,15 +232,13 @@ function lookup(_venue, key) {
   assert.strictEqual(invertAmerican(bestOpponentAmerican([marinersKalshi])), -118);
 }
 
-// Inverse: WSH fair = sign-flip of fee-included ATL American, not WSH last.
+// Inverse: WSH fair = sign-flip of posted ATL American, not WSH last. No taker theta.
 {
   const atl = 0.42;
   const wshLast = 0.60;
-  const atlEff = applyTakerFeeToProb(atl, KALSHI_TAKER_THETA);
-  assert.ok(Math.abs(atlEff - (0.42 * (1 + 0.07 * 0.58))) < 1e-12);
-  const atlAm = feeIncludedAmerican(atl, KALSHI_TAKER_THETA);
-  assert.strictEqual(atlAm, americanFromProb(atlEff));
-  const wshOur = ourTrueFromOpponentYes(atl, KALSHI_TAKER_THETA);
+  const atlAm = postedAmericanFromYes(atl);
+  assert.strictEqual(atlAm, americanFromProb(atl));
+  const wshOur = ourTrueFromOpponentYes(atl);
   assert.ok(Math.abs(wshOur - ourTrueProb(atlAm)) < 1e-12);
   assert.strictEqual(americanFromProb(wshOur), invertAmerican(atlAm));
   assert.ok(Math.abs(wshOur - (1 - wshLast)) > 1e-6, 'must not use 1-WSH last');
@@ -247,13 +246,13 @@ function lookup(_venue, key) {
   assert.ok(trueProb(-150) > 0.59 && trueProb(-150) < 0.61);
 }
 
-// Best-of-two venues: cheaper/better opponent American (more plus), then flip.
+// Best-of-two venues: posted opponent American as-is (more plus), then flip.
 {
   const kalshiAtl = 0.50;
   const polyAtl = 0.40;
-  const kalshiAm = feeIncludedAmerican(kalshiAtl, KALSHI_TAKER_THETA);
-  const polyAm = feeIncludedAmerican(polyAtl, POLY_TAKER_THETA);
-  assert.ok(polyAm > kalshiAm, 'poly 0.40 after 5% is a better opponent American than kalshi 0.50 after 7%');
+  const kalshiAm = postedAmericanFromYes(kalshiAtl);
+  const polyAm = postedAmericanFromYes(polyAtl);
+  assert.ok(polyAm > kalshiAm, 'poly 0.40 as-is is a better opponent American than kalshi 0.50');
   const our = ourTrueFromOpponents([
     { venue: 'kalshi', yesProb: kalshiAtl },
     { venue: 'polymarket', yesProb: polyAtl },
@@ -270,8 +269,8 @@ function lookup(_venue, key) {
 {
   const kalshiAtl = 0.35;
   const polyAtl = 0.40;
-  const kalshiAm = feeIncludedAmerican(kalshiAtl, KALSHI_TAKER_THETA);
-  const polyAm = feeIncludedAmerican(polyAtl, POLY_TAKER_THETA);
+  const kalshiAm = postedAmericanFromYes(kalshiAtl);
+  const polyAm = postedAmericanFromYes(polyAtl);
   assert.ok(kalshiAm > polyAm);
   const our = ourTrueFromOpponents([
     { venue: 'kalshi', yesProb: kalshiAtl },
@@ -282,8 +281,8 @@ function lookup(_venue, key) {
 }
 
 {
-  const wshOur = ourTrueFromOpponentYes(0.42, KALSHI_TAKER_THETA);
-  const cwsOur = ourTrueFromOpponentYes(0.50, KALSHI_TAKER_THETA);
+  const wshOur = ourTrueFromOpponentYes(0.42);
+  const cwsOur = ourTrueFromOpponentYes(0.50);
   const inverse = priceUnhedgedCombo({
     venue: 'kalshi',
     legs: [
