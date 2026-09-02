@@ -114,6 +114,12 @@ function quoteUnhedged(venue, legs, yesProbs, sides, env) {
   };
 }
 
+function cleanProb(p) {
+  if (p == null) return null;
+  const r = Math.round(p * 1e6) / 1e6;
+  return r > 0 && r < 1 ? r : null;
+}
+
 function dollarProb(v) {
   const n = numOrNull(v);
   if (n == null) return null;
@@ -133,7 +139,7 @@ function yesProbFromKalshiMarket(m) {
   const bid = dollarProb(m.yes_bid_dollars != null ? m.yes_bid_dollars : m.yes_bid);
   const ask = dollarProb(m.yes_ask_dollars != null ? m.yes_ask_dollars : m.yes_ask);
   const last = dollarProb(m.last_price_dollars != null ? m.last_price_dollars : m.last_price);
-  if (bid != null && ask != null) return (bid + ask) / 2;
+  if (bid != null && ask != null) return cleanProb((bid + ask) / 2);
   if (last != null) return last;
   return bid != null ? bid : ask;
 }
@@ -150,7 +156,7 @@ function yesProbFromPmMarket(m) {
           : src.currentPx != null ? src.currentPx
             : src.price
   );
-  if (bid != null && ask != null) return (bid + ask) / 2;
+  if (bid != null && ask != null) return cleanProb((bid + ask) / 2);
   if (last != null) return last;
   if (bid != null) return bid;
   if (ask != null) return ask;

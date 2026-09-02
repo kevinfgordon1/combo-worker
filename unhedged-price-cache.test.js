@@ -72,7 +72,7 @@ assert.ok(Math.abs(fairYesProb([0.7, 0.7], ['yes', 'no']) - 0.21) < 1e-12);
 
 // Missing / invalid leg price → no fair (do not invent).
 assert.strictEqual(fairYesProb([0.4, null], ['yes', 'yes']), null);
-assert.strictEqual(quoteUnhedged('kalshi', mlbLegs, [0.4], ['yes']).fairAmerican, null);
+assert.strictEqual(quoteUnhedged('kalshi', mlbLegs, [0.4, null], ['yes', 'yes']).fairAmerican, null);
 
 {
   const priced = quoteUnhedged('kalshi', nflLegs, [0.4, 0.4], ['yes', 'yes'], { UNHEDGED_YES_CUSHION: '0.05' });
