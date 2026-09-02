@@ -1010,12 +1010,79 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.strictEqual(unhedgedFetches, 0);
   assert.ok(unhedgedRows.some((r) => r.rfq_id === 'rfq_unhedged_mlb3'));
   assert.ok(!unhedgedRows.some((r) => r.rfq_id === tennisRfq.id));
+  const mlb3row = unhedgedRows.find((r) => r.rfq_id === 'rfq_unhedged_mlb3');
+  assert.strictEqual(mlb3row.our_fair_american, null);
+  assert.strictEqual(mlb3row.our_quote_american, null);
   const beforeLock = unhedgedRows.length;
   const lockShadow = await unhedgedLoop.handleRfq({ ...pmRfq, id: 'rfq_lock_not_unhedged' });
   assert.strictEqual(lockShadow.action, 'quoteable');
   await new Promise((r) => setTimeout(r, 20));
   assert.strictEqual(unhedgedRows.length, beforeLock);
   unhedgedLoop.stop();
+
+  const { createUnhedgedPriceCache } = require('./unhedged-price-cache');
+  const { americanFromProb } = require('./engine');
+  const pricedRows = [];
+  let pricedCreate = 0;
+  let pricedMarketGets = 0;
+  const pricedCache = createUnhedgedPriceCache({
+    seed: {
+      polymarket: {
+        'aec-mlb-cws-det-2026-08-14-cws': 0.5,
+        'aec-mlb-bos-pit-2026-08-14-pit': 0.5,
+        'aec-mlb-nyy-bal-2026-08-14-nyy': 0.5,
+      },
+    },
+  });
+  const pricedLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+      UNHEDGED_RFQ_LIVE: 'true',
+    },
+    http: {
+      async getUserId() { return { rfqUserId: 'rfquser_test' }; },
+      async listRfqs() { return { rfqs: [] }; },
+      async listQuotes() { return { quotes: [] }; },
+      async getCombo() { throw new Error('unhedged must not hydrate'); },
+      async createQuote() { pricedCreate += 1; throw new Error('unhedged must not POST'); },
+      async confirmQuote() { throw new Error('unhedged must not confirm'); },
+      async deleteQuote() { return { statusCode: 200 }; },
+      close() {},
+    },
+    startWs: false,
+    getParlays: () => [kalshiParlay],
+    fetchMarket: async () => { pricedMarketGets += 1; return null; },
+    persistUnhedged: async (row) => { pricedRows.push(row); },
+    unhedgedPrices: pricedCache,
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  await pricedLoop.handleRfq({
+    id: 'rfq_unhedged_priced',
+    status: 'RFQ_STATUS_OPEN',
+    qtyDecimal: '8',
+    comboLegs: [
+      { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-bos-pit-2026-08-14-pit', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-nyy-bal-2026-08-14-nyy', side: 'SIDE_BUY' },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(pricedCreate, 0, 'priced unhedged must not createQuote');
+  assert.strictEqual(pricedMarketGets, 0, 'shadow insert must not HTTP');
+  const priced = pricedRows.find((r) => r.rfq_id === 'rfq_unhedged_priced');
+  assert.ok(priced);
+  assert.strictEqual(priced.our_fair_american, americanFromProb(0.125));
+  const polyNet = 0.125;
+  const polyQuoteYes = Math.ceil(1.05 * polyNet * 100 - 1e-9) / 100;
+  assert.strictEqual(priced.our_quote_american, americanFromProb(polyQuoteYes));
+  pricedLoop.stop();
 
   const parsed = parsePrivateMessage(JSON.stringify({
     requestId: 'rfq-sub-1',

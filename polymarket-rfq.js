@@ -38,7 +38,7 @@ const {
   sameIdentitySet,
   TEAM_ALIASES,
 } = require('./leg-identity');
-const { isUnhedgedRfqShadow, shadowUnhedgedMiss } = require('./unhedged-rfq');
+const { isUnhedgedRfqShadow, isUnhedgedRfqLive, shadowUnhedgedMiss } = require('./unhedged-rfq');
 
 const MODE = 'POLY';
 const RECONCILE_MS = 3000;
@@ -551,9 +551,15 @@ function startPolymarketRfqLoop(ctx = {}) {
     `[${MODE}] starting — live=${live}. ` +
     `POST create-quote / confirm only when POLYMARKET_RFQ_LIVE is truthy. ` +
     `Kalshi quoting keeps running. Remaining is shared via reserve.js. ` +
-    `Unhedged RFQ shadow (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(env) ? 'on' : 'off'}) ` +
+    `Unhedged RFQ shadow (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(env) ? 'on' : 'off'}, ` +
+    `UNHEDGED_RFQ_LIVE=${isUnhedgedRfqLive(env) ? 'on' : 'off'}) ` +
     `persists in-scope unmatched MLB/NFL/NCAAF ML combos — never posts.`
   );
+
+  const unhedgedPrices = ctx.unhedgedPrices || null;
+  if (unhedgedPrices && typeof unhedgedPrices.setPmFetch === 'function') {
+    unhedgedPrices.setPmFetch(ctx.fetchMarket || ((slug) => http.getMarketBySlug(slug)));
+  }
 
   function persistUnhedgedShadow(rfq) {
     shadowUnhedgedMiss(rfq, {
@@ -561,6 +567,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       supabase: ctx.supabase,
       persist: ctx.persistUnhedged,
       env,
+      priceCache: unhedgedPrices,
     });
   }
 
