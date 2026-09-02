@@ -598,7 +598,12 @@ function startPolymarketRfqLoop(ctx = {}) {
       persist: async (row, meta) => {
         unhedgedFills.remember(row);
         if (typeof ctx.persistUnhedged === 'function') await ctx.persistUnhedged(row, meta);
-        else if (ctx.supabase) await persistUnhedgedRfq(ctx.supabase, row);
+        else if (ctx.supabase) {
+          const out = await persistUnhedgedRfq(ctx.supabase, row);
+          if (out && out.alreadyFilled) {
+            unhedgedFills.remember({ venue: row.venue, rfq_id: row.rfq_id, status: 'filled' });
+          }
+        }
       },
       env,
       priceCache: unhedgedPrices,

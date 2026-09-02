@@ -472,7 +472,12 @@ function noteReleased(quoteId, pending, reason) {
 
 function persistUnhedgedRow(row) {
   if (unhedgedFills) unhedgedFills.remember(row);
-  return persistUnhedgedRfq(supabase, row);
+  return persistUnhedgedRfq(supabase, row).then((out) => {
+    if (out && out.alreadyFilled && unhedgedFills) {
+      unhedgedFills.remember({ venue: row.venue, rfq_id: row.rfq_id, status: 'filled' });
+    }
+    return out;
+  });
 }
 
 function onRfqDeleted(evt, env) {
