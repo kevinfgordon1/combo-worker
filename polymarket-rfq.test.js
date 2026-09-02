@@ -960,6 +960,63 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.strictEqual(hydrateFetches, tennisBareFetches);
   hydrateLoop.stop();
 
+  // Unhedged shadow: in-scope unmatched persist; tennis / lock-match do not.
+  const unhedgedRows = [];
+  let unhedgedFetches = 0;
+  const unhedgedLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'false',
+    },
+    http: {
+      async getUserId() { return { rfqUserId: 'rfquser_test' }; },
+      async listRfqs() { return { rfqs: [] }; },
+      async listQuotes() { return { quotes: [] }; },
+      async getCombo() { throw new Error('unhedged must not hydrate'); },
+      async createQuote() { throw new Error('unhedged must not POST'); },
+      async confirmQuote() { throw new Error('unhedged must not confirm'); },
+      async deleteQuote() { return { statusCode: 200 }; },
+      close() {},
+    },
+    startWs: false,
+    getParlays: () => [kalshiParlay],
+    fetchMarket: async (slug) => {
+      unhedgedFetches += 1;
+      return lockMarkets.get(slug) || null;
+    },
+    persistUnhedged: async (row) => { unhedgedRows.push(row); },
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  const tennisShadow = await unhedgedLoop.handleRfq(tennisRfq);
+  assert.strictEqual(tennisShadow.reason, 'no_lock_overlap');
+  const threeMlb = await unhedgedLoop.handleRfq({
+    id: 'rfq_unhedged_mlb3',
+    status: 'RFQ_STATUS_OPEN',
+    qtyDecimal: '8',
+    comboLegs: [
+      { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-bos-pit-2026-08-14-pit', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-nyy-bal-2026-08-14-nyy', side: 'SIDE_BUY' },
+    ],
+  });
+  assert.strictEqual(threeMlb.reason, 'no_lock_overlap');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(unhedgedFetches, 0);
+  assert.ok(unhedgedRows.some((r) => r.rfq_id === 'rfq_unhedged_mlb3'));
+  assert.ok(!unhedgedRows.some((r) => r.rfq_id === tennisRfq.id));
+  const beforeLock = unhedgedRows.length;
+  const lockShadow = await unhedgedLoop.handleRfq({ ...pmRfq, id: 'rfq_lock_not_unhedged' });
+  assert.strictEqual(lockShadow.action, 'quoteable');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(unhedgedRows.length, beforeLock);
+  unhedgedLoop.stop();
+
   const parsed = parsePrivateMessage(JSON.stringify({
     requestId: 'rfq-sub-1',
     subscriptionType: 'SUBSCRIPTION_TYPE_RFQ',
