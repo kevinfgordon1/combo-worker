@@ -1,12 +1,20 @@
 'use strict';
 const assert = require('assert');
 const { normalizeRfq } = require('./rfq');
+const fs = require('fs');
+const path = require('path');
 const {
+  SCOPE_LEAGUES,
   isUnhedgedRfqShadow,
   isUnhedgedRfqLive,
+  isUnhedgedFillStatus,
   classifyUnhedgedRfq,
   considerUnhedgedRfq,
+  considerUnhedgedFill,
   maybePersistUnhedged,
+  maybePersistUnhedgedFill,
+  createUnhedgedFillTracker,
+  resolveUnhedgedFill,
   parseKalshiUnhedgedTicker,
   parsePmUnhedgedSlug,
 } = require('./unhedged-rfq');
@@ -34,6 +42,25 @@ assert.strictEqual(isUnhedgedRfqShadow({ UNHEDGED_RFQ_SHADOW: '0' }), false);
 assert.strictEqual(isUnhedgedRfqShadow({ UNHEDGED_RFQ_SHADOW: 'off' }), false);
 assert.strictEqual(isUnhedgedRfqLive({}), false);
 assert.strictEqual(isUnhedgedRfqLive({ UNHEDGED_RFQ_LIVE: 'true' }), true);
+assert.ok(SCOPE_LEAGUES.has('mlb'));
+assert.ok(SCOPE_LEAGUES.has('nfl'));
+assert.ok(!SCOPE_LEAGUES.has('ncaaf'));
+assert.ok(isUnhedgedFillStatus('filled'));
+assert.ok(isUnhedgedFillStatus('RFQ_STATUS_EXECUTED'));
+assert.ok(isUnhedgedFillStatus('accepted'));
+assert.ok(!isUnhedgedFillStatus('open'));
+assert.ok(!isUnhedgedFillStatus('closed'));
+
+// Combo Locks Miss tape / quote path stay unwired from this module.
+{
+  const src = fs.readFileSync(path.join(__dirname, 'unhedged-rfq.js'), 'utf8');
+  assert.ok(!/require\(['"]\.\/skip-tape['"]\)/.test(src));
+  assert.ok(!src.includes('combo_submissions'));
+  const skipSrc = fs.readFileSync(path.join(__dirname, 'skip-tape.js'), 'utf8');
+  assert.ok(!skipSrc.includes('unhedged_rfqs'));
+  const engineSrc = fs.readFileSync(path.join(__dirname, 'engine.js'), 'utf8');
+  assert.ok(!engineSrc.includes('unhedged_rfqs'));
+}
 
 const mlbCws = parseKalshiUnhedgedTicker('KXMLBGAME-26AUG141840CWSDET-CWS:yes');
 assert.ok(mlbCws);
@@ -212,15 +239,42 @@ function pmRfq(id, symbols, extra = {}) {
   assert.strictEqual(classifyUnhedgedRfq(rfq, { venue: 'polymarket' }).persist, false);
 }
 
-// NFL + NCAAF independent 2-leg pass
+// NFL independent 2-leg pass; NCAAF is out of scope (no insert, no fill)
+{
+  const rfq = kalshiRfq('rfq-nfl-2', [
+    'KXNFLGAME-26SEP071330BUFKC-KC:yes',
+    'KXNFLGAME-26SEP071330DALPHI-PHI:yes',
+  ]);
+  const out = classifyUnhedgedRfq(rfq, { venue: 'kalshi', now: Date.parse('2026-09-01T12:00:00Z') });
+  assert.strictEqual(out.persist, true);
+  assert.strictEqual(out.status, 'seen');
+}
+
+{
+  const rfq = kalshiRfq('rfq-ncaaf', [
+    'KXNCAAFGAME-26SEP12OSUTEX-OSU:yes',
+    'KXNCAAFGAME-26SEP12ALAUGA-ALA:yes',
+  ]);
+  const out = classifyUnhedgedRfq(rfq, { venue: 'kalshi', now: Date.parse('2026-09-01T12:00:00Z') });
+  assert.strictEqual(out.persist, false);
+  assert.ok(out.reason === 'not_in_scope' || out.reason === 'not_moneyline');
+}
+
 {
   const rfq = kalshiRfq('rfq-nfl-ncaaf', [
     'KXNFLGAME-26SEP071330BUFKC-KC:yes',
     'KXNCAAFGAME-26SEP12OSUTEX-OSU:yes',
   ]);
   const out = classifyUnhedgedRfq(rfq, { venue: 'kalshi', now: Date.parse('2026-09-01T12:00:00Z') });
-  assert.strictEqual(out.persist, true);
-  assert.strictEqual(out.status, 'seen');
+  assert.strictEqual(out.persist, false);
+}
+
+{
+  const rfq = pmRfq('rfq-pm-ncaaf', [
+    'aec-ncaaf-osu-tex-2026-09-12-osu',
+    'aec-ncaaf-ala-uga-2026-09-12-ala',
+  ]);
+  assert.strictEqual(classifyUnhedgedRfq(rfq, { venue: 'polymarket' }).persist, false);
 }
 
 // Date-only PM slugs are not midnight starts
@@ -473,6 +527,177 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(noOpp.persist, true);
     assert.strictEqual(noOpp.our_fair_american, null);
     assert.strictEqual(noOpp.our_quote_american, null);
+
+    // Insert seen, then a later fill updates the same row (taker_* stays).
+    const store = new Map();
+    const persist = async (row, meta) => {
+      const key = `${row.venue}:${row.rfq_id}`;
+      if (meta && meta.mode === 'fill') {
+        const prev = store.get(key);
+        if (!prev) return;
+        store.set(key, { ...prev, ...row });
+        return;
+      }
+      store.set(key, { ...row });
+    };
+    const seenRfq = kalshiRfq('rfq-seen-then-fill', [
+      'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+      'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
+    ], { yesPrice: '0.18' });
+    const seenOut = await maybePersistUnhedged(seenRfq, {
+      venue: 'kalshi',
+      extra: { msg: { yes_price: '0.18' } },
+      now: Date.parse('2026-08-14T20:00:00Z'),
+      persist,
+    });
+    assert.strictEqual(seenOut.persist, true);
+    assert.strictEqual(seenOut.status, 'seen');
+    const seenRow = store.get('kalshi:rfq-seen-then-fill');
+    assert.strictEqual(seenRow.status, 'seen');
+    assert.strictEqual(seenRow.taker_yes_price, 0.18);
+    assert.ok(!('fill_yes_price' in seenRow) || seenRow.fill_yes_price == null);
+
+    const fillOut = await maybePersistUnhedgedFill({
+      venue: 'kalshi',
+      rfqId: 'rfq-seen-then-fill',
+      extra: { status: 'filled', yes_price: 0.22, no_price: 0.78, filled_at: '2026-08-14T20:05:00Z' },
+      persist,
+      known: true,
+    });
+    assert.strictEqual(fillOut.persist, true);
+    assert.strictEqual(fillOut.status, 'filled');
+    const filledRow = store.get('kalshi:rfq-seen-then-fill');
+    assert.strictEqual(filledRow.status, 'filled');
+    assert.strictEqual(filledRow.taker_yes_price, 0.18, 'taker_* stays the original RFQ');
+    assert.strictEqual(filledRow.fill_yes_price, 0.22);
+    assert.strictEqual(filledRow.fill_no_price, 0.78);
+    assert.ok(filledRow.fill_american != null);
+    assert.strictEqual(Date.parse(filledRow.filled_at), Date.parse('2026-08-14T20:05:00Z'));
+
+    // Out-of-scope (tennis / NCAAF) still not inserted, even on a fill event.
+    const tennisFill = await maybePersistUnhedgedFill({
+      venue: 'polymarket',
+      rfq: pmRfq('rfq-tennis-fill', [
+        'aec-atp-djokovic-alcaraz-2026-08-14-djokovic',
+        'aec-atp-sinner-medvedev-2026-08-14-sinner',
+      ]),
+      extra: { status: 'RFQ_STATUS_FILLED', buyPrice: 0.31 },
+      persist,
+      known: true,
+    });
+    assert.strictEqual(tennisFill.persist, false);
+    assert.ok(!store.has('polymarket:rfq-tennis-fill'));
+
+    const ncaafFill = await maybePersistUnhedgedFill({
+      venue: 'kalshi',
+      rfq: kalshiRfq('rfq-ncaaf-fill', [
+        'KXNCAAFGAME-26SEP12OSUTEX-OSU:yes',
+        'KXNCAAFGAME-26SEP12ALAUGA-ALA:yes',
+      ]),
+      extra: { status: 'executed', yes_price: 0.40 },
+      persist,
+      known: true,
+    });
+    assert.strictEqual(ncaafFill.persist, false);
+    assert.ok(!store.has('kalshi:rfq-ncaaf-fill'));
+
+    // Unknown id (never persisted) is not inserted from a fill event.
+    const unknownFill = await maybePersistUnhedgedFill({
+      venue: 'kalshi',
+      rfqId: 'rfq-never-seen',
+      extra: { status: 'filled', yes_price: 0.50 },
+      persist,
+    });
+    assert.strictEqual(unknownFill.persist, false);
+    assert.strictEqual(unknownFill.reason, 'unknown_row');
+    assert.ok(!store.has('kalshi:rfq-never-seen'));
+
+    // Tracker: close event without fill status queues; REST filled updates after pad.
+    const trackerRows = [];
+    const tracker = createUnhedgedFillTracker({
+      persist: async (row, meta) => {
+        if (meta && meta.mode === 'fill') trackerRows.push(row);
+      },
+      fetchRfq: async (id) => {
+        assert.strictEqual(id, 'rfq-seen-then-fill');
+        return { id, status: 'executed', yes_price: 0.25, no_price: 0.75 };
+      },
+      fetchTrades: async () => { throw new Error('must not tape-crawl unless needed'); },
+    });
+    tracker.remember(seenRow);
+    const closed = await tracker.onClosed({
+      venue: 'kalshi',
+      rfqId: 'rfq-seen-then-fill',
+      extra: { type: 'rfq_deleted', msg: { id: 'rfq-seen-then-fill' } },
+      now: Date.parse('2026-08-14T20:06:00Z'),
+    });
+    assert.strictEqual(closed.reason, 'queued');
+    assert.strictEqual(trackerRows.length, 0);
+    await tracker.tick(Date.parse('2026-08-14T20:07:00Z'));
+    assert.strictEqual(trackerRows.length, 1);
+    assert.strictEqual(trackerRows[0].status, 'filled');
+    assert.strictEqual(trackerRows[0].fill_yes_price, 0.25);
+
+    // Unknown close does not GET / tape.
+    let fetchedUnknown = 0;
+    const idle = createUnhedgedFillTracker({
+      persist: async (row) => { trackerRows.push(row); },
+      fetchRfq: async () => { fetchedUnknown += 1; return { status: 'filled' }; },
+    });
+    const skip = await idle.onClosed({
+      venue: 'kalshi',
+      rfqId: 'rfq-tennis-firehose',
+      extra: { type: 'rfq_deleted', msg: { id: 'rfq-tennis-firehose', status: 'filled' } },
+    });
+    assert.strictEqual(skip.reason, 'unknown_row');
+    assert.strictEqual(fetchedUnknown, 0);
+
+    const padClosed = Date.parse('2026-08-14T20:10:00Z');
+    const tapeResolve = await resolveUnhedgedFill({
+      venue: 'kalshi',
+      rfq_id: 'rfq-tape-one',
+      contracts: 10,
+      market_ticker: 'KXMVE-X',
+      closedMs: padClosed,
+    }, {
+      now: padClosed + 1000,
+      fetchRfq: async () => ({ id: 'rfq-tape-one', status: 'closed', updated_ts: padClosed, market_ticker: 'KXMVE-X', contracts: 10 }),
+      fetchTrades: async () => [{
+        count_fp: '10.00',
+        yes_price_dollars: '0.19',
+        no_price_dollars: '0.81',
+        created_time: padClosed,
+        is_block_trade: true,
+      }],
+    });
+    assert.strictEqual(tapeResolve.retry, true, '45s pad must elapse');
+    const tapeReady = await resolveUnhedgedFill({
+      venue: 'kalshi',
+      rfq_id: 'rfq-tape-one',
+      contracts: 10,
+      market_ticker: 'KXMVE-X',
+      closedMs: padClosed,
+    }, {
+      now: padClosed + 45000,
+      fetchRfq: async () => ({ id: 'rfq-tape-one', status: 'closed', updated_ts: padClosed, market_ticker: 'KXMVE-X', contracts: 10 }),
+      fetchTrades: async () => [{
+        count_fp: '10.00',
+        yes_price_dollars: '0.19',
+        no_price_dollars: '0.81',
+        created_time: padClosed,
+        is_block_trade: true,
+      }],
+    });
+    assert.strictEqual(tapeReady.retry, false);
+    assert.ok(tapeReady.patch);
+    assert.strictEqual(tapeReady.patch.status, 'filled');
+    assert.strictEqual(tapeReady.patch.fill_yes_price, 0.19);
+
+    assert.strictEqual(considerUnhedgedFill({
+      venue: 'kalshi',
+      rfqId: 'rfq-open',
+      extra: { status: 'open' },
+    }).reason, 'not_filled');
 
     console.log('unhedged-rfq.test.js ok');
   }).catch((e) => {

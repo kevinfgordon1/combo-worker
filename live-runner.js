@@ -17,13 +17,15 @@
 // SKIP TAPE: oversized / limit_reached skips persist a distinct reason on
 //   combo_submissions, then one RFQ+ticker tape lookup after close (or pad).
 //   Quote-watcher stays parked. We do not write combo_matches or watcher_debug.
-// UNHEDGED SHADOW: unmatched in-scope MLB/NFL/NCAAF ML combos persist to
+// UNHEDGED SHADOW: unmatched in-scope MLB/NFL ML combos persist to
 //   unhedged_rfqs (UNHEDGED_RFQ_SHADOW, default on). Never POSTs. Combo Locks
 //   match / reserve / quote path is unchanged. Fair is inverse-bet ourTrue:
-//   opponent YES → fee-included American (series taker: MLB 0.035, NFL/NCAAF
-//   0.07, Poly 0.06), best Kalshi/Poly, then sign-flip (not same-side last,
+//   opponent YES → fee-included American (series taker: MLB 0.035, NFL 0.07,
+//   Poly 0.06), best Kalshi/Poly, then sign-flip (not same-side last,
 //   not Odds API). Combo WRAP is separate (NFL maker 0; else 0.035).
 //   Lookups stay sync off the 4s in-memory cache. UNHEDGED_RFQ_LIVE stays off.
+//   When a persisted row later fills (WS/REST leave-open or one-shot tape
+//   after 45s pad), UPDATE status=filled. NCAAF is out of scope.
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
@@ -54,7 +56,13 @@ const {
   isSkipTapeEligible,
   resolveSkipTape,
 } = require('./skip-tape');
-const { isUnhedgedRfqShadow, isUnhedgedRfqLive, shadowUnhedgedMiss } = require('./unhedged-rfq');
+const {
+  isUnhedgedRfqShadow,
+  isUnhedgedRfqLive,
+  persistUnhedgedRfq,
+  shadowUnhedgedMiss,
+  createUnhedgedFillTracker,
+} = require('./unhedged-rfq');
 const { createUnhedgedPriceCache } = require('./unhedged-price-cache');
 
 const MODE = 'LIVE';
@@ -124,6 +132,7 @@ const counts = {
 };
 
 const pendingSkipTapes = new Map(); // submission id → skip row awaiting tape
+let unhedgedFills = null; // already-persisted unhedged RFQs awaiting fill
 const unknownCols = new Set();
 const COL_ERR = /Could not find the '([^']+)' column/i;
 const SKIP_TAPE_LOOKBACK_MS = 24 * 3600 * 1000;
@@ -461,12 +470,25 @@ function noteReleased(quoteId, pending, reason) {
   );
 }
 
-function onRfqDeleted(evt) {
+function persistUnhedgedRow(row) {
+  if (unhedgedFills) unhedgedFills.remember(row);
+  return persistUnhedgedRfq(supabase, row);
+}
+
+function onRfqDeleted(evt, env) {
   const rfqId = evt && evt.rfqId;
   if (!rfqId) return;
   const dropped = dropPendingForRfq(pendingQuotes, rfqId, { confirming: confirmingQuotes });
   for (const { id, quote } of dropped) {
     noteReleased(id, quote, 'closed');
+  }
+  if (unhedgedFills && rfqId) {
+    unhedgedFills.onClosed({
+      venue: 'kalshi',
+      rfqId,
+      extra: env,
+      rfq: evt,
+    }).catch((e) => console.error('[UNHEDGED] fill close', e && e.message));
   }
 }
 
@@ -951,9 +973,11 @@ async function onRfq(rfq, env) {
     shadowUnhedgedMiss(rfq, {
       venue: 'kalshi',
       extra: env && env.msg ? { msg: env.msg } : null,
+      persist: persistUnhedgedRow,
       supabase,
       env: process.env,
       priceCache: unhedgedPrices,
+      onPersisted: (row) => { if (unhedgedFills) unhedgedFills.remember(row); },
     });
     return;
   }
@@ -1130,7 +1154,7 @@ async function main() {
     `Skipped oversized/cap RFQs get a targeted tape lookup after close. ` +
     `Unhedged RFQ shadow (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(process.env) ? 'on' : 'off'}, ` +
     `UNHEDGED_RFQ_LIVE=${isUnhedgedRfqLive(process.env) ? 'on' : 'off'}) ` +
-    `persists in-scope unmatched MLB/NFL/NCAAF ML combos — never posts.`
+    `persists in-scope unmatched MLB/NFL ML combos — never posts.`
   );
 
   unhedgedPrices = createUnhedgedPriceCache({
@@ -1155,6 +1179,17 @@ async function main() {
   }, 2000);
   setInterval(() => {
     reconcileSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape tick`, e.message));
+  }, SKIP_TAPE_TICK_MS);
+
+  unhedgedFills = createUnhedgedFillTracker({
+    supabase,
+    env: process.env,
+    fetchRfq: fetchSkipRfq,
+    fetchTrades: fetchSkipTrades,
+  });
+  unhedgedFills.hydrate().catch((e) => console.error('[UNHEDGED] fill hydrate', e && e.message));
+  setInterval(() => {
+    unhedgedFills.tick().catch((e) => console.error('[UNHEDGED] fill tick', e && e.message));
   }, SKIP_TAPE_TICK_MS);
 
   // Step 2 — pre-warm + keep warm
@@ -1186,7 +1221,7 @@ async function main() {
     pem: PEM,
     onStatus: (s, i) => console.log(`[${MODE}] ws:${s}`, i || ''),
     onRfqCreated: (rfq, env) => onRfq(rfq, env).catch((e) => console.error('onRfq', e)),
-    onRfqDeleted: (evt) => { try { onRfqDeleted(evt); } catch (e) { console.error('onRfqDeleted', e); } },
+    onRfqDeleted: (evt, env) => { try { onRfqDeleted(evt, env); } catch (e) { console.error('onRfqDeleted', e); } },
     onQuoteAccepted: (evt) => onQuoteAccepted(evt).catch((e) => console.error('onQuoteAccepted', e)),
     onQuoteExecuted: (evt) => onQuoteExecuted(evt).catch((e) => console.error('onQuoteExecuted', e)),
   });

@@ -38,7 +38,13 @@ const {
   sameIdentitySet,
   TEAM_ALIASES,
 } = require('./leg-identity');
-const { isUnhedgedRfqShadow, isUnhedgedRfqLive, shadowUnhedgedMiss } = require('./unhedged-rfq');
+const {
+  isUnhedgedRfqShadow,
+  isUnhedgedRfqLive,
+  persistUnhedgedRfq,
+  shadowUnhedgedMiss,
+  createUnhedgedFillTracker,
+} = require('./unhedged-rfq');
 
 const MODE = 'POLY';
 const RECONCILE_MS = 3000;
@@ -553,7 +559,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     `Kalshi quoting keeps running. Remaining is shared via reserve.js. ` +
     `Unhedged RFQ shadow (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(env) ? 'on' : 'off'}, ` +
     `UNHEDGED_RFQ_LIVE=${isUnhedgedRfqLive(env) ? 'on' : 'off'}) ` +
-    `persists in-scope unmatched MLB/NFL/NCAAF ML combos — never posts.`
+    `persists in-scope unmatched MLB/NFL ML combos — never posts.`
   );
 
   const unhedgedPrices = ctx.unhedgedPrices || null;
@@ -561,13 +567,42 @@ function startPolymarketRfqLoop(ctx = {}) {
     unhedgedPrices.setPmFetch(ctx.fetchMarket || ((slug) => http.getMarketBySlug(slug)));
   }
 
+  async function fetchUnhedgedPmRfq(rfqId) {
+    if (typeof ctx.fetchUnhedgedRfq === 'function') return ctx.fetchUnhedgedRfq(rfqId);
+    if (!http || typeof http.request !== 'function') return null;
+    try {
+      const res = await http.request('GET', `/v1/rfqs/${encodeURIComponent(rfqId)}`);
+      if (!res || res.statusCode === 404) return null;
+      const j = res.json;
+      return (j && (j.rfq || j)) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  const unhedgedFills = ctx.unhedgedFills || createUnhedgedFillTracker({
+    supabase: ctx.supabase,
+    persist: ctx.persistUnhedged,
+    env,
+    fetchRfq: fetchUnhedgedPmRfq,
+    fetchTrades: ctx.fetchUnhedgedTrades,
+  });
+  if (typeof unhedgedFills.hydrate === 'function') {
+    unhedgedFills.hydrate().catch((e) => console.error('[UNHEDGED] fill hydrate', e && e.message));
+  }
+
   function persistUnhedgedShadow(rfq) {
     shadowUnhedgedMiss(rfq, {
       venue: 'polymarket',
       supabase: ctx.supabase,
-      persist: ctx.persistUnhedged,
+      persist: async (row, meta) => {
+        unhedgedFills.remember(row);
+        if (typeof ctx.persistUnhedged === 'function') await ctx.persistUnhedged(row, meta);
+        else if (ctx.supabase) await persistUnhedgedRfq(ctx.supabase, row);
+      },
       env,
       priceCache: unhedgedPrices,
+      onPersisted: (row) => unhedgedFills.remember(row),
     });
   }
 
@@ -834,6 +869,25 @@ function startPolymarketRfqLoop(ctx = {}) {
         `[${MODE}] RESERVE RELEASED closed ${quote.label || ''} quote_id=${id} rfq=${rfqId}`
       );
     }
+    unhedgedFills.onClosed({
+      venue: 'polymarket',
+      rfqId,
+      extra: evt,
+      rfq,
+    }).catch((e) => console.error('[UNHEDGED] fill close', e && e.message));
+  }
+
+  function noteUnhedgedFillEvent(evt) {
+    const rfq = (evt && evt.rfq) || {};
+    const quote = (evt && evt.quote) || {};
+    const rfqId = rfq.id || rfq.rfqId || quote.rfqId || quote.rfq_id || (evt && evt.rfqId);
+    if (!rfqId) return;
+    unhedgedFills.onClosed({
+      venue: 'polymarket',
+      rfqId,
+      extra: evt,
+      rfq,
+    }).catch((e) => console.error('[UNHEDGED] fill event', e && e.message));
   }
 
   function handleQuoteExecuted(evt) {
@@ -932,8 +986,12 @@ function startPolymarketRfqLoop(ctx = {}) {
       handleRfqClosed(evt);
     } else if (evt.type === 'quoteAccepted') {
       handleQuoteAccepted(evt).catch((e) => console.error(`[${MODE}] onAccept`, e.message));
+      noteUnhedgedFillEvent(evt);
+    } else if (evt.type === 'quoteConfirmed') {
+      noteUnhedgedFillEvent(evt);
     } else if (evt.type === 'quoteExecuted') {
       handleQuoteExecuted(evt);
+      noteUnhedgedFillEvent(evt);
     } else if (evt.type === 'quoteDeleted') {
       const q = evt.quote || {};
       const id = q.id || q.quoteId;
@@ -973,14 +1031,19 @@ function startPolymarketRfqLoop(ctx = {}) {
     cancelUnaccepted().catch((e) => console.error(`[${MODE}] ttl`, e.message));
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start`, e.message));
   }, 2000);
+  const fillTimer = setInterval(() => {
+    unhedgedFills.tick().catch((e) => console.error('[UNHEDGED] fill tick', e && e.message));
+  }, ctx.unhedgedFillMs != null ? ctx.unhedgedFillMs : (ctx.startWs === false ? 60 * 60 * 1000 : 15000));
   if (reconcileTimer.unref) reconcileTimer.unref();
   if (ttlTimer.unref) ttlTimer.unref();
+  if (fillTimer.unref) fillTimer.unref();
 
   return {
     stop() {
       stopped = true;
       clearInterval(reconcileTimer);
       clearInterval(ttlTimer);
+      clearInterval(fillTimer);
       try { ws && ws.stop && ws.stop(); } catch (_) {}
       try { http.close && http.close(); } catch (_) {}
     },

@@ -1,12 +1,12 @@
-// In-memory MLB/NFL/NCAAF moneyline cache for unhedged RFQ shadow pricing.
+// In-memory MLB/NFL moneyline cache for unhedged RFQ shadow pricing.
 // Refresh on a short interval. Lookups are synchronous — never HTTP on the
-// RFQ path. Kalshi: signed GET /markets for KXMLBGAME / KXNFLGAME / KXNCAAFGAME.
-// Polymarket: getMarketBySlug for watched aec-* slugs only.
+// RFQ path. Kalshi: signed GET /markets for KXMLBGAME / KXNFLGAME (NCAAF is
+// out of unhedged scope). Polymarket: getMarketBySlug for watched aec-* slugs.
 // The Odds API is not the quote clock.
 //
 // Fair lookups use the *opponent* YES (other ticker in the same Kalshi event;
 // other aec-* ML in the same Polymarket game). Hitting that ask is taker:
-// convert raw YES with the series taker coeff (MLB 0.035, NFL/NCAAF 0.07,
+// convert raw YES with the series taker coeff (MLB 0.035, NFL 0.07,
 // Poly 0.06). ourTrue is the sign-flip of the best Kalshi/Poly fee-included
 // opponent American. Same-side last is never fair.
 'use strict';
@@ -15,7 +15,7 @@ const { normTeam } = require('./leg-identity');
 const { parseKalshiUnhedgedTicker, parsePmUnhedgedSlug } = require('./unhedged-rfq');
 const { ourTrueFromOpponents, takerThetaForVenue } = require('./unhedged-quote');
 
-const KALSHI_ML_SERIES = ['KXMLBGAME', 'KXNFLGAME', 'KXNCAAFGAME'];
+const KALSHI_ML_SERIES = ['KXMLBGAME', 'KXNFLGAME'];
 const DEFAULT_REFRESH_MS = 4000;
 const KALSHI_PAGE_LIMIT = 200;
 const PM_ML_PREFIX = 'aec-';

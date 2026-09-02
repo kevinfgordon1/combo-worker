@@ -2,9 +2,14 @@
 // Combo Locks. Never POSTs, confirms, or fills. POLYMARKET_RFQ_LIVE and Kalshi
 // lock quoting stay on their existing paths.
 //
-// In-scope (v1): pregame 2–4 legs, MLB/NFL/NCAAF full-game moneylines only,
+// In-scope (v1): pregame 2–4 legs, MLB/NFL full-game moneylines only,
 // independent events (distinct games AND distinct teams). No SGP / spreads /
-// totals / props. Tennis / LoL / CS2 are a silent skip (no insert).
+// totals / props / NCAAF. Tennis / LoL / CS2 / NCAAF are a silent skip (no insert).
+//
+// Fill-by-others: when an already-persisted row's RFQ later fills (Kalshi
+// status filled/executed/accepted, or Polymarket confirm/fill), UPDATE that
+// row to status=filled. Keep taker_* as the original RFQ. Do not insert
+// out-of-scope firehose just to count fills. No public-tape crawl of open RFQs.
 //
 // Fair is inverse-bet ourTrue (Promo Builder / EV): convert opponent YES to
 // a fee-included American with the series taker coeff (KXMLBGAME 0.035,
@@ -19,15 +24,19 @@
 //      UNHEDGED_RFQ_LIVE default OFF — posting is not wired on this path.
 'use strict';
 const { parseKalshiTicker } = require('./leg-identity');
-const { findStartedEvent } = require('./started');
+const { findStartedEvent, parseTs } = require('./started');
 const { americanFromProb } = require('./engine');
+const { normalizeTrade, matchTapeTrades } = require('./tape');
 const {
   isUnhedgedRfqLive,
   quoteMultFromEnv,
   priceUnhedgedCombo,
 } = require('./unhedged-quote');
 
-const SCOPE_LEAGUES = new Set(['mlb', 'nfl', 'ncaaf']);
+const SCOPE_LEAGUES = new Set(['mlb', 'nfl']);
+// Same pad as Combo Locks skip-tape / quote-watcher. Copied — do not import skip-tape.
+const FILL_TAPE_PAD_MS = 45000;
+const FILL_STATUSES = new Set(['filled', 'executed', 'accepted', 'confirmed']);
 const SILENT_SKIP = new Set(['tennis', 'lol', 'cs2']);
 
 const KALSHI_SERIES = {
@@ -545,6 +554,9 @@ async function maybePersistUnhedged(rfq, opts = {}) {
 function shadowUnhedgedMiss(rfq, opts = {}) {
   maybePersistUnhedged(rfq, opts).then((out) => {
     if (out && out.persist && out.row) {
+      if (typeof opts.onPersisted === 'function') {
+        try { opts.onPersisted(out.row); } catch (_) {}
+      }
       console.log(
         `[UNHEDGED] ${out.status} ${opts.venue || out.venue} rfq=${out.row.rfq_id} ` +
         `legs=${(out.row.legs || []).length}` +
@@ -557,16 +569,474 @@ function shadowUnhedgedMiss(rfq, opts = {}) {
   });
 }
 
+function normalizeFillStatus(v) {
+  if (v == null || v === '') return '';
+  return String(v).trim().toLowerCase().replace(/-/g, '_');
+}
+
+function bareFillStatus(v) {
+  return normalizeFillStatus(v)
+    .replace(/^rfq_status_/, '')
+    .replace(/^quote_status_/, '');
+}
+
+function isUnhedgedFillStatus(status) {
+  return FILL_STATUSES.has(bareFillStatus(status));
+}
+
+function eventTypeFilled(type) {
+  const t = normalizeFillStatus(type);
+  if (!t) return false;
+  if (t === 'rfq_deleted' || t === 'rfq_expired' || t === 'rfq_closed' || t === 'rfqclosed') {
+    return false;
+  }
+  return (
+    t === 'quote_accepted' || t === 'quoteaccepted'
+    || t === 'quote_executed' || t === 'quoteexecuted'
+    || t === 'quote_confirmed' || t === 'quoteconfirmed'
+    || t === 'rfq_filled' || t === 'rfqfilled'
+  );
+}
+
+function pickNumFrom(src, keys) {
+  if (!src || typeof src !== 'object') return null;
+  for (const k of keys) {
+    if (src[k] != null && src[k] !== '') {
+      const n = numOrNull(src[k]);
+      if (n != null) return n;
+    }
+  }
+  return null;
+}
+
+function extractFillPrices(src) {
+  const yes = pickNumFrom(src, [
+    'fill_yes_price', 'fillYesPrice', 'executed_yes_price', 'executedYesPrice',
+    'yes_price_dollars', 'yes_price', 'yesPrice', 'buyPrice', 'buy_price',
+  ]);
+  const no = pickNumFrom(src, [
+    'fill_no_price', 'fillNoPrice', 'executed_no_price', 'executedNoPrice',
+    'no_price_dollars', 'no_price', 'noPrice', 'sellPrice', 'sell_price',
+  ]);
+  let american = pickNumFrom(src, [
+    'fill_american', 'fillAmerican', 'executed_american', 'american',
+  ]);
+  if (american == null && yes != null && yes > 0 && yes < 1) {
+    american = americanFromProb(yes);
+  }
+  return { yes, no, american };
+}
+
+function extractFilledAt(src, fallbackMs) {
+  if (!src || typeof src !== 'object') {
+    return fallbackMs != null ? new Date(fallbackMs).toISOString() : null;
+  }
+  const raw = src.filled_at || src.filledAt || src.executed_ts || src.executedTs
+    || src.accepted_ts || src.acceptedTs || src.confirmed_ts || src.updated_ts
+    || src.updatedTime || src.deleted_ts || src.closed_ts || null;
+  const ms = parseTs(raw);
+  if (ms != null) return new Date(ms).toISOString();
+  return fallbackMs != null ? new Date(fallbackMs).toISOString() : null;
+}
+
+function collectFillSources(opts = {}) {
+  const extra = opts.extra || {};
+  const event = opts.event || extra;
+  return [
+    extra.msg, extra.rfq, extra.quote, extra.execution,
+    opts.rfq, opts.quote,
+    event && event.msg, event && event.rfq, event && event.quote,
+    event, extra,
+  ].filter((x) => x && typeof x === 'object');
+}
+
+function extractUnhedgedFill(opts = {}) {
+  const sources = collectFillSources(opts);
+  let filled = false;
+  let yes = null;
+  let no = null;
+  let american = null;
+  let filledAt = null;
+  let status = null;
+
+  const eventType = opts.type || (opts.extra && opts.extra.type) || (opts.event && opts.event.type);
+  if (eventTypeFilled(eventType)) filled = true;
+
+  for (const src of sources) {
+    if (isUnhedgedFillStatus(src.status)) {
+      filled = true;
+      status = src.status;
+    }
+    if (eventTypeFilled(src.type)) filled = true;
+    const px = extractFillPrices(src);
+    if (yes == null && px.yes != null) yes = px.yes;
+    if (no == null && px.no != null) no = px.no;
+    if (american == null && px.american != null) american = px.american;
+    if (!filledAt) filledAt = extractFilledAt(src, null);
+  }
+  if (filled && !filledAt) filledAt = extractFilledAt(null, opts.now != null ? opts.now : Date.now());
+  if (american == null && yes != null && yes > 0 && yes < 1) american = americanFromProb(yes);
+  return { filled, yes, no, american, filledAt, status };
+}
+
+function buildUnhedgedFillPatch(fill, { venue, rfqId } = {}) {
+  if (!fill || !fill.filled || !rfqId || !venue) return null;
+  return {
+    rfq_id: String(rfqId),
+    venue,
+    status: 'filled',
+    fill_yes_price: fill.yes == null ? null : fill.yes,
+    fill_no_price: fill.no == null ? null : fill.no,
+    fill_american: fill.american == null ? null : fill.american,
+    filled_at: fill.filledAt || null,
+  };
+}
+
+function rfqIdFromFillOpts(opts = {}) {
+  const extra = opts.extra || {};
+  const rfq = opts.rfq || extra.rfq || extra.msg || {};
+  return opts.rfqId || opts.rfq_id
+    || (rfq && (rfq.rfqId || rfq.rfq_id || rfq.id))
+    || extra.rfqId || extra.rfq_id || extra.id
+    || (opts.event && (opts.event.rfqId || (opts.event.rfq && (opts.event.rfq.id || opts.event.rfq.rfqId))))
+    || null;
+}
+
+function knownKey(venue, rfqId) {
+  return `${venue}:${rfqId}`;
+}
+
+function considerUnhedgedFill(opts = {}) {
+  if (!isUnhedgedRfqShadow(opts.env)) return fail('flag_off');
+  const venue = opts.venue;
+  if (venue !== 'kalshi' && venue !== 'polymarket') return fail('bad_venue');
+  const rfqId = rfqIdFromFillOpts(opts);
+  if (!rfqId) return fail('bad_rfq');
+
+  const rfq = opts.rfq;
+  const hasLegs = !!(rfq && (
+    (Array.isArray(rfq.legs) && rfq.legs.length)
+    || (Array.isArray(rfq.comboLegs) && rfq.comboLegs.length)
+    || (Array.isArray(rfq.legKeys) && rfq.legKeys.length)
+    || (Array.isArray(rfq.mve_selected_legs) && rfq.mve_selected_legs.length)
+  ));
+  if (hasLegs) {
+    const classified = classifyUnhedgedRfq(rfq, opts);
+    if (!classified.inScope || !classified.persist) {
+      return fail(classified.reason || 'not_in_scope');
+    }
+  }
+
+  const fill = extractUnhedgedFill(opts);
+  if (!fill.filled) return fail('not_filled');
+  const row = buildUnhedgedFillPatch(fill, { venue, rfqId });
+  if (!row) return fail('bad_rfq');
+  return { persist: true, inScope: true, reason: null, status: 'filled', row, fill };
+}
+
+async function lookupKnownUnhedgedRow(opts, venue, rfqId) {
+  if (opts.known === true || opts.existingRow) return true;
+  if (opts.knownIds && typeof opts.knownIds.has === 'function') {
+    return opts.knownIds.has(knownKey(venue, rfqId));
+  }
+  if (opts.supabase) {
+    const { data, error } = await opts.supabase
+      .from('unhedged_rfqs')
+      .select('rfq_id,status')
+      .eq('venue', venue)
+      .eq('rfq_id', rfqId)
+      .limit(1);
+    if (error) {
+      console.error('[UNHEDGED] fill lookup failed', error.message);
+      return false;
+    }
+    return !!(data && data.length);
+  }
+  return false;
+}
+
+async function persistUnhedgedFill(supabase, patch) {
+  if (!supabase || !patch || !patch.rfq_id || !patch.venue) {
+    return { ok: false, reason: 'no_client' };
+  }
+  const body = {
+    status: 'filled',
+    fill_yes_price: patch.fill_yes_price == null ? null : patch.fill_yes_price,
+    fill_no_price: patch.fill_no_price == null ? null : patch.fill_no_price,
+    fill_american: patch.fill_american == null ? null : patch.fill_american,
+    filled_at: patch.filled_at || null,
+  };
+  const { error, data } = await supabase
+    .from('unhedged_rfqs')
+    .update(body)
+    .eq('venue', patch.venue)
+    .eq('rfq_id', patch.rfq_id)
+    .select('rfq_id');
+  if (error) {
+    console.error('[UNHEDGED] fill update failed', error.message);
+    return { ok: false, error };
+  }
+  return { ok: true, updated: !!(data && data.length) };
+}
+
+async function maybePersistUnhedgedFill(opts = {}) {
+  const considered = considerUnhedgedFill(opts);
+  if (!considered.persist || !considered.row) return considered;
+  const known = await lookupKnownUnhedgedRow(opts, considered.row.venue, considered.row.rfq_id);
+  if (!known) return { persist: false, inScope: false, reason: 'unknown_row', status: null, row: null };
+
+  if (typeof opts.persist === 'function') {
+    try { await opts.persist(considered.row, { mode: 'fill' }); } catch (e) {
+      console.error('[UNHEDGED] fill persist failed', e && e.message);
+    }
+    return considered;
+  }
+  if (opts.supabase) {
+    await persistUnhedgedFill(opts.supabase, considered.row);
+  }
+  return considered;
+}
+
+function isFillLookupReady({ status, closedMs, now, padMs = FILL_TAPE_PAD_MS }) {
+  const s = bareFillStatus(status);
+  if (s === 'open') return false;
+  if (closedMs != null && now < closedMs + padMs) return false;
+  if (status == null && closedMs == null) return false;
+  return true;
+}
+
+function tickerOfFillRfq(rfq, row) {
+  return (row && row.market_ticker)
+    || (rfq && (rfq.market_ticker || rfq.ticker || rfq.symbol))
+    || null;
+}
+
+function rfqClosedMsForFill(rfq) {
+  if (!rfq) return null;
+  return parseTs(rfq.updated_ts) || parseTs(rfq.updatedTime)
+    || parseTs(rfq.cancelled_ts) || parseTs(rfq.closed_ts)
+    || parseTs(rfq.deleted_ts) || parseTs(rfq.executed_ts) || null;
+}
+
+function rfqCountForFillTape(rfq, fallbackContracts) {
+  const fromRfq = numOrNull(rfq && (rfq.contracts_fp != null ? rfq.contracts_fp : rfq.contracts));
+  if (fromRfq > 0) return fromRfq;
+  const stored = numOrNull(fallbackContracts);
+  return stored > 0 ? stored : null;
+}
+
+// One RFQ GET (+ optional one trades GET for THAT ticker) after close.
+// Never for open RFQs. Never for ids we did not already persist.
+async function resolveUnhedgedFill(row, {
+  fetchRfq, fetchTrades, now = Date.now(), padMs = FILL_TAPE_PAD_MS, extra,
+} = {}) {
+  if (!row || !row.rfq_id || !row.venue) {
+    return { retry: false, patch: null, reason: 'bad_row' };
+  }
+
+  const fromEvent = extractUnhedgedFill({ extra, rfq: extra && extra.rfq, venue: row.venue, now });
+  if (fromEvent.filled && (fromEvent.yes != null || fromEvent.no != null || !fetchRfq)) {
+    return {
+      retry: false,
+      patch: buildUnhedgedFillPatch(fromEvent, { venue: row.venue, rfqId: row.rfq_id }),
+      reason: 'event',
+    };
+  }
+
+  let rfq = null;
+  if (typeof fetchRfq === 'function') {
+    try { rfq = await fetchRfq(row.rfq_id); } catch (e) {
+      return { retry: true, error: e };
+    }
+  }
+  if (rfq) {
+    const restFill = extractUnhedgedFill({ rfq, extra: rfq, venue: row.venue, now });
+    if (restFill.filled) {
+      return {
+        retry: false,
+        patch: buildUnhedgedFillPatch(restFill, { venue: row.venue, rfqId: row.rfq_id }),
+        reason: 'rfq',
+      };
+    }
+  }
+
+  const closedMs = rfqClosedMsForFill(rfq) || row.closedMs || null;
+  const status = (rfq && rfq.status) || (row.status !== 'seen' && row.status !== 'started' ? row.status : null);
+  if (!isFillLookupReady({ status, closedMs, now, padMs })) {
+    return { retry: true };
+  }
+
+  if (typeof fetchTrades === 'function') {
+    const ticker = tickerOfFillRfq(rfq, row);
+    if (ticker) {
+      const created = parseTs(rfq && (rfq.created_ts || rfq.createdTime)) || row.createdMs || null;
+      const minTs = Math.max(0, Math.floor((created || closedMs || now) / 1000) - 1);
+      const maxTs = Math.ceil(((closedMs || now) + padMs) / 1000);
+      let trades;
+      try { trades = await fetchTrades(ticker, minTs, maxTs); } catch (e) {
+        return { retry: true, error: e };
+      }
+      const windowStart = created || 0;
+      const windowEnd = (closedMs || now) + padMs;
+      const normalized = (trades || []).map((t) => normalizeTrade(t, parseTs))
+        .filter((t) => t.ts == null || (t.ts >= windowStart - 1000 && t.ts <= windowEnd + 1000));
+      const result = matchTapeTrades(normalized, {
+        rfqCount: rfqCountForFillTape(rfq, row.contracts),
+        closedMs,
+      });
+      if (result && result.match === 'matched') {
+        const yes = result.yesPrice != null ? result.yesPrice : null;
+        const no = result.noPrice != null ? result.noPrice : null;
+        const american = yes != null && yes > 0 && yes < 1 ? americanFromProb(yes) : null;
+        const filledAt = result.tradeTs != null ? new Date(result.tradeTs).toISOString() : new Date(now).toISOString();
+        return {
+          retry: false,
+          patch: buildUnhedgedFillPatch(
+            { filled: true, yes, no, american, filledAt },
+            { venue: row.venue, rfqId: row.rfq_id }
+          ),
+          reason: 'tape',
+          result,
+        };
+      }
+    }
+  }
+
+  return { retry: false, patch: null, reason: 'not_filled' };
+}
+
+function createUnhedgedFillTracker(opts = {}) {
+  const known = new Set();
+  const pending = new Map();
+  const env = opts.env;
+  const maxPerTick = opts.maxPerTick != null ? opts.maxPerTick : 5;
+
+  function remember(row) {
+    if (!row || !row.venue || !row.rfq_id) return;
+    known.add(knownKey(row.venue, row.rfq_id));
+  }
+
+  async function hydrate() {
+    if (!opts.supabase) return;
+    try {
+      const { data, error } = await opts.supabase
+        .from('unhedged_rfqs')
+        .select('venue,rfq_id,status,contracts')
+        .in('status', ['seen', 'started'])
+        .limit(500);
+      if (error) {
+        console.error('[UNHEDGED] fill hydrate failed', error.message);
+        return;
+      }
+      for (const r of data || []) remember(r);
+    } catch (e) {
+      console.error('[UNHEDGED] fill hydrate', e && e.message);
+    }
+  }
+
+  async function applyPatch(patch) {
+    if (!patch) return;
+    remember(patch);
+    if (typeof opts.persist === 'function') {
+      await opts.persist(patch, { mode: 'fill' });
+      return;
+    }
+    if (opts.supabase) await persistUnhedgedFill(opts.supabase, patch);
+  }
+
+  async function onClosed({ venue, rfqId, extra, rfq, now } = {}) {
+    if (!isUnhedgedRfqShadow(env || opts.env)) return fail('flag_off');
+    if (!rfqId || (venue !== 'kalshi' && venue !== 'polymarket')) return fail('bad_rfq');
+    if (!known.has(knownKey(venue, rfqId))) return fail('unknown_row');
+
+    const immediate = considerUnhedgedFill({
+      venue, rfqId, extra, rfq, env: env || opts.env, now, known: true,
+    });
+    if (immediate.persist && immediate.row) {
+      await applyPatch(immediate.row);
+      pending.delete(knownKey(venue, rfqId));
+      return immediate;
+    }
+
+    pending.set(knownKey(venue, rfqId), {
+      venue,
+      rfq_id: rfqId,
+      extra,
+      rfq,
+      closedMs: now != null ? now : Date.now(),
+      contracts: rfq && (rfq.contracts != null ? rfq.contracts : rfq.contracts_fp),
+      market_ticker: rfq && (rfq.market_ticker || rfq.ticker || rfq.symbol),
+    });
+    return { persist: false, reason: 'queued', status: null, row: null };
+  }
+
+  async function tick(now = Date.now()) {
+    if (!pending.size) return;
+    const fetchRfq = opts.fetchRfq;
+    const fetchTrades = opts.fetchTrades;
+    let looked = 0;
+    for (const [key, row] of pending) {
+      if (looked >= maxPerTick) break;
+      looked += 1;
+      try {
+        const out = await resolveUnhedgedFill(row, {
+          fetchRfq, fetchTrades, now, extra: row.extra,
+        });
+        if (out.retry) continue;
+        pending.delete(key);
+        if (out.patch) {
+          await applyPatch(out.patch);
+          console.log(
+            `[UNHEDGED] filled ${out.patch.venue} rfq=${out.patch.rfq_id}` +
+            (out.patch.fill_american != null ? ` fill=${out.patch.fill_american}` : '') +
+            (out.reason ? ` via=${out.reason}` : '')
+          );
+        }
+      } catch (e) {
+        console.error('[UNHEDGED] fill tick', row.rfq_id, e && e.message);
+      }
+    }
+  }
+
+  return { remember, hydrate, onClosed, tick, known, pending };
+}
+
+function shadowUnhedgedFill(opts = {}) {
+  const run = opts.tracker
+    ? opts.tracker.onClosed(opts)
+    : maybePersistUnhedgedFill(opts);
+  Promise.resolve(run).then((out) => {
+    if (out && out.persist && out.row) {
+      console.log(
+        `[UNHEDGED] filled ${out.row.venue} rfq=${out.row.rfq_id}` +
+        (out.row.fill_american != null ? ` fill=${out.row.fill_american}` : '')
+      );
+    }
+  }).catch((e) => {
+    console.error('[UNHEDGED] fill', e && e.message);
+  });
+}
+
 module.exports = {
   SCOPE_LEAGUES,
+  FILL_TAPE_PAD_MS,
   isUnhedgedRfqShadow,
   isUnhedgedRfqLive,
+  isUnhedgedFillStatus,
   classifyUnhedgedRfq,
   buildUnhedgedRow,
+  buildUnhedgedFillPatch,
   considerUnhedgedRfq,
+  considerUnhedgedFill,
   persistUnhedgedRfq,
+  persistUnhedgedFill,
   maybePersistUnhedged,
+  maybePersistUnhedgedFill,
   shadowUnhedgedMiss,
+  shadowUnhedgedFill,
+  extractUnhedgedFill,
+  resolveUnhedgedFill,
+  createUnhedgedFillTracker,
   parseKalshiUnhedgedTicker,
   parsePmUnhedgedSlug,
   priceClassified,
