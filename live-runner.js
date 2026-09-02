@@ -20,9 +20,9 @@
 // UNHEDGED SHADOW: unmatched in-scope MLB/NFL/NCAAF ML combos persist to
 //   unhedged_rfqs (UNHEDGED_RFQ_SHADOW, default on). Never POSTs. Combo Locks
 //   match / reserve / quote path is unchanged. Fair is inverse-bet ourTrue:
-//   posted opponent YES → American as-is (no singles taker theta), best
-//   Kalshi/Poly opponent American, then sign-flip (not same-side last,
-//   not Odds API). Combo wrap is the only fee.
+//   opponent YES → fee-included American (series taker: MLB 0.035, NFL/NCAAF
+//   0.07, Poly 0.06), best Kalshi/Poly, then sign-flip (not same-side last,
+//   not Odds API). Combo WRAP is separate (NFL maker 0; else 0.035).
 //   Lookups stay sync off the 4s in-memory cache. UNHEDGED_RFQ_LIVE stays off.
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY

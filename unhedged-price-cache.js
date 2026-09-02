@@ -5,15 +5,15 @@
 // The Odds API is not the quote clock.
 //
 // Fair lookups use the *opponent* YES (other ticker in the same Kalshi event;
-// other aec-* ML in the same Polymarket game). Convert that book YES (taker
-// ask / last) to American as-is — no Kalshi 0.07 / Poly 0.05/0.06 taker
-// theta on singles. ourTrue is the sign-flip of the best Kalshi/Poly
+// other aec-* ML in the same Polymarket game). Hitting that ask is taker:
+// convert raw YES with the series taker coeff (MLB 0.035, NFL/NCAAF 0.07,
+// Poly 0.06). ourTrue is the sign-flip of the best Kalshi/Poly fee-included
 // opponent American. Same-side last is never fair.
 'use strict';
 
 const { normTeam } = require('./leg-identity');
 const { parseKalshiUnhedgedTicker, parsePmUnhedgedSlug } = require('./unhedged-rfq');
-const { ourTrueFromOpponents } = require('./unhedged-quote');
+const { ourTrueFromOpponents, takerThetaForVenue } = require('./unhedged-quote');
 
 const KALSHI_ML_SERIES = ['KXMLBGAME', 'KXNFLGAME', 'KXNCAAFGAME'];
 const DEFAULT_REFRESH_MS = 4000;
@@ -362,7 +362,7 @@ function createUnhedgedPriceCache({
     const id = `${venue}:${key}`;
     if (seen.has(id)) return;
     seen.add(id);
-    quotes.push({ venue, yesProb: p, key });
+    quotes.push({ venue, yesProb: p, key, theta: takerThetaForVenue(venue, key) });
   }
 
   function opponentQuotes(leg) {
