@@ -1026,7 +1026,6 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     ourTrueFromOpponentYes,
     quoteYesFromFair,
     productFair,
-    POLY_TAKER_THETA,
   } = require('./unhedged-quote');
   const pricedRows = [];
   let pricedCreate = 0;
@@ -1087,7 +1086,7 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.strictEqual(pricedMarketGets, 0, 'shadow insert must not HTTP');
   const priced = pricedRows.find((r) => r.rfq_id === 'rfq_unhedged_priced');
   assert.ok(priced);
-  const polyLegOur = ourTrueFromOpponentYes(0.5, POLY_TAKER_THETA);
+  const polyLegOur = ourTrueFromOpponentYes(0.5);
   const polyFair = productFair([polyLegOur, polyLegOur, polyLegOur]);
   assert.strictEqual(priced.our_fair_american, americanFromProb(polyFair));
   const polyQuoteYes = quoteYesFromFair(polyFair, { feeRate: 0 });

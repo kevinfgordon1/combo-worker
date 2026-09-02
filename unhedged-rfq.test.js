@@ -20,8 +20,6 @@ const {
   bestOpponentAmerican,
   quoteYesFromFair,
   productFair,
-  KALSHI_TAKER_THETA,
-  POLY_TAKER_THETA,
 } = require('./unhedged-quote');
 
 assert.strictEqual(isUnhedgedRfqShadow({}), true);
@@ -323,9 +321,9 @@ function pmRfq(id, symbols, extra = {}) {
       -118
     );
 
-    // Inverse fair: WSH = sign-flip of fee-included ATL, not WSH last. Missing opponent → nulls.
-    const wshOur = ourTrueFromOpponentYes(0.42, KALSHI_TAKER_THETA);
-    const cwsOur = ourTrueFromOpponentYes(0.50, KALSHI_TAKER_THETA);
+    // Inverse fair: WSH = sign-flip of posted ATL American, not WSH last. Missing opponent → nulls.
+    const wshOur = ourTrueFromOpponentYes(0.42);
+    const cwsOur = ourTrueFromOpponentYes(0.50);
     const mlbFair = productFair([wshOur, cwsOur]);
     const mlbQuoteYes = quoteYesFromFair(mlbFair, { feeRate: 0.035 });
     const mlbCache = createUnhedgedPriceCache({
@@ -350,8 +348,8 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(mlbPriced.our_quote_american, americanFromProb(mlbQuoteYes));
     assert.ok(mlbPriced.our_fair_american !== americanFromProb(0.60 * 0.55));
 
-    const nflOurA = ourTrueFromOpponentYes(0.50, KALSHI_TAKER_THETA);
-    const nflOurB = ourTrueFromOpponentYes(0.50, KALSHI_TAKER_THETA);
+    const nflOurA = ourTrueFromOpponentYes(0.50);
+    const nflOurB = ourTrueFromOpponentYes(0.50);
     const nflFair = productFair([nflOurA, nflOurB]);
     const nflQuoteYes = quoteYesFromFair(nflFair, { feeRate: 0 });
     const nflCache = createUnhedgedPriceCache({
@@ -387,8 +385,8 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(netCostFromFair(0.25, 0), 0.25);
     assert.ok(netCostFromFair(0.25, 0.035) > 0.25);
 
-    const polyOurA = ourTrueFromOpponentYes(0.50, POLY_TAKER_THETA);
-    const polyOurB = ourTrueFromOpponentYes(0.50, POLY_TAKER_THETA);
+    const polyOurA = ourTrueFromOpponentYes(0.50);
+    const polyOurB = ourTrueFromOpponentYes(0.50);
     const polyFair = productFair([polyOurA, polyOurB]);
     const polyQuoteYes = quoteYesFromFair(polyFair, { feeRate: 0 });
     const polyCache = createUnhedgedPriceCache({
@@ -433,7 +431,7 @@ function pmRfq(id, symbols, extra = {}) {
       priceCache: bestCache,
       now: Date.parse('2026-08-14T20:00:00Z'),
     });
-    const bestWsh = ourTrueFromOpponentYes(0.40, POLY_TAKER_THETA);
+    const bestWsh = ourTrueFromOpponentYes(0.40);
     const bestFair = productFair([bestWsh, cwsOur]);
     assert.strictEqual(bestPriced.our_fair_american, americanFromProb(bestFair));
     assert.ok(bestPriced.our_fair_american !== mlbPriced.our_fair_american);
