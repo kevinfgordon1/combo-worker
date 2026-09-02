@@ -64,6 +64,10 @@ assert.ok(!isUnhedgedFillStatus('closed'));
   assert.ok(!src.includes('combo_submissions'));
   assert.ok(!/filledAt = extractFilledAt\(null/.test(src));
   assert.ok(!/new Date\(now\)\.toISOString\(\)/.test(src));
+  assert.ok(
+    !/filled_at:\s*prev\.filled_at\s*\|\|\s*next\.filled_at/.test(src),
+    'later tape tradeTs must win over a stale filled_at'
+  );
   const skipSrc = fs.readFileSync(path.join(__dirname, 'skip-tape.js'), 'utf8');
   assert.ok(!skipSrc.includes('unhedged_rfqs'));
   const engineSrc = fs.readFileSync(path.join(__dirname, 'engine.js'), 'utf8');
@@ -1052,42 +1056,96 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(skipFilled.reason, 'already_filled');
     assert.strictEqual(hydratePatches.length, 0);
 
-    // Second fill patch keeps the original filled_at; null prices do not clobber.
-    const firstFilledAt = '2026-08-14T20:05:00.000Z';
+    // Existing restart/created stamp + later tape tradeTs → store the print.
+    const restartFilledAt = '2026-09-02T17:57:00.000Z'; // 1:57 PM ET
+    const tapeFilledAt = '2026-09-02T18:28:00.000Z'; // 2:28 PM ET
     assert.deepStrictEqual(mergeUnhedgedFillPatch(
-      { filled_at: firstFilledAt, fill_yes_price: 0.22, fill_no_price: 0.78, fill_american: -355 },
-      { filled_at: '2026-09-02T17:25:00.000Z', fill_yes_price: null, fill_no_price: null, fill_american: null }
+      { filled_at: restartFilledAt, fill_yes_price: 0.22, fill_no_price: 0.78, fill_american: -355 },
+      { filled_at: tapeFilledAt, fill_yes_price: 0.19, fill_no_price: 0.81, fill_american: -426 }
+    ), {
+      status: 'filled',
+      fill_yes_price: 0.19,
+      fill_no_price: 0.81,
+      fill_american: -426,
+      filled_at: tapeFilledAt,
+    });
+
+    // Patch without a timestamp keeps existing filled_at; null prices do not clobber.
+    assert.deepStrictEqual(mergeUnhedgedFillPatch(
+      { filled_at: restartFilledAt, fill_yes_price: 0.22, fill_no_price: 0.78, fill_american: -355 },
+      { filled_at: null, fill_yes_price: null, fill_no_price: null, fill_american: null }
     ), {
       status: 'filled',
       fill_yes_price: 0.22,
       fill_no_price: 0.78,
       fill_american: -355,
-      filled_at: firstFilledAt,
+      filled_at: restartFilledAt,
     });
-    const secondFillDb = createMemSupabase([{
+
+    // No Date.now() fallback — empty patch stays null unless created/closed exists.
+    const beforeMerge = Date.now();
+    const noTsMerge = mergeUnhedgedFillPatch({}, { fill_yes_price: 0.22 });
+    assert.strictEqual(noTsMerge.filled_at, null);
+    assert.ok(noTsMerge.filled_at == null || Date.parse(noTsMerge.filled_at) < beforeMerge);
+    assert.strictEqual(mergeUnhedgedFillPatch(
+      { created_at: restartFilledAt },
+      { fill_yes_price: 0.22 }
+    ).filled_at, restartFilledAt);
+
+    // First fill: venue/tradeTs stamped when the row has none yet.
+    assert.strictEqual(mergeUnhedgedFillPatch(
+      { created_at: restartFilledAt },
+      { filled_at: tapeFilledAt }
+    ).filled_at, tapeFilledAt);
+
+    const tapeOverRestartDb = createMemSupabase([{
       venue: 'kalshi',
       rfq_id: 'rfq-second-fill',
       status: 'filled',
-      filled_at: firstFilledAt,
+      filled_at: restartFilledAt,
+      created_at: restartFilledAt,
       fill_yes_price: 0.22,
       fill_no_price: 0.78,
       fill_american: -355,
     }]);
-    const secondFill = await persistUnhedgedFill(secondFillDb, {
+    const tapeOverRestart = await persistUnhedgedFill(tapeOverRestartDb, {
       venue: 'kalshi',
       rfq_id: 'rfq-second-fill',
+      status: 'filled',
+      fill_yes_price: 0.19,
+      fill_no_price: 0.81,
+      fill_american: -426,
+      filled_at: tapeFilledAt,
+    });
+    assert.strictEqual(tapeOverRestart.ok, true);
+    const afterTape = tapeOverRestartDb._rows.get('kalshi:rfq-second-fill');
+    assert.strictEqual(afterTape.filled_at, tapeFilledAt);
+    assert.strictEqual(afterTape.fill_yes_price, 0.19);
+
+    const keepExistingDb = createMemSupabase([{
+      venue: 'kalshi',
+      rfq_id: 'rfq-keep-ts',
+      status: 'filled',
+      filled_at: restartFilledAt,
+      fill_yes_price: 0.22,
+      fill_no_price: 0.78,
+      fill_american: -355,
+    }]);
+    const keepExisting = await persistUnhedgedFill(keepExistingDb, {
+      venue: 'kalshi',
+      rfq_id: 'rfq-keep-ts',
       status: 'filled',
       fill_yes_price: null,
       fill_no_price: null,
       fill_american: null,
-      filled_at: '2026-09-02T17:25:00.000Z',
+      filled_at: null,
     });
-    assert.strictEqual(secondFill.ok, true);
-    const keptSecond = secondFillDb._rows.get('kalshi:rfq-second-fill');
-    assert.strictEqual(keptSecond.filled_at, firstFilledAt);
-    assert.strictEqual(keptSecond.fill_yes_price, 0.22);
-    assert.strictEqual(keptSecond.fill_no_price, 0.78);
-    assert.strictEqual(keptSecond.fill_american, -355);
+    assert.strictEqual(keepExisting.ok, true);
+    const keptExisting = keepExistingDb._rows.get('kalshi:rfq-keep-ts');
+    assert.strictEqual(keptExisting.filled_at, restartFilledAt);
+    assert.strictEqual(keptExisting.fill_yes_price, 0.22);
+    assert.strictEqual(keptExisting.fill_no_price, 0.78);
+    assert.strictEqual(keptExisting.fill_american, -355);
 
     console.log('unhedged-rfq.test.js ok');
   }).catch((e) => {
