@@ -1018,7 +1018,78 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.strictEqual(lockShadow.action, 'quoteable');
   await new Promise((r) => setTimeout(r, 20));
   assert.strictEqual(unhedgedRows.length, beforeLock);
+
+  // Already-persisted MLB row updates to filled; tennis/NCAAF never insert.
+  const mergePersist = async (row, meta) => {
+    if (meta && meta.mode === 'fill') {
+      const prev = unhedgedRows.find((r) => r.rfq_id === row.rfq_id);
+      if (prev) Object.assign(prev, row);
+      return;
+    }
+    unhedgedRows.push(row);
+  };
   unhedgedLoop.stop();
+  const fillLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'false',
+    },
+    http: {
+      async getUserId() { return { rfqUserId: 'rfquser_test' }; },
+      async listRfqs() { return { rfqs: [] }; },
+      async listQuotes() { return { quotes: [] }; },
+      async getCombo() { throw new Error('unhedged must not hydrate'); },
+      async createQuote() { throw new Error('unhedged must not POST'); },
+      async confirmQuote() { throw new Error('unhedged must not confirm'); },
+      async deleteQuote() { return { statusCode: 200 }; },
+      close() {},
+    },
+    startWs: false,
+    getParlays: () => [kalshiParlay],
+    persistUnhedged: mergePersist,
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  await fillLoop.handleRfq({
+    id: 'rfq_unhedged_fill_mlb',
+    status: 'RFQ_STATUS_OPEN',
+    qtyDecimal: '8',
+    buyPrice: 0.18,
+    comboLegs: [
+      { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-bos-pit-2026-08-14-pit', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-nyy-bal-2026-08-14-nyy', side: 'SIDE_BUY' },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  const preFill = unhedgedRows.find((r) => r.rfq_id === 'rfq_unhedged_fill_mlb');
+  assert.ok(preFill);
+  assert.strictEqual(preFill.status, 'seen');
+  const seenTaker = preFill.taker_yes_price;
+  fillLoop.handleRfqClosed({
+    type: 'quoteAccepted',
+    rfq: {
+      id: 'rfq_unhedged_fill_mlb',
+      status: 'RFQ_STATUS_FILLED',
+      buyPrice: 0.27,
+    },
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(preFill.status, 'filled');
+  assert.strictEqual(preFill.fill_yes_price, 0.27);
+  assert.strictEqual(preFill.taker_yes_price, seenTaker, 'taker_* stays the original RFQ');
+  fillLoop.handleRfqClosed({
+    type: 'rfqClosed',
+    rfq: { id: 'rfq_ncaaf_never', status: 'RFQ_STATUS_FILLED', buyPrice: 0.40 },
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.ok(!unhedgedRows.some((r) => r.rfq_id === 'rfq_ncaaf_never'));
+  fillLoop.stop();
 
   const { createUnhedgedPriceCache } = require('./unhedged-price-cache');
   const { americanFromProb } = require('./engine');

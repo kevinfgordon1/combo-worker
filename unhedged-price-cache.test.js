@@ -92,7 +92,7 @@ const live = createUnhedgedPriceCache({
 live.watch('polymarket', [{ symbol: 'aec-mlb-cws-det-2026-08-14-cws' }]);
 
 return live.refresh().then(async () => {
-  assert.ok(kalshiCalls >= 3, 'one GET per Kalshi ML series');
+  assert.ok(kalshiCalls >= 2, 'one GET per in-scope Kalshi ML series (MLB/NFL)');
   assert.strictEqual(pmCalls, 2, 'watch RFQ slug + derived opponent aec-*');
   assert.strictEqual(live.getYesProb('kalshi', 'KXMLBGAME-26AUG141840CWSDET-CWS'), 0.58);
   assert.strictEqual(live.getYesProb('kalshi', 'KXNFLGAME-26SEP071330BUFKC-KC'), 0.61);

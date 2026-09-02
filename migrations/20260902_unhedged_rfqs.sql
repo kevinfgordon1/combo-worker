@@ -20,6 +20,10 @@ create table if not exists public.unhedged_rfqs (
   our_quote_american integer,
   status text not null,
   skip_reason text,
+  fill_yes_price numeric,
+  fill_no_price numeric,
+  fill_american integer,
+  filled_at timestamptz,
   unique (venue, rfq_id)
 );
 
