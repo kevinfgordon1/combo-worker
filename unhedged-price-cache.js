@@ -2,6 +2,9 @@
 // Refresh on a short interval. Lookups are synchronous — never HTTP on the
 // RFQ path. Kalshi: signed GET /markets for KXMLBGAME / KXNFLGAME (NCAAF is
 // out of unhedged scope). Polymarket: getMarketBySlug for watched aec-* slugs.
+// Poly RFQ legs add their symbol; Kalshi MLB/NFL ML legs also watch synthesized
+// aec slugs for both teams (pick + opponent, both team orders). Watch-list
+// only — do not crawl the Poly RFQ firehose.
 // The Odds API is not the quote clock.
 //
 // Fair lookups use the *opponent* YES (other ticker in the same Kalshi event;
@@ -11,7 +14,7 @@
 // opponent American. Same-side last is never fair.
 'use strict';
 
-const { normTeam } = require('./leg-identity');
+const { normTeam, kalshiTickerPieces } = require('./leg-identity');
 const { parseKalshiUnhedgedTicker, parsePmUnhedgedSlug } = require('./unhedged-rfq');
 const { ourTrueFromOpponents, takerThetaForVenue } = require('./unhedged-quote');
 
@@ -157,6 +160,48 @@ function opponentTeamOf(parsed) {
   const teams = (parsed.teams || []).map((t) => normTeam(league, t)).filter(Boolean);
   const others = [...new Set(teams)].filter((t) => t !== sel);
   return others.length === 1 ? others[0] : null;
+}
+
+// Inverse of parsePmUnhedgedSlug for US sports ML: aec-{league}-{t1}-{t2}-{date}-{pick}.
+// Codes (cin), not spoken names (reds). Team order is not in the ticker identity
+// (teams are sorted), so watch both orders. Also watch the identity-normalized
+// pair (chw→cws) when it differs from the raw ticker codes.
+function addPmMlPairSlugs(out, league, date, teamA, teamB) {
+  const a = String(teamA || '').toLowerCase();
+  const b = String(teamB || '').toLowerCase();
+  const lg = String(league || '').toLowerCase();
+  const dt = String(date || '');
+  if (!a || !b || a === b || (lg !== 'mlb' && lg !== 'nfl') || !/^\d{4}-\d{2}-\d{2}$/.test(dt)) return;
+  for (const [left, right] of [[a, b], [b, a]]) {
+    for (const pick of [left, right]) {
+      const slug = `aec-${lg}-${left}-${right}-${dt}-${pick}`;
+      const parsed = parsePmUnhedgedSlug(slug, 'yes');
+      if (parsed && !parsed.skip) out.add(slug);
+    }
+  }
+}
+
+function pmMlSlugsFromKalshiLeg(leg) {
+  const ticker = typeof leg === 'string'
+    ? String(leg)
+    : (leg && (leg.ticker || leg.market_ticker));
+  if (!ticker) return [];
+  const parsed = parseKalshiUnhedgedTicker(ticker, (leg && leg.side) || 'yes');
+  if (!parsed || parsed.skip) return [];
+  const league = String(parsed.league || '').toLowerCase();
+  if (league !== 'mlb' && league !== 'nfl') return [];
+  if (parsed.marketType && parsed.marketType !== 'moneyline') return [];
+  const date = parsed.date;
+  if (!date) return [];
+  const out = new Set();
+  const pieces = kalshiTickerPieces(ticker, (leg && leg.side) || 'yes');
+  if (pieces && pieces.teams && pieces.teams.length === 2) {
+    addPmMlPairSlugs(out, league, date, pieces.teams[0], pieces.teams[1]);
+  }
+  if (parsed.teams && parsed.teams.length === 2) {
+    addPmMlPairSlugs(out, league, date, parsed.teams[0], parsed.teams[1]);
+  }
+  return [...out];
 }
 
 function parseLeg(leg) {
@@ -477,6 +522,10 @@ function createUnhedgedPriceCache({
           }
         }
       }
+      // Kalshi RFQ legs have ticker (KXMLBGAME-…-CIN), not symbol. Synthesize
+      // aec-* ML slugs for both teams so refreshPm fills polymarket + pmGames.
+      // Do not crawl the Poly firehose — only these per-leg candidates.
+      for (const s of pmMlSlugsFromKalshiLeg(leg)) addWatch(s);
     }
     if (added && timer) scheduleSoon();
   }
@@ -594,4 +643,5 @@ module.exports = {
   pmGamePrefix,
   gameKeyFromParsed,
   opponentTeamOf,
+  pmMlSlugsFromKalshiLeg,
 };

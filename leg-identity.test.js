@@ -2,6 +2,7 @@
 const assert = require('assert');
 const {
   parseKalshiTicker,
+  kalshiTickerPieces,
   identitiesFromParlay,
   identityFromMarket,
   identitiesFromPolymarketLegs,
@@ -76,6 +77,19 @@ assert.strictEqual(
 const pitId = parseKalshiTicker('KXMLBGAME-26AUG141840BOSPIT-PIT:yes');
 assert.strictEqual(pitId.selection, 'pit');
 assert.deepStrictEqual(pitId.teams, ['bos', 'pit']);
+
+// Raw ticker codes stay as-written (wsh, cin). Identity still aliases wsh→was.
+const wshPieces = kalshiTickerPieces('KXMLBGAME-26AUG141840WSHATL-WSH:yes');
+assert.ok(wshPieces);
+assert.deepStrictEqual(wshPieces.teams, ['wsh', 'atl']);
+assert.strictEqual(wshPieces.selection, 'wsh');
+assert.strictEqual(wshPieces.date, '2026-08-14');
+const wshId = parseKalshiTicker('KXMLBGAME-26AUG141840WSHATL-WSH:yes');
+assert.strictEqual(wshId.selection, 'was');
+assert.deepStrictEqual(wshId.teams, ['atl', 'was']);
+const cinPieces = kalshiTickerPieces('KXMLBGAME-26SEP021840CINCHC-CIN:yes');
+assert.deepStrictEqual(cinPieces.teams, ['cin', 'chc']);
+assert.strictEqual(cinPieces.selection, 'cin');
 
 assert.strictEqual(parseKalshiTicker('KXMVESPORTSMULTIGAMEEXTENDED-S2026FF'), null);
 assert.strictEqual(parseKalshiTicker('KXMLBGAME-26AUG141840CWSDET-CWS:yes').side, 'yes');
