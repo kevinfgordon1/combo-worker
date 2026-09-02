@@ -149,7 +149,10 @@ function makeIdentity(partial) {
   return identityKey(id) ? id : null;
 }
 
-function parseKalshiTicker(text, sideOverride) {
+// Raw ticker pieces before identity aliases / sort. Slug builders need the
+// codes as they appear (wsh, cws), not spoken names and not always normTeam
+// (mlb wsh → was). Combo Locks identity still goes through makeIdentity.
+function kalshiTickerPieces(text, sideOverride) {
   if (text == null || text === '') return null;
   let raw = String(text).trim();
   let side = sideOverride ? String(sideOverride).toLowerCase() : '';
@@ -191,14 +194,29 @@ function parseKalshiTicker(text, sideOverride) {
   if (!pair) return null;
   if (!selection) selection = pair[0];
 
-  return makeIdentity({
+  return {
+    series,
     league: spec.league,
     date,
-    teams: pair,
+    teams: [String(pair[0]).toLowerCase(), String(pair[1]).toLowerCase()],
+    selection: String(selection).toLowerCase(),
+    side,
     marketType: spec.marketType,
     period: spec.period,
-    selection,
-    side,
+  };
+}
+
+function parseKalshiTicker(text, sideOverride) {
+  const pieces = kalshiTickerPieces(text, sideOverride);
+  if (!pieces) return null;
+  return makeIdentity({
+    league: pieces.league,
+    date: pieces.date,
+    teams: pieces.teams,
+    marketType: pieces.marketType,
+    period: pieces.period,
+    selection: pieces.selection,
+    side: pieces.side,
   });
 }
 
@@ -419,6 +437,7 @@ module.exports = {
   identityKey,
   makeIdentity,
   parseKalshiTicker,
+  kalshiTickerPieces,
   identityFromLockFields,
   identitiesFromParlay,
   identityFromMarket,
