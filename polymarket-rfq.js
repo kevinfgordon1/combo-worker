@@ -38,6 +38,7 @@ const {
   sameIdentitySet,
   TEAM_ALIASES,
 } = require('./leg-identity');
+const { isUnhedgedRfqShadow, shadowUnhedgedMiss } = require('./unhedged-rfq');
 
 const MODE = 'POLY';
 const RECONCILE_MS = 3000;
@@ -549,8 +550,19 @@ function startPolymarketRfqLoop(ctx = {}) {
   console.log(
     `[${MODE}] starting — live=${live}. ` +
     `POST create-quote / confirm only when POLYMARKET_RFQ_LIVE is truthy. ` +
-    `Kalshi quoting keeps running. Remaining is shared via reserve.js.`
+    `Kalshi quoting keeps running. Remaining is shared via reserve.js. ` +
+    `Unhedged RFQ shadow (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(env) ? 'on' : 'off'}) ` +
+    `persists in-scope unmatched MLB/NFL/NCAAF ML combos — never posts.`
   );
+
+  function persistUnhedgedShadow(rfq) {
+    shadowUnhedgedMiss(rfq, {
+      venue: 'polymarket',
+      supabase: ctx.supabase,
+      persist: ctx.persistUnhedged,
+      env,
+    });
+  }
 
   function parlays() {
     return typeof ctx.getParlays === 'function' ? (ctx.getParlays() || []) : (ctx.parlays || []);
@@ -599,7 +611,10 @@ function startPolymarketRfqLoop(ctx = {}) {
     const locks = parlays();
     let rfq = normalizePolymarketRfq(raw);
     if (!rfq || !rfq.rfqId) return { action: 'skip', reason: 'bad_rfq' };
-    if (!locks.length) return { action: 'skip', reason: 'no_locks' };
+    if (!locks.length) {
+      persistUnhedgedShadow(rfq);
+      return { action: 'skip', reason: 'no_locks' };
+    }
 
     if (needsHydrate(rfq, locks)) {
       rfq = (await hydrateRfq(http, raw)) || rfq;
@@ -607,6 +622,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
 
     if (!couldMatchActiveLocks(rfq, locks)) {
+      persistUnhedgedShadow(rfq);
       return { action: 'skip', reason: 'no_lock_overlap' };
     }
 

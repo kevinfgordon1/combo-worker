@@ -17,6 +17,9 @@
 // SKIP TAPE: oversized / limit_reached skips persist a distinct reason on
 //   combo_submissions, then one RFQ+ticker tape lookup after close (or pad).
 //   Quote-watcher stays parked. We do not write combo_matches or watcher_debug.
+// UNHEDGED SHADOW: unmatched in-scope MLB/NFL/NCAAF ML combos persist to
+//   unhedged_rfqs (UNHEDGED_RFQ_SHADOW, default on). Never POSTs. Combo Locks
+//   match / reserve / quote path is unchanged.
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
@@ -47,6 +50,7 @@ const {
   isSkipTapeEligible,
   resolveSkipTape,
 } = require('./skip-tape');
+const { isUnhedgedRfqShadow, shadowUnhedgedMiss } = require('./unhedged-rfq');
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -936,7 +940,16 @@ async function onRfq(rfq, env) {
   counts.combos++;
 
   const p = matchParlay(rfq, parlays);
-  if (!p) return;
+  if (!p) {
+    // Combo Locks miss — shadow in-scope unhedged RFQs only. Never quotes.
+    shadowUnhedgedMiss(rfq, {
+      venue: 'kalshi',
+      extra: env && env.msg ? { msg: env.msg } : null,
+      supabase,
+      env: process.env,
+    });
+    return;
+  }
   counts.matched++;
 
   const started = startedForParlay(p, rfq, env && env.msg ? { msg: env.msg } : null);
@@ -1107,7 +1120,9 @@ async function main() {
     `Remaining = max - filled - outstanding quotes (Kalshi + Polymarket). ` +
     `Unaccepted quotes are DELETE'd after ${RESERVE_TTL_MS / 1000}s. ` +
     `rfq_deleted releases immediately. ` +
-    `Skipped oversized/cap RFQs get a targeted tape lookup after close.`
+    `Skipped oversized/cap RFQs get a targeted tape lookup after close. ` +
+    `Unhedged RFQ shadow (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(process.env) ? 'on' : 'off'}) ` +
+    `persists in-scope unmatched MLB/NFL/NCAAF ML combos — never posts.`
   );
 
   await refresh();
