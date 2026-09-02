@@ -178,6 +178,39 @@ return live.refresh().then(async () => {
   const kOur = kalshiCheaper.getOurTrue(wshLeg);
   assert.ok(Math.abs(kOur - ourTrueFromOpponentYes(0.35, KALSHI_TAKER_THETA)) < 1e-12);
 
+  // Kevin: Sox true = invert(best fee-included Mariners). Kalshi Mariners +118-class
+  // vs a worse Poly Mariners — pick Kalshi, sign-flip. Sox last is not fair.
+  const soxLeg = {
+    ticker: 'KXMLBGAME-26AUG141840BOSSEA-BOS',
+    symbol: 'aec-mlb-bos-sea-2026-08-14-bos',
+    league: 'mlb',
+    selection: 'bos',
+    teams: ['bos', 'sea'],
+    date: '2026-08-14',
+    side: 'yes',
+  };
+  const soxSea = createUnhedgedPriceCache({
+    seed: {
+      kalshi: {
+        'KXMLBGAME-26AUG141840BOSSEA-BOS': 0.60,
+        'KXMLBGAME-26AUG141840BOSSEA-SEA': 0.35,
+      },
+      polymarket: {
+        'aec-mlb-bos-sea-2026-08-14-bos': 0.59,
+        'aec-mlb-bos-sea-2026-08-14-sea': 0.40,
+      },
+    },
+  });
+  const seaKalshiAm = feeIncludedAmerican(0.35, KALSHI_TAKER_THETA);
+  const seaPolyAm = feeIncludedAmerican(0.40, POLY_TAKER_THETA);
+  assert.ok(seaKalshiAm > seaPolyAm, 'Kalshi Mariners is the better opponent American');
+  const soxOur = soxSea.getOurTrue(soxLeg);
+  assert.ok(Math.abs(soxOur - ourTrueProb(seaKalshiAm)) < 1e-12);
+  assert.strictEqual(americanFromProb(soxOur), invertAmerican(seaKalshiAm));
+  assert.ok(Math.abs(soxOur - 0.60) > 1e-6, 'must not use same-side Sox last');
+  const soxQuotes = soxSea.opponentQuotes(soxLeg);
+  assert.ok(soxQuotes.every((q) => !/BOS$|-bos$/i.test(q.key)), 'opponent quotes exclude Sox last');
+
   // Ingest by event_ticker pairs the other Kalshi ticker.
   const eventCache = createUnhedgedPriceCache();
   eventCache.ingestKalshiMarkets([

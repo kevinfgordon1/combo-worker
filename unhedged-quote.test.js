@@ -217,6 +217,20 @@ function lookup(_venue, key) {
   assert.strictEqual(invertAmerican(-110), 110);
 }
 
+// Kevin: fee-included Mariners +118 (Kalshi) vs Poly Mariners +105 — pick +118, invert to Sox -118.
+// Same-side Sox last is not an opponent quote and must not win the pick.
+{
+  const marinersKalshi = { venue: 'kalshi', american: 118 };
+  const marinersPoly = { venue: 'polymarket', american: 105 };
+  const soxLast = { venue: 'kalshi', american: -150 };
+  assert.strictEqual(bestOpponentAmerican([marinersKalshi, marinersPoly]), 118);
+  const soxTrue = ourTrueFromOpponents([marinersKalshi, marinersPoly]);
+  assert.strictEqual(americanFromProb(soxTrue), -118);
+  assert.notStrictEqual(americanFromProb(soxTrue), -114);
+  assert.notStrictEqual(americanFromProb(soxTrue), invertAmerican(soxLast.american));
+  assert.strictEqual(invertAmerican(bestOpponentAmerican([marinersKalshi])), -118);
+}
+
 // Inverse: WSH fair = sign-flip of fee-included ATL American, not WSH last.
 {
   const atl = 0.42;
