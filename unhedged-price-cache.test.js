@@ -9,11 +9,14 @@ const {
 const { classifyUnhedgedRfq } = require('./unhedged-rfq');
 const { normalizeRfq } = require('./rfq');
 const {
-  applyTakerFeeToProb,
+  feeIncludedAmerican,
+  invertAmerican,
   ourTrueFromOpponentYes,
+  ourTrueProb,
   KALSHI_TAKER_THETA,
   POLY_TAKER_THETA,
 } = require('./unhedged-quote');
+const { americanFromProb } = require('./engine');
 
 assert.strictEqual(kalshiYesProb({
   yes_bid_dollars: '0.40',
@@ -118,7 +121,7 @@ return live.refresh().then(async () => {
 
   live.stop();
 
-  // Inverse on a two-way: WSH ourTrue = 1 − fee-adjusted ATL, not WSH last.
+  // Inverse on a two-way: WSH ourTrue = sign-flip of fee-included ATL, not WSH last.
   const wshCache = createUnhedgedPriceCache({
     seed: {
       kalshi: {
@@ -141,7 +144,7 @@ return live.refresh().then(async () => {
   assert.ok(Math.abs(wshOur - 0.60) > 1e-6);
   assert.strictEqual(wshCache.getYesProb('kalshi', 'KXMLBGAME-26AUG141840WSHATL-WSH'), 0.60);
 
-  // Best-of-two venues: cheaper opponent YES after taker fee.
+  // Best-of-two venues: cheaper/better opponent American after taker fee, then flip.
   const bothVenues = createUnhedgedPriceCache({
     seed: {
       kalshi: {
@@ -155,10 +158,11 @@ return live.refresh().then(async () => {
     },
   });
   const cheapOur = bothVenues.getOurTrue(wshLeg);
-  const polyEff = applyTakerFeeToProb(0.40, POLY_TAKER_THETA);
-  const kalshiEff = applyTakerFeeToProb(0.50, KALSHI_TAKER_THETA);
-  assert.ok(polyEff < kalshiEff);
-  assert.ok(Math.abs(cheapOur - (1 - polyEff)) < 1e-12);
+  const polyAm = feeIncludedAmerican(0.40, POLY_TAKER_THETA);
+  const kalshiAm = feeIncludedAmerican(0.50, KALSHI_TAKER_THETA);
+  assert.ok(polyAm > kalshiAm);
+  assert.ok(Math.abs(cheapOur - ourTrueProb(polyAm)) < 1e-12);
+  assert.strictEqual(americanFromProb(cheapOur), invertAmerican(polyAm));
 
   const kalshiCheaper = createUnhedgedPriceCache({
     seed: {
@@ -173,6 +177,39 @@ return live.refresh().then(async () => {
   });
   const kOur = kalshiCheaper.getOurTrue(wshLeg);
   assert.ok(Math.abs(kOur - ourTrueFromOpponentYes(0.35, KALSHI_TAKER_THETA)) < 1e-12);
+
+  // Kevin: Sox true = invert(best fee-included Mariners). Kalshi Mariners +118-class
+  // vs a worse Poly Mariners — pick Kalshi, sign-flip. Sox last is not fair.
+  const soxLeg = {
+    ticker: 'KXMLBGAME-26AUG141840BOSSEA-BOS',
+    symbol: 'aec-mlb-bos-sea-2026-08-14-bos',
+    league: 'mlb',
+    selection: 'bos',
+    teams: ['bos', 'sea'],
+    date: '2026-08-14',
+    side: 'yes',
+  };
+  const soxSea = createUnhedgedPriceCache({
+    seed: {
+      kalshi: {
+        'KXMLBGAME-26AUG141840BOSSEA-BOS': 0.60,
+        'KXMLBGAME-26AUG141840BOSSEA-SEA': 0.35,
+      },
+      polymarket: {
+        'aec-mlb-bos-sea-2026-08-14-bos': 0.59,
+        'aec-mlb-bos-sea-2026-08-14-sea': 0.40,
+      },
+    },
+  });
+  const seaKalshiAm = feeIncludedAmerican(0.35, KALSHI_TAKER_THETA);
+  const seaPolyAm = feeIncludedAmerican(0.40, POLY_TAKER_THETA);
+  assert.ok(seaKalshiAm > seaPolyAm, 'Kalshi Mariners is the better opponent American');
+  const soxOur = soxSea.getOurTrue(soxLeg);
+  assert.ok(Math.abs(soxOur - ourTrueProb(seaKalshiAm)) < 1e-12);
+  assert.strictEqual(americanFromProb(soxOur), invertAmerican(seaKalshiAm));
+  assert.ok(Math.abs(soxOur - 0.60) > 1e-6, 'must not use same-side Sox last');
+  const soxQuotes = soxSea.opponentQuotes(soxLeg);
+  assert.ok(soxQuotes.every((q) => !/BOS$|-bos$/i.test(q.key)), 'opponent quotes exclude Sox last');
 
   // Ingest by event_ticker pairs the other Kalshi ticker.
   const eventCache = createUnhedgedPriceCache();

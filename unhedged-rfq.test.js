@@ -14,6 +14,10 @@ const { createUnhedgedPriceCache } = require('./unhedged-price-cache');
 const { americanFromProb } = require('./engine');
 const {
   ourTrueFromOpponentYes,
+  ourTrueFromOpponents,
+  ourTrueProb,
+  invertAmerican,
+  bestOpponentAmerican,
   quoteYesFromFair,
   productFair,
   KALSHI_TAKER_THETA,
@@ -306,7 +310,20 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(tennisOut.persist, false);
     assert.strictEqual(rows.length, 1);
 
-    // Inverse fair: WSH = 1 − fee-adjusted ATL, not WSH last. Missing opponent → nulls.
+    // Kevin: opponent +118 → our -118 (not -114); opponent -140 → our +140.
+    assert.strictEqual(invertAmerican(118), -118);
+    assert.notStrictEqual(invertAmerican(118), -114);
+    assert.strictEqual(invertAmerican(-140), 140);
+    assert.strictEqual(americanFromProb(ourTrueProb(118)), -118);
+    assert.notStrictEqual(americanFromProb(ourTrueProb(118)), -114);
+    assert.strictEqual(americanFromProb(ourTrueProb(-140)), 140);
+    assert.strictEqual(bestOpponentAmerican([{ american: 118 }, { american: -140 }]), 118);
+    assert.strictEqual(
+      americanFromProb(ourTrueFromOpponents([{ american: 118 }, { american: -140 }])),
+      -118
+    );
+
+    // Inverse fair: WSH = sign-flip of fee-included ATL, not WSH last. Missing opponent → nulls.
     const wshOur = ourTrueFromOpponentYes(0.42, KALSHI_TAKER_THETA);
     const cwsOur = ourTrueFromOpponentYes(0.50, KALSHI_TAKER_THETA);
     const mlbFair = productFair([wshOur, cwsOur]);
