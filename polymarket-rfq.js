@@ -555,12 +555,18 @@ function startPolymarketRfqLoop(ctx = {}) {
     `persists in-scope unmatched MLB/NFL/NCAAF ML combos — never posts.`
   );
 
+  const priceCache = ctx.priceCache || null;
+  if (priceCache && typeof priceCache.setFetchPmMarket === 'function') {
+    priceCache.setFetchPmMarket((slug) => http.getMarketBySlug(slug));
+  }
+
   function persistUnhedgedShadow(rfq) {
     shadowUnhedgedMiss(rfq, {
       venue: 'polymarket',
       supabase: ctx.supabase,
       persist: ctx.persistUnhedged,
       env,
+      priceCache,
     });
   }
 

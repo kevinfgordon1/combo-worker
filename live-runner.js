@@ -18,8 +18,9 @@
 //   combo_submissions, then one RFQ+ticker tape lookup after close (or pad).
 //   Quote-watcher stays parked. We do not write combo_matches or watcher_debug.
 // UNHEDGED SHADOW: unmatched in-scope MLB/NFL/NCAAF ML combos persist to
-//   unhedged_rfqs (UNHEDGED_RFQ_SHADOW, default on). Never POSTs. Combo Locks
-//   match / reserve / quote path is unchanged.
+//   unhedged_rfqs (UNHEDGED_RFQ_SHADOW, default on). Fair / would-quote
+//   Americans come from an interval ML price cache (not a per-RFQ fetch).
+//   Never POSTs. Combo Locks match / reserve / quote path is unchanged.
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
@@ -51,6 +52,7 @@ const {
   resolveSkipTape,
 } = require('./skip-tape');
 const { isUnhedgedRfqShadow, shadowUnhedgedMiss } = require('./unhedged-rfq');
+const { createUnhedgedPriceCache } = require('./unhedged-price-cache');
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -623,6 +625,19 @@ async function fetchSkipTrades(ticker, minTs, maxTs) {
   return (json && json.trades) || [];
 }
 
+const unhedgedPriceCache = createUnhedgedPriceCache({
+  listKalshiMarkets: async (seriesTicker, cursor) => {
+    const qs = new URLSearchParams({
+      series_ticker: String(seriesTicker),
+      status: 'open',
+      limit: '200',
+    });
+    if (cursor) qs.set('cursor', String(cursor));
+    const { json } = await kalshiGet('/trade-api/v2/markets', qs.toString());
+    return json || { markets: [] };
+  },
+});
+
 async function persistSkipTape(id, patch) {
   const body = stripUnknown(patch);
   if (!Object.keys(body).length) return;
@@ -947,6 +962,7 @@ async function onRfq(rfq, env) {
       extra: env && env.msg ? { msg: env.msg } : null,
       supabase,
       env: process.env,
+      priceCache: unhedgedPriceCache,
     });
     return;
   }
@@ -1127,6 +1143,12 @@ async function main() {
 
   await refresh();
   setInterval(refresh, 30000);
+  if (isUnhedgedRfqShadow(process.env)) {
+    unhedgedPriceCache.refresh()
+      .then((n) => console.log(`[${MODE}] unhedged ML cache kalshi=${n.kalshi} poly=${n.poly}`))
+      .catch((e) => console.error(`[${MODE}] unhedged price refresh`, e.message));
+    unhedgedPriceCache.start(process.env);
+  }
   setInterval(() => {
     cancelUnacceptedQuotes().catch((e) => console.error(`[${MODE}] cancel-unaccepted tick`, e.message));
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start tick`, e.message));
@@ -1155,6 +1177,7 @@ async function main() {
     sessionFilledByParlay,
     supabase,
     env: process.env,
+    priceCache: unhedgedPriceCache,
   });
   polyLoop = poly;
 
@@ -1172,6 +1195,7 @@ async function main() {
   process.on('SIGINT', () => {
     client.stop();
     try { poly && poly.stop && poly.stop(); } catch (_) {}
+    try { unhedgedPriceCache.stop(); } catch (_) {}
     try { kalshiHttp.close(); } catch (_) {}
     console.log(`[${MODE}] final`, counts);
     process.exit(0);

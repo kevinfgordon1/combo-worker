@@ -9,6 +9,7 @@ const {
   parseKalshiUnhedgedTicker,
   parsePmUnhedgedSlug,
 } = require('./unhedged-rfq');
+const { createUnhedgedPriceCache, wouldQuoteYesProb, makerFeeCoeff } = require('./unhedged-price-cache');
 
 assert.strictEqual(isUnhedgedRfqShadow({}), true);
 assert.strictEqual(isUnhedgedRfqShadow({ UNHEDGED_RFQ_SHADOW: '' }), true);
@@ -263,6 +264,58 @@ function pmRfq(id, symbols, extra = {}) {
   assert.strictEqual(out.reason, 'flag_off');
 }
 
+// Seeded cache: NFL 0-fee quote is longer than MLB 0.035 for the same p's.
+{
+  const cache = createUnhedgedPriceCache();
+  cache.seed('kalshi', 'KXNFLGAME-26SEP071330BUFKC-KC', 0.40);
+  cache.seed('kalshi', 'KXNFLGAME-26SEP071330DALPHI-DAL', 0.40);
+  cache.seed('kalshi', 'KXMLBGAME-26AUG141840CWSDET-CWS', 0.40);
+  cache.seed('kalshi', 'KXMLBGAME-26AUG141840BOSPIT-PIT', 0.40);
+  const nfl = classifyUnhedgedRfq(kalshiRfq('rfq-nfl-fee', [
+    'KXNFLGAME-26SEP071330BUFKC-KC:yes',
+    'KXNFLGAME-26SEP071330DALPHI-DAL:yes',
+  ]), { venue: 'kalshi', now: Date.parse('2026-09-01T12:00:00Z'), priceCache: cache });
+  const mlb = classifyUnhedgedRfq(kalshiRfq('rfq-mlb-fee', [
+    'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+    'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
+  ]), { venue: 'kalshi', now: Date.parse('2026-08-14T20:00:00Z'), priceCache: cache });
+  assert.strictEqual(nfl.persist, true);
+  assert.strictEqual(mlb.persist, true);
+  assert.ok(nfl.our_fair_american != null);
+  assert.strictEqual(nfl.our_fair_american, mlb.our_fair_american);
+  assert.ok(nfl.our_quote_american != null && mlb.our_quote_american != null);
+  assert.strictEqual(makerFeeCoeff('kalshi', nfl.legs), 0);
+  assert.strictEqual(makerFeeCoeff('kalshi', mlb.legs), 0.035);
+  const fairP = 0.16;
+  const nflP = wouldQuoteYesProb(fairP, { venue: 'kalshi', legs: nfl.legs, cushion: 0.05 });
+  const mlbP = wouldQuoteYesProb(fairP, { venue: 'kalshi', legs: mlb.legs, cushion: 0.05 });
+  assert.ok(mlbP > nflP);
+  assert.ok(nfl.our_quote_american >= mlb.our_quote_american, 'NFL 0-fee is the longer (or equal after penny) quote');
+}
+
+// Poly rebate path via cache: priced, not fair, still no invent on a missing slug.
+{
+  const cache = createUnhedgedPriceCache();
+  cache.seed('polymarket', 'aec-mlb-cws-det-2026-08-14-cws', 0.40);
+  cache.seed('polymarket', 'aec-mlb-bos-pit-2026-08-14-pit', 0.40);
+  const hit = classifyUnhedgedRfq(pmRfq('rfq-pm-priced', [
+    'aec-mlb-cws-det-2026-08-14-cws',
+    'aec-mlb-bos-pit-2026-08-14-pit',
+  ]), { venue: 'polymarket', now: Date.parse('2026-08-14T20:00:00Z'), priceCache: cache });
+  assert.strictEqual(hit.persist, true);
+  assert.ok(hit.our_fair_american != null);
+  assert.ok(hit.our_quote_american != null);
+  assert.ok(hit.our_quote_american !== hit.our_fair_american);
+
+  const miss = classifyUnhedgedRfq(pmRfq('rfq-pm-miss-price', [
+    'aec-mlb-cws-det-2026-08-14-cws',
+    'aec-mlb-nyy-bal-2026-08-14-nyy',
+  ]), { venue: 'polymarket', now: Date.parse('2026-08-14T20:00:00Z'), priceCache: cache });
+  assert.strictEqual(miss.persist, true);
+  assert.strictEqual(miss.our_fair_american, null);
+  assert.strictEqual(miss.our_quote_american, null);
+}
+
 // persist helper is called only when in-scope
 {
   const rows = [];
@@ -282,6 +335,7 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(rows[0].rfq_id, 'rfq-persist-pass');
     assert.strictEqual(rows[0].status, 'seen');
     assert.strictEqual(rows[0].our_fair_american, null);
+    assert.strictEqual(rows[0].our_quote_american, null);
 
     const tennis = pmRfq('rfq-persist-tennis', [
       'aec-atp-djokovic-alcaraz-2026-08-14-djokovic',

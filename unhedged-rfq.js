@@ -6,10 +6,12 @@
 // independent events (distinct games AND distinct teams). No SGP / spreads /
 // totals / props. Tennis / LoL / CS2 are a silent skip (no insert).
 //
-// Fair/quote Americans stay null unless already present on the RFQ — this
-// worker has no odds feed for unmatched parlays. Do not invent prices.
+// Fair/quote Americans come from the in-memory ML price cache (interval
+// refresh — not a per-RFQ fetch). If any leg has no cached full-game ML
+// price, both stay null. Do not invent prices. Never POST / confirm / fill.
 //
 // Env: UNHEDGED_RFQ_SHADOW default ON (collect tape). Set 0/false/off to idle.
+//      UNHEDGED_YES_CUSHION default 0.05 (YES probability). Posting stays off.
 'use strict';
 const { parseKalshiTicker } = require('./leg-identity');
 const { findStartedEvent } = require('./started');
@@ -422,7 +424,7 @@ function classifyUnhedgedRfq(rfq, opts = {}) {
   }));
 
   const status = started && started.started ? 'started' : 'seen';
-  return {
+  const classified = {
     persist: true,
     inScope: true,
     reason: status === 'started' ? 'game_started' : null,
@@ -436,6 +438,31 @@ function classifyUnhedgedRfq(rfq, opts = {}) {
     venue,
     rfqId: rfq.rfqId || rfq.id || null,
   };
+  applyUnhedgedPrices(classified, opts);
+  return classified;
+}
+
+// Sync cache lookup only. Never fetch here — missing prices stay null.
+function applyUnhedgedPrices(classified, opts = {}) {
+  if (!classified || !classified.persist) return classified;
+  const cache = opts.priceCache;
+  if (!cache || typeof cache.price !== 'function') {
+    classified.our_fair_american = null;
+    classified.our_quote_american = null;
+    return classified;
+  }
+  try {
+    if (typeof cache.remember === 'function') {
+      cache.remember(classified.venue, classified.legs);
+    }
+    const priced = cache.price(classified.venue, classified.legs, opts.env);
+    classified.our_fair_american = priced && priced.fairAmerican != null ? priced.fairAmerican : null;
+    classified.our_quote_american = priced && priced.quoteAmerican != null ? priced.quoteAmerican : null;
+  } catch (e) {
+    classified.our_fair_american = null;
+    classified.our_quote_american = null;
+  }
+  return classified;
 }
 
 function buildUnhedgedRow(classified, rfq) {
@@ -517,4 +544,5 @@ module.exports = {
   shadowUnhedgedMiss,
   parseKalshiUnhedgedTicker,
   parsePmUnhedgedSlug,
+  applyUnhedgedPrices,
 };
