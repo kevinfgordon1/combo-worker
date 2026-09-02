@@ -12,6 +12,8 @@
 // LATENCY: Steps 0–4 — instrument, POST first, undici keep-alive, pre-stage.
 // START GATE: never quote (and cancel open quotes) once any leg's start <= now.
 //   Started still wins; the cap is a second gate.
+//   Polymarket confirm + resting-quote cancel uses the same startedFor /
+//   findStartedEvent (polymarket-rfq.js) — date-only PM slugs are not starts.
 // SKIP TAPE: oversized / limit_reached skips persist a distinct reason on
 //   combo_submissions, then one RFQ+ticker tape lookup after close (or pad).
 //   Quote-watcher stays parked. We do not write combo_matches or watcher_debug.
@@ -90,6 +92,7 @@ let filledByParlay = {};
 let sessionFilledByParlay = {};
 const pendingQuotes = new Map();
 const polyPendingQuotes = new Map();
+let polyLoop = null;
 
 function outstandingFor(parlayId, excludeQuoteId) {
   return sumOutstanding(pendingQuotes, parlayId, excludeQuoteId)
@@ -159,6 +162,9 @@ async function refresh() {
     // cannot re-pin remaining.
     clearStaleLiveSubmissions().catch((e) => console.error(`[${MODE}] clear stale is_live`, e.message));
     cancelStartedQuotes().catch((e) => console.error(`[${MODE}] cancel-on-start refresh`, e.message));
+    if (polyLoop && typeof polyLoop.cancelStartedQuotes === 'function') {
+      polyLoop.cancelStartedQuotes().catch((e) => console.error(`[${MODE}] poly cancel-on-start refresh`, e.message));
+    }
     loadPendingSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape load`, e.message));
   } catch (e) {
     console.error(`[${MODE}] refresh failed`, e.message);
@@ -1135,6 +1141,7 @@ async function main() {
     supabase,
     env: process.env,
   });
+  polyLoop = poly;
 
   const client = createKalshiWs({
     keyId: KEY_ID,

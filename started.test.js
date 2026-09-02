@@ -117,6 +117,29 @@ const rfq = normalizeRfq({
   assert.strictEqual(hit.started, false);
 }
 
+// Date-only Polymarket slugs (aec-mlb-…-2026-08-14) are not midnight starts.
+{
+  const hit = findStartedEvent(
+    {
+      isCombo: true,
+      legKeys: [
+        'AEC-MLB-CWS-DET-2026-08-14-CWS:yes',
+        'AEC-MLB-BOS-PIT-2026-08-14-PIT:yes',
+      ],
+    },
+    {
+      label: 'pm-date-only',
+      legs: [
+        { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'yes' },
+        { symbol: 'aec-mlb-bos-pit-2026-08-14-pit', side: 'yes' },
+      ],
+    },
+    null,
+    AFTER
+  );
+  assert.strictEqual(hit.started, false);
+}
+
 // ANY source started wins — later starts_at cannot override an earlier ticker.
 {
   const hit = findStartedEvent(
