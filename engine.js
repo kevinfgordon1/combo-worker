@@ -3,7 +3,9 @@
 // The fill odds you enter are the odds you SELL at AFTER your maker fee — already baked in.
 // So the lock math uses them directly (no separate fee term). KFEE/TAKER_FEE are only used to
 // recover the nominal exchange price and the taker's matched odds for display.
-const KFEE = 0.0175; // your maker fee (¼ of taker); baked into the fill odds you enter
+// Combo RFQ maker is fee_type quadratic_with_combo_maker_fees: 0.5 × taker's 0.07
+// = 0.035 × C × P × (1−P). Live KXMVE quotes use this curve. Taker stays 0.07.
+const KFEE = 0.035; // combo RFQ maker fee coefficient (½ of taker 0.07)
 const TAKER_FEE = 0.07; // the taker (other side of your combo) pays this
 const aToDec = (a) => (a > 0 ? 1 + a / 100 : 1 + 100 / Math.abs(a));
 const impliedProb = (a) => (a > 0 ? 100 / (a + 100) : Math.abs(a) / (Math.abs(a) + 100));
