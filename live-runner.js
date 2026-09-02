@@ -19,9 +19,9 @@
 //   Quote-watcher stays parked. We do not write combo_matches or watcher_debug.
 // UNHEDGED SHADOW: unmatched in-scope MLB/NFL/NCAAF ML combos persist to
 //   unhedged_rfqs (UNHEDGED_RFQ_SHADOW, default on). Never POSTs. Combo Locks
-//   match / reserve / quote path is unchanged. Fair/would-quote Americans
-//   come from an in-memory ML cache (Kalshi series + PM aec-* slugs), not
-//   per-RFQ HTTP and not The Odds API. UNHEDGED_RFQ_LIVE stays off.
+//   match / reserve / quote path is unchanged. Fair is inverse-bet ourTrue
+//   from Kalshi+Polymarket opponent MLs (not same-side last, not Odds API).
+//   Lookups stay sync off the 4s in-memory cache. UNHEDGED_RFQ_LIVE stays off.
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)

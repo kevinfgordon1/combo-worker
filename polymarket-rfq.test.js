@@ -1022,15 +1022,24 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
 
   const { createUnhedgedPriceCache } = require('./unhedged-price-cache');
   const { americanFromProb } = require('./engine');
+  const {
+    ourTrueFromOpponentYes,
+    quoteYesFromFair,
+    productFair,
+    POLY_TAKER_THETA,
+  } = require('./unhedged-quote');
   const pricedRows = [];
   let pricedCreate = 0;
   let pricedMarketGets = 0;
   const pricedCache = createUnhedgedPriceCache({
     seed: {
       polymarket: {
-        'aec-mlb-cws-det-2026-08-14-cws': 0.5,
-        'aec-mlb-bos-pit-2026-08-14-pit': 0.5,
-        'aec-mlb-nyy-bal-2026-08-14-nyy': 0.5,
+        'aec-mlb-cws-det-2026-08-14-cws': 0.61,
+        'aec-mlb-cws-det-2026-08-14-det': 0.5,
+        'aec-mlb-bos-pit-2026-08-14-pit': 0.62,
+        'aec-mlb-bos-pit-2026-08-14-bos': 0.5,
+        'aec-mlb-nyy-bal-2026-08-14-nyy': 0.63,
+        'aec-mlb-nyy-bal-2026-08-14-bal': 0.5,
       },
     },
   });
@@ -1078,10 +1087,12 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.strictEqual(pricedMarketGets, 0, 'shadow insert must not HTTP');
   const priced = pricedRows.find((r) => r.rfq_id === 'rfq_unhedged_priced');
   assert.ok(priced);
-  assert.strictEqual(priced.our_fair_american, americanFromProb(0.125));
-  const polyNet = 0.125;
-  const polyQuoteYes = Math.ceil(1.05 * polyNet * 100 - 1e-9) / 100;
+  const polyLegOur = ourTrueFromOpponentYes(0.5, POLY_TAKER_THETA);
+  const polyFair = productFair([polyLegOur, polyLegOur, polyLegOur]);
+  assert.strictEqual(priced.our_fair_american, americanFromProb(polyFair));
+  const polyQuoteYes = quoteYesFromFair(polyFair, { feeRate: 0 });
   assert.strictEqual(priced.our_quote_american, americanFromProb(polyQuoteYes));
+  assert.ok(priced.our_fair_american !== americanFromProb(0.61 * 0.62 * 0.63));
   pricedLoop.stop();
 
   const parsed = parsePrivateMessage(JSON.stringify({

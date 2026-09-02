@@ -8,6 +8,12 @@ const {
 } = require('./unhedged-price-cache');
 const { classifyUnhedgedRfq } = require('./unhedged-rfq');
 const { normalizeRfq } = require('./rfq');
+const {
+  applyTakerFeeToProb,
+  ourTrueFromOpponentYes,
+  KALSHI_TAKER_THETA,
+  POLY_TAKER_THETA,
+} = require('./unhedged-quote');
 
 assert.strictEqual(kalshiYesProb({
   yes_bid_dollars: '0.40',
@@ -42,6 +48,13 @@ assert.strictEqual(cache.getYesProb('kalshi', 'KXMLBGAME-26AUG141840CWSDET-CWS')
 assert.strictEqual(cache.getYesProb('kalshi', 'KXMLBGAME-26AUG141840CWSDET-CWS:yes'), 0.55);
 assert.strictEqual(cache.getYesProb('polymarket', 'aec-mlb-cws-det-2026-08-14-cws'), 0.55);
 assert.strictEqual(cache.getYesProb('kalshi', 'KXMLBGAME-MISSING'), null);
+assert.strictEqual(cache.getOurTrue({
+  ticker: 'KXMLBGAME-26AUG141840CWSDET-CWS',
+  league: 'mlb',
+  selection: 'cws',
+  teams: ['cws', 'det'],
+  date: '2026-08-14',
+}), null, 'same-side last is not fair when opponent is missing');
 
 cache.ingestKalshiMarkets([
   { ticker: 'KXNFLGAME-26SEP071330BUFKC-KC', yes_bid_dollars: '0.48', yes_ask_dollars: '0.52' },
@@ -77,7 +90,7 @@ live.watch('polymarket', [{ symbol: 'aec-mlb-cws-det-2026-08-14-cws' }]);
 
 return live.refresh().then(async () => {
   assert.ok(kalshiCalls >= 3, 'one GET per Kalshi ML series');
-  assert.strictEqual(pmCalls, 1);
+  assert.strictEqual(pmCalls, 2, 'watch RFQ slug + derived opponent aec-*');
   assert.strictEqual(live.getYesProb('kalshi', 'KXMLBGAME-26AUG141840CWSDET-CWS'), 0.58);
   assert.strictEqual(live.getYesProb('kalshi', 'KXNFLGAME-26SEP071330BUFKC-KC'), 0.61);
   assert.strictEqual(live.getYesProb('polymarket', 'aec-mlb-cws-det-2026-08-14-cws'), 0.45);
@@ -104,6 +117,79 @@ return live.refresh().then(async () => {
   assert.strictEqual(pmCalls, before.pmCalls, 'classify must not HTTP');
 
   live.stop();
+
+  // Inverse on a two-way: WSH ourTrue = 1 − fee-adjusted ATL, not WSH last.
+  const wshCache = createUnhedgedPriceCache({
+    seed: {
+      kalshi: {
+        'KXMLBGAME-26AUG141840WSHATL-WSH': 0.60,
+        'KXMLBGAME-26AUG141840WSHATL-ATL': 0.42,
+      },
+    },
+  });
+  const wshLeg = {
+    ticker: 'KXMLBGAME-26AUG141840WSHATL-WSH',
+    league: 'mlb',
+    selection: 'wsh',
+    teams: ['wsh', 'atl'],
+    date: '2026-08-14',
+    side: 'yes',
+  };
+  const wshOur = wshCache.getOurTrue(wshLeg);
+  const expectWsh = ourTrueFromOpponentYes(0.42, KALSHI_TAKER_THETA);
+  assert.ok(Math.abs(wshOur - expectWsh) < 1e-12);
+  assert.ok(Math.abs(wshOur - 0.60) > 1e-6);
+  assert.strictEqual(wshCache.getYesProb('kalshi', 'KXMLBGAME-26AUG141840WSHATL-WSH'), 0.60);
+
+  // Best-of-two venues: cheaper opponent YES after taker fee.
+  const bothVenues = createUnhedgedPriceCache({
+    seed: {
+      kalshi: {
+        'KXMLBGAME-26AUG141840WSHATL-WSH': 0.60,
+        'KXMLBGAME-26AUG141840WSHATL-ATL': 0.50,
+      },
+      polymarket: {
+        'aec-mlb-wsh-atl-2026-08-14-wsh': 0.59,
+        'aec-mlb-wsh-atl-2026-08-14-atl': 0.40,
+      },
+    },
+  });
+  const cheapOur = bothVenues.getOurTrue(wshLeg);
+  const polyEff = applyTakerFeeToProb(0.40, POLY_TAKER_THETA);
+  const kalshiEff = applyTakerFeeToProb(0.50, KALSHI_TAKER_THETA);
+  assert.ok(polyEff < kalshiEff);
+  assert.ok(Math.abs(cheapOur - (1 - polyEff)) < 1e-12);
+
+  const kalshiCheaper = createUnhedgedPriceCache({
+    seed: {
+      kalshi: {
+        'KXMLBGAME-26AUG141840WSHATL-WSH': 0.60,
+        'KXMLBGAME-26AUG141840WSHATL-ATL': 0.35,
+      },
+      polymarket: {
+        'aec-mlb-wsh-atl-2026-08-14-atl': 0.40,
+      },
+    },
+  });
+  const kOur = kalshiCheaper.getOurTrue(wshLeg);
+  assert.ok(Math.abs(kOur - ourTrueFromOpponentYes(0.35, KALSHI_TAKER_THETA)) < 1e-12);
+
+  // Ingest by event_ticker pairs the other Kalshi ticker.
+  const eventCache = createUnhedgedPriceCache();
+  eventCache.ingestKalshiMarkets([
+    {
+      ticker: 'KXMLBGAME-26AUG141840WSHATL-WSH',
+      event_ticker: 'KXMLBGAME-26AUG141840WSHATL',
+      last_price_dollars: '0.60',
+    },
+    {
+      ticker: 'KXMLBGAME-26AUG141840WSHATL-ATL',
+      event_ticker: 'KXMLBGAME-26AUG141840WSHATL',
+      last_price_dollars: '0.42',
+    },
+  ]);
+  assert.ok(Math.abs(eventCache.getOurTrue(wshLeg) - expectWsh) < 1e-12);
+
   console.log('unhedged-price-cache.test.js ok');
 }).catch((e) => {
   live.stop();

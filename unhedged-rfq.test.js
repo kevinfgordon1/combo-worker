@@ -12,6 +12,13 @@ const {
 } = require('./unhedged-rfq');
 const { createUnhedgedPriceCache } = require('./unhedged-price-cache');
 const { americanFromProb } = require('./engine');
+const {
+  ourTrueFromOpponentYes,
+  quoteYesFromFair,
+  productFair,
+  KALSHI_TAKER_THETA,
+  POLY_TAKER_THETA,
+} = require('./unhedged-quote');
 
 assert.strictEqual(isUnhedgedRfqShadow({}), true);
 assert.strictEqual(isUnhedgedRfqShadow({ UNHEDGED_RFQ_SHADOW: '' }), true);
@@ -299,12 +306,44 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(tennisOut.persist, false);
     assert.strictEqual(rows.length, 1);
 
-    // Cache prices every ML leg → persist fair + would-quote. Missing price → both null.
+    // Inverse fair: WSH = 1 − fee-adjusted ATL, not WSH last. Missing opponent → nulls.
+    const wshOur = ourTrueFromOpponentYes(0.42, KALSHI_TAKER_THETA);
+    const cwsOur = ourTrueFromOpponentYes(0.50, KALSHI_TAKER_THETA);
+    const mlbFair = productFair([wshOur, cwsOur]);
+    const mlbQuoteYes = quoteYesFromFair(mlbFair, { feeRate: 0.035 });
+    const mlbCache = createUnhedgedPriceCache({
+      seed: {
+        kalshi: {
+          'KXMLBGAME-26AUG141840WSHATL-WSH': 0.60,
+          'KXMLBGAME-26AUG141840WSHATL-ATL': 0.42,
+          'KXMLBGAME-26AUG141840CWSDET-CWS': 0.55,
+          'KXMLBGAME-26AUG141840CWSDET-DET': 0.50,
+        },
+      },
+    });
+    const mlbPriced = classifyUnhedgedRfq(kalshiRfq('rfq-mlb-priced', [
+      'KXMLBGAME-26AUG141840WSHATL-WSH:yes',
+      'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+    ]), {
+      venue: 'kalshi',
+      priceCache: mlbCache,
+      now: Date.parse('2026-08-14T20:00:00Z'),
+    });
+    assert.strictEqual(mlbPriced.our_fair_american, americanFromProb(mlbFair));
+    assert.strictEqual(mlbPriced.our_quote_american, americanFromProb(mlbQuoteYes));
+    assert.ok(mlbPriced.our_fair_american !== americanFromProb(0.60 * 0.55));
+
+    const nflOurA = ourTrueFromOpponentYes(0.50, KALSHI_TAKER_THETA);
+    const nflOurB = ourTrueFromOpponentYes(0.50, KALSHI_TAKER_THETA);
+    const nflFair = productFair([nflOurA, nflOurB]);
+    const nflQuoteYes = quoteYesFromFair(nflFair, { feeRate: 0 });
     const nflCache = createUnhedgedPriceCache({
       seed: {
         kalshi: {
-          'KXNFLGAME-26SEP071330BUFKC-KC': 0.5,
-          'KXNFLGAME-26SEP071330DALPHI-PHI': 0.5,
+          'KXNFLGAME-26SEP071330BUFKC-KC': 0.48,
+          'KXNFLGAME-26SEP071330BUFKC-BUF': 0.50,
+          'KXNFLGAME-26SEP071330DALPHI-PHI': 0.47,
+          'KXNFLGAME-26SEP071330DALPHI-DAL': 0.50,
         },
       },
     });
@@ -319,34 +358,29 @@ function pmRfq(id, symbols, extra = {}) {
       persist: async (row) => { rows.push(row); },
     });
     assert.strictEqual(nflOut.persist, true);
-    assert.strictEqual(nflOut.our_fair_american, americanFromProb(0.25));
-    assert.strictEqual(nflOut.our_quote_american, americanFromProb(0.27));
-    assert.strictEqual(rows[rows.length - 1].our_quote_american, americanFromProb(0.27));
+    assert.strictEqual(nflOut.our_fair_american, americanFromProb(nflFair));
+    assert.strictEqual(nflOut.our_quote_american, americanFromProb(nflQuoteYes));
 
-    const mlbCache = createUnhedgedPriceCache({
-      seed: {
-        kalshi: {
-          'KXMLBGAME-26AUG141840CWSDET-CWS': 0.5,
-          'KXMLBGAME-26AUG141840BOSPIT-PIT': 0.5,
-        },
-      },
-    });
-    const mlbPriced = classifyUnhedgedRfq(kalshiRfq('rfq-mlb-priced', [
-      'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
-      'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
-    ]), {
-      venue: 'kalshi',
-      priceCache: mlbCache,
-      now: Date.parse('2026-08-14T20:00:00Z'),
-    });
-    assert.strictEqual(mlbPriced.our_fair_american, americanFromProb(0.25));
-    assert.strictEqual(mlbPriced.our_quote_american, americanFromProb(0.27));
+    // Same inverse fair: NFL maker 0 vs MLB 0.035 still changes net / quote.
+    const sameFairNfl = quoteYesFromFair(0.25, { feeRate: 0 });
+    const sameFairMlb = quoteYesFromFair(0.25, { feeRate: 0.035 });
+    assert.strictEqual(sameFairNfl, 0.27);
+    assert.strictEqual(sameFairMlb, 0.27);
+    const { netCostFromFair } = require('./unhedged-quote');
+    assert.strictEqual(netCostFromFair(0.25, 0), 0.25);
+    assert.ok(netCostFromFair(0.25, 0.035) > 0.25);
 
+    const polyOurA = ourTrueFromOpponentYes(0.50, POLY_TAKER_THETA);
+    const polyOurB = ourTrueFromOpponentYes(0.50, POLY_TAKER_THETA);
+    const polyFair = productFair([polyOurA, polyOurB]);
+    const polyQuoteYes = quoteYesFromFair(polyFair, { feeRate: 0 });
     const polyCache = createUnhedgedPriceCache({
       seed: {
         polymarket: {
-          'aec-mlb-cws-det-2026-08-14-cws': 0.5,
-          'aec-mlb-bos-pit-2026-08-14-pit': 0.5,
+          'aec-mlb-cws-det-2026-08-14-cws': 0.61,
+          'aec-mlb-cws-det-2026-08-14-det': 0.50,
+          'aec-mlb-bos-pit-2026-08-14-pit': 0.62,
+          'aec-mlb-bos-pit-2026-08-14-bos': 0.50,
         },
       },
     });
@@ -358,7 +392,34 @@ function pmRfq(id, symbols, extra = {}) {
       priceCache: polyCache,
       now: Date.parse('2026-08-14T20:00:00Z'),
     });
-    assert.strictEqual(polyPriced.our_quote_american, americanFromProb(0.27));
+    assert.strictEqual(polyPriced.our_fair_american, americanFromProb(polyFair));
+    assert.strictEqual(polyPriced.our_quote_american, americanFromProb(polyQuoteYes));
+
+    const bestCache = createUnhedgedPriceCache({
+      seed: {
+        kalshi: {
+          'KXMLBGAME-26AUG141840WSHATL-WSH': 0.60,
+          'KXMLBGAME-26AUG141840WSHATL-ATL': 0.50,
+          'KXMLBGAME-26AUG141840CWSDET-CWS': 0.55,
+          'KXMLBGAME-26AUG141840CWSDET-DET': 0.50,
+        },
+        polymarket: {
+          'aec-mlb-wsh-atl-2026-08-14-atl': 0.40,
+        },
+      },
+    });
+    const bestPriced = classifyUnhedgedRfq(kalshiRfq('rfq-best-opp', [
+      'KXMLBGAME-26AUG141840WSHATL-WSH:yes',
+      'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+    ]), {
+      venue: 'kalshi',
+      priceCache: bestCache,
+      now: Date.parse('2026-08-14T20:00:00Z'),
+    });
+    const bestWsh = ourTrueFromOpponentYes(0.40, POLY_TAKER_THETA);
+    const bestFair = productFair([bestWsh, cwsOur]);
+    assert.strictEqual(bestPriced.our_fair_american, americanFromProb(bestFair));
+    assert.ok(bestPriced.our_fair_american !== mlbPriced.our_fair_american);
 
     const halfCache = createUnhedgedPriceCache({
       seed: { kalshi: { 'KXMLBGAME-26AUG141840CWSDET-CWS': 0.5 } },
@@ -374,6 +435,26 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(missingPx.persist, true);
     assert.strictEqual(missingPx.our_fair_american, null);
     assert.strictEqual(missingPx.our_quote_american, null);
+
+    const sameSideOnly = createUnhedgedPriceCache({
+      seed: {
+        kalshi: {
+          'KXMLBGAME-26AUG141840WSHATL-WSH': 0.60,
+          'KXMLBGAME-26AUG141840CWSDET-CWS': 0.55,
+        },
+      },
+    });
+    const noOpp = classifyUnhedgedRfq(kalshiRfq('rfq-no-opp', [
+      'KXMLBGAME-26AUG141840WSHATL-WSH:yes',
+      'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+    ]), {
+      venue: 'kalshi',
+      priceCache: sameSideOnly,
+      now: Date.parse('2026-08-14T20:00:00Z'),
+    });
+    assert.strictEqual(noOpp.persist, true);
+    assert.strictEqual(noOpp.our_fair_american, null);
+    assert.strictEqual(noOpp.our_quote_american, null);
 
     console.log('unhedged-rfq.test.js ok');
   }).catch((e) => {

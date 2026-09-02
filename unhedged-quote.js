@@ -1,6 +1,7 @@
 // Unhedged RFQ shadow quote math — independent of Combo Locks / engine KFEE.
-// Do not POST from this module. Fair is the product of independent YES probs
-// (honor yes/no).
+// Do not POST from this module. Fair is the product of independent ourTrue
+// probs (honor yes/no). ourTrue is inverse-bet: 1 minus the fee-adjusted
+// implied of the cheapest Kalshi/Poly opponent YES (Promo Builder / EV).
 //
 // Would-quote YES = margin × net_cost, then the first penny at or above that
 // (Kevin: fair 0.10 MLB → fee 0.00315 → net 0.10315 → 0.1083 → 0.11).
@@ -13,6 +14,8 @@ const KALSHI_COMBO_MAKER = 0.035;
 const KALSHI_NFL_MAKER = 0;
 const POLY_MAKER_RATE = 0; // rebates ignored; never bake rebate income into the quote
 const DEFAULT_QUOTE_MULT = 1.05;
+const KALSHI_TAKER_THETA = 0.07;
+const POLY_TAKER_THETA = 0.05;
 
 function numOrNull(v) {
   if (v == null || v === '') return null;
@@ -101,21 +104,80 @@ function productFair(probs) {
   return validProb(acc);
 }
 
-function priceUnhedgedCombo({ venue, legs, getYesProb, margin = DEFAULT_QUOTE_MULT } = {}) {
+// Promo Builder / EV: trueProb(bestOpponentOdds) then ourTrue = 1 - that.
+// Missing opponent is null here (do not invent 0.5).
+function trueProb(bestOpponentOdds) {
+  if (bestOpponentOdds == null || bestOpponentOdds === '') return null;
+  const n = Number(bestOpponentOdds);
+  if (!Number.isFinite(n) || n === 0) return null;
+  if (n < 0) return Math.abs(n) / (Math.abs(n) + 100);
+  return 100 / (n + 100);
+}
+
+function ourTrueProb(bestOpponentOdds) {
+  const tp = trueProb(bestOpponentOdds);
+  return tp == null ? null : validProb(1 - tp);
+}
+
+// odds-shared.js: p_eff = p * (1 + θ·(1−p)). Kalshi θ=0.07, Poly US θ=0.05.
+function applyTakerFeeToProb(p, theta) {
+  const raw = validProb(p);
+  if (raw == null) return null;
+  const t = Number.isFinite(theta) ? theta : 0;
+  return validProb(raw * (1 + t * (1 - raw)));
+}
+
+function ourTrueFromOpponentYes(rawYes, theta) {
+  const eff = applyTakerFeeToProb(rawYes, theta);
+  return eff == null ? null : validProb(1 - eff);
+}
+
+function takerThetaForVenue(venue) {
+  if (venue === 'kalshi') return KALSHI_TAKER_THETA;
+  if (venue === 'polymarket') return POLY_TAKER_THETA;
+  return null;
+}
+
+// Cheapest opponent YES for a taker = lowest fee-adjusted YES / best American.
+function bestOpponentEff(quotes) {
+  let best = null;
+  for (const q of quotes || []) {
+    if (!q) continue;
+    const theta = q.theta != null ? q.theta : takerThetaForVenue(q.venue);
+    if (theta == null) continue;
+    const raw = q.yesProb != null ? q.yesProb : q.p;
+    const eff = applyTakerFeeToProb(raw, theta);
+    if (eff == null) continue;
+    if (best == null || eff < best) best = eff;
+  }
+  return best;
+}
+
+function ourTrueFromOpponents(quotes) {
+  const eff = bestOpponentEff(quotes);
+  return eff == null ? null : validProb(1 - eff);
+}
+
+function priceUnhedgedCombo({ venue, legs, getOurTrue, getYesProb, margin = DEFAULT_QUOTE_MULT } = {}) {
   const empty = { our_fair_american: null, our_quote_american: null, fairYes: null, quoteYes: null };
   if (!venue || !Array.isArray(legs) || !legs.length) return empty;
-  if (typeof getYesProb !== 'function') return empty;
+  if (typeof getOurTrue !== 'function' && typeof getYesProb !== 'function') return empty;
 
   const feeRate = venueMakerRate(venue, legs);
   if (feeRate == null) return empty;
 
   const probs = [];
   for (const leg of legs) {
-    const key = venue === 'kalshi'
-      ? (leg && (leg.ticker || leg.symbol))
-      : (leg && (leg.symbol || leg.ticker));
-    if (!key) return empty;
-    const yes = getYesProb(venue, key, leg);
+    let yes = null;
+    if (typeof getOurTrue === 'function') {
+      yes = getOurTrue(leg);
+    } else {
+      const key = venue === 'kalshi'
+        ? (leg && (leg.ticker || leg.symbol))
+        : (leg && (leg.symbol || leg.ticker));
+      if (!key) return empty;
+      yes = getYesProb(venue, key, leg);
+    }
     const p = sideProb(yes, leg && leg.side);
     if (p == null) return empty;
     probs.push(p);
@@ -142,6 +204,8 @@ module.exports = {
   KALSHI_NFL_MAKER,
   POLY_MAKER_RATE,
   DEFAULT_QUOTE_MULT,
+  KALSHI_TAKER_THETA,
+  POLY_TAKER_THETA,
   isUnhedgedRfqLive,
   quoteMultFromEnv,
   makerFee,
@@ -152,6 +216,13 @@ module.exports = {
   quoteYesFromFair,
   sideProb,
   productFair,
+  trueProb,
+  ourTrueProb,
+  applyTakerFeeToProb,
+  ourTrueFromOpponentYes,
+  takerThetaForVenue,
+  bestOpponentEff,
+  ourTrueFromOpponents,
   priceUnhedgedCombo,
   validProb,
   floor2,
