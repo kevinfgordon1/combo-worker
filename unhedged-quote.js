@@ -11,6 +11,8 @@
 // Combo WRAP (unchanged, Combos row is separate): NFL-only maker 0;
 // MLB/NCAAF/mixed 0.035*p*(1-p). Polymarket maker 0, no rebate. Then
 // 1.05 * net_cost, first penny up.
+// Also annotate each input leg with fair_yes / fair_american (the invert).
+// Row-level our_* stay the parlay product + wrap.
 'use strict';
 const { americanFromProb } = require('./engine');
 
@@ -220,8 +222,17 @@ function ourTrueFromOpponents(quotes) {
   return am == null ? null : ourTrueProb(am);
 }
 
+function annotateLegFair(leg, yesProb) {
+  const p = sideProb(yesProb, leg && leg.side);
+  return {
+    ...(leg && typeof leg === 'object' ? leg : {}),
+    fair_yes: p,
+    fair_american: p == null ? null : americanFromProb(p),
+  };
+}
+
 function priceUnhedgedCombo({ venue, legs, getOurTrue, getYesProb, margin = DEFAULT_QUOTE_MULT } = {}) {
-  const empty = { our_fair_american: null, our_quote_american: null, fairYes: null, quoteYes: null };
+  const empty = { our_fair_american: null, our_quote_american: null, fairYes: null, quoteYes: null, legs: null };
   if (!venue || !Array.isArray(legs) || !legs.length) return empty;
   if (typeof getOurTrue !== 'function' && typeof getYesProb !== 'function') return empty;
 
@@ -229,6 +240,8 @@ function priceUnhedgedCombo({ venue, legs, getOurTrue, getYesProb, margin = DEFA
   if (feeRate == null) return empty;
 
   const probs = [];
+  const annotated = [];
+  let complete = true;
   for (const leg of legs) {
     let yes = null;
     if (typeof getOurTrue === 'function') {
@@ -237,20 +250,22 @@ function priceUnhedgedCombo({ venue, legs, getOurTrue, getYesProb, margin = DEFA
       const key = venue === 'kalshi'
         ? (leg && (leg.ticker || leg.symbol))
         : (leg && (leg.symbol || leg.ticker));
-      if (!key) return empty;
-      yes = getYesProb(venue, key, leg);
+      if (key) yes = getYesProb(venue, key, leg);
     }
-    const p = sideProb(yes, leg && leg.side);
-    if (p == null) return empty;
-    probs.push(p);
+    const next = annotateLegFair(leg, yes);
+    annotated.push(next);
+    if (next.fair_yes == null) complete = false;
+    else probs.push(next.fair_yes);
   }
+
+  if (!complete) return { ...empty, legs: annotated };
 
   const fairYes = productFair(probs);
   const netCost = netCostFromFair(fairYes, feeRate);
   const quoteYes = quoteYesFromFair(fairYes, { feeRate, margin });
   const fairAm = americanFromProb(fairYes);
   const quoteAm = americanFromProb(quoteYes);
-  if (fairAm == null || quoteAm == null) return empty;
+  if (fairAm == null || quoteAm == null) return { ...empty, legs: annotated };
   return {
     our_fair_american: fairAm,
     our_quote_american: quoteAm,
@@ -258,6 +273,7 @@ function priceUnhedgedCombo({ venue, legs, getOurTrue, getYesProb, margin = DEFA
     quoteYes,
     netCost,
     feeRate,
+    legs: annotated,
   };
 }
 
@@ -294,6 +310,7 @@ module.exports = {
   bestOpponentAmerican,
   bestOpponentEff,
   ourTrueFromOpponents,
+  annotateLegFair,
   priceUnhedgedCombo,
   validProb,
   floor2,

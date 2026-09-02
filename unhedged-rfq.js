@@ -15,8 +15,11 @@
 // a fee-included American with the series taker coeff (KXMLBGAME 0.035,
 // KXNFLGAME/KXNCAAFGAME 0.07, Poly US 0.06). Best opponent American across
 // Kalshi vs Polymarket, then sign-flip. Do not use same-side last.
+// Persist that invert on each legs jsonb object as fair_american / fair_yes
+// so the dashboard can show "Rockies ML +145". Row-level our_fair_american /
+// our_quote_american stay the parlay product + wrap.
 // RFQ venue only selects the combo maker-fee wrap. Missing opponent → both
-// Americans stay null.
+// row-level Americans stay null (that leg's fair_american is also null).
 // Pricing is sync from the in-memory cache — never a per-RFQ HTTP call.
 // Do not invent prices. Do not POST / confirm / fill.
 //
@@ -440,6 +443,8 @@ function classifyUnhedgedRfq(rfq, opts = {}) {
     selection: p.selection,
     teams: p.teams,
     date: p.date || null,
+    fair_american: null,
+    fair_yes: null,
   }));
 
   const status = started && started.started ? 'started' : 'seen';
@@ -467,6 +472,18 @@ function classifyUnhedgedRfq(rfq, opts = {}) {
   };
 }
 
+function applyLegFairs(legs, pricedLegs) {
+  if (!Array.isArray(legs) || !Array.isArray(pricedLegs)) return;
+  const n = Math.min(legs.length, pricedLegs.length);
+  for (let i = 0; i < n; i += 1) {
+    const dest = legs[i];
+    const src = pricedLegs[i];
+    if (!dest || typeof dest !== 'object') continue;
+    dest.fair_yes = src && src.fair_yes != null ? src.fair_yes : null;
+    dest.fair_american = src && src.fair_american != null ? src.fair_american : null;
+  }
+}
+
 function priceClassified({ venue, legs, priceCache, getOurTrue, getYesProb, env, margin }) {
   const empty = { our_fair_american: null, our_quote_american: null };
   if (priceCache && typeof priceCache.watch === 'function') {
@@ -491,6 +508,7 @@ function priceClassified({ venue, legs, priceCache, getOurTrue, getYesProb, env,
     getYesProb: yesFn || undefined,
     margin: mult,
   });
+  applyLegFairs(legs, priced.legs);
   return {
     our_fair_american: priced.our_fair_american,
     our_quote_american: priced.our_quote_american,

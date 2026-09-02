@@ -136,6 +136,10 @@ function lookup(_venue, key) {
   assert.strictEqual(nfl.netCost, 0.25);
   assert.strictEqual(nfl.our_fair_american, americanFromProb(0.25));
   assert.strictEqual(nfl.our_quote_american, americanFromProb(0.27));
+  assert.strictEqual(nfl.legs.length, 2);
+  assert.strictEqual(nfl.legs[0].fair_american, americanFromProb(0.5));
+  assert.strictEqual(nfl.legs[1].fair_american, americanFromProb(0.5));
+  assert.strictEqual(nfl.legs[0].fair_yes, 0.5);
 }
 
 {
@@ -197,12 +201,15 @@ function lookup(_venue, key) {
   });
   assert.strictEqual(missing.our_fair_american, null);
   assert.strictEqual(missing.our_quote_american, null);
+  assert.strictEqual(missing.legs[0].fair_american, americanFromProb(0.5));
+  assert.strictEqual(missing.legs[1].fair_american, null);
 }
 
 {
   const noLookup = priceUnhedgedCombo({ venue: 'kalshi', legs: mlbLegs });
   assert.strictEqual(noLookup.our_fair_american, null);
   assert.strictEqual(noLookup.our_quote_american, null);
+  assert.strictEqual(noLookup.legs, null);
 }
 
 // Kevin: 0.45 MLB Kalshi opponent → +118 then Sox −118.
@@ -348,6 +355,11 @@ function lookup(_venue, key) {
   assert.ok(Math.abs(inverse.fairYes - fair) < 1e-12);
   assert.strictEqual(inverse.feeRate, 0.035);
   assert.ok(inverse.netCost > inverse.fairYes);
+  assert.strictEqual(inverse.legs[0].fair_american, americanFromProb(wshOur));
+  assert.strictEqual(inverse.legs[1].fair_american, americanFromProb(cwsOur));
+  assert.strictEqual(inverse.legs[0].fair_yes, wshOur);
+  assert.strictEqual(inverse.legs[1].fair_yes, cwsOur);
+  assert.ok(inverse.our_fair_american !== inverse.legs[0].fair_american);
 
   const nflInv = priceUnhedgedCombo({
     venue: 'kalshi',
@@ -387,6 +399,8 @@ function lookup(_venue, key) {
   });
   assert.strictEqual(missingOpp.our_fair_american, null);
   assert.strictEqual(missingOpp.our_quote_american, null);
+  assert.strictEqual(missingOpp.legs[0].fair_american, null);
+  assert.strictEqual(missingOpp.legs[1].fair_american, null);
 }
 
 console.log('unhedged-quote.test.js ok');
