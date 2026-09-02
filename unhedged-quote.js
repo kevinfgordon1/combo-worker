@@ -4,14 +4,14 @@
 //
 // Would-quote YES = margin × net_cost, then the first penny at or above that
 // (Kevin: fair 0.10 MLB → fee 0.00315 → net 0.10315 → 0.1083 → 0.11).
-// net_cost = fair YES + Kalshi combo maker fee − Polymarket maker rebate.
-// No flat ¢ YES cushion.
+// net_cost = fair YES + Kalshi combo maker fee (if any). Polymarket maker
+// cost is 0 — rebates are ignored and never baked into the quote.
 'use strict';
 const { americanFromProb } = require('./engine');
 
 const KALSHI_COMBO_MAKER = 0.035;
 const KALSHI_NFL_MAKER = 0;
-const POLY_MAKER_REBATE = 0.0125;
+const POLY_MAKER_RATE = 0; // rebates ignored; never bake rebate income into the quote
 const DEFAULT_QUOTE_MULT = 1.05;
 
 function numOrNull(v) {
@@ -62,7 +62,7 @@ function kalshiMakerRate(legs) {
 }
 
 function venueMakerRate(venue, legs) {
-  if (venue === 'polymarket') return -POLY_MAKER_REBATE;
+  if (venue === 'polymarket') return POLY_MAKER_RATE;
   if (venue === 'kalshi') return kalshiMakerRate(legs);
   return null;
 }
@@ -140,7 +140,7 @@ function priceUnhedgedCombo({ venue, legs, getYesProb, margin = DEFAULT_QUOTE_MU
 module.exports = {
   KALSHI_COMBO_MAKER,
   KALSHI_NFL_MAKER,
-  POLY_MAKER_REBATE,
+  POLY_MAKER_RATE,
   DEFAULT_QUOTE_MULT,
   isUnhedgedRfqLive,
   quoteMultFromEnv,

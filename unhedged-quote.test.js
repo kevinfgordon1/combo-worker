@@ -4,7 +4,7 @@ const { americanFromProb } = require('./engine');
 const {
   KALSHI_COMBO_MAKER,
   KALSHI_NFL_MAKER,
-  POLY_MAKER_REBATE,
+  POLY_MAKER_RATE,
   DEFAULT_QUOTE_MULT,
   isUnhedgedRfqLive,
   makerFee,
@@ -24,7 +24,7 @@ assert.strictEqual(isUnhedgedRfqLive({ UNHEDGED_RFQ_LIVE: 'true' }), true);
 assert.strictEqual(DEFAULT_QUOTE_MULT, 1.05);
 assert.strictEqual(KALSHI_NFL_MAKER, 0);
 assert.strictEqual(KALSHI_COMBO_MAKER, 0.035);
-assert.strictEqual(POLY_MAKER_REBATE, 0.0125);
+assert.strictEqual(POLY_MAKER_RATE, 0);
 
 const nflLegs = [
   { league: 'nfl', ticker: 'KXNFLGAME-A-KC', side: 'yes' },
@@ -51,7 +51,8 @@ assert.strictEqual(kalshiMakerRate(nflLegs), 0);
 assert.strictEqual(kalshiMakerRate(mlbLegs), 0.035);
 assert.strictEqual(kalshiMakerRate(ncaafLegs), 0.035);
 assert.strictEqual(kalshiMakerRate(mixedLegs), 0.035);
-assert.strictEqual(venueMakerRate('polymarket', mlbLegs), -0.0125);
+assert.strictEqual(venueMakerRate('polymarket', mlbLegs), 0);
+assert.strictEqual(venueMakerRate('polymarket', nflLegs), 0);
 
 // Kevin: fair 0.10, MLB, fee 0.035*0.1*0.9=0.00315, net=0.10315,
 // quote YES=0.1083 → 0.11 after penny grid.
@@ -67,25 +68,21 @@ assert.strictEqual(makerFee(kevinFair, 0), 0);
 assert.strictEqual(quoteYesFromFair(kevinFair, { feeRate: 0 }), 0.11);
 assert.ok(netCostFromFair(kevinFair, 0) < netCostFromFair(kevinFair, 0.035));
 
-const polyNet = kevinFair - 0.0125 * 0.1 * 0.9;
-assert.ok(Math.abs(netCostFromFair(kevinFair, -0.0125) - polyNet) < 1e-12);
-assert.ok(polyNet < kevinFair);
-assert.strictEqual(quoteYesFromFair(kevinFair, { feeRate: -0.0125 }), 0.11);
+assert.strictEqual(netCostFromFair(kevinFair, 0), kevinFair);
+assert.strictEqual(quoteYesFromFair(kevinFair, { feeRate: 0 }), 0.11);
 
 // 2-leg even money: fair = 0.25
 const fair = 0.25;
 assert.strictEqual(makerFee(fair, 0), 0);
 assert.strictEqual(makerFee(fair, 0.035), 0.035 * 0.25 * 0.75);
-assert.strictEqual(makerFee(fair, -0.0125), -0.0125 * 0.25 * 0.75);
-
 const nflQuoteYes = quoteYesFromFair(fair, { feeRate: 0 });
 const mlbQuoteYes = quoteYesFromFair(fair, { feeRate: 0.035 });
-const polyQuoteYes = quoteYesFromFair(fair, { feeRate: -0.0125 });
+const polyQuoteYes = quoteYesFromFair(fair, { feeRate: 0 });
 assert.strictEqual(nflQuoteYes, 0.27);
 assert.strictEqual(mlbQuoteYes, 0.27);
 assert.strictEqual(polyQuoteYes, 0.27);
 assert.ok(netCostFromFair(fair, 0.035) > netCostFromFair(fair, 0));
-assert.ok(netCostFromFair(fair, -0.0125) < netCostFromFair(fair, 0));
+assert.strictEqual(netCostFromFair(fair, 0), fair);
 
 const prices = {
   'KXNFLGAME-A-KC': 0.5,
@@ -143,8 +140,10 @@ function lookup(_venue, key) {
     ],
     getYesProb: lookup,
   });
-  assert.strictEqual(poly.feeRate, -0.0125);
-  assert.ok(poly.netCost < 0.25);
+  assert.strictEqual(poly.feeRate, 0);
+  assert.strictEqual(poly.netCost, poly.fairYes);
+  assert.strictEqual(poly.netCost, 0.25);
+  assert.ok(poly.netCost !== 0.25 - (0.0125 * 0.25 * 0.75), 'rebate must not lower net_cost');
   assert.strictEqual(poly.quoteYes, 0.27);
   assert.strictEqual(poly.our_quote_american, americanFromProb(0.27));
 }
