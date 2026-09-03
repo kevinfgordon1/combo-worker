@@ -5,6 +5,7 @@ const { normalizeTrade } = require('./tape');
 const {
   classifySkip,
   skipPersistExtra,
+  withVenue,
   isSkipTapeEligible,
   tapeFieldsFromMatch,
   isTapeReady,
@@ -74,6 +75,31 @@ const args = {
   assert.strictEqual(cap.remaining, 0);
   assert.strictEqual(cap.contracts, 10);
   assert.ok(!('market_ticker' in cap));
+}
+
+// Miss tape insert extras: default kalshi; Poly fallback; caller venue wins.
+{
+  const kalshiBody = { status: 'quoted', ...withVenue() };
+  assert.strictEqual(kalshiBody.venue, 'kalshi');
+  assert.strictEqual(kalshiBody.status, 'quoted');
+
+  const skipBody = { status: 'declined', ...withVenue({ skip_reason: 'oversized', contracts: 8000 }) };
+  assert.strictEqual(skipBody.venue, 'kalshi');
+  assert.strictEqual(skipBody.skip_reason, 'oversized');
+  assert.strictEqual(skipBody.contracts, 8000);
+
+  const polyWrap = (extra) => ({ status: 'quoted', ...withVenue(extra, 'polymarket') });
+  const polyBody = polyWrap({ quote_id: 'q-pm', is_live: true });
+  assert.strictEqual(polyBody.venue, 'polymarket');
+  assert.strictEqual(polyBody.quote_id, 'q-pm');
+  assert.strictEqual(polyBody.is_live, true);
+
+  const alreadyPoly = polyWrap({ venue: 'polymarket', skip_reason: 'oversized' });
+  assert.strictEqual(alreadyPoly.venue, 'polymarket');
+  assert.strictEqual(alreadyPoly.skip_reason, 'oversized');
+
+  assert.strictEqual(withVenue({ venue: 'polymarket' }).venue, 'polymarket');
+  assert.strictEqual(withVenue(undefined, 'polymarket').venue, 'polymarket');
 }
 
 // ── eligibility: active lock, before kickoff, not already taped ────────

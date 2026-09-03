@@ -24,6 +24,13 @@ function skipPersistExtra({ skipReason, contracts, remaining, marketTicker }) {
   return extra;
 }
 
+// Miss tape chips (aibetbuilder #61) read combo_submissions.venue.
+// extra.venue wins when the caller already set kalshi | polymarket.
+function withVenue(extra = {}, fallback = 'kalshi') {
+  const src = extra && typeof extra === 'object' ? extra : {};
+  return { ...src, venue: src.venue || fallback };
+}
+
 function isTrackedSkipReason(reason) {
   return SKIP_REASONS.includes(reason);
 }
@@ -135,6 +142,7 @@ module.exports = {
   SKIP_REASONS,
   classifySkip,
   skipPersistExtra,
+  withVenue,
   isTrackedSkipReason,
   isSkipTapeEligible,
   tapeFieldsFromMatch,
