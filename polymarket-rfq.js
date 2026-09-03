@@ -197,14 +197,17 @@ function teamInTokens(league, team, tokens) {
 function identityHitsTokens(id, tokens) {
   if (!id) return false;
   // Combo Locks only price full-game ML (`aec`). Player-prop prefixes
-  // (astatc, …) share league/date/team tokens and also emit 2-char stat
-  // suffixes (`tb` = total bases) that collide with team codes (TB Rays).
+  // (astatc, …) share league/date tokens and emit 2-char stat suffixes
+  // (`tb` = total bases) that collide with team codes (TB Rays).
   if (!tokens.has('aec')) return false;
   const leagueTokens = LEAGUE_SLUG_TOKENS[id.league] || (id.league ? [id.league] : []);
   if (!leagueTokens.some((t) => tokens.has(t))) return false;
   if (!tokensHaveDate(tokens, id.date)) return false;
-  const teams = [id.selection, ...(id.teams || [])];
-  return teams.some((team) => teamInTokens(id.league, team, tokens));
+  const teams = (id.teams || []).filter(Boolean);
+  // Both clubs, not selection-only / one-token overlap. Prop `-tb-` must
+  // not count as a Rays game unless the opponent is also in the slugs.
+  if (teams.length < 2) return false;
+  return teams.every((team) => teamInTokens(id.league, team, tokens));
 }
 
 function rfqSides(rfq) {
