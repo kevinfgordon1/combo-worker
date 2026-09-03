@@ -242,7 +242,7 @@ function lookup(_venue, key) {
   );
 }
 
-// Kevin 2026-09-03: NFL taker on the ASK, not mid. SEA 0.63 → −183; NE 0.39 → +146 (~+145).
+// Kevin 2026-09-03: NFL taker on the ASK, not mid. SEA 0.63 → −183; NE 0.39 → +146.
 // Mid (0.625 / 0.385) → −179 / +149 — wrong vs the live book.
 {
   const seaAsk = feeIncludedAmerican(0.63, KALSHI_TAKER_THETA);
@@ -250,7 +250,7 @@ function lookup(_venue, key) {
   const seaMid = feeIncludedAmerican(0.625, KALSHI_TAKER_THETA);
   const neMid = feeIncludedAmerican(0.385, KALSHI_TAKER_THETA);
   assert.strictEqual(seaAsk, -183);
-  assert.ok(neAsk === 145 || neAsk === 146, `NE ask American ${neAsk} not +145/+146`);
+  assert.strictEqual(neAsk, 146);
   assert.strictEqual(seaMid, -179);
   assert.strictEqual(neMid, 149);
   assert.notStrictEqual(seaAsk, seaMid);

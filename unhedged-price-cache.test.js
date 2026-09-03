@@ -359,7 +359,7 @@ return live.refresh().then(async () => {
 
   // Kevin 2026-09-03: KXNFLGAME-26SEP09NESEA — opponent ASK, not mid.
   // Live book: NE YES 0.38/0.39, SEA YES 0.62/0.63. NFL θ=0.07.
-  // SEA ask → −183; NE ask → +145/+146. Mid would be −179 / +149.
+  // SEA ask → −183; NE ask → +146. Mid would be −179 / +149.
   {
     const neSea = createUnhedgedPriceCache();
     neSea.ingestKalshiMarkets([
@@ -411,9 +411,9 @@ return live.refresh().then(async () => {
     const neMidAm = feeIncludedAmerican(0.385, KALSHI_TAKER_THETA);
     const seaMidAm = feeIncludedAmerican(0.625, KALSHI_TAKER_THETA);
     assert.strictEqual(seaAskAm, -183);
-    assert.ok(neAskAm === 145 || neAskAm === 146, `NE ask American ${neAskAm} not +145/+146`);
+    assert.strictEqual(neAskAm, 146);
     assert.strictEqual(neOdds.kalshi_opponent_american, -183);
-    assert.strictEqual(seaOdds.kalshi_opponent_american, neAskAm);
+    assert.strictEqual(seaOdds.kalshi_opponent_american, 146);
     assert.notStrictEqual(neOdds.kalshi_opponent_american, seaMidAm);
     assert.notStrictEqual(seaOdds.kalshi_opponent_american, neMidAm);
     assert.strictEqual(neOdds.fair_american, invertAmerican(neOdds.kalshi_opponent_american));

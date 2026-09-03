@@ -8,7 +8,7 @@
 // Kevin: Mariners 45¢ on KXMLBGAME → 0.035×0.45×0.55 ≈ 0.0087 → 0.4587 →
 // +118, invert Sox −118. Full 0.07 haircut to +114 is wrong for MLB GAME.
 // Opponent YES is the posted ASK, not (bid+ask)/2. Kevin 2026-09-03 NE/SEA
-// NFL: SEA ask 0.63 + θ=0.07 → −183; NE ask 0.39 + θ=0.07 → ~+146 (~+145).
+// NFL: SEA ask 0.63 + θ=0.07 → −183; NE ask 0.39 + θ=0.07 → +146.
 // Mid 0.625 / 0.385 → −179 / +149, which is wrong vs the live book.
 //
 // Combo WRAP (unchanged, Combos row is separate): NFL-only maker 0;
