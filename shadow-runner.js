@@ -98,6 +98,7 @@ async function log(p, rfq, d, status) {
       user_id: p.user_id, parlay_id: p.id, rfq_id: rfq.rfqId, label: p.label,
       fill_american: d ? d.fillAmerican : p.fill_american,
       contracts: d ? d.contracts : rfq.contracts, worst_lock: d ? d.worst : null, status,
+      venue: 'kalshi',
     });
   } catch (e) { console.error(`[${MODE}] log insert failed`, e.message); }
 }

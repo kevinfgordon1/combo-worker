@@ -56,6 +56,7 @@ const { shortId } = require('./short-id');
 const {
   classifySkip,
   skipPersistExtra,
+  withVenue,
   isSkipTapeEligible,
   resolveSkipTape,
 } = require('./skip-tape');
@@ -232,7 +233,7 @@ function logAsync(p, rfq, d, status, extra = {}) {
     contracts,
     worst_lock: d ? d.worst : null,
     status: normalizeStatus(status),
-    ...extra,
+    ...withVenue(extra),
   });
   return supabase.from('combo_submissions').insert(body).select('id').then(({ data, error }) => {
     if (error) {
@@ -908,6 +909,7 @@ async function onQuoteExecuted(evt) {
         quote_id: quoteId,
         order_id: orderId || null,
         is_live: true,
+        venue: 'kalshi',
       });
       if (insErr) console.error(`[${MODE}] insert filled failed`, insErr.message);
     }
@@ -1230,7 +1232,8 @@ async function main() {
     filledSoFarFor,
     killEngagedFor,
     startedFor: startedForParlay,
-    logAsync,
+    logAsync: (p, rfq, d, status, extra = {}) =>
+      logAsync(p, rfq, d, status, withVenue(extra, 'polymarket')),
     sendAlert,
     counts,
     sessionFilledByParlay,
