@@ -17,6 +17,7 @@ const {
   mapComboLegs,
   normalizePolymarketRfq,
   couldMatchActiveLocks,
+  logActiveLockIdentityFails,
   cheapDirectMatch,
   matchPolymarketParlay,
   matchPolymarketParlayDetailed,
@@ -393,6 +394,46 @@ assert.strictEqual(
   evaluatePolymarketRfq({ rfq: ncaafRfq, parlays: [ncaafPmLock] }).action,
   'quoteable'
 );
+
+const texLaaLock = {
+  id: 'tex-laa-lock',
+  user_id: 'u1',
+  label: 'Texas Rangers ML + Angels ML',
+  parlay_stake: 100,
+  parlay_american: 400,
+  fill_american: 350,
+  hedge_mode: '1x',
+  max_contracts: 116,
+  leg_keys: [
+    'KXMLBGAME-26SEP031840TBTEX-TEX:yes',
+    'KXMLBGAME-26SEP031840LAAPIT-LAA:yes',
+  ],
+  legs: [],
+};
+const texLaaRfq = {
+  id: 'rfq_tex_laa',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'aec-mlb-tb-tex-2026-09-03-tex', side: 'SIDE_BUY' },
+    { symbol: 'aec-mlb-laa-pit-2026-09-03-laa', side: 'SIDE_BUY' },
+  ],
+};
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(texLaaRfq), [texLaaLock]), true);
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(pmRfq), [texLaaLock]), false);
+
+const identityFailLogs = [];
+assert.strictEqual(logActiveLockIdentityFails([kalshiParlay, texLaaLock], (m) => identityFailLogs.push(m)), 0);
+assert.deepStrictEqual(identityFailLogs, []);
+assert.strictEqual(logActiveLockIdentityFails([ncaafPmLock], (m) => identityFailLogs.push(m)), 0);
+assert.deepStrictEqual(identityFailLogs, []);
+const unparseableMl = {
+  id: 'bad-ml',
+  label: 'Garbage ML lock',
+  leg_keys: ['KXMLBGAME-26SEP031840XXXXX-XXX:yes'],
+};
+assert.strictEqual(logActiveLockIdentityFails([unparseableMl], (m) => identityFailLogs.push(m)), 1);
+assert.ok(identityFailLogs.some((l) => l.includes('[POLY] lock-identity-fail label=Garbage ML lock')));
 
 const quoteable = evaluatePolymarketRfq({
   rfq: pmRfq,

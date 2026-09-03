@@ -91,6 +91,39 @@ const cinPieces = kalshiTickerPieces('KXMLBGAME-26SEP021840CINCHC-CIN:yes');
 assert.deepStrictEqual(cinPieces.teams, ['cin', 'chc']);
 assert.strictEqual(cinPieces.selection, 'cin');
 
+// Length-5 / mixed 2-char Kalshi MLB blobs (TBTEX, SDCIN, …). teamLen=3
+// even-split only accepts 6; greedy known-code split covers 2+3 / 3+2 / 2+2.
+const mlbMixed = [
+  ['KXMLBGAME-26SEP031840TBTEX-TEX:yes', ['tb', 'tex'], 'tex'],
+  ['KXMLBGAME-26SEP031840SDCIN-SD:yes', ['sd', 'cin'], 'sd'],
+  ['KXMLBGAME-26SEP031840SFPIT-SF:yes', ['sf', 'pit'], 'sf'],
+  ['KXMLBGAME-26SEP031840KCCLE-KC:yes', ['kc', 'cle'], 'kc'],
+  ['KXMLBGAME-26SEP031840PHIAZ-PHI:yes', ['phi', 'az'], 'phi'],
+  ['KXMLBGAME-26SEP031840SDTB-SD:yes', ['sd', 'tb'], 'sd'],
+];
+for (const [ticker, teams, selection] of mlbMixed) {
+  const pieces = kalshiTickerPieces(ticker);
+  assert.ok(pieces, ticker);
+  assert.deepStrictEqual(pieces.teams, teams, ticker);
+  assert.strictEqual(pieces.selection, selection, ticker);
+  const id = parseKalshiTicker(ticker);
+  assert.ok(id, ticker);
+  assert.deepStrictEqual(id.teams, teams.slice().sort(), ticker);
+  assert.strictEqual(id.selection, selection, ticker);
+}
+
+const texLaaLock = identitiesFromParlay({
+  label: 'Texas Rangers ML + Angels ML',
+  leg_keys: [
+    'KXMLBGAME-26SEP031840TBTEX-TEX:yes',
+    'KXMLBGAME-26SEP031840LAAPIT-LAA:yes',
+  ],
+});
+assert.ok(texLaaLock.ok);
+assert.strictEqual(texLaaLock.keys.length, 2);
+assert.ok(texLaaLock.keys.some((k) => k.includes('tb+tex') && k.endsWith('|tex|yes')));
+assert.ok(texLaaLock.keys.some((k) => k.includes('laa+pit') && k.endsWith('|laa|yes')));
+
 assert.strictEqual(parseKalshiTicker('KXMVESPORTSMULTIGAMEEXTENDED-S2026FF'), null);
 assert.strictEqual(parseKalshiTicker('KXMLBGAME-26AUG141840CWSDET-CWS:yes').side, 'yes');
 

@@ -37,6 +37,7 @@ const {
   identitiesFromPolymarketLegs,
   sameIdentitySet,
   TEAM_ALIASES,
+  SERIES,
 } = require('./leg-identity');
 const {
   isUnhedgedRfqShadow,
@@ -241,6 +242,51 @@ function cheapDirectMatch(rfq, parlays) {
   const viaLegs = matchParlay(asRfq, rewritten);
   if (!viaLegs) return null;
   return parlays.find((x) => x.id === viaLegs.id) || viaLegs;
+}
+
+function kalshiMlTickersFromParlay(parlay) {
+  const out = [];
+  const keys = parlay && (parlay.leg_keys || parlay.legKeys);
+  if (Array.isArray(keys)) {
+    for (const k of keys) {
+      if (k != null && k !== '') out.push(String(k));
+    }
+  }
+  if (parlay && Array.isArray(parlay.legs)) {
+    for (const leg of parlay.legs) {
+      if (typeof leg === 'string') out.push(leg);
+      else if (leg && typeof leg === 'object') {
+        const t = leg.ticker || leg.market_ticker || leg.event_ticker;
+        if (t) out.push(String(t));
+      }
+    }
+  }
+  return out;
+}
+
+function isKalshiMoneylineLock(parlay) {
+  return kalshiMlTickersFromParlay(parlay).some((text) => {
+    const raw = String(text).trim();
+    const series = raw.split('-')[0].split(':')[0].toUpperCase();
+    return Boolean(SERIES[series]);
+  });
+}
+
+// Active Kalshi ML locks that identitiesFromParlay cannot read (e.g. a
+// previously unknown team blob) are otherwise a silent no_lock_overlap.
+// Log once per reconcile — not per firehose RFQ — so silence is diagnosable.
+function logActiveLockIdentityFails(parlays, log = console.log) {
+  if (!Array.isArray(parlays) || !parlays.length) return 0;
+  let n = 0;
+  for (const p of parlays) {
+    if (!isKalshiMoneylineLock(p)) continue;
+    const lock = identitiesFromParlay(p);
+    if (lock.ok) continue;
+    const label = (p && (p.label || p.id)) || '?';
+    log(`[${MODE}] lock-identity-fail label=${label}`);
+    n += 1;
+  }
+  return n;
 }
 
 // Cheap over-approximation of evaluate/match: no HTTP, no metadata.
@@ -1043,7 +1089,9 @@ function startPolymarketRfqLoop(ctx = {}) {
   }
 
   async function reconcileOpenRfqs() {
-    if (!parlays().length) return;
+    const locks = parlays();
+    if (!locks.length) return;
+    logActiveLockIdentityFails(locks);
     try {
       const listed = await http.listRfqs({ status: 'RFQ_STATUS_OPEN', limit: 100 });
       const rows = (listed && listed.rfqs) || [];
@@ -1175,6 +1223,8 @@ module.exports = {
   normalizePolymarketRfq,
   cheapDirectMatch,
   couldMatchActiveLocks,
+  logActiveLockIdentityFails,
+  isKalshiMoneylineLock,
   matchPolymarketParlay,
   matchPolymarketParlayDetailed,
   evaluatePolymarketRfq,
