@@ -196,6 +196,10 @@ function teamInTokens(league, team, tokens) {
 
 function identityHitsTokens(id, tokens) {
   if (!id) return false;
+  // Combo Locks only price full-game ML (`aec`). Player-prop prefixes
+  // (astatc, …) share league/date/team tokens and also emit 2-char stat
+  // suffixes (`tb` = total bases) that collide with team codes (TB Rays).
+  if (!tokens.has('aec')) return false;
   const leagueTokens = LEAGUE_SLUG_TOKENS[id.league] || (id.league ? [id.league] : []);
   if (!leagueTokens.some((t) => tokens.has(t))) return false;
   if (!tokensHaveDate(tokens, id.date)) return false;

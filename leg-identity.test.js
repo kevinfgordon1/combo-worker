@@ -91,6 +91,58 @@ const cinPieces = kalshiTickerPieces('KXMLBGAME-26SEP021840CINCHC-CIN:yes');
 assert.deepStrictEqual(cinPieces.teams, ['cin', 'chc']);
 assert.strictEqual(cinPieces.selection, 'cin');
 
+// Athletics: Kalshi OAK (legacy) and ATH (current) are the same club as Poly ath.
+const oakId = parseKalshiTicker('KXMLBGAME-26SEP031840OAKSEA-OAK:yes');
+const athId = parseKalshiTicker('KXMLBGAME-26SEP031840ATHSEA-ATH:yes');
+assert.ok(oakId);
+assert.ok(athId);
+assert.strictEqual(oakId.selection, 'ath');
+assert.deepStrictEqual(oakId.teams, ['ath', 'sea']);
+assert.strictEqual(athId.selection, 'ath');
+assert.deepStrictEqual(athId.teams, ['ath', 'sea']);
+assert.strictEqual(identityKey(oakId), identityKey(athId));
+assert.strictEqual(
+  identityKey(oakId),
+  'mlb|2026-09-03|ath+sea|moneyline|full|ath|yes'
+);
+const oakPieces = kalshiTickerPieces('KXMLBGAME-26SEP031840OAKSEA-OAK:yes');
+assert.deepStrictEqual(oakPieces.teams, ['oak', 'sea']);
+assert.strictEqual(oakPieces.selection, 'oak');
+
+const athMarket = {
+  metadata: {
+    event_id: 'mlb-ath-sea-2026-09-03',
+    event_start_time: '2026-09-03T22:40:00Z',
+    event_subcategory: 'BASEBALL',
+    market_sport_type: 'baseball_team_full_game_winner',
+    outcome_strike: '0.0',
+    long_participant_id: 'mlb-ath',
+    short_participant_id: 'mlb-sea',
+  },
+};
+const buyAth = identityFromMarket(athMarket, 'yes');
+assert.ok(buyAth.identity);
+assert.strictEqual(identityKey(buyAth.identity), identityKey(oakId));
+assert.ok(sameIdentitySet([identityKey(oakId)], [identityKey(buyAth.identity)]));
+
+const oakLock = identitiesFromParlay({
+  label: 'Athletics ML + Angels ML',
+  leg_keys: [
+    'KXMLBGAME-26SEP031840OAKSEA-OAK:yes',
+    'KXMLBGAME-26SEP031840LAAPIT-LAA:yes',
+  ],
+});
+const athLock = identitiesFromParlay({
+  label: 'Athletics ML + Angels ML',
+  leg_keys: [
+    'KXMLBGAME-26SEP031840ATHSEA-ATH:yes',
+    'KXMLBGAME-26SEP031840LAAPIT-LAA:yes',
+  ],
+});
+assert.ok(oakLock.ok);
+assert.ok(athLock.ok);
+assert.ok(sameIdentitySet(oakLock.keys, athLock.keys));
+
 // Length-5 / mixed 2-char Kalshi MLB blobs (TBTEX, SDCIN, …). teamLen=3
 // even-split only accepts 6; greedy known-code split covers 2+3 / 3+2 / 2+2.
 const mlbMixed = [

@@ -41,7 +41,7 @@ const SUBCATEGORY_LEAGUE = {
 
 // League-scoped aliases only — do not invent cross-league maps (CHI is Cubs, not Sox).
 const TEAM_ALIASES = {
-  mlb: { chw: 'cws', wsh: 'was', tbr: 'tb', sdp: 'sd', sfg: 'sf', kcr: 'kc' },
+  mlb: { chw: 'cws', wsh: 'was', tbr: 'tb', sdp: 'sd', sfg: 'sf', kcr: 'kc', oak: 'ath' },
   nfl: { gnb: 'gb', jac: 'jax', wsh: 'was' },
   nba: { uta: 'utah', pho: 'phx', gsw: 'gs', nyk: 'ny', nop: 'no' },
   nhl: {},
