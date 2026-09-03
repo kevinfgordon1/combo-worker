@@ -390,16 +390,32 @@ function pmRfq(id, symbols, extra = {}) {
   assert.ok(!out.started);
 }
 
-// Kalshi ticker HHMM after first pitch → mark started (still persist)
+// Kalshi ticker HHMM after first pitch → silent skip (no insert, no price watch)
 {
   const rfq = kalshiRfq('rfq-started', [
     'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
     'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
   ]);
-  const out = classifyUnhedgedRfq(rfq, { venue: 'kalshi', now: Date.parse('2026-08-14T23:44:00Z') });
-  assert.strictEqual(out.persist, true);
-  assert.strictEqual(out.status, 'started');
+  let watched = 0;
+  const out = classifyUnhedgedRfq(rfq, {
+    venue: 'kalshi',
+    now: Date.parse('2026-08-14T23:44:00Z'),
+    priceCache: { watch() { watched += 1; } },
+  });
+  assert.strictEqual(out.persist, false);
+  assert.strictEqual(out.inScope, false);
   assert.strictEqual(out.reason, 'game_started');
+  assert.strictEqual(out.row, null);
+  assert.strictEqual(watched, 0, 'started RFQ must not watch price cache');
+  const fillSkip = considerUnhedgedFill({
+    venue: 'kalshi',
+    rfq,
+    extra: { status: 'filled', yes_price: 0.92 },
+    now: Date.parse('2026-08-14T23:44:00Z'),
+    known: true,
+  });
+  assert.strictEqual(fillSkip.persist, false);
+  assert.strictEqual(fillSkip.reason, 'game_started');
 }
 
 // Taker price present → store it; still do not invent our quote
@@ -468,6 +484,20 @@ function pmRfq(id, symbols, extra = {}) {
     });
     assert.strictEqual(tennisOut.persist, false);
     assert.strictEqual(rows.length, 1);
+
+    // Started MLB GAME is not inserted (same silent family as tennis).
+    const startedIns = await maybePersistUnhedged(kalshiRfq('rfq-started-no-insert', [
+      'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+      'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
+    ]), {
+      venue: 'kalshi',
+      now: Date.parse('2026-08-14T23:44:00Z'),
+      persist: async (row) => { rows.push(row); },
+    });
+    assert.strictEqual(startedIns.persist, false);
+    assert.strictEqual(startedIns.reason, 'game_started');
+    assert.strictEqual(rows.length, 1);
+    assert.ok(!rows.some((r) => r.rfq_id === 'rfq-started-no-insert'));
 
     // Kevin: opponent +118 → our -118 (not -114); opponent -140 → our +140.
     assert.strictEqual(invertAmerican(118), -118);
@@ -856,6 +886,61 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(ncaafFill.persist, false);
     assert.ok(!store.has('kalshi:rfq-ncaaf-fill'));
 
+    // Fill event on a started MLB RFQ does not insert or patch unhedged_rfqs.
+    const startedFillEvent = await maybePersistUnhedgedFill({
+      venue: 'kalshi',
+      rfq: kalshiRfq('rfq-live-tigers', [
+        'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+        'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
+      ]),
+      extra: { status: 'filled', yes_price: 0.92, filled_at: '2026-08-14T23:50:00Z' },
+      now: Date.parse('2026-08-14T23:44:00Z'),
+      persist,
+      known: true,
+    });
+    assert.strictEqual(startedFillEvent.persist, false);
+    assert.strictEqual(startedFillEvent.reason, 'game_started');
+    assert.ok(!store.has('kalshi:rfq-live-tigers'));
+
+    const startedDb = createMemSupabase([{
+      venue: 'kalshi',
+      rfq_id: 'rfq-started-no-fill',
+      status: 'started',
+      skip_reason: 'game_started',
+      legs: [{ ticker: 'KXMLBGAME-26AUG141840CWSDET-CWS' }],
+      our_fair_american: -1192,
+      fill_yes_price: null,
+      fill_no_price: null,
+      fill_american: null,
+    }]);
+    const startedRowFill = await persistUnhedgedFill(startedDb, {
+      venue: 'kalshi',
+      rfq_id: 'rfq-started-no-fill',
+      status: 'filled',
+      fill_yes_price: 0.92,
+      fill_no_price: 0.08,
+      fill_american: -1192,
+      filled_at: '2026-08-14T23:50:00Z',
+    });
+    assert.strictEqual(startedRowFill.ok, false);
+    assert.strictEqual(startedRowFill.reason, 'game_started');
+    const stillStarted = startedDb._rows.get('kalshi:rfq-started-no-fill');
+    assert.strictEqual(stillStarted.status, 'started');
+    assert.strictEqual(stillStarted.fill_yes_price, null);
+    assert.strictEqual(stillStarted.fill_american, null);
+    assert.strictEqual(stillStarted.our_fair_american, -1192);
+
+    const startedKnownFill = await maybePersistUnhedgedFill({
+      venue: 'kalshi',
+      rfqId: 'rfq-started-no-fill',
+      extra: { status: 'filled', yes_price: 0.92 },
+      persist,
+      supabase: startedDb,
+    });
+    assert.strictEqual(startedKnownFill.persist, false);
+    assert.strictEqual(startedKnownFill.reason, 'game_started');
+    assert.strictEqual(startedDb._rows.get('kalshi:rfq-started-no-fill').status, 'started');
+
     // Unknown id (never persisted) is not inserted from a fill event.
     const unknownFill = await maybePersistUnhedgedFill({
       venue: 'kalshi',
@@ -1057,6 +1142,120 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(skipFilled.reason, 'already_filled');
     assert.strictEqual(hydratePatches.length, 0);
 
+    // Hydrate/onClosed/tick must not queue or patch started/live RFQs.
+    const startedHydrateDb = createMemSupabase([
+      {
+        venue: 'kalshi',
+        rfq_id: 'rfq-started-hydrate',
+        status: 'started',
+        skip_reason: 'game_started',
+        contracts: 10,
+        our_fair_american: -1192,
+      },
+      { venue: 'kalshi', rfq_id: 'rfq-seen-hydrate', status: 'seen', contracts: 10 },
+    ]);
+    const startedPatches = [];
+    let startedFetched = 0;
+    const startedTracker = createUnhedgedFillTracker({
+      supabase: startedHydrateDb,
+      persist: async (row) => { startedPatches.push(row); },
+      fetchRfq: async () => {
+        startedFetched += 1;
+        return { status: 'filled', yes_price: 0.92 };
+      },
+    });
+    await startedTracker.hydrate();
+    assert.ok(!startedTracker.known.has('kalshi:rfq-started-hydrate'));
+    assert.ok(startedTracker.known.has('kalshi:rfq-seen-hydrate'));
+    startedTracker.remember({
+      venue: 'kalshi',
+      rfq_id: 'rfq-started-hydrate',
+      status: 'started',
+    });
+    assert.ok(!startedTracker.known.has('kalshi:rfq-started-hydrate'));
+    const startedClosed = await startedTracker.onClosed({
+      venue: 'kalshi',
+      rfqId: 'rfq-started-hydrate',
+      rfq: kalshiRfq('rfq-started-hydrate', [
+        'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+        'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
+      ]),
+      extra: { status: 'filled', yes_price: 0.92, filled_at: '2026-08-14T23:50:00Z' },
+      now: Date.parse('2026-08-14T23:44:00Z'),
+    });
+    assert.strictEqual(startedClosed.persist, false);
+    assert.strictEqual(startedClosed.reason, 'game_started');
+    assert.strictEqual(startedPatches.length, 0);
+    assert.ok(!startedTracker.pending.has('kalshi:rfq-started-hydrate'));
+    await startedTracker.tick(Date.parse('2026-08-14T23:50:00Z'));
+    assert.strictEqual(startedFetched, 0);
+    assert.strictEqual(startedPatches.length, 0);
+    const hydratedStarted = startedHydrateDb._rows.get('kalshi:rfq-started-hydrate');
+    assert.strictEqual(hydratedStarted.status, 'started');
+    assert.strictEqual(hydratedStarted.our_fair_american, -1192);
+
+    // Known pregame row + later started fill event: do not patch.
+    startedTracker.remember({ venue: 'kalshi', rfq_id: 'rfq-seen-then-live', status: 'seen' });
+    const liveClose = await startedTracker.onClosed({
+      venue: 'kalshi',
+      rfqId: 'rfq-seen-then-live',
+      rfq: kalshiRfq('rfq-seen-then-live', [
+        'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+        'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
+      ]),
+      extra: { status: 'filled', yes_price: 0.92 },
+      now: Date.parse('2026-08-14T23:44:00Z'),
+    });
+    assert.strictEqual(liveClose.persist, false);
+    assert.strictEqual(liveClose.reason, 'game_started');
+    assert.strictEqual(startedPatches.length, 0);
+    assert.ok(!startedTracker.pending.has('kalshi:rfq-seen-then-live'));
+
+    const startedResolve = await resolveUnhedgedFill({
+      venue: 'kalshi',
+      rfq_id: 'rfq-started-resolve',
+      rfq: kalshiRfq('rfq-started-resolve', [
+        'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+        'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
+      ]),
+    }, {
+      now: Date.parse('2026-08-14T23:44:00Z'),
+      extra: { status: 'filled', yes_price: 0.92 },
+      fetchRfq: async () => ({ status: 'filled', yes_price: 0.92 }),
+    });
+    assert.strictEqual(startedResolve.retry, false);
+    assert.strictEqual(startedResolve.patch, null);
+    assert.strictEqual(startedResolve.reason, 'game_started');
+
+    // REST fetch of a started ticker must not fill-patch either.
+    const startedRest = await resolveUnhedgedFill({
+      venue: 'kalshi',
+      rfq_id: 'rfq-started-rest',
+    }, {
+      now: Date.parse('2026-08-14T23:44:00Z'),
+      extra: { status: 'filled', yes_price: 0.92 },
+      fetchRfq: async () => kalshiRfq('rfq-started-rest', [
+        'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+        'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
+      ], { yesPrice: '0.92' }),
+    });
+    assert.strictEqual(startedRest.patch, null);
+    assert.strictEqual(startedRest.reason, 'game_started');
+
+    startedTracker.pending.set('kalshi:rfq-pending-started', {
+      venue: 'kalshi',
+      rfq_id: 'rfq-pending-started',
+      rfq: kalshiRfq('rfq-pending-started', [
+        'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+        'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
+      ]),
+      extra: { status: 'filled', yes_price: 0.92 },
+    });
+    await startedTracker.tick(Date.parse('2026-08-14T23:50:00Z'));
+    assert.ok(!startedTracker.pending.has('kalshi:rfq-pending-started'));
+    assert.strictEqual(startedFetched, 0);
+    assert.strictEqual(startedPatches.length, 0);
+
     // Existing restart/created stamp + later tape tradeTs → store the print.
     const restartFilledAt = '2026-09-02T17:57:00.000Z'; // 1:57 PM ET
     const tapeFilledAt = '2026-09-02T18:28:00.000Z'; // 2:28 PM ET
@@ -1164,10 +1363,19 @@ function pmRfq(id, symbols, extra = {}) {
             persist: async () => {},
           });
         }
+        shadowUnhedgedMiss(kalshiRfq('rfq-quiet-started', [
+          'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+          'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
+        ]), {
+          venue: 'kalshi',
+          now: Date.parse('2026-08-14T23:44:00Z'),
+          persist: async () => { throw new Error('must not persist started'); },
+        });
         await new Promise((r) => setImmediate(r));
         await new Promise((r) => setImmediate(r));
         assert.ok(!logs.some((l) => /\[UNHEDGED\] seen kalshi rfq=/.test(l)));
         assert.ok(!logs.some((l) => /\[UNHEDGED\] started kalshi rfq=/.test(l)));
+        assert.ok(!logs.some((l) => /game_started/.test(l)));
       } finally {
         console.log = origLog;
       }

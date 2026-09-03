@@ -4,12 +4,17 @@
 //
 // In-scope (v1): pregame 2–4 legs, MLB/NFL full-game moneylines only,
 // independent events (distinct games AND distinct teams). No SGP / spreads /
-// totals / props / NCAAF. Tennis / LoL / CS2 / NCAAF are a silent skip (no insert).
+// totals / props / NCAAF. Tennis / LoL / CS2 / NCAAF / live (any started
+// leg via findStartedEvent, same helper Combo Locks uses) are a silent skip
+// (no insert, no fill patch, no price-cache watch). Kevin will not live-trade
+// unhedged — do not record in-game RFQs even for paper/analytics.
 //
-// Fill-by-others: when an already-persisted row's RFQ later fills (Kalshi
-// status filled/executed/accepted, or Polymarket confirm/fill), UPDATE that
-// row to status=filled. Keep taker_* as the original RFQ. Do not insert
+// Fill-by-others: when an already-persisted pregame row's RFQ later fills
+// (Kalshi status filled/executed/accepted, or Polymarket confirm/fill), UPDATE
+// that row to status=filled. Keep taker_* as the original RFQ. Do not insert
 // out-of-scope firehose just to count fills. No public-tape crawl of open RFQs.
+// If findStartedEvent says a leg started, do not fill-update (no status=filled,
+// no prices) — hydrate/onClosed/tick must not queue or patch started/live RFQs.
 // blotter filled_at is venue filled/executed/tradeTs when the patch has one
 // (later tape print wins over a stale restart/created stamp). If the patch
 // has no timestamp: keep existing, else RFQ created/closed, else null.
@@ -349,6 +354,12 @@ function fail(reason) {
   return { persist: false, inScope: false, reason, status: null, row: null };
 }
 
+// Same findStartedEvent Combo Locks uses (ticker HHMM, explicit start keys).
+function isUnhedgedStarted(rfq, extra, now) {
+  const hit = findStartedEvent(rfq || null, null, extra || null, now);
+  return !!(hit && hit.started);
+}
+
 function extractTakerPrice(rfq, extra) {
   const msg = (extra && extra.msg) || {};
   const src = rfq && typeof rfq === 'object' ? rfq : {};
@@ -440,7 +451,9 @@ function classifyUnhedgedRfq(rfq, opts = {}) {
   const indep = independenceCheck(parsed);
   if (indep) return fail(indep);
 
-  const started = findStartedEvent(rfq, null, opts.extra || null, opts.now);
+  // Before price-cache watch — live RFQs must not bump RAM or persist.
+  if (isUnhedgedStarted(rfq, opts.extra, opts.now)) return fail('game_started');
+
   const size = extractSize(rfq);
   const taker = extractTakerPrice(rfq, opts.extra);
   const legsJson = parsed.map((p) => ({
@@ -453,7 +466,6 @@ function classifyUnhedgedRfq(rfq, opts = {}) {
     date: p.date || null,
   }));
 
-  const status = started && started.started ? 'started' : 'seen';
   const priced = priceClassified({
     venue,
     legs: legsJson,
@@ -466,9 +478,9 @@ function classifyUnhedgedRfq(rfq, opts = {}) {
   return {
     persist: true,
     inScope: true,
-    reason: status === 'started' ? 'game_started' : null,
-    status,
-    started: started && started.started ? started : null,
+    reason: null,
+    status: 'seen',
+    started: null,
     legs,
     size,
     taker,
@@ -553,7 +565,7 @@ function oddsOnlyUnhedgedPatch(row) {
   };
 }
 
-// Seen/started upsert must not clobber status=filled (WS replay / re-see).
+// Seen upsert must not clobber status=filled (WS replay / re-see).
 // Non-filled rows still get a full update. Filled rows keep status/fill and
 // only refresh per-leg odds when present.
 async function persistUnhedgedRfq(supabase, row) {
@@ -644,6 +656,10 @@ function noteSeenStarted(status) {
 
 function shadowUnhedgedMiss(rfq, opts = {}) {
   maybePersistUnhedged(rfq, opts).then((out) => {
+    if (out && out.reason === 'game_started') {
+      noteSeenStarted('started');
+      return;
+    }
     if (out && out.persist && out.row) {
       if (typeof opts.onPersisted === 'function') {
         try { opts.onPersisted(out.row); } catch (_) {}
@@ -829,6 +845,7 @@ function considerUnhedgedFill(opts = {}) {
   if (!rfqId) return fail('bad_rfq');
 
   const rfq = opts.rfq;
+  if (isUnhedgedStarted(rfq, opts.extra, opts.now)) return fail('game_started');
   const hasLegs = !!(rfq && (
     (Array.isArray(rfq.legs) && rfq.legs.length)
     || (Array.isArray(rfq.comboLegs) && rfq.comboLegs.length)
@@ -850,9 +867,10 @@ function considerUnhedgedFill(opts = {}) {
 }
 
 async function lookupKnownUnhedgedRow(opts, venue, rfqId) {
-  if (opts.known === true || opts.existingRow) return true;
+  if (opts.existingRow) return opts.existingRow;
+  if (opts.known === true) return { status: opts.knownStatus || null };
   if (opts.knownIds && typeof opts.knownIds.has === 'function') {
-    return opts.knownIds.has(knownKey(venue, rfqId));
+    return opts.knownIds.has(knownKey(venue, rfqId)) ? { status: null } : null;
   }
   if (opts.supabase) {
     const { data, error } = await opts.supabase
@@ -863,11 +881,11 @@ async function lookupKnownUnhedgedRow(opts, venue, rfqId) {
       .limit(1);
     if (error) {
       console.error('[UNHEDGED] fill lookup failed', error.message);
-      return false;
+      return null;
     }
-    return !!(data && data.length);
+    return (data && data[0]) || null;
   }
-  return false;
+  return null;
 }
 
 function coalesceFillPrice(next, prev) {
@@ -907,7 +925,7 @@ async function persistUnhedgedFill(supabase, patch) {
   }
   const { data: existingRows, error: lookupError } = await supabase
     .from('unhedged_rfqs')
-    .select('filled_at,fill_yes_price,fill_no_price,fill_american,created_at')
+    .select('filled_at,fill_yes_price,fill_no_price,fill_american,created_at,status')
     .eq('venue', patch.venue)
     .eq('rfq_id', patch.rfq_id)
     .limit(1);
@@ -915,12 +933,16 @@ async function persistUnhedgedFill(supabase, patch) {
     console.error('[UNHEDGED] fill update failed', lookupError.message);
     return { ok: false, error: lookupError };
   }
+  if (existingRows && existingRows[0] && existingRows[0].status === 'started') {
+    return { ok: false, reason: 'game_started', updated: false };
+  }
   const body = mergeUnhedgedFillPatch(existingRows && existingRows[0], patch);
   const { error, data } = await supabase
     .from('unhedged_rfqs')
     .update(body)
     .eq('venue', patch.venue)
     .eq('rfq_id', patch.rfq_id)
+    .neq('status', 'started')
     .select('rfq_id');
   if (error) {
     console.error('[UNHEDGED] fill update failed', error.message);
@@ -934,6 +956,7 @@ async function maybePersistUnhedgedFill(opts = {}) {
   if (!considered.persist || !considered.row) return considered;
   const known = await lookupKnownUnhedgedRow(opts, considered.row.venue, considered.row.rfq_id);
   if (!known) return { persist: false, inScope: false, reason: 'unknown_row', status: null, row: null };
+  if (known.status === 'started') return fail('game_started');
 
   if (typeof opts.persist === 'function') {
     try { await opts.persist(considered.row, { mode: 'fill' }); } catch (e) {
@@ -983,21 +1006,28 @@ async function resolveUnhedgedFill(row, {
   if (!row || !row.rfq_id || !row.venue) {
     return { retry: false, patch: null, reason: 'bad_row' };
   }
+  if (isUnhedgedStarted(row.rfq, extra || row.extra, now)) {
+    return { retry: false, patch: null, reason: 'game_started' };
+  }
 
   const fromEvent = extractUnhedgedFill({ extra, rfq: extra && extra.rfq, venue: row.venue, now });
-  if (fromEvent.filled && (fromEvent.yes != null || fromEvent.no != null || !fetchRfq)) {
+  const eventComplete = fromEvent.filled && (fromEvent.yes != null || fromEvent.no != null || !fetchRfq);
+
+  let rfq = null;
+  if (typeof fetchRfq === 'function') {
+    try { rfq = await fetchRfq(row.rfq_id); } catch (e) {
+      if (!eventComplete) return { retry: true, error: e };
+    }
+  }
+  if (isUnhedgedStarted(rfq, extra, now)) {
+    return { retry: false, patch: null, reason: 'game_started' };
+  }
+  if (eventComplete) {
     return {
       retry: false,
       patch: buildUnhedgedFillPatch(fromEvent, { venue: row.venue, rfqId: row.rfq_id }),
       reason: 'event',
     };
-  }
-
-  let rfq = null;
-  if (typeof fetchRfq === 'function') {
-    try { rfq = await fetchRfq(row.rfq_id); } catch (e) {
-      return { retry: true, error: e };
-    }
   }
   if (rfq) {
     const restFill = extractUnhedgedFill({ rfq, extra: rfq, venue: row.venue, now });
@@ -1066,6 +1096,7 @@ function createUnhedgedFillTracker(opts = {}) {
 
   function remember(row) {
     if (!row || !row.venue || !row.rfq_id) return;
+    if (row.status === 'started') return;
     const key = knownKey(row.venue, row.rfq_id);
     known.add(key);
     if (row.status === 'filled') filled.add(key);
@@ -1075,7 +1106,7 @@ function createUnhedgedFillTracker(opts = {}) {
     const { data, error } = await opts.supabase
       .from('unhedged_rfqs')
       .select('venue,rfq_id,status,contracts')
-      .in('status', ['seen', 'started'])
+      .eq('status', 'seen')
       .limit(500);
     if (error) {
       console.error('[UNHEDGED] fill hydrate failed', error.message);
@@ -1122,6 +1153,7 @@ function createUnhedgedFillTracker(opts = {}) {
   async function onClosed({ venue, rfqId, extra, rfq, now } = {}) {
     if (!isUnhedgedRfqShadow(env || opts.env)) return fail('flag_off');
     if (!rfqId || (venue !== 'kalshi' && venue !== 'polymarket')) return fail('bad_rfq');
+    if (isUnhedgedStarted(rfq, extra, now)) return fail('game_started');
     const key = knownKey(venue, rfqId);
     if (!known.has(key)) return fail('unknown_row');
     if (filled.has(key)) return fail('already_filled');
@@ -1129,6 +1161,7 @@ function createUnhedgedFillTracker(opts = {}) {
     const immediate = considerUnhedgedFill({
       venue, rfqId, extra, rfq, env: env || opts.env, now, known: true,
     });
+    if (immediate.reason === 'game_started') return immediate;
     if (immediate.persist && immediate.row) {
       await applyPatch(immediate.row);
       pending.delete(knownKey(venue, rfqId));
@@ -1154,6 +1187,10 @@ function createUnhedgedFillTracker(opts = {}) {
     let looked = 0;
     for (const [key, row] of pending) {
       if (filled.has(key)) {
+        pending.delete(key);
+        continue;
+      }
+      if (isUnhedgedStarted(row.rfq, row.extra, now)) {
         pending.delete(key);
         continue;
       }
@@ -1220,6 +1257,7 @@ module.exports = {
   extractUnhedgedFill,
   resolveUnhedgedFill,
   createUnhedgedFillTracker,
+  isUnhedgedStarted,
   parseKalshiUnhedgedTicker,
   parsePmUnhedgedSlug,
   priceClassified,

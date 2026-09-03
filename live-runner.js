@@ -24,8 +24,9 @@
 //   Poly 0.06), best Kalshi/Poly, then sign-flip (not same-side last,
 //   not Odds API). Combo WRAP is separate (NFL maker 0; else 0.035).
 //   Lookups stay sync off the 4s in-memory cache. UNHEDGED_RFQ_LIVE stays off.
-//   When a persisted row later fills (WS/REST leave-open or one-shot tape
-//   after 45s pad), UPDATE status=filled. NCAAF is out of scope.
+//   Started/live RFQs (findStartedEvent) are a silent skip — no insert, no
+//   fill patch. When a persisted pregame row later fills (WS/REST leave-open
+//   or one-shot tape after 45s pad), UPDATE status=filled. NCAAF is out of scope.
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
