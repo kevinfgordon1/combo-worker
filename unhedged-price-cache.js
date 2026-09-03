@@ -2,10 +2,12 @@
 // Refresh on a short interval. Lookups are synchronous — never HTTP on the
 // RFQ path. Kalshi: signed GET /markets for KXMLBGAME / KXNFLGAME (NCAAF is
 // out of unhedged scope). Polymarket: getMarketBySlug for watched aec-* slugs.
-// Poly RFQ legs add their symbol; Kalshi MLB/NFL ML legs also watch synthesized
-// game slugs aec-{mlb|nfl}-{t1}-{t2}-{YYYY-MM-DD} (both team orders) plus
-// suffixed aec-…-{pick} variants if US lists them. Watch-list only — do not
-// crawl the Poly RFQ firehose.
+// Poly RFQ legs watch the game slug of their symbol; Kalshi MLB/NFL ML legs
+// watch synthesized game slugs aec-{mlb|nfl}-{t1}-{t2}-{YYYY-MM-DD} (both
+// team orders, one LRU game slot). No suffixed pick permutations. Watch list
+// is an LRU of ~48 games. refreshPm runs a pool of 4, never Promise.all of
+// hundreds. kalshi/polymarket maps evict rows older than 30 minutes.
+// Watch-list only — do not crawl the Poly RFQ firehose.
 // Production US full-game ML is one slug with two team outcomes
 // (long_participant_id = which YES pays). Ingest splits those into per-team
 // YES — never one mid-market price. Suffixed 1-team slugs stay as-is.
@@ -33,6 +35,10 @@ const KALSHI_ML_SERIES = ['KXMLBGAME', 'KXNFLGAME'];
 const DEFAULT_REFRESH_MS = 4000;
 const KALSHI_PAGE_LIMIT = 200;
 const PM_ML_PREFIX = 'aec-';
+// Memory caps — do not bump Railway RAM. Watch games, not every RFQ permutation.
+const DEFAULT_PM_WATCH_GAMES = 48;
+const DEFAULT_PM_REFRESH_CONCURRENCY = 4;
+const DEFAULT_PRICE_STALE_MS = 30 * 60 * 1000;
 
 function numOrNull(v) {
   if (v == null || v === '') return null;
@@ -212,6 +218,50 @@ function refreshMsFromEnv(env = process.env) {
   return n >= 1000 && n <= 60_000 ? n : DEFAULT_REFRESH_MS;
 }
 
+function intInRange(v, fallback, lo, hi) {
+  const n = numOrNull(v);
+  if (n == null) return fallback;
+  const i = Math.floor(n);
+  return i >= lo && i <= hi ? i : fallback;
+}
+
+function pmWatchGamesFromEnv(env = process.env) {
+  return intInRange(env && env.UNHEDGED_PM_WATCH_GAMES, DEFAULT_PM_WATCH_GAMES, 8, 128);
+}
+
+function pmRefreshConcurrencyFromEnv(env = process.env) {
+  return intInRange(
+    env && env.UNHEDGED_PM_REFRESH_CONCURRENCY,
+    DEFAULT_PM_REFRESH_CONCURRENCY,
+    1,
+    8
+  );
+}
+
+function staleMsFromEnv(env = process.env) {
+  return intInRange(env && env.UNHEDGED_PRICE_STALE_MS, DEFAULT_PRICE_STALE_MS, 60_000, 6 * 60 * 60 * 1000);
+}
+
+// Bounded pool — never Promise.all a unbounded watch list.
+async function mapLimit(items, limit, fn) {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) return [];
+  const conc = Math.max(1, Math.min(Math.floor(limit) || 1, list.length));
+  const out = new Array(list.length);
+  let next = 0;
+  async function worker() {
+    while (next < list.length) {
+      const i = next;
+      next += 1;
+      out[i] = await fn(list[i], i);
+    }
+  }
+  const workers = [];
+  for (let w = 0; w < conc; w += 1) workers.push(worker());
+  await Promise.all(workers);
+  return out;
+}
+
 function normKalshiKey(key) {
   const s = String(key || '').trim();
   if (!s) return '';
@@ -284,10 +334,11 @@ function opponentTeamOf(parsed) {
 }
 
 // Inverse of parsePmUnhedgedSlug for US sports ML.
-// Production: aec-{league}-{t1}-{t2}-{YYYY-MM-DD} (no pick). Suffixed
-// aec-…-{pick} stay as extra candidates. Codes (cin), not spoken names.
-// Team order is not in the ticker identity, so watch both orders. Also
-// watch the identity-normalized pair (chw→cws) when it differs from raw codes.
+// Production: one game slug aec-{league}-{t1}-{t2}-{YYYY-MM-DD} (no pick).
+// Team order is not in the ticker identity, so watch both orders — they
+// share one LRU game slot. Do not add suffixed aec-…-{pick} permutations;
+// ingest of the game slug splits per-team YES. Codes (cin), not spoken names.
+// Also watch the identity-normalized pair (chw→cws) when it differs.
 function addPmMlPairSlugs(out, league, date, teamA, teamB) {
   const a = String(teamA || '').toLowerCase();
   const b = String(teamB || '').toLowerCase();
@@ -298,11 +349,6 @@ function addPmMlPairSlugs(out, league, date, teamA, teamB) {
     const game = `aec-${lg}-${left}-${right}-${dt}`;
     const parsedGame = parsePmUnhedgedSlug(game, 'yes');
     if (parsedGame && !parsedGame.skip) out.add(game);
-    for (const pick of [left, right]) {
-      const slug = `${game}-${pick}`;
-      const parsed = parsePmUnhedgedSlug(slug, 'yes');
-      if (parsed && !parsed.skip) out.add(slug);
-    }
   }
 }
 
@@ -396,6 +442,9 @@ function createUnhedgedPriceCache({
   env = process.env,
   seed = null,
   now = () => Date.now(),
+  maxPmWatchGames = null,
+  pmRefreshConcurrency = null,
+  staleMs = null,
 } = {}) {
   const kalshi = new Map();
   const polymarket = new Map();
@@ -404,10 +453,20 @@ function createUnhedgedPriceCache({
   const pmByPrefix = new Map();
   const pmGames = new Map();
   const pmWatch = new Set();
+  const pmWatchGames = new Map(); // gameKey -> Set(slugs), insertion order = LRU
   let timer = null;
   let refreshing = false;
   let pmFetch = fetchPmMarket;
   const refreshEvery = intervalMs != null ? intervalMs : refreshMsFromEnv(env);
+  const watchGameCap = maxPmWatchGames != null
+    ? intInRange(maxPmWatchGames, DEFAULT_PM_WATCH_GAMES, 1, 128)
+    : pmWatchGamesFromEnv(env);
+  const refreshConc = pmRefreshConcurrency != null
+    ? intInRange(pmRefreshConcurrency, DEFAULT_PM_REFRESH_CONCURRENCY, 1, 8)
+    : pmRefreshConcurrencyFromEnv(env);
+  const priceStaleMs = staleMs != null
+    ? intInRange(staleMs, DEFAULT_PRICE_STALE_MS, 1, 6 * 60 * 60 * 1000)
+    : staleMsFromEnv(env);
 
   function unindexKalshi(key, entry) {
     if (!entry) return;
@@ -636,49 +695,86 @@ function createUnhedgedPriceCache({
     return `${key.slice(0, i)}-${rawOpp}`;
   }
 
+  function evictPmForGame(gameKey) {
+    if (!gameKey) return;
+    const members = pmGames.get(gameKey);
+    if (!members) return;
+    for (const key of [...members]) {
+      const entry = polymarket.get(key);
+      unindexPm(key, entry);
+      polymarket.delete(key);
+    }
+  }
+
+  function evictOldestWatchGames() {
+    while (pmWatchGames.size > watchGameCap) {
+      const oldestKey = pmWatchGames.keys().next().value;
+      const slugs = pmWatchGames.get(oldestKey);
+      pmWatchGames.delete(oldestKey);
+      if (slugs) {
+        for (const s of slugs) pmWatch.delete(s);
+      }
+      evictPmForGame(oldestKey);
+    }
+  }
+
+  function evictStalePrices() {
+    const cutoff = now() - priceStaleMs;
+    for (const [key, entry] of kalshi) {
+      if (!entry || entry.at < cutoff) {
+        unindexKalshi(key, entry);
+        kalshi.delete(key);
+      }
+    }
+    for (const [key, entry] of polymarket) {
+      if (!entry || entry.at < cutoff) {
+        unindexPm(key, entry);
+        polymarket.delete(key);
+      }
+    }
+  }
+
+  function watchGameKeyOf(slug) {
+    const parsed = parsePmUnhedgedSlug(slug, 'yes');
+    return (parsed && !parsed.skip && gameKeyFromParsed(parsed)) || slug;
+  }
+
+  let addedWatch = false;
+
+  function addWatch(key) {
+    const raw = normPmKey(key);
+    if (!raw || !raw.startsWith(PM_ML_PREFIX)) return;
+    // Prefer the production game slug. Suffixed pick slugs are not watched —
+    // ingestPmMarket splits a game slug into per-team YES.
+    const k = pmGameSlugOf(raw) || raw;
+    const gameKey = watchGameKeyOf(k);
+    let bundle = pmWatchGames.get(gameKey);
+    if (bundle) {
+      pmWatchGames.delete(gameKey);
+    } else {
+      bundle = new Set();
+    }
+    if (!bundle.has(k)) {
+      bundle.add(k);
+      pmWatch.add(k);
+      addedWatch = true;
+    }
+    pmWatchGames.set(gameKey, bundle);
+    evictOldestWatchGames();
+  }
+
   function watch(venue, legs) {
     if (!Array.isArray(legs)) return;
-    let added = false;
-    function addWatch(key) {
-      const k = normPmKey(key);
-      if (!k || !k.startsWith(PM_ML_PREFIX)) return;
-      if (!pmWatch.has(k)) {
-        pmWatch.add(k);
-        added = true;
-      }
-    }
+    addedWatch = false;
     for (const leg of legs) {
       const pmKey = normPmKey(leg && (leg.symbol || (venue === 'polymarket' ? leg.ticker : '')));
-      if (pmKey) {
-        addWatch(pmKey);
-        const game = pmGameSlugOf(pmKey);
-        if (game) addWatch(game);
-        const opp = derivePmOpponentSlug(pmKey, leg);
-        if (opp) addWatch(opp);
-        const prefix = pmGamePrefix(pmKey);
-        const members = pmByPrefix.get(prefix);
-        if (members) {
-          for (const s of members) addWatch(s);
-        }
-      }
-      const parsed = parseLeg(leg);
-      const gk = parsed && gameKeyFromParsed(parsed);
-      if (gk) {
-        const slugs = pmGames.get(gk);
-        if (slugs) {
-          for (const s of slugs) {
-            addWatch(s);
-            const opp = derivePmOpponentSlug(s, null);
-            if (opp) addWatch(opp);
-          }
-        }
-      }
+      if (pmKey) addWatch(pmKey);
       // Kalshi RFQ legs have ticker (KXMLBGAME-…-CIN), not symbol. Synthesize
-      // game slugs (both orders) plus suffixed pick variants so refreshPm
-      // fills per-team YES. Do not crawl the Poly firehose.
+      // game slugs only (both orders). Do not add 8 pick permutations and
+      // do not crawl the Poly firehose.
       for (const s of pmMlSlugsFromKalshiLeg(leg)) addWatch(s);
     }
-    if (added && timer) scheduleSoon();
+    if (addedWatch && timer) scheduleSoon();
   }
 
   function setPmFetch(fn) {
@@ -711,7 +807,7 @@ function createUnhedgedPriceCache({
     if (typeof pmFetch !== 'function' || !pmWatch.size) return 0;
     const slugs = [...pmWatch];
     let misses = 0;
-    await Promise.all(slugs.map(async (slug) => {
+    await mapLimit(slugs, refreshConc, async (slug) => {
       try {
         const market = await pmFetch(slug);
         if (!market || !ingestPmMarket(slug, market)) misses += 1;
@@ -719,7 +815,7 @@ function createUnhedgedPriceCache({
         misses += 1;
         console.error('[UNHEDGED] pm market', slug, e && e.message);
       }
-    }));
+    });
     return misses;
   }
 
@@ -727,6 +823,7 @@ function createUnhedgedPriceCache({
     if (refreshing) return { skipped: true };
     refreshing = true;
     try {
+      evictStalePrices();
       const [, pmMiss] = await Promise.all([refreshKalshi(), refreshPm()]);
       const missCount = pmMiss || 0;
       if (missCount) console.log(`[UNHEDGED] pm miss ${missCount}`);
@@ -783,13 +880,20 @@ function createUnhedgedPriceCache({
     _kalshi: kalshi,
     _polymarket: polymarket,
     _pmWatch: pmWatch,
+    _pmWatchGames: pmWatchGames,
+    _maxPmWatchGames: watchGameCap,
+    _pmRefreshConcurrency: refreshConc,
   };
 }
 
 module.exports = {
   KALSHI_ML_SERIES,
   DEFAULT_REFRESH_MS,
+  DEFAULT_PM_WATCH_GAMES,
+  DEFAULT_PM_REFRESH_CONCURRENCY,
+  DEFAULT_PRICE_STALE_MS,
   KALSHI_PAGE_LIMIT,
+  mapLimit,
   createUnhedgedPriceCache,
   kalshiYesProb,
   pmYesProb,
