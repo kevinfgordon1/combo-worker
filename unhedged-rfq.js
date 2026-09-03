@@ -15,10 +15,10 @@
 // out-of-scope firehose just to count fills. No public-tape crawl of open RFQs.
 // If findStartedEvent says a leg started, do not fill-update (no status=filled,
 // no prices) — hydrate/onClosed/tick must not queue or patch started/live RFQs.
-// blotter filled_at is venue filled/executed/tradeTs when the patch has one
-// (later tape print wins over a stale restart/created stamp). If the patch
-// has no timestamp: keep existing, else RFQ created/closed, else null.
-// Never Date.now() (restart would stamp the whole tape).
+// blotter filled_at is the later of patch vs existing venue/tradeTs
+// (true later tape print wins). If only one side has a timestamp, use that.
+// If neither: RFQ created/closed, else null. Never Date.now()
+// (restart would stamp the whole tape).
 // Re-see of an already-filled RFQ must not flip status back to seen/started.
 //
 // Fair is inverse-bet ourTrue (Promo Builder / EV): convert opponent YES to
@@ -892,9 +892,22 @@ function coalesceFillPrice(next, prev) {
   return next != null ? next : (prev != null ? prev : null);
 }
 
+function laterFilledAt(a, b) {
+  if (a && !b) return a;
+  if (b && !a) return b;
+  if (!a && !b) return null;
+  const am = parseTs(a);
+  const bm = parseTs(b);
+  if (am == null && bm == null) return a;
+  if (am == null) return b;
+  if (bm == null) return a;
+  return bm > am ? b : a;
+}
+
 function coalesceFilledAt(next, prev) {
-  if (next && next.filled_at) return next.filled_at;
-  if (prev && prev.filled_at) return prev.filled_at;
+  const nextAt = next && next.filled_at;
+  const prevAt = prev && prev.filled_at;
+  if (nextAt || prevAt) return laterFilledAt(nextAt, prevAt);
   return firstIsoTs(prev, RFQ_CLOSED_TS_KEYS)
     || firstIsoTs(prev, RFQ_CREATED_TS_KEYS)
     || firstIsoTs(prev, ['created_at', 'closed_at'])
@@ -904,8 +917,8 @@ function coalesceFilledAt(next, prev) {
     || null;
 }
 
-// Venue/tradeTs filled_at on the patch wins (later tape print). If the patch
-// has no timestamp, keep existing, else created/closed, else null.
+// Later of next vs prev filled_at wins (true later tape print). If only one
+// side has a timestamp, use that. Else created/closed, else null.
 // Never Date.now(). Null fill prices do not clobber.
 function mergeUnhedgedFillPatch(existing, patch) {
   const prev = existing || {};

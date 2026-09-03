@@ -89,12 +89,25 @@ function matchTapeTrades(normalizedTrades, { rfqCount, closedMs } = {}) {
   const keys = new Set(pool.map((t) => priceKey(t.yes, t.no)));
   if (keys.size > 1) return { match: 'ambiguous' };
 
+  // Same-price size pool: closest to closedMs when known, else latest print.
+  // Proximity ties (and open RFQs with closedMs null) take the latest ts —
+  // do not keep pool[0] (often the first/earliest block from RFQ create).
   let best = pool[0];
-  if (closedMs != null && pool.length > 1) {
-    let bestAbs = Infinity;
+  if (pool.length > 1) {
+    let bestAbs = closedMs != null
+      ? (best.ts != null ? Math.abs(best.ts - closedMs) : Infinity)
+      : 0;
+    let bestTs = best.ts != null ? best.ts : -Infinity;
     for (const t of pool) {
-      const dt = t.ts != null ? Math.abs(t.ts - closedMs) : Infinity;
-      if (dt < bestAbs) { bestAbs = dt; best = t; }
+      const dt = closedMs != null
+        ? (t.ts != null ? Math.abs(t.ts - closedMs) : Infinity)
+        : 0;
+      const ts = t.ts != null ? t.ts : -Infinity;
+      if (dt < bestAbs || (dt === bestAbs && ts > bestTs)) {
+        best = t;
+        bestAbs = dt;
+        bestTs = ts;
+      }
     }
   }
   return {
