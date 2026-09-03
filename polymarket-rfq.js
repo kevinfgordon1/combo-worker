@@ -41,6 +41,7 @@ const {
 const {
   isUnhedgedRfqShadow,
   isUnhedgedRfqLive,
+  isUnhedgedFillStatus,
   persistUnhedgedRfq,
   shadowUnhedgedMiss,
   createUnhedgedFillTracker,
@@ -532,6 +533,74 @@ async function hydrateRfq(http, raw) {
   return rfq;
 }
 
+function pickPolymarketRfqRow(rows, rfqId) {
+  const list = Array.isArray(rows) ? rows : [];
+  const matches = list.filter((x) => {
+    if (!x || typeof x !== 'object') return false;
+    const id = x.id || x.rfqId || x.rfq_id;
+    return id == null || String(id) === String(rfqId);
+  });
+  const pool = matches.length ? matches : list;
+  return pool.find((x) => x && isUnhedgedFillStatus(x.status)) || pool[0] || null;
+}
+
+// Retail RFQ lookup for unhedged fill resolution. Prefer listRfqs (same path
+// as hydrate) including FILLED; GET-by-id is a fallback. Enrich from accepted
+// quotes when the RFQ row has no fill status/prices. Never uses Kalshi tape.
+async function fetchPolymarketUnhedgedRfq(http, rfqId) {
+  if (!http || rfqId == null || rfqId === '') return null;
+
+  async function fromList(query) {
+    if (typeof http.listRfqs !== 'function') return null;
+    try {
+      const listed = await http.listRfqs(query);
+      const rows = (listed && (listed.rfqs || listed.data)) || [];
+      return pickPolymarketRfqRow(rows, rfqId);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  let rfq = await fromList({ rfqId });
+  if (!rfq || !isUnhedgedFillStatus(rfq.status)) {
+    const filled = await fromList({ rfqId, status: 'RFQ_STATUS_FILLED' });
+    if (filled) rfq = filled;
+  }
+
+  if (!rfq && typeof http.request === 'function') {
+    try {
+      const res = await http.request('GET', `/v1/rfqs/${encodeURIComponent(rfqId)}`);
+      if (res && res.statusCode !== 404) {
+        const j = res.json;
+        const got = (j && (j.rfq || j)) || null;
+        if (got && typeof got === 'object') rfq = got;
+      }
+    } catch (_) {}
+  }
+
+  if ((!rfq || !isUnhedgedFillStatus(rfq.status)) && typeof http.listQuotes === 'function') {
+    try {
+      const listed = await http.listQuotes({ rfqId });
+      const quotes = (listed && (listed.quotes || listed.data)) || [];
+      const q = quotes.find((x) => x && isUnhedgedFillStatus(x.status)) || null;
+      if (q) {
+        const existingYes = rfq && (rfq.buyPrice != null ? rfq.buyPrice : rfq.buy_price);
+        const existingNo = rfq && (rfq.sellPrice != null ? rfq.sellPrice : rfq.sell_price);
+        rfq = {
+          ...(rfq || { id: rfqId, rfqId }),
+          status: (rfq && isUnhedgedFillStatus(rfq.status) && rfq.status) || q.status || 'RFQ_STATUS_FILLED',
+          buyPrice: existingYes != null ? existingYes : (q.buyPrice != null ? q.buyPrice : (q.buy_price != null ? q.buy_price : (q.price != null ? q.price : q.yesPrice))),
+          sellPrice: existingNo != null ? existingNo : (q.sellPrice != null ? q.sellPrice : (q.sell_price != null ? q.sell_price : q.noPrice)),
+          filled_at: q.acceptedTime || q.accepted_time || q.confirmedTime || q.executedTime
+            || (rfq && (rfq.filled_at || rfq.filledAt)) || null,
+        };
+      }
+    } catch (_) {}
+  }
+
+  return rfq;
+}
+
 function startPolymarketRfqLoop(ctx = {}) {
   const env = ctx.env || process.env;
   const keyId = env.POLYMARKET_KEY_ID;
@@ -569,17 +638,10 @@ function startPolymarketRfqLoop(ctx = {}) {
 
   async function fetchUnhedgedPmRfq(rfqId) {
     if (typeof ctx.fetchUnhedgedRfq === 'function') return ctx.fetchUnhedgedRfq(rfqId);
-    if (!http || typeof http.request !== 'function') return null;
-    try {
-      const res = await http.request('GET', `/v1/rfqs/${encodeURIComponent(rfqId)}`);
-      if (!res || res.statusCode === 404) return null;
-      const j = res.json;
-      return (j && (j.rfq || j)) || null;
-    } catch (_) {
-      return null;
-    }
+    return fetchPolymarketUnhedgedRfq(http, rfqId);
   }
 
+  const ownFills = !ctx.unhedgedFills;
   const unhedgedFills = ctx.unhedgedFills || createUnhedgedFillTracker({
     supabase: ctx.supabase,
     persist: ctx.persistUnhedged,
@@ -587,7 +649,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     fetchRfq: fetchUnhedgedPmRfq,
     fetchTrades: ctx.fetchUnhedgedTrades,
   });
-  if (typeof unhedgedFills.hydrate === 'function') {
+  if (ownFills && typeof unhedgedFills.hydrate === 'function') {
     unhedgedFills.hydrate().catch((e) => console.error('[UNHEDGED] fill hydrate', e && e.message));
   }
 
@@ -1036,19 +1098,22 @@ function startPolymarketRfqLoop(ctx = {}) {
     cancelUnaccepted().catch((e) => console.error(`[${MODE}] ttl`, e.message));
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start`, e.message));
   }, 2000);
-  const fillTimer = setInterval(() => {
-    unhedgedFills.tick().catch((e) => console.error('[UNHEDGED] fill tick', e && e.message));
-  }, ctx.unhedgedFillMs != null ? ctx.unhedgedFillMs : (ctx.startWs === false ? 60 * 60 * 1000 : 15000));
+  let fillTimer = null;
+  if (ownFills) {
+    fillTimer = setInterval(() => {
+      unhedgedFills.tick().catch((e) => console.error('[UNHEDGED] fill tick', e && e.message));
+    }, ctx.unhedgedFillMs != null ? ctx.unhedgedFillMs : (ctx.startWs === false ? 60 * 60 * 1000 : 15000));
+    if (fillTimer.unref) fillTimer.unref();
+  }
   if (reconcileTimer.unref) reconcileTimer.unref();
   if (ttlTimer.unref) ttlTimer.unref();
-  if (fillTimer.unref) fillTimer.unref();
 
   return {
     stop() {
       stopped = true;
       clearInterval(reconcileTimer);
       clearInterval(ttlTimer);
-      clearInterval(fillTimer);
+      if (fillTimer) clearInterval(fillTimer);
       try { ws && ws.stop && ws.stop(); } catch (_) {}
       try { http.close && http.close(); } catch (_) {}
     },
@@ -1064,6 +1129,8 @@ function startPolymarketRfqLoop(ctx = {}) {
     seenRfqs,
     live,
     marketCache,
+    unhedgedFills,
+    fetchUnhedgedRfq: fetchUnhedgedPmRfq,
   };
 }
 
@@ -1086,4 +1153,5 @@ module.exports = {
   quoteBodyFromEval,
   acceptedFromEvent,
   startPolymarketRfqLoop,
+  fetchPolymarketUnhedgedRfq,
 };

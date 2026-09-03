@@ -73,6 +73,14 @@ assert.ok(!isUnhedgedFillStatus('closed'));
   assert.ok(!skipSrc.includes('unhedged_rfqs'));
   const engineSrc = fs.readFileSync(path.join(__dirname, 'engine.js'), 'utf8');
   assert.ok(!engineSrc.includes('unhedged_rfqs'));
+  const liveSrc = fs.readFileSync(path.join(__dirname, 'live-runner.js'), 'utf8');
+  assert.ok(
+    /startPolymarketRfqLoop\(\{[\s\S]*unhedgedFills/.test(liveSrc),
+    'Poly loop must receive the shared unhedged fill tracker'
+  );
+  assert.ok(liveSrc.includes('fetchUnhedgedVenueRfq'));
+  assert.ok(liveSrc.includes('fetchUnhedgedVenueTrades'));
+  assert.ok(!/createUnhedgedFillTracker\(\{[\s\S]*fetchRfq:\s*fetchSkipRfq/.test(liveSrc));
 }
 
 const mlbCws = parseKalshiUnhedgedTicker('KXMLBGAME-26AUG141840CWSDET-CWS:yes');
@@ -1121,6 +1129,125 @@ function pmRfq(id, symbols, extra = {}) {
     assert.ok(tapeNoTs.patch);
     assert.notStrictEqual(tapeNoTs.patch.filled_at, new Date(tapeNoTsNow).toISOString());
     assert.strictEqual(Date.parse(tapeNoTs.patch.filled_at), Date.parse('2026-08-14T20:00:00Z'));
+
+    // Polymarket: event / RFQ fill — never Kalshi public tape.
+    const polyEvent = await resolveUnhedgedFill({
+      venue: 'polymarket',
+      rfq_id: 'rfq-poly-event',
+    }, {
+      extra: {
+        type: 'quoteAccepted',
+        rfq: { id: 'rfq-poly-event', status: 'RFQ_STATUS_FILLED', buyPrice: 0.27 },
+      },
+      fetchTrades: async () => { throw new Error('must not Kalshi-tape Poly'); },
+    });
+    assert.strictEqual(polyEvent.retry, false);
+    assert.strictEqual(polyEvent.reason, 'event');
+    assert.ok(polyEvent.patch);
+    assert.strictEqual(polyEvent.patch.venue, 'polymarket');
+    assert.strictEqual(polyEvent.patch.fill_yes_price, 0.27);
+
+    let polyTapeCalls = 0;
+    const polyRest = await resolveUnhedgedFill({
+      venue: 'polymarket',
+      rfq_id: 'rfq-poly-rest',
+      closedMs: padClosed,
+    }, {
+      now: padClosed + 1000,
+      fetchRfq: async (id, row) => {
+        assert.strictEqual(id, 'rfq-poly-rest');
+        assert.strictEqual(row.venue, 'polymarket');
+        return { id, status: 'RFQ_STATUS_FILLED', buyPrice: 0.31, sellPrice: 0.69 };
+      },
+      fetchTrades: async () => {
+        polyTapeCalls += 1;
+        throw new Error('must not Kalshi-tape Poly');
+      },
+    });
+    assert.strictEqual(polyRest.retry, false);
+    assert.strictEqual(polyRest.reason, 'rfq');
+    assert.ok(polyRest.patch);
+    assert.strictEqual(polyRest.patch.venue, 'polymarket');
+    assert.strictEqual(polyRest.patch.fill_yes_price, 0.31);
+    assert.strictEqual(polyTapeCalls, 0);
+
+    const polyClosed = await resolveUnhedgedFill({
+      venue: 'polymarket',
+      rfq_id: 'rfq-poly-closed',
+      closedMs: padClosed,
+      market_ticker: 'aec-mlb-cws-det-2026-08-14-cws',
+    }, {
+      now: padClosed + 45000,
+      fetchRfq: async () => ({ id: 'rfq-poly-closed', status: 'RFQ_STATUS_CLOSED' }),
+      fetchTrades: async () => {
+        polyTapeCalls += 1;
+        return [{
+          count_fp: '10.00',
+          yes_price_dollars: '0.19',
+          no_price_dollars: '0.81',
+          created_time: padClosed,
+          is_block_trade: true,
+        }];
+      },
+    });
+    assert.strictEqual(polyTapeCalls, 0, 'Poly must not use Kalshi tape');
+    assert.strictEqual(polyClosed.retry, false);
+    assert.strictEqual(polyClosed.patch, null);
+    assert.strictEqual(polyClosed.reason, 'not_filled');
+
+    const polyLogs = [];
+    const origFillLog = console.log;
+    console.log = (...args) => { polyLogs.push(args.map(String).join(' ')); };
+    try {
+      const polyFillRows = [];
+      const polyTracker = createUnhedgedFillTracker({
+        persist: async (row, meta) => { if (meta && meta.mode === 'fill') polyFillRows.push(row); },
+        fetchRfq: async (id, row) => {
+          assert.strictEqual(row.venue, 'polymarket');
+          return { id, status: 'RFQ_STATUS_FILLED', buyPrice: 0.31 };
+        },
+        fetchTrades: async () => { throw new Error('must not Kalshi-tape Poly'); },
+      });
+      polyTracker.remember({ venue: 'polymarket', rfq_id: 'rfq-poly-log', status: 'seen' });
+      const queuedPoly = await polyTracker.onClosed({
+        venue: 'polymarket',
+        rfqId: 'rfq-poly-log',
+        extra: { type: 'rfqClosed', rfq: { id: 'rfq-poly-log' } },
+        now: Date.parse('2026-08-14T20:06:00Z'),
+      });
+      assert.strictEqual(queuedPoly.reason, 'queued');
+      await polyTracker.tick(Date.parse('2026-08-14T20:07:00Z'));
+      assert.strictEqual(polyFillRows.length, 1);
+      assert.strictEqual(polyFillRows[0].venue, 'polymarket');
+      assert.ok(polyLogs.some((l) => /\[UNHEDGED\] filled polymarket rfq=rfq-poly-log/.test(l)));
+    } finally {
+      console.log = origFillLog;
+    }
+
+    // Kalshi tape path is unchanged (still matches after pad).
+    const kalshiStillTape = await resolveUnhedgedFill({
+      venue: 'kalshi',
+      rfq_id: 'rfq-tape-still',
+      contracts: 10,
+      market_ticker: 'KXMVE-X',
+      closedMs: padClosed,
+    }, {
+      now: padClosed + 45000,
+      fetchRfq: async () => ({ id: 'rfq-tape-still', status: 'closed', updated_ts: padClosed, market_ticker: 'KXMVE-X', contracts: 10 }),
+      fetchTrades: async (ticker, minTs, maxTs, row) => {
+        assert.strictEqual(row.venue, 'kalshi');
+        assert.strictEqual(ticker, 'KXMVE-X');
+        return [{
+          count_fp: '10.00',
+          yes_price_dollars: '0.19',
+          no_price_dollars: '0.81',
+          created_time: padClosed,
+          is_block_trade: true,
+        }];
+      },
+    });
+    assert.strictEqual(kalshiStillTape.reason, 'tape');
+    assert.strictEqual(kalshiStillTape.patch.fill_yes_price, 0.19);
 
     // Filled row is not overwritten back to seen on WS re-see; odds may refresh.
     const keepFilledDb = createMemSupabase([{

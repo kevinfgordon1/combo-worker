@@ -25,8 +25,10 @@
 //   not Odds API). Combo WRAP is separate (NFL maker 0; else 0.035).
 //   Lookups stay sync off the 4s in-memory cache. UNHEDGED_RFQ_LIVE stays off.
 //   Started/live RFQs (findStartedEvent) are a silent skip — no insert, no
-//   fill patch. When a persisted pregame row later fills (WS/REST leave-open
-//   or one-shot tape after 45s pad), UPDATE status=filled. NCAAF is out of scope.
+//   fill patch. One shared fill tracker owns Kalshi + Polymarket rows: Kalshi
+//   uses skip-RFQ + public tape; Poly uses RFQ/events (never Kalshi tape).
+//   When a persisted pregame row later fills, UPDATE status=filled.
+//   NCAAF is out of scope.
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
@@ -657,6 +659,21 @@ async function fetchSkipTrades(ticker, minTs, maxTs) {
   return (json && json.trades) || [];
 }
 
+async function fetchUnhedgedVenueRfq(rfqId, row) {
+  if (row && row.venue === 'polymarket') {
+    if (polyLoop && typeof polyLoop.fetchUnhedgedRfq === 'function') {
+      return polyLoop.fetchUnhedgedRfq(rfqId);
+    }
+    return null;
+  }
+  return fetchSkipRfq(rfqId);
+}
+
+async function fetchUnhedgedVenueTrades(ticker, minTs, maxTs, row) {
+  if (row && row.venue === 'polymarket') return [];
+  return fetchSkipTrades(ticker, minTs, maxTs);
+}
+
 async function persistSkipTape(id, patch) {
   const body = stripUnknown(patch);
   if (!Object.keys(body).length) return;
@@ -1190,8 +1207,8 @@ async function main() {
   unhedgedFills = createUnhedgedFillTracker({
     supabase,
     env: process.env,
-    fetchRfq: fetchSkipRfq,
-    fetchTrades: fetchSkipTrades,
+    fetchRfq: fetchUnhedgedVenueRfq,
+    fetchTrades: fetchUnhedgedVenueTrades,
   });
   unhedgedFills.hydrate().catch((e) => console.error('[UNHEDGED] fill hydrate', e && e.message));
   setInterval(() => {
@@ -1219,6 +1236,7 @@ async function main() {
     supabase,
     env: process.env,
     unhedgedPrices,
+    unhedgedFills,
   });
   polyLoop = poly;
 

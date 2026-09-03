@@ -25,7 +25,9 @@ const {
   shouldConfirmNow,
   quoteBodyFromEval,
   startPolymarketRfqLoop,
+  fetchPolymarketUnhedgedRfq,
 } = require('./polymarket-rfq');
+const { createUnhedgedFillTracker, isUnhedgedFillStatus } = require('./unhedged-rfq');
 const { createMarketCache } = require('./polymarket-market-cache');
 
 // Fixed seed / timestamp / path — do not rotate these; they are the signing fixture.
@@ -1090,6 +1092,129 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   await new Promise((r) => setTimeout(r, 15));
   assert.ok(!unhedgedRows.some((r) => r.rfq_id === 'rfq_ncaaf_never'));
   fillLoop.stop();
+
+  // Shared tracker from live-runner: persist remember()s; event + RFQ fill
+  // without Kalshi tape.
+  const listedOpenThenFilled = await fetchPolymarketUnhedgedRfq({
+    async listRfqs(query) {
+      if (query && query.status === 'RFQ_STATUS_FILLED') {
+        return { rfqs: [{ id: 'rfq_list_filled', status: 'RFQ_STATUS_FILLED', buyPrice: 0.41 }] };
+      }
+      return { rfqs: [{ id: 'rfq_list_filled', status: 'RFQ_STATUS_OPEN', buyPrice: 0.18 }] };
+    },
+    async listQuotes() { return { quotes: [] }; },
+  }, 'rfq_list_filled');
+  assert.ok(isUnhedgedFillStatus(listedOpenThenFilled.status));
+  assert.strictEqual(listedOpenThenFilled.buyPrice, 0.41);
+
+  const fromAcceptedQuote = await fetchPolymarketUnhedgedRfq({
+    async listRfqs() { return { rfqs: [] }; },
+    async listQuotes() {
+      return { quotes: [{ rfqId: 'rfq_q', status: 'QUOTE_STATUS_ACCEPTED', buyPrice: 0.33 }] };
+    },
+  }, 'rfq_q');
+  assert.ok(isUnhedgedFillStatus(fromAcceptedQuote.status));
+  assert.strictEqual(fromAcceptedQuote.buyPrice, 0.33);
+
+  const sharedSeen = [];
+  const sharedFills = [];
+  let kalshiTapeCalls = 0;
+  const sharedTracker = createUnhedgedFillTracker({
+    persist: async (row, meta) => {
+      if (meta && meta.mode === 'fill') sharedFills.push(row);
+    },
+    fetchRfq: async (id, row) => {
+      assert.strictEqual(row.venue, 'polymarket');
+      return { id, status: 'RFQ_STATUS_FILLED', buyPrice: 0.29 };
+    },
+    fetchTrades: async () => {
+      kalshiTapeCalls += 1;
+      throw new Error('must not use Kalshi tape for Poly');
+    },
+  });
+  const sharedLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'false',
+    },
+    http: {
+      async getUserId() { return { rfqUserId: 'rfquser_test' }; },
+      async listRfqs(query) {
+        if (query && query.rfqId === 'rfq_fetch_me') {
+          return { rfqs: [{ id: 'rfq_fetch_me', status: 'RFQ_STATUS_FILLED', buyPrice: 0.22 }] };
+        }
+        return { rfqs: [] };
+      },
+      async listQuotes() { return { quotes: [] }; },
+      async getCombo() { throw new Error('unhedged must not hydrate'); },
+      async createQuote() { throw new Error('unhedged must not POST'); },
+      async confirmQuote() { throw new Error('unhedged must not confirm'); },
+      async deleteQuote() { return { statusCode: 200 }; },
+      close() {},
+    },
+    startWs: false,
+    getParlays: () => [kalshiParlay],
+    persistUnhedged: async (row) => { sharedSeen.push(row); },
+    unhedgedFills: sharedTracker,
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+  });
+  assert.strictEqual(sharedLoop.unhedgedFills, sharedTracker);
+  const fetched = await sharedLoop.fetchUnhedgedRfq('rfq_fetch_me');
+  assert.strictEqual(fetched.status, 'RFQ_STATUS_FILLED');
+  assert.strictEqual(fetched.buyPrice, 0.22);
+  await new Promise((r) => setTimeout(r, 15));
+  await sharedLoop.handleRfq({
+    id: 'rfq_shared_tracker',
+    status: 'RFQ_STATUS_OPEN',
+    qtyDecimal: '8',
+    comboLegs: [
+      { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-bos-pit-2026-08-14-pit', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-nyy-bal-2026-08-14-nyy', side: 'SIDE_BUY' },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(sharedSeen.some((r) => r.rfq_id === 'rfq_shared_tracker'));
+  assert.ok(sharedTracker.known.has('polymarket:rfq_shared_tracker'));
+
+  sharedLoop.handleRfqClosed({
+    type: 'rfqClosed',
+    rfq: { id: 'rfq_shared_tracker', status: 'RFQ_STATUS_FILLED', buyPrice: 0.29 },
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(sharedFills.length, 1);
+  assert.strictEqual(sharedFills[0].venue, 'polymarket');
+  assert.strictEqual(sharedFills[0].fill_yes_price, 0.29);
+  assert.strictEqual(kalshiTapeCalls, 0);
+
+  await sharedLoop.handleRfq({
+    id: 'rfq_shared_rest',
+    status: 'RFQ_STATUS_OPEN',
+    qtyDecimal: '8',
+    comboLegs: [
+      { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-bos-pit-2026-08-14-pit', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-nyy-bal-2026-08-14-nyy', side: 'SIDE_BUY' },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  sharedLoop.handleRfqClosed({
+    type: 'rfqClosed',
+    rfq: { id: 'rfq_shared_rest' },
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(sharedFills.length, 1, 'rfqClosed without status queues');
+  await sharedTracker.tick(Date.parse('2026-08-14T20:10:00Z'));
+  assert.strictEqual(sharedFills.length, 2);
+  assert.strictEqual(sharedFills[1].rfq_id, 'rfq_shared_rest');
+  assert.strictEqual(sharedFills[1].fill_yes_price, 0.29);
+  assert.strictEqual(kalshiTapeCalls, 0);
+  sharedLoop.stop();
 
   const { createUnhedgedPriceCache } = require('./unhedged-price-cache');
   const { americanFromProb } = require('./engine');

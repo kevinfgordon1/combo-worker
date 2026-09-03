@@ -1028,7 +1028,7 @@ async function resolveUnhedgedFill(row, {
 
   let rfq = null;
   if (typeof fetchRfq === 'function') {
-    try { rfq = await fetchRfq(row.rfq_id); } catch (e) {
+    try { rfq = await fetchRfq(row.rfq_id, row); } catch (e) {
       if (!eventComplete) return { retry: true, error: e };
     }
   }
@@ -1059,14 +1059,17 @@ async function resolveUnhedgedFill(row, {
     return { retry: true };
   }
 
-  if (typeof fetchTrades === 'function') {
+  // Kalshi public tape only. Polymarket retail RFQs resolve via event / RFQ
+  // GET (or a Poly-specific fetchTrades). Never hit Kalshi /markets/trades
+  // with a Poly ticker.
+  if (typeof fetchTrades === 'function' && row.venue !== 'polymarket') {
     const ticker = tickerOfFillRfq(rfq, row);
     if (ticker) {
       const created = parseTs(rfq && (rfq.created_ts || rfq.createdTime)) || row.createdMs || null;
       const minTs = Math.max(0, Math.floor((created || closedMs || now) / 1000) - 1);
       const maxTs = Math.ceil(((closedMs || now) + padMs) / 1000);
       let trades;
-      try { trades = await fetchTrades(ticker, minTs, maxTs); } catch (e) {
+      try { trades = await fetchTrades(ticker, minTs, maxTs, row); } catch (e) {
         return { retry: true, error: e };
       }
       const windowStart = created || 0;
