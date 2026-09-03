@@ -544,57 +544,80 @@ function pickPolymarketRfqRow(rows, rfqId) {
   return pool.find((x) => x && isUnhedgedFillStatus(x.status)) || pool[0] || null;
 }
 
-// Retail RFQ lookup for unhedged fill resolution. Prefer listRfqs (same path
-// as hydrate) including FILLED; GET-by-id is a fallback. Enrich from accepted
-// quotes when the RFQ row has no fill status/prices. Never uses Kalshi tape.
+function pickPmFillPrice(src, keys) {
+  if (!src || typeof src !== 'object') return null;
+  for (const k of keys) {
+    if (src[k] != null && src[k] !== '') return src[k];
+  }
+  return null;
+}
+
+function pickPmFilledAt(src) {
+  return pickPmFillPrice(src, [
+    'filled_at', 'filledAt', 'acceptedTime', 'accepted_time',
+    'confirmedTime', 'confirmed_time', 'executedTime', 'executed_time',
+    'updatedTime', 'updated_ts',
+  ]);
+}
+
+// Object extractUnhedgedFill can read as filled (status + buyPrice/sellPrice/filled_at).
+function polyUnhedgedFillObject(rfqId, rfq, quote) {
+  const buy = pickPmFillPrice(quote, ['buyPrice', 'buy_price', 'price', 'yesPrice', 'yes_price'])
+    ?? pickPmFillPrice(rfq, ['buyPrice', 'buy_price', 'yesPrice', 'yes_price']);
+  const sell = pickPmFillPrice(quote, ['sellPrice', 'sell_price', 'noPrice', 'no_price'])
+    ?? pickPmFillPrice(rfq, ['sellPrice', 'sell_price', 'noPrice', 'no_price']);
+  const filledAt = pickPmFilledAt(quote) || pickPmFilledAt(rfq) || null;
+  const status = (rfq && isUnhedgedFillStatus(rfq.status) && rfq.status)
+    || (quote && isUnhedgedFillStatus(quote.status) && quote.status)
+    || 'RFQ_STATUS_FILLED';
+  return {
+    ...(rfq || {}),
+    id: rfqId,
+    rfqId,
+    status,
+    buyPrice: buy,
+    sellPrice: sell,
+    filled_at: filledAt,
+  };
+}
+
+// Concrete Poly fill lookup. Never Kalshi tape. Never POST/confirm.
+// 1) GET /v1/rfqs/:id
+// 2) If status is not filled/executed/accepted/confirmed, GET listQuotes({ rfqId })
+// 3) Accepted/confirmed/executed quote → object extractUnhedgedFill reads as filled.
 async function fetchPolymarketUnhedgedRfq(http, rfqId) {
   if (!http || rfqId == null || rfqId === '') return null;
 
-  async function fromList(query) {
-    if (typeof http.listRfqs !== 'function') return null;
-    try {
-      const listed = await http.listRfqs(query);
-      const rows = (listed && (listed.rfqs || listed.data)) || [];
-      return pickPolymarketRfqRow(rows, rfqId);
-    } catch (_) {
-      return null;
-    }
-  }
-
-  let rfq = await fromList({ rfqId });
-  if (!rfq || !isUnhedgedFillStatus(rfq.status)) {
-    const filled = await fromList({ rfqId, status: 'RFQ_STATUS_FILLED' });
-    if (filled) rfq = filled;
-  }
-
-  if (!rfq && typeof http.request === 'function') {
+  let rfq = null;
+  if (typeof http.request === 'function') {
     try {
       const res = await http.request('GET', `/v1/rfqs/${encodeURIComponent(rfqId)}`);
       if (res && res.statusCode !== 404) {
         const j = res.json;
         const got = (j && (j.rfq || j)) || null;
-        if (got && typeof got === 'object') rfq = got;
+        if (got && typeof got === 'object' && !Array.isArray(got)) rfq = got;
       }
     } catch (_) {}
   }
 
-  if ((!rfq || !isUnhedgedFillStatus(rfq.status)) && typeof http.listQuotes === 'function') {
+  if (!rfq && typeof http.listRfqs === 'function') {
+    try {
+      const listed = await http.listRfqs({ rfqId });
+      const rows = (listed && (listed.rfqs || listed.data)) || [];
+      rfq = pickPolymarketRfqRow(rows, rfqId);
+    } catch (_) {}
+  }
+
+  if (rfq && isUnhedgedFillStatus(rfq.status)) {
+    return polyUnhedgedFillObject(rfqId, rfq, null);
+  }
+
+  if (typeof http.listQuotes === 'function') {
     try {
       const listed = await http.listQuotes({ rfqId });
       const quotes = (listed && (listed.quotes || listed.data)) || [];
       const q = quotes.find((x) => x && isUnhedgedFillStatus(x.status)) || null;
-      if (q) {
-        const existingYes = rfq && (rfq.buyPrice != null ? rfq.buyPrice : rfq.buy_price);
-        const existingNo = rfq && (rfq.sellPrice != null ? rfq.sellPrice : rfq.sell_price);
-        rfq = {
-          ...(rfq || { id: rfqId, rfqId }),
-          status: (rfq && isUnhedgedFillStatus(rfq.status) && rfq.status) || q.status || 'RFQ_STATUS_FILLED',
-          buyPrice: existingYes != null ? existingYes : (q.buyPrice != null ? q.buyPrice : (q.buy_price != null ? q.buy_price : (q.price != null ? q.price : q.yesPrice))),
-          sellPrice: existingNo != null ? existingNo : (q.sellPrice != null ? q.sellPrice : (q.sell_price != null ? q.sell_price : q.noPrice)),
-          filled_at: q.acceptedTime || q.accepted_time || q.confirmedTime || q.executedTime
-            || (rfq && (rfq.filled_at || rfq.filledAt)) || null,
-        };
-      }
+      if (q) return polyUnhedgedFillObject(rfqId, rfq, q);
     } catch (_) {}
   }
 
@@ -755,6 +778,14 @@ function startPolymarketRfqLoop(ctx = {}) {
 
     if (evaluation.action !== 'quoteable') {
       logSkip(evaluation);
+      if (
+        evaluation.reason === 'unmatched'
+        || evaluation.reason === 'unmatched_leg'
+        || evaluation.reason === 'no_legs'
+        || evaluation.reason === 'no_locks'
+      ) {
+        persistUnhedgedShadow(evaluation.rfq || rfq);
+      }
       if (evaluation.reason === 'game_started' && evaluation.parlay) {
         try {
           await cancelOpenQuotesForParlay(evaluation.parlay.id, evaluation.started);

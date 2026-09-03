@@ -659,6 +659,7 @@ async function fetchSkipTrades(ticker, minTs, maxTs) {
   return (json && json.trades) || [];
 }
 
+// Venue-aware. Poly ids must never hit Kalshi skip-RFQ / public tape (404).
 async function fetchUnhedgedVenueRfq(rfqId, row) {
   if (row && row.venue === 'polymarket') {
     if (polyLoop && typeof polyLoop.fetchUnhedgedRfq === 'function') {
