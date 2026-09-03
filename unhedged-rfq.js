@@ -616,11 +616,41 @@ async function maybePersistUnhedged(rfq, opts = {}) {
   return considered;
 }
 
+// Do not console.log every seen/started RFQ — that was a 4s-interval log
+// firehose. One count line per minute. Filled logs stay per-row.
+const SEEN_STARTED_LOG_MS = 60_000;
+const seenStartedCounts = { seen: 0, started: 0, timer: null };
+
+function flushSeenStartedLog() {
+  seenStartedCounts.timer = null;
+  const seen = seenStartedCounts.seen;
+  const started = seenStartedCounts.started;
+  seenStartedCounts.seen = 0;
+  seenStartedCounts.started = 0;
+  if (seen || started) {
+    console.log(`[UNHEDGED] ${seen} seen ${started} started /min`);
+  }
+}
+
+function noteSeenStarted(status) {
+  if (status === 'started') seenStartedCounts.started += 1;
+  else if (status === 'seen') seenStartedCounts.seen += 1;
+  else return;
+  if (!seenStartedCounts.timer) {
+    seenStartedCounts.timer = setTimeout(flushSeenStartedLog, SEEN_STARTED_LOG_MS);
+    if (seenStartedCounts.timer.unref) seenStartedCounts.timer.unref();
+  }
+}
+
 function shadowUnhedgedMiss(rfq, opts = {}) {
   maybePersistUnhedged(rfq, opts).then((out) => {
     if (out && out.persist && out.row) {
       if (typeof opts.onPersisted === 'function') {
         try { opts.onPersisted(out.row); } catch (_) {}
+      }
+      if (out.status === 'seen' || out.status === 'started') {
+        noteSeenStarted(out.status);
+        return;
       }
       console.log(
         `[UNHEDGED] ${out.status} ${opts.venue || out.venue} rfq=${out.row.rfq_id} ` +

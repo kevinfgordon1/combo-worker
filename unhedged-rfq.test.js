@@ -16,6 +16,7 @@ const {
   persistUnhedgedRfq,
   persistUnhedgedFill,
   mergeUnhedgedFillPatch,
+  shadowUnhedgedMiss,
   extractFilledAt,
   extractUnhedgedFill,
   createUnhedgedFillTracker,
@@ -1146,6 +1147,31 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(keptExisting.fill_yes_price, 0.22);
     assert.strictEqual(keptExisting.fill_no_price, 0.78);
     assert.strictEqual(keptExisting.fill_american, -355);
+
+    // seen/started persist is a 1-line count, not a log per RFQ. Filled stays per-row.
+    {
+      const logs = [];
+      const origLog = console.log;
+      console.log = (...args) => { logs.push(args.map(String).join(' ')); };
+      try {
+        for (let i = 0; i < 3; i += 1) {
+          shadowUnhedgedMiss(kalshiRfq(`rfq-quiet-${i}`, [
+            'KXMLBGAME-26AUG141840CWSDET-CWS:yes',
+            'KXMLBGAME-26AUG141840BOSPIT-PIT:yes',
+          ]), {
+            venue: 'kalshi',
+            now: Date.parse('2026-08-14T20:00:00Z'),
+            persist: async () => {},
+          });
+        }
+        await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setImmediate(r));
+        assert.ok(!logs.some((l) => /\[UNHEDGED\] seen kalshi rfq=/.test(l)));
+        assert.ok(!logs.some((l) => /\[UNHEDGED\] started kalshi rfq=/.test(l)));
+      } finally {
+        console.log = origLog;
+      }
+    }
 
     console.log('unhedged-rfq.test.js ok');
   }).catch((e) => {
