@@ -122,7 +122,7 @@ function kalshiRfq(id, tickers, extra = {}) {
   });
 }
 
-function createMemSupabase(initRows = []) {
+function createMemSupabase(initRows = [], { rejectCols = [] } = {}) {
   const rows = new Map();
   for (const r of initRows) rows.set(`${r.venue}:${r.rfq_id}`, { ...r });
 
@@ -140,6 +140,16 @@ function createMemSupabase(initRows = []) {
   }
 
   function exec(state) {
+    if ((state.op === 'insert' || state.op === 'update') && rejectCols.length && state.payload) {
+      for (const col of rejectCols) {
+        if (Object.prototype.hasOwnProperty.call(state.payload, col)) {
+          return {
+            data: null,
+            error: { message: `Could not find the '${col}' column of 'unhedged_rfqs' in the schema cache` },
+          };
+        }
+      }
+    }
     if (state.op === 'insert') {
       const row = state.payload;
       const key = `${row.venue}:${row.rfq_id}`;
@@ -1532,6 +1542,57 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(keptExisting.fill_yes_price, 0.22);
     assert.strictEqual(keptExisting.fill_no_price, 0.78);
     assert.strictEqual(keptExisting.fill_american, -355);
+
+    // Fill UPDATE stamps updated_at = ISO now; filled_at stays the venue/tape ts.
+    const fillNow = Date.parse('2026-09-03T21:00:00Z');
+    const todayFill = considerUnhedgedFill({
+      venue: 'kalshi',
+      rfqId: 'rfq-today-updated',
+      extra: { status: 'filled', yes_price: 0.22, filled_at: restartFilledAt },
+      now: fillNow,
+      known: true,
+    });
+    assert.strictEqual(todayFill.persist, true);
+    assert.strictEqual(todayFill.row.filled_at, restartFilledAt);
+    assert.strictEqual(todayFill.row.updated_at, new Date(fillNow).toISOString());
+    assert.notStrictEqual(todayFill.row.updated_at, todayFill.row.filled_at);
+
+    const staleSeenDb = createMemSupabase([{
+      venue: 'kalshi',
+      rfq_id: 'rfq-stale-seen',
+      status: 'seen',
+      created_at: restartFilledAt,
+      filled_at: null,
+    }]);
+    const staleFill = await persistUnhedgedFill(staleSeenDb, {
+      venue: 'kalshi',
+      rfq_id: 'rfq-stale-seen',
+      status: 'filled',
+      fill_yes_price: 0.22,
+      filled_at: restartFilledAt,
+    }, { now: fillNow });
+    assert.strictEqual(staleFill.ok, true);
+    const stamped = staleSeenDb._rows.get('kalshi:rfq-stale-seen');
+    assert.strictEqual(stamped.filled_at, restartFilledAt);
+    assert.strictEqual(stamped.updated_at, new Date(fillNow).toISOString());
+
+    const noColDb = createMemSupabase([{
+      venue: 'kalshi',
+      rfq_id: 'rfq-no-updated-col',
+      status: 'seen',
+    }], { rejectCols: ['updated_at'] });
+    const degraded = await persistUnhedgedFill(noColDb, {
+      venue: 'kalshi',
+      rfq_id: 'rfq-no-updated-col',
+      status: 'filled',
+      fill_yes_price: 0.22,
+      filled_at: restartFilledAt,
+    }, { now: fillNow });
+    assert.strictEqual(degraded.ok, true);
+    const degradedRow = noColDb._rows.get('kalshi:rfq-no-updated-col');
+    assert.strictEqual(degradedRow.status, 'filled');
+    assert.strictEqual(degradedRow.fill_yes_price, 0.22);
+    assert.ok(!Object.prototype.hasOwnProperty.call(degradedRow, 'updated_at'));
 
     // seen/started persist is a 1-line count, not a log per RFQ. Filled stays per-row.
     {

@@ -19,7 +19,10 @@
 // (true later tape print wins). If only one side has a timestamp, use that.
 // If neither: RFQ created/closed, else null. Never Date.now()
 // (restart would stamp the whole tape).
-// Re-see of an already-filled RFQ must not flip status back to seen/started.
+// Fill UPDATE also stamps updated_at = ISO now so site Today (created_at OR
+// updated_at) sees same-day patches when filled_at is stale. Missing column
+// degrades — fills still persist. Re-see of an already-filled RFQ must not
+// flip status back to seen/started.
 //
 // Fair is inverse-bet ourTrue (Promo Builder / EV): convert opponent YES to
 // a fee-included American with the series taker coeff (KXMLBGAME 0.035,
@@ -810,7 +813,17 @@ function extractUnhedgedFill(opts = {}) {
   return { filled, yes, no, american, filledAt, status };
 }
 
-function buildUnhedgedFillPatch(fill, { venue, rfqId } = {}) {
+function isoNow(now) {
+  const ms = now != null ? Number(now) : Date.now();
+  return new Date(Number.isFinite(ms) ? ms : Date.now()).toISOString();
+}
+
+function isMissingUnhedgedCol(error, col) {
+  const msg = String((error && error.message) || error || '');
+  return new RegExp(`(?:Could not find the|column).*['"]?${col}['"]?`, 'i').test(msg);
+}
+
+function buildUnhedgedFillPatch(fill, { venue, rfqId, now } = {}) {
   if (!fill || !fill.filled || !rfqId || !venue) return null;
   return {
     rfq_id: String(rfqId),
@@ -820,6 +833,7 @@ function buildUnhedgedFillPatch(fill, { venue, rfqId } = {}) {
     fill_no_price: fill.no == null ? null : fill.no,
     fill_american: fill.american == null ? null : fill.american,
     filled_at: fill.filledAt || null,
+    updated_at: isoNow(now),
   };
 }
 
@@ -861,7 +875,7 @@ function considerUnhedgedFill(opts = {}) {
 
   const fill = extractUnhedgedFill(opts);
   if (!fill.filled) return fail('not_filled');
-  const row = buildUnhedgedFillPatch(fill, { venue, rfqId });
+  const row = buildUnhedgedFillPatch(fill, { venue, rfqId, now: opts.now });
   if (!row) return fail('bad_rfq');
   return { persist: true, inScope: true, reason: null, status: 'filled', row, fill };
 }
@@ -932,7 +946,7 @@ function mergeUnhedgedFillPatch(existing, patch) {
   };
 }
 
-async function persistUnhedgedFill(supabase, patch) {
+async function persistUnhedgedFill(supabase, patch, { omitUpdatedAt = false, now } = {}) {
   if (!supabase || !patch || !patch.rfq_id || !patch.venue) {
     return { ok: false, reason: 'no_client' };
   }
@@ -950,6 +964,7 @@ async function persistUnhedgedFill(supabase, patch) {
     return { ok: false, reason: 'game_started', updated: false };
   }
   const body = mergeUnhedgedFillPatch(existingRows && existingRows[0], patch);
+  if (!omitUpdatedAt) body.updated_at = isoNow(now != null ? now : Date.now());
   const { error, data } = await supabase
     .from('unhedged_rfqs')
     .update(body)
@@ -958,6 +973,10 @@ async function persistUnhedgedFill(supabase, patch) {
     .neq('status', 'started')
     .select('rfq_id');
   if (error) {
+    if (!omitUpdatedAt && isMissingUnhedgedCol(error, 'updated_at')) {
+      console.warn('[UNHEDGED] unhedged_rfqs missing column updated_at — degrading');
+      return persistUnhedgedFill(supabase, patch, { omitUpdatedAt: true, now });
+    }
     console.error('[UNHEDGED] fill update failed', error.message);
     return { ok: false, error };
   }
