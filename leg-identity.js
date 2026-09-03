@@ -54,6 +54,17 @@ const NFL_CODES = [
   'was', 'wsh',
 ].sort((a, b) => b.length - a.length);
 
+// Kalshi MLB blobs are usually 3+3 (CWSDET) but often 2+3 / 3+2 / 2+2
+// (TBTEX, PHIAZ, SDTB). 2-char codes used on KXMLBGAME: tb, sd, sf, kc, az.
+const MLB_CODES = [
+  'ari', 'ath', 'atl', 'az', 'bal', 'bos', 'chc', 'chw', 'cin', 'cle', 'col',
+  'cws', 'det', 'hou', 'kc', 'kcr', 'laa', 'lad', 'mia', 'mil', 'min', 'nym',
+  'nyy', 'oak', 'phi', 'pit', 'sd', 'sdp', 'sea', 'sf', 'sfg', 'sfo', 'stl',
+  'tb', 'tbr', 'tex', 'tor', 'was', 'wsh',
+].sort((a, b) => b.length - a.length);
+
+const LEAGUE_TEAM_CODES = { nfl: NFL_CODES, mlb: MLB_CODES };
+
 const DT_RE = /^(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})(\d{4})(.*)$/i;
 
 function normTeam(league, code) {
@@ -98,19 +109,25 @@ function etDateFromValue(v) {
   return etDateFromMs(ms);
 }
 
+function splitKnownCodes(s, league) {
+  const codes = LEAGUE_TEAM_CODES[league];
+  if (!codes) return null;
+  for (const a of codes) {
+    if (!s.startsWith(a)) continue;
+    const rest = s.slice(a.length);
+    if (codes.includes(rest)) return [a, rest];
+  }
+  return null;
+}
+
 function splitTeams(blob, league, teamLen) {
   const s = String(blob || '').toLowerCase();
   if (!s) return null;
   if (teamLen && s.length === teamLen * 2) {
     return [s.slice(0, teamLen), s.slice(teamLen)];
   }
-  if (league === 'nfl') {
-    for (const a of NFL_CODES) {
-      if (!s.startsWith(a)) continue;
-      const rest = s.slice(a.length);
-      if (NFL_CODES.includes(rest)) return [a, rest];
-    }
-  }
+  const known = splitKnownCodes(s, league);
+  if (known) return known;
   if (s.length === 6) return [s.slice(0, 3), s.slice(3)];
   if (s.length === 4) return [s.slice(0, 2), s.slice(2)];
   return null;
