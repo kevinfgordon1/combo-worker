@@ -422,6 +422,113 @@ const texLaaRfq = {
 assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(texLaaRfq), [texLaaLock]), true);
 assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(pmRfq), [texLaaLock]), false);
 
+const oakAthLock = {
+  id: 'oak-ath-lock',
+  user_id: 'u1',
+  label: 'Athletics ML + Angels ML',
+  parlay_stake: 100,
+  parlay_american: 400,
+  fill_american: 350,
+  hedge_mode: '1x',
+  max_contracts: 116,
+  leg_keys: [
+    'KXMLBGAME-26SEP031840OAKSEA-OAK:yes',
+    'KXMLBGAME-26SEP031840LAAPIT-LAA:yes',
+  ],
+  legs: [],
+};
+const athSeaRfq = {
+  id: 'rfq_ath_sea',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'aec-mlb-ath-sea-2026-09-03-ath', side: 'SIDE_BUY' },
+    { symbol: 'aec-mlb-laa-pit-2026-09-03-laa', side: 'SIDE_BUY' },
+  ],
+};
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(athSeaRfq), [oakAthLock]), true);
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(athSeaRfq), [texLaaLock]), false);
+
+// Production locks store current Kalshi ATH (not only legacy OAK).
+const athCurrentLock = {
+  ...oakAthLock,
+  id: 'ath-current-lock',
+  leg_keys: [
+    'KXMLBGAME-26SEP031840ATHSEA-ATH:yes',
+    'KXMLBGAME-26SEP031840LAAPIT-LAA:yes',
+  ],
+};
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(athSeaRfq), [athCurrentLock]), true);
+
+// One-team overlap is not enough: aec-mlb-tb-bos has `tb` but not `tex`.
+const tbBosLaaRfq = {
+  id: 'rfq_tb_bos_laa',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'aec-mlb-tb-bos-2026-09-03-tb', side: 'SIDE_BUY' },
+    { symbol: 'aec-mlb-laa-pit-2026-09-03-laa', side: 'SIDE_BUY' },
+  ],
+};
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(tbBosLaaRfq), [texLaaLock]), false);
+
+// astatc player props share mlb/date/ath-sea tokens and emit `-tb-` (total
+// bases). That must not look like a Rays ML lock, and real aec-mlb-tb-tex
+// RFQs must still match.
+const astatcPropRfq = {
+  id: 'rfq_astatc_tb',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'astatc-mlb-ath-sea-2026-09-03-tb-domcan-gte2', side: 'SIDE_BUY' },
+    { symbol: 'astatc-mlb-ath-sea-2026-09-03-h-foo-gte1', side: 'SIDE_BUY' },
+  ],
+};
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(astatcPropRfq), [texLaaLock]), false);
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(astatcPropRfq), [oakAthLock]), false);
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(texLaaRfq), [texLaaLock]), true);
+
+// 3-leg lock (ath-sea + tb-tex + bos-bal) matches only an exact 3-leg aec
+// ML RFQ — do not treat a 2-leg subset as a match.
+const threeLegLock = {
+  id: 'ath-tb-bos-lock',
+  user_id: 'u1',
+  label: 'Athletics ML + Rangers ML + Red Sox ML',
+  parlay_stake: 100,
+  parlay_american: 400,
+  fill_american: 350,
+  hedge_mode: '1x',
+  max_contracts: 116,
+  leg_keys: [
+    'KXMLBGAME-26SEP031840ATHSEA-ATH:yes',
+    'KXMLBGAME-26SEP031840TBTEX-TEX:yes',
+    'KXMLBGAME-26SEP031840BOSBAL-BOS:yes',
+  ],
+  legs: [],
+};
+const twoOfThreeRfq = {
+  id: 'rfq_ath_tb_only',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'aec-mlb-ath-sea-2026-09-03-ath', side: 'SIDE_BUY' },
+    { symbol: 'aec-mlb-tb-tex-2026-09-03-tex', side: 'SIDE_BUY' },
+  ],
+};
+const exactThreeRfq = {
+  id: 'rfq_ath_tb_bos',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'aec-mlb-ath-sea-2026-09-03-ath', side: 'SIDE_BUY' },
+    { symbol: 'aec-mlb-tb-tex-2026-09-03-tex', side: 'SIDE_BUY' },
+    { symbol: 'aec-mlb-bos-bal-2026-09-03-bos', side: 'SIDE_BUY' },
+  ],
+};
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(twoOfThreeRfq), [threeLegLock]), false);
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(exactThreeRfq), [threeLegLock]), true);
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(astatcPropRfq), [threeLegLock]), false);
+
 const identityFailLogs = [];
 assert.strictEqual(logActiveLockIdentityFails([kalshiParlay, texLaaLock], (m) => identityFailLogs.push(m)), 0);
 assert.deepStrictEqual(identityFailLogs, []);
