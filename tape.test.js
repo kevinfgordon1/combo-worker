@@ -148,6 +148,32 @@ assert.strictEqual(americanFromProb(0.6), -150);
   assert.strictEqual(r.tradeTs, Date.parse('2026-08-12T20:00:03Z'));
 }
 
+// open RFQ (closedMs null): same-price size pool → latest print, not pool[0]
+{
+  const early = '2026-09-02T03:11:00Z'; // Sep 2 11:11 PM ET
+  const late = '2026-09-03T18:30:00Z'; // Sep 3 ~2:30 PM ET
+  const earlyFirst = [
+    n({ count_fp: '10.00', no_price_dollars: '0.92', yes_price_dollars: '0.08', created_time: early, is_block_trade: true }),
+    n({ count_fp: '10.00', no_price_dollars: '0.92', yes_price_dollars: '0.08', created_time: late, is_block_trade: true }),
+  ];
+  const r = matchTapeTrades(earlyFirst, { rfqCount: 10, closedMs: null });
+  assert.strictEqual(r.match, 'matched');
+  assert.strictEqual(r.tradeTs, Date.parse(late));
+  const lateFirst = matchTapeTrades(earlyFirst.slice().reverse(), { rfqCount: 10, closedMs: null });
+  assert.strictEqual(lateFirst.tradeTs, Date.parse(late));
+}
+
+// closedMs proximity tie: later print wins
+{
+  const trades = [
+    n({ count_fp: '10.00', no_price_dollars: '0.92', yes_price_dollars: '0.08', created_time: '2026-08-12T19:59:50Z', is_block_trade: true }),
+    n({ count_fp: '10.00', no_price_dollars: '0.92', yes_price_dollars: '0.08', created_time: '2026-08-12T20:00:10Z', is_block_trade: true }),
+  ];
+  const r = matchTapeTrades(trades, { rfqCount: 10, closedMs: closed });
+  assert.strictEqual(r.match, 'matched');
+  assert.strictEqual(r.tradeTs, Date.parse('2026-08-12T20:00:10Z'));
+}
+
 // Telegram display: last 5 of Kalshi UUIDs; short/null stay as-is or '?'
 assert.strictEqual(shortId('aa8b3c36-c9ec-4d87-bb6d-6a4782b40c72'), '40c72');
 assert.strictEqual(shortId('abc'), 'abc');

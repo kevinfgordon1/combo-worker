@@ -1033,6 +1033,47 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(tapeReady.patch.status, 'filled');
     assert.strictEqual(tapeReady.patch.fill_yes_price, 0.19);
 
+    // Long-lived RFQ (no closedMs): early create-time print + later rematch → T2.
+    const tapeT1 = '2026-09-02T03:11:00.000Z';
+    const tapeT2 = '2026-09-03T18:30:00.000Z';
+    const openTape = await resolveUnhedgedFill({
+      venue: 'kalshi',
+      rfq_id: 'rfq-tape-open',
+      contracts: 10,
+      market_ticker: 'KXMVE-X',
+      createdMs: Date.parse(tapeT1),
+    }, {
+      now: Date.parse(tapeT2),
+      fetchRfq: async () => ({
+        id: 'rfq-tape-open',
+        status: 'closed',
+        created_ts: tapeT1,
+        market_ticker: 'KXMVE-X',
+        contracts: 10,
+      }),
+      fetchTrades: async () => [
+        {
+          count_fp: '10.00',
+          yes_price_dollars: '0.08',
+          no_price_dollars: '0.92',
+          created_time: tapeT1,
+          is_block_trade: true,
+        },
+        {
+          count_fp: '10.00',
+          yes_price_dollars: '0.08',
+          no_price_dollars: '0.92',
+          created_time: tapeT2,
+          is_block_trade: true,
+        },
+      ],
+    });
+    assert.strictEqual(openTape.retry, false);
+    assert.strictEqual(openTape.reason, 'tape');
+    assert.ok(openTape.patch);
+    assert.strictEqual(openTape.result.tradeTs, Date.parse(tapeT2));
+    assert.strictEqual(Date.parse(openTape.patch.filled_at), Date.parse(tapeT2));
+
     assert.strictEqual(considerUnhedgedFill({
       venue: 'kalshi',
       rfqId: 'rfq-open',
@@ -1256,7 +1297,7 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(startedFetched, 0);
     assert.strictEqual(startedPatches.length, 0);
 
-    // Existing restart/created stamp + later tape tradeTs → store the print.
+    // Later of next vs prev filled_at wins (not blindly next).
     const restartFilledAt = '2026-09-02T17:57:00.000Z'; // 1:57 PM ET
     const tapeFilledAt = '2026-09-02T18:28:00.000Z'; // 2:28 PM ET
     assert.deepStrictEqual(mergeUnhedgedFillPatch(
@@ -1269,6 +1310,11 @@ function pmRfq(id, symbols, extra = {}) {
       fill_american: -426,
       filled_at: tapeFilledAt,
     });
+    // Existing T2 + earlier patch T1 → keep T2.
+    assert.strictEqual(mergeUnhedgedFillPatch(
+      { filled_at: tapeFilledAt, fill_yes_price: 0.19, fill_no_price: 0.81, fill_american: -426 },
+      { filled_at: restartFilledAt, fill_yes_price: 0.19, fill_no_price: 0.81, fill_american: -426 }
+    ).filled_at, tapeFilledAt);
 
     // Patch without a timestamp keeps existing filled_at; null prices do not clobber.
     assert.deepStrictEqual(mergeUnhedgedFillPatch(
@@ -1321,6 +1367,19 @@ function pmRfq(id, symbols, extra = {}) {
     const afterTape = tapeOverRestartDb._rows.get('kalshi:rfq-second-fill');
     assert.strictEqual(afterTape.filled_at, tapeFilledAt);
     assert.strictEqual(afterTape.fill_yes_price, 0.19);
+
+    // Earlier rematch must not rewind an already-later filled_at.
+    const keepLater = await persistUnhedgedFill(tapeOverRestartDb, {
+      venue: 'kalshi',
+      rfq_id: 'rfq-second-fill',
+      status: 'filled',
+      fill_yes_price: 0.19,
+      fill_no_price: 0.81,
+      fill_american: -426,
+      filled_at: restartFilledAt,
+    });
+    assert.strictEqual(keepLater.ok, true);
+    assert.strictEqual(tapeOverRestartDb._rows.get('kalshi:rfq-second-fill').filled_at, tapeFilledAt);
 
     const keepExistingDb = createMemSupabase([{
       venue: 'kalshi',
