@@ -73,6 +73,14 @@ assert.ok(!isUnhedgedFillStatus('closed'));
   assert.ok(!skipSrc.includes('unhedged_rfqs'));
   const engineSrc = fs.readFileSync(path.join(__dirname, 'engine.js'), 'utf8');
   assert.ok(!engineSrc.includes('unhedged_rfqs'));
+  const liveSrc = fs.readFileSync(path.join(__dirname, 'live-runner.js'), 'utf8');
+  assert.ok(
+    /startPolymarketRfqLoop\(\{[\s\S]*unhedgedFills/.test(liveSrc),
+    'Poly loop must receive the shared unhedged fill tracker'
+  );
+  assert.ok(liveSrc.includes('fetchUnhedgedVenueRfq'));
+  assert.ok(liveSrc.includes('fetchUnhedgedVenueTrades'));
+  assert.ok(!/createUnhedgedFillTracker\(\{[\s\S]*fetchRfq:\s*fetchSkipRfq/.test(liveSrc));
 }
 
 const mlbCws = parseKalshiUnhedgedTicker('KXMLBGAME-26AUG141840CWSDET-CWS:yes');
@@ -114,7 +122,7 @@ function kalshiRfq(id, tickers, extra = {}) {
   });
 }
 
-function createMemSupabase(initRows = []) {
+function createMemSupabase(initRows = [], { rejectCols = [] } = {}) {
   const rows = new Map();
   for (const r of initRows) rows.set(`${r.venue}:${r.rfq_id}`, { ...r });
 
@@ -132,6 +140,16 @@ function createMemSupabase(initRows = []) {
   }
 
   function exec(state) {
+    if ((state.op === 'insert' || state.op === 'update') && rejectCols.length && state.payload) {
+      for (const col of rejectCols) {
+        if (Object.prototype.hasOwnProperty.call(state.payload, col)) {
+          return {
+            data: null,
+            error: { message: `Could not find the '${col}' column of 'unhedged_rfqs' in the schema cache` },
+          };
+        }
+      }
+    }
     if (state.op === 'insert') {
       const row = state.payload;
       const key = `${row.venue}:${row.rfq_id}`;
@@ -1122,6 +1140,125 @@ function pmRfq(id, symbols, extra = {}) {
     assert.notStrictEqual(tapeNoTs.patch.filled_at, new Date(tapeNoTsNow).toISOString());
     assert.strictEqual(Date.parse(tapeNoTs.patch.filled_at), Date.parse('2026-08-14T20:00:00Z'));
 
+    // Polymarket: event / RFQ fill — never Kalshi public tape.
+    const polyEvent = await resolveUnhedgedFill({
+      venue: 'polymarket',
+      rfq_id: 'rfq-poly-event',
+    }, {
+      extra: {
+        type: 'quoteAccepted',
+        rfq: { id: 'rfq-poly-event', status: 'RFQ_STATUS_FILLED', buyPrice: 0.27 },
+      },
+      fetchTrades: async () => { throw new Error('must not Kalshi-tape Poly'); },
+    });
+    assert.strictEqual(polyEvent.retry, false);
+    assert.strictEqual(polyEvent.reason, 'event');
+    assert.ok(polyEvent.patch);
+    assert.strictEqual(polyEvent.patch.venue, 'polymarket');
+    assert.strictEqual(polyEvent.patch.fill_yes_price, 0.27);
+
+    let polyTapeCalls = 0;
+    const polyRest = await resolveUnhedgedFill({
+      venue: 'polymarket',
+      rfq_id: 'rfq-poly-rest',
+      closedMs: padClosed,
+    }, {
+      now: padClosed + 1000,
+      fetchRfq: async (id, row) => {
+        assert.strictEqual(id, 'rfq-poly-rest');
+        assert.strictEqual(row.venue, 'polymarket');
+        return { id, status: 'RFQ_STATUS_FILLED', buyPrice: 0.31, sellPrice: 0.69 };
+      },
+      fetchTrades: async () => {
+        polyTapeCalls += 1;
+        throw new Error('must not Kalshi-tape Poly');
+      },
+    });
+    assert.strictEqual(polyRest.retry, false);
+    assert.strictEqual(polyRest.reason, 'rfq');
+    assert.ok(polyRest.patch);
+    assert.strictEqual(polyRest.patch.venue, 'polymarket');
+    assert.strictEqual(polyRest.patch.fill_yes_price, 0.31);
+    assert.strictEqual(polyTapeCalls, 0);
+
+    const polyClosed = await resolveUnhedgedFill({
+      venue: 'polymarket',
+      rfq_id: 'rfq-poly-closed',
+      closedMs: padClosed,
+      market_ticker: 'aec-mlb-cws-det-2026-08-14-cws',
+    }, {
+      now: padClosed + 45000,
+      fetchRfq: async () => ({ id: 'rfq-poly-closed', status: 'RFQ_STATUS_CLOSED' }),
+      fetchTrades: async () => {
+        polyTapeCalls += 1;
+        return [{
+          count_fp: '10.00',
+          yes_price_dollars: '0.19',
+          no_price_dollars: '0.81',
+          created_time: padClosed,
+          is_block_trade: true,
+        }];
+      },
+    });
+    assert.strictEqual(polyTapeCalls, 0, 'Poly must not use Kalshi tape');
+    assert.strictEqual(polyClosed.retry, false);
+    assert.strictEqual(polyClosed.patch, null);
+    assert.strictEqual(polyClosed.reason, 'not_filled');
+
+    const polyLogs = [];
+    const origFillLog = console.log;
+    console.log = (...args) => { polyLogs.push(args.map(String).join(' ')); };
+    try {
+      const polyFillRows = [];
+      const polyTracker = createUnhedgedFillTracker({
+        persist: async (row, meta) => { if (meta && meta.mode === 'fill') polyFillRows.push(row); },
+        fetchRfq: async (id, row) => {
+          assert.strictEqual(row.venue, 'polymarket');
+          return { id, status: 'RFQ_STATUS_FILLED', buyPrice: 0.31 };
+        },
+        fetchTrades: async () => { throw new Error('must not Kalshi-tape Poly'); },
+      });
+      polyTracker.remember({ venue: 'polymarket', rfq_id: 'rfq-poly-log', status: 'seen' });
+      const queuedPoly = await polyTracker.onClosed({
+        venue: 'polymarket',
+        rfqId: 'rfq-poly-log',
+        extra: { type: 'rfqClosed', rfq: { id: 'rfq-poly-log' } },
+        now: Date.parse('2026-08-14T20:06:00Z'),
+      });
+      assert.strictEqual(queuedPoly.reason, 'queued');
+      await polyTracker.tick(Date.parse('2026-08-14T20:07:00Z'));
+      assert.strictEqual(polyFillRows.length, 1);
+      assert.strictEqual(polyFillRows[0].venue, 'polymarket');
+      assert.ok(polyLogs.some((l) => /\[UNHEDGED\] filled polymarket rfq=rfq-poly-log/.test(l)));
+    } finally {
+      console.log = origFillLog;
+    }
+
+    // Kalshi tape path is unchanged (still matches after pad).
+    const kalshiStillTape = await resolveUnhedgedFill({
+      venue: 'kalshi',
+      rfq_id: 'rfq-tape-still',
+      contracts: 10,
+      market_ticker: 'KXMVE-X',
+      closedMs: padClosed,
+    }, {
+      now: padClosed + 45000,
+      fetchRfq: async () => ({ id: 'rfq-tape-still', status: 'closed', updated_ts: padClosed, market_ticker: 'KXMVE-X', contracts: 10 }),
+      fetchTrades: async (ticker, minTs, maxTs, row) => {
+        assert.strictEqual(row.venue, 'kalshi');
+        assert.strictEqual(ticker, 'KXMVE-X');
+        return [{
+          count_fp: '10.00',
+          yes_price_dollars: '0.19',
+          no_price_dollars: '0.81',
+          created_time: padClosed,
+          is_block_trade: true,
+        }];
+      },
+    });
+    assert.strictEqual(kalshiStillTape.reason, 'tape');
+    assert.strictEqual(kalshiStillTape.patch.fill_yes_price, 0.19);
+
     // Filled row is not overwritten back to seen on WS re-see; odds may refresh.
     const keepFilledDb = createMemSupabase([{
       venue: 'kalshi',
@@ -1405,6 +1542,57 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(keptExisting.fill_yes_price, 0.22);
     assert.strictEqual(keptExisting.fill_no_price, 0.78);
     assert.strictEqual(keptExisting.fill_american, -355);
+
+    // Fill UPDATE stamps updated_at = ISO now; filled_at stays the venue/tape ts.
+    const fillNow = Date.parse('2026-09-03T21:00:00Z');
+    const todayFill = considerUnhedgedFill({
+      venue: 'kalshi',
+      rfqId: 'rfq-today-updated',
+      extra: { status: 'filled', yes_price: 0.22, filled_at: restartFilledAt },
+      now: fillNow,
+      known: true,
+    });
+    assert.strictEqual(todayFill.persist, true);
+    assert.strictEqual(todayFill.row.filled_at, restartFilledAt);
+    assert.strictEqual(todayFill.row.updated_at, new Date(fillNow).toISOString());
+    assert.notStrictEqual(todayFill.row.updated_at, todayFill.row.filled_at);
+
+    const staleSeenDb = createMemSupabase([{
+      venue: 'kalshi',
+      rfq_id: 'rfq-stale-seen',
+      status: 'seen',
+      created_at: restartFilledAt,
+      filled_at: null,
+    }]);
+    const staleFill = await persistUnhedgedFill(staleSeenDb, {
+      venue: 'kalshi',
+      rfq_id: 'rfq-stale-seen',
+      status: 'filled',
+      fill_yes_price: 0.22,
+      filled_at: restartFilledAt,
+    }, { now: fillNow });
+    assert.strictEqual(staleFill.ok, true);
+    const stamped = staleSeenDb._rows.get('kalshi:rfq-stale-seen');
+    assert.strictEqual(stamped.filled_at, restartFilledAt);
+    assert.strictEqual(stamped.updated_at, new Date(fillNow).toISOString());
+
+    const noColDb = createMemSupabase([{
+      venue: 'kalshi',
+      rfq_id: 'rfq-no-updated-col',
+      status: 'seen',
+    }], { rejectCols: ['updated_at'] });
+    const degraded = await persistUnhedgedFill(noColDb, {
+      venue: 'kalshi',
+      rfq_id: 'rfq-no-updated-col',
+      status: 'filled',
+      fill_yes_price: 0.22,
+      filled_at: restartFilledAt,
+    }, { now: fillNow });
+    assert.strictEqual(degraded.ok, true);
+    const degradedRow = noColDb._rows.get('kalshi:rfq-no-updated-col');
+    assert.strictEqual(degradedRow.status, 'filled');
+    assert.strictEqual(degradedRow.fill_yes_price, 0.22);
+    assert.ok(!Object.prototype.hasOwnProperty.call(degradedRow, 'updated_at'));
 
     // seen/started persist is a 1-line count, not a log per RFQ. Filled stays per-row.
     {
