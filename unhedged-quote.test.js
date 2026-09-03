@@ -242,6 +242,21 @@ function lookup(_venue, key) {
   );
 }
 
+// Kevin 2026-09-03: NFL taker on the ASK, not mid. SEA 0.63 → −183; NE 0.39 → +146 (~+145).
+// Mid (0.625 / 0.385) → −179 / +149 — wrong vs the live book.
+{
+  const seaAsk = feeIncludedAmerican(0.63, KALSHI_TAKER_THETA);
+  const neAsk = feeIncludedAmerican(0.39, KALSHI_TAKER_THETA);
+  const seaMid = feeIncludedAmerican(0.625, KALSHI_TAKER_THETA);
+  const neMid = feeIncludedAmerican(0.385, KALSHI_TAKER_THETA);
+  assert.strictEqual(seaAsk, -183);
+  assert.ok(neAsk === 145 || neAsk === 146, `NE ask American ${neAsk} not +145/+146`);
+  assert.strictEqual(seaMid, -179);
+  assert.strictEqual(neMid, 149);
+  assert.notStrictEqual(seaAsk, seaMid);
+  assert.notStrictEqual(neAsk, neMid);
+}
+
 // Invert is sign-flip of fee-included opponent American. +118 → -118, not -114.
 {
   assert.strictEqual(invertAmerican(118), -118);

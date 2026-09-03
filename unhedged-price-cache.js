@@ -15,9 +15,10 @@
 //
 // Fair lookups use the *opponent* YES (other ticker in the same Kalshi event;
 // other team's Poly YES in the same game). Hitting that ask is taker:
-// convert raw YES with the series taker coeff (MLB 0.035, NFL 0.07,
-// Poly 0.06, no rebate). ourTrue is the sign-flip of the best Kalshi/Poly
-// fee-included opponent American. Same-side last is never fair.
+// store the opponent ASK (not bid/ask mid), then convert with the series
+// taker coeff (MLB 0.035, NFL 0.07, Poly 0.06, no rebate). ourTrue is the
+// sign-flip of the best Kalshi/Poly fee-included opponent American.
+// Same-side last is never fair. Combo Locks quoting does not use this helper.
 'use strict';
 
 const {
@@ -62,24 +63,35 @@ function amountValue(q) {
   return asProb(q);
 }
 
-function pickYesProb(bid, ask, last, extras) {
-  const b = asProb(bid);
-  const a = asProb(ask);
-  if (b != null && a != null) return (b + a) / 2;
-  if (b != null) return b;
-  if (a != null) return a;
-  const l = asProb(last);
-  if (l != null) return l;
-  for (const x of extras || []) {
+function firstYesProb(values) {
+  for (const x of values || []) {
     const p = asProb(x);
     if (p != null) return p;
   }
   return null;
 }
 
+// Mid of bid+ask. Not used for unhedged opponent / fair quotes (those hit
+// the ask). Kept so a later maker-side reader can average without sharing
+// pickYesAskProb.
+function pickYesProb(bid, ask, last, extras) {
+  const b = asProb(bid);
+  const a = asProb(ask);
+  if (b != null && a != null) return (b + a) / 2;
+  if (b != null) return b;
+  if (a != null) return a;
+  return firstYesProb([last, ...(extras || [])]);
+}
+
+// Opponent YES: hitting the posted ask is taker. Prefer ask, then bid, then
+// last, then extras. Never (bid+ask)/2 — mid is the wrong Kevin American.
+function pickYesAskProb(bid, ask, last, extras) {
+  return firstYesProb([ask, bid, last, ...(extras || [])]);
+}
+
 function kalshiYesProb(market) {
   if (!market || typeof market !== 'object') return null;
-  return pickYesProb(
+  return pickYesAskProb(
     market.yes_bid_dollars != null ? market.yes_bid_dollars : market.yes_bid,
     market.yes_ask_dollars != null ? market.yes_ask_dollars : market.yes_ask,
     market.last_price_dollars != null ? market.last_price_dollars : market.last_price
@@ -115,7 +127,7 @@ function pmYesProb(market) {
   const longSide = sides.find((s) => s && s.long === true);
   const outcomes = parseOutcomePrices(market.outcomePrices);
   const prices = market.prices && typeof market.prices === 'object' ? market.prices : {};
-  return pickYesProb(
+  return pickYesAskProb(
     amountValue(market.bestBidQuote) != null ? amountValue(market.bestBidQuote) : (market.bestBid != null ? market.bestBid : prices.bestBid),
     amountValue(market.bestAskQuote) != null ? amountValue(market.bestAskQuote) : (market.bestAsk != null ? market.bestAsk : prices.bestAsk),
     market.lastTradePrice != null ? market.lastTradePrice : prices.lastTradePrice,
@@ -134,7 +146,7 @@ function sideTeamCode(side) {
 
 function sideYesProb(side) {
   if (!side || typeof side !== 'object') return null;
-  return pickYesProb(
+  return pickYesAskProb(
     amountValue(side.bestBidQuote) != null ? amountValue(side.bestBidQuote) : (side.bestBid != null ? side.bestBid : side.bid),
     amountValue(side.bestAskQuote) != null ? amountValue(side.bestAskQuote) : (side.bestAsk != null ? side.bestAsk : side.ask),
     side.lastTradePrice != null ? side.lastTradePrice : side.last,
@@ -895,6 +907,8 @@ module.exports = {
   KALSHI_PAGE_LIMIT,
   mapLimit,
   createUnhedgedPriceCache,
+  pickYesProb,
+  pickYesAskProb,
   kalshiYesProb,
   pmYesProb,
   isPmFullGameMl,

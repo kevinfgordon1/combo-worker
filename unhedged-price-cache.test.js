@@ -4,6 +4,8 @@ const fs = require('fs');
 const path = require('path');
 const {
   createUnhedgedPriceCache,
+  pickYesProb,
+  pickYesAskProb,
   kalshiYesProb,
   pmYesProb,
   pmTeamYesProbs,
@@ -24,16 +26,35 @@ const {
   ourTrueProb,
   annotateLegOdds,
   KALSHI_MLB_TAKER_THETA,
+  KALSHI_TAKER_THETA,
   POLY_TAKER_THETA,
 } = require('./unhedged-quote');
 const { americanFromProb } = require('./engine');
 
+// Mid helper still averages when both sides exist — opponent path must not.
+assert.strictEqual(pickYesProb(0.38, 0.39), 0.385);
+assert.strictEqual(pickYesProb(0.62, 0.63), 0.625);
+assert.strictEqual(pickYesAskProb(0.38, 0.39), 0.39);
+assert.strictEqual(pickYesAskProb(0.62, 0.63), 0.63);
+assert.strictEqual(pickYesAskProb(0.38, null, 0.40), 0.38, 'ask missing → bid');
+assert.strictEqual(pickYesAskProb(null, null, 0.55), 0.55, 'ask+bid missing → last');
+assert.notStrictEqual(pickYesAskProb(0.38, 0.39), pickYesProb(0.38, 0.39));
+
 assert.strictEqual(kalshiYesProb({
   yes_bid_dollars: '0.40',
   yes_ask_dollars: '0.50',
-}), 0.45);
+}), 0.50, 'opponent ingest uses ask, not mid 0.45');
+assert.strictEqual(kalshiYesProb({
+  yes_bid_dollars: '0.38',
+  yes_ask_dollars: '0.39',
+}), 0.39);
+assert.strictEqual(kalshiYesProb({
+  yes_bid_dollars: '0.62',
+  yes_ask_dollars: '0.63',
+}), 0.63);
 assert.strictEqual(kalshiYesProb({ last_price: 55 }), 0.55);
 assert.strictEqual(kalshiYesProb({ last_price_dollars: '0.62' }), 0.62);
+assert.strictEqual(kalshiYesProb({ yes_bid_dollars: '0.38' }), 0.38);
 assert.strictEqual(kalshiYesProb({}), null);
 
 // Inverse of parsePmUnhedgedSlug: codes + both orders, never spoken names.
@@ -104,7 +125,7 @@ function twoOutcomeGame(slug, longTeam, shortTeam, longYes, shortYes, date = '20
 assert.strictEqual(pmYesProb({
   bestBidQuote: { value: '0.41', currency: 'USD' },
   bestAskQuote: { value: '0.43', currency: 'USD' },
-}), 0.42);
+}), 0.43, 'Poly opponent YES uses ask, not mid 0.42');
 assert.strictEqual(pmYesProb({
   marketSides: [{ long: true, price: '0.61' }],
 }), 0.61);
@@ -168,7 +189,7 @@ cache.ingestKalshiMarkets([
   { ticker: 'KXNFLGAME-26SEP071330BUFKC-KC', yes_bid_dollars: '0.48', yes_ask_dollars: '0.52' },
   { ticker: 'KXNBAGAME-26JAN01NYKBOS-NYK', yes_bid_dollars: '0.60', yes_ask_dollars: '0.62' },
 ]);
-assert.strictEqual(cache.getYesProb('kalshi', 'KXNFLGAME-26SEP071330BUFKC-KC'), 0.50);
+assert.strictEqual(cache.getYesProb('kalshi', 'KXNFLGAME-26SEP071330BUFKC-KC'), 0.52);
 assert.strictEqual(cache.getYesProb('kalshi', 'KXNBAGAME-26JAN01NYKBOS-NYK'), null, 'non-ML series ignored');
 
 let kalshiCalls = 0;
@@ -335,6 +356,135 @@ return live.refresh().then(async () => {
   });
   assert.strictEqual(americanFromProb(kcOur), -114);
   assert.notStrictEqual(americanFromProb(kcOur), -118);
+
+  // Kevin 2026-09-03: KXNFLGAME-26SEP09NESEA — opponent ASK, not mid.
+  // Live book: NE YES 0.38/0.39, SEA YES 0.62/0.63. NFL θ=0.07.
+  // SEA ask → −183; NE ask → +145/+146. Mid would be −179 / +149.
+  {
+    const neSea = createUnhedgedPriceCache();
+    neSea.ingestKalshiMarkets([
+      {
+        ticker: 'KXNFLGAME-26SEP09NESEA-NE',
+        event_ticker: 'KXNFLGAME-26SEP09NESEA',
+        yes_bid_dollars: '0.38',
+        yes_ask_dollars: '0.39',
+      },
+      {
+        ticker: 'KXNFLGAME-26SEP09NESEA-SEA',
+        event_ticker: 'KXNFLGAME-26SEP09NESEA',
+        yes_bid_dollars: '0.62',
+        yes_ask_dollars: '0.63',
+      },
+    ]);
+    assert.strictEqual(neSea.getYesProb('kalshi', 'KXNFLGAME-26SEP09NESEA-NE'), 0.39);
+    assert.strictEqual(neSea.getYesProb('kalshi', 'KXNFLGAME-26SEP09NESEA-SEA'), 0.63);
+    assert.notStrictEqual(neSea.getYesProb('kalshi', 'KXNFLGAME-26SEP09NESEA-NE'), 0.385);
+    assert.notStrictEqual(neSea.getYesProb('kalshi', 'KXNFLGAME-26SEP09NESEA-SEA'), 0.625);
+
+    const neLeg = {
+      ticker: 'KXNFLGAME-26SEP09NESEA-NE',
+      league: 'nfl',
+      selection: 'ne',
+      teams: ['ne', 'sea'],
+      date: '2026-09-09',
+      side: 'yes',
+    };
+    const seaLeg = {
+      ticker: 'KXNFLGAME-26SEP09NESEA-SEA',
+      league: 'nfl',
+      selection: 'sea',
+      teams: ['ne', 'sea'],
+      date: '2026-09-09',
+      side: 'yes',
+    };
+    const neQuotes = neSea.opponentQuotes(neLeg);
+    const seaQuotes = neSea.opponentQuotes(seaLeg);
+    assert.ok(neQuotes.some((q) => q.venue === 'kalshi' && q.yesProb === 0.63 && q.theta === 0.07));
+    assert.ok(seaQuotes.some((q) => q.venue === 'kalshi' && q.yesProb === 0.39 && q.theta === 0.07));
+    assert.ok(!neQuotes.some((q) => q.yesProb === 0.625 || q.yesProb === 0.385));
+    assert.ok(!seaQuotes.some((q) => q.yesProb === 0.625 || q.yesProb === 0.385));
+
+    const neOdds = annotateLegOdds(neLeg, neQuotes);
+    const seaOdds = annotateLegOdds(seaLeg, seaQuotes);
+    const neAskAm = feeIncludedAmerican(0.39, KALSHI_TAKER_THETA);
+    const seaAskAm = feeIncludedAmerican(0.63, KALSHI_TAKER_THETA);
+    const neMidAm = feeIncludedAmerican(0.385, KALSHI_TAKER_THETA);
+    const seaMidAm = feeIncludedAmerican(0.625, KALSHI_TAKER_THETA);
+    assert.strictEqual(seaAskAm, -183);
+    assert.ok(neAskAm === 145 || neAskAm === 146, `NE ask American ${neAskAm} not +145/+146`);
+    assert.strictEqual(neOdds.kalshi_opponent_american, -183);
+    assert.strictEqual(seaOdds.kalshi_opponent_american, neAskAm);
+    assert.notStrictEqual(neOdds.kalshi_opponent_american, seaMidAm);
+    assert.notStrictEqual(seaOdds.kalshi_opponent_american, neMidAm);
+    assert.strictEqual(neOdds.fair_american, invertAmerican(neOdds.kalshi_opponent_american));
+    assert.strictEqual(seaOdds.fair_american, invertAmerican(seaOdds.kalshi_opponent_american));
+    neSea.stop();
+  }
+
+  // Poly opponent YES is also the ask (not mid), same NE/SEA book.
+  {
+    const polyNeSea = createUnhedgedPriceCache();
+    const polyGame = {
+      slug: 'aec-nfl-ne-sea-2026-09-09',
+      metadata: {
+        market_sport_type: 'football_team_full_game_winner',
+        event_start_time: '2026-09-09T00:15:00Z',
+        long_participant_id: 'nfl-ne',
+        short_participant_id: 'nfl-sea',
+      },
+      marketSides: [
+        {
+          long: true,
+          team: { abbreviation: 'NE', league: 'nfl' },
+          bestBid: '0.38',
+          bestAsk: '0.39',
+          price: '0.385',
+        },
+        {
+          long: false,
+          team: { abbreviation: 'SEA', league: 'nfl' },
+          bestBid: '0.62',
+          bestAsk: '0.63',
+          price: '0.625',
+        },
+      ],
+      outcomePrices: '["0.385","0.625"]',
+    };
+    const teamRows = pmTeamYesProbs(polyGame, 'aec-nfl-ne-sea-2026-09-09');
+    assert.strictEqual(teamRows.find((r) => r.team === 'ne').yesProb, 0.39);
+    assert.strictEqual(teamRows.find((r) => r.team === 'sea').yesProb, 0.63);
+    assert.ok(polyNeSea.ingestPmMarket('aec-nfl-ne-sea-2026-09-09', polyGame));
+    assert.strictEqual(polyNeSea.getYesProb('polymarket', 'aec-nfl-ne-sea-2026-09-09-ne'), 0.39);
+    assert.strictEqual(polyNeSea.getYesProb('polymarket', 'aec-nfl-ne-sea-2026-09-09-sea'), 0.63);
+
+    const neLeg = {
+      symbol: 'aec-nfl-ne-sea-2026-09-09-ne',
+      league: 'nfl',
+      selection: 'ne',
+      teams: ['ne', 'sea'],
+      date: '2026-09-09',
+      side: 'yes',
+    };
+    const seaLeg = {
+      symbol: 'aec-nfl-ne-sea-2026-09-09-sea',
+      league: 'nfl',
+      selection: 'sea',
+      teams: ['ne', 'sea'],
+      date: '2026-09-09',
+      side: 'yes',
+    };
+    const neOdds = annotateLegOdds(neLeg, polyNeSea.opponentQuotes(neLeg));
+    const seaOdds = annotateLegOdds(seaLeg, polyNeSea.opponentQuotes(seaLeg));
+    const seaAskAm = feeIncludedAmerican(0.63, POLY_TAKER_THETA);
+    const neAskAm = feeIncludedAmerican(0.39, POLY_TAKER_THETA);
+    const seaMidAm = feeIncludedAmerican(0.625, POLY_TAKER_THETA);
+    const neMidAm = feeIncludedAmerican(0.385, POLY_TAKER_THETA);
+    assert.strictEqual(neOdds.poly_opponent_american, seaAskAm);
+    assert.strictEqual(seaOdds.poly_opponent_american, neAskAm);
+    assert.notStrictEqual(neOdds.poly_opponent_american, seaMidAm);
+    assert.notStrictEqual(seaOdds.poly_opponent_american, neMidAm);
+    polyNeSea.stop();
+  }
 
   // Ingest by event_ticker pairs the other Kalshi ticker.
   const eventCache = createUnhedgedPriceCache();
