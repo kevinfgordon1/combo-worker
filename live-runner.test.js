@@ -80,5 +80,14 @@ assert.ok(
   /combo_submissions'\)\.insert\(\{[\s\S]*venue:\s*'kalshi'/.test(shadowSrc),
   'shadow-runner Combo Locks inserts must stamp venue kalshi'
 );
+assert.ok(
+  liveSrc.includes('fetchPolymarketUnhedgedRfq'),
+  'shared tracker Poly fetchRfq must call fetchPolymarketUnhedgedRfq, not wait for polyLoop'
+);
+assert.ok(!/polyLoop\.fetchUnhedgedRfq/.test(liveSrc));
+assert.ok(
+  /http:\s*polyUnhedgedHttp \|\| undefined/.test(liveSrc),
+  'quoting loop should reuse the same Poly HTTP the fill tracker already has'
+);
 
 console.log('live-runner.test.js ok');

@@ -713,6 +713,15 @@ const loopOff = startPolymarketRfqLoop({
   reconcileMs: 60 * 60 * 1000,
 });
 assert.strictEqual(loopOff.live, false);
+assert.strictEqual(typeof loopOff.fetchUnhedgedRfq, 'function');
+assert.strictEqual(typeof loopOff.fetchUnhedgedTrades, 'function');
+
+{
+  const skipped = startPolymarketRfqLoop({ env: {}, startWs: false });
+  assert.strictEqual(typeof skipped.fetchUnhedgedRfq, 'function');
+  assert.strictEqual(typeof skipped.fetchUnhedgedTrades, 'function');
+  skipped.stop();
+}
 
 Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.strictEqual(out.post, false);
@@ -1291,6 +1300,88 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   }, 'rfq_q');
   assert.ok(isUnhedgedFillStatus(fromAcceptedQuote.status));
   assert.strictEqual(fromAcceptedQuote.buyPrice, 0.33);
+
+  // Documented GET /v1/rfqs?rfqId= first. Do not treat list wrappers as an RFQ.
+  let getById = 0;
+  const fromListRfqs = await fetchPolymarketUnhedgedRfq({
+    async listRfqs(query) {
+      assert.strictEqual(query.rfqId, 'rfq_list_first');
+      return {
+        rfqs: [{
+          id: 'rfq_list_first',
+          status: 'RFQ_STATUS_CLOSED',
+          buyPrice: 0.24,
+          updatedTime: '2026-08-14T20:09:00Z',
+        }],
+      };
+    },
+    async request() { getById += 1; return { statusCode: 404, json: null }; },
+    async listQuotes() { return { quotes: [] }; },
+  }, 'rfq_list_first');
+  assert.strictEqual(getById, 0, 'listRfqs hit must skip GET /v1/rfqs/:id');
+  assert.ok(isUnhedgedFillStatus(fromListRfqs.status));
+  assert.strictEqual(fromListRfqs.buyPrice, 0.24);
+
+  // Unfiltered listQuotes is often ACTIVE-only after close; retry EXECUTED.
+  const quoteQueries = [];
+  const fromExecutedQuery = await fetchPolymarketUnhedgedRfq({
+    async listRfqs() {
+      return { rfqs: [{ id: 'rfq_exec_q', status: 'RFQ_STATUS_CLOSED' }] };
+    },
+    async listQuotes(query) {
+      quoteQueries.push(query);
+      if (query && query.status === 'QUOTE_STATUS_EXECUTED') {
+        return { quotes: [{ rfqId: 'rfq_exec_q', status: 'QUOTE_STATUS_EXECUTED', buyPrice: 0.41 }] };
+      }
+      return { quotes: [] };
+    },
+  }, 'rfq_exec_q');
+  assert.ok(quoteQueries.some((q) => q && q.rfqId === 'rfq_exec_q' && !q.status));
+  assert.ok(quoteQueries.some((q) => q && q.status === 'QUOTE_STATUS_EXECUTED'));
+  assert.ok(isUnhedgedFillStatus(fromExecutedQuery.status));
+  assert.strictEqual(fromExecutedQuery.buyPrice, 0.41);
+
+  const fromClosedPriced = await fetchPolymarketUnhedgedRfq({
+    async listRfqs() {
+      return { rfqs: [{ id: 'rfq_closed_px', status: 'RFQ_STATUS_CLOSED', buyPrice: 0.22, sellPrice: 0.78 }] };
+    },
+    async listQuotes() { return { quotes: [] }; },
+  }, 'rfq_closed_px');
+  assert.ok(isUnhedgedFillStatus(fromClosedPriced.status));
+  assert.strictEqual(fromClosedPriced.buyPrice, 0.22);
+
+  const closedAt = new Date().toISOString();
+  const fromLastTrade = await fetchPolymarketUnhedgedRfq({
+    async listRfqs() {
+      return {
+        rfqs: [{
+          id: 'rfq_last_px',
+          status: 'RFQ_STATUS_CLOSED',
+          symbol: 'aec-mlb-cws-det-2026-08-14-cws',
+          createdTime: new Date(Date.now() - 60000).toISOString(),
+          updatedTime: closedAt,
+        }],
+      };
+    },
+    async listQuotes() { return { quotes: [] }; },
+    async getMarketBbo(symbol) {
+      assert.strictEqual(symbol, 'aec-mlb-cws-det-2026-08-14-cws');
+      return { lastTradePx: { value: 0.37, ts: closedAt } };
+    },
+  }, 'rfq_last_px');
+  assert.ok(isUnhedgedFillStatus(fromLastTrade.status));
+  assert.strictEqual(fromLastTrade.buyPrice, 0.37);
+
+  const fromClosedEmpty = await fetchPolymarketUnhedgedRfq({
+    async listRfqs() {
+      return { rfqs: [{ id: 'rfq_closed_empty', status: 'RFQ_STATUS_CLOSED' }] };
+    },
+    async listQuotes() { return { quotes: [] }; },
+    async getMarketBbo() { return {}; },
+    async request() { return { statusCode: 404, json: null }; },
+  }, 'rfq_closed_empty');
+  assert.ok(fromClosedEmpty);
+  assert.ok(!isUnhedgedFillStatus(fromClosedEmpty.status), 'CLOSED without quote/trade is not a fill');
 
   const sharedSeen = [];
   const sharedFills = [];

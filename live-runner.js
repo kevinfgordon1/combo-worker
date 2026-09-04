@@ -26,7 +26,9 @@
 //   Lookups stay sync off the 4s in-memory cache. UNHEDGED_RFQ_LIVE stays off.
 //   Started/live RFQs (findStartedEvent) are a silent skip — no insert, no
 //   fill patch. One shared fill tracker owns Kalshi + Polymarket rows: Kalshi
-//   uses skip-RFQ + public tape; Poly uses RFQ/events (never Kalshi tape).
+//   uses skip-RFQ + public tape; Poly uses fetchPolymarketUnhedgedRfq /
+//   last-trade on a Poly HTTP client created before the quoting loop
+//   (never wait on polyLoop, never Kalshi tape).
 //   When a persisted pregame row later fills, UPDATE status=filled.
 //   NCAAF is out of scope.
 //
@@ -51,7 +53,12 @@ const {
   listStaleUnaccepted,
 } = require('./reserve');
 const { startHeartbeat } = require('./heartbeat');
-const { startPolymarketRfqLoop } = require('./polymarket-rfq');
+const {
+  startPolymarketRfqLoop,
+  fetchPolymarketUnhedgedRfq,
+  fetchPolymarketUnhedgedTrades,
+} = require('./polymarket-rfq');
+const { createPolymarketHttp } = require('./polymarket-client');
 const { shortId } = require('./short-id');
 const {
   classifySkip,
@@ -114,6 +121,9 @@ let sessionFilledByParlay = {};
 const pendingQuotes = new Map();
 const polyPendingQuotes = new Map();
 let polyLoop = null;
+// Poly fill GET/tape uses this client, created before the shared tracker.
+// Do not wait for startPolymarketRfqLoop — tracker + warmConnection run first.
+let polyUnhedgedHttp = null;
 let unhedgedPrices = null;
 
 function outstandingFor(parlayId, excludeQuoteId) {
@@ -660,19 +670,28 @@ async function fetchSkipTrades(ticker, minTs, maxTs) {
   return (json && json.trades) || [];
 }
 
+function createPolyUnhedgedHttp() {
+  const keyId = process.env.POLYMARKET_KEY_ID;
+  const secretKey = process.env.POLYMARKET_SECRET_KEY;
+  if (!keyId || !secretKey) return null;
+  return createPolymarketHttp({ keyId, secretKey });
+}
+
 // Venue-aware. Poly ids must never hit Kalshi skip-RFQ / public tape (404).
+// Bound to polyUnhedgedHttp — do not require the quoting loop to be up.
 async function fetchUnhedgedVenueRfq(rfqId, row) {
   if (row && row.venue === 'polymarket') {
-    if (polyLoop && typeof polyLoop.fetchUnhedgedRfq === 'function') {
-      return polyLoop.fetchUnhedgedRfq(rfqId);
-    }
-    return null;
+    if (!polyUnhedgedHttp) return null;
+    return fetchPolymarketUnhedgedRfq(polyUnhedgedHttp, rfqId);
   }
   return fetchSkipRfq(rfqId);
 }
 
 async function fetchUnhedgedVenueTrades(ticker, minTs, maxTs, row) {
-  if (row && row.venue === 'polymarket') return [];
+  if (row && row.venue === 'polymarket') {
+    if (!polyUnhedgedHttp) return [];
+    return fetchPolymarketUnhedgedTrades(polyUnhedgedHttp, ticker, minTs, maxTs, row);
+  }
   return fetchSkipTrades(ticker, minTs, maxTs);
 }
 
@@ -1207,6 +1226,7 @@ async function main() {
     reconcileSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape tick`, e.message));
   }, SKIP_TAPE_TICK_MS);
 
+  polyUnhedgedHttp = createPolyUnhedgedHttp();
   unhedgedFills = createUnhedgedFillTracker({
     supabase,
     env: process.env,
@@ -1241,6 +1261,7 @@ async function main() {
     env: process.env,
     unhedgedPrices,
     unhedgedFills,
+    http: polyUnhedgedHttp || undefined,
   });
   polyLoop = poly;
 
@@ -1259,6 +1280,7 @@ async function main() {
     client.stop();
     try { poly && poly.stop && poly.stop(); } catch (_) {}
     try { unhedgedPrices && unhedgedPrices.stop && unhedgedPrices.stop(); } catch (_) {}
+    try { polyUnhedgedHttp && polyUnhedgedHttp.close && polyUnhedgedHttp.close(); } catch (_) {}
     try { kalshiHttp.close(); } catch (_) {}
     console.log(`[${MODE}] final`, counts);
     process.exit(0);

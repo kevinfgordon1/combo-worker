@@ -126,7 +126,17 @@ function rfqFromEvent(obj) {
 function quoteFromEvent(obj) {
   if (!obj || typeof obj !== 'object') return null;
   if (obj.quote && typeof obj.quote === 'object') return obj.quote;
-  return obj;
+  // Do not treat a bare RFQ (rfqClosed/rfqCreated) as a quote. Quote
+  // payloads have rfqId / buyPrice / QUOTE_STATUS_* .
+  if (obj.rfq && typeof obj.rfq === 'object' && obj.buyPrice == null && !obj.rfqId) {
+    return null;
+  }
+  if (obj.status && /^RFQ_STATUS_/i.test(String(obj.status)) && !obj.rfqId && obj.buyPrice == null) {
+    return null;
+  }
+  if (obj.rfqId || obj.rfq_id || obj.buyPrice != null || obj.sellPrice != null) return obj;
+  if (obj.status && /^QUOTE_STATUS_/i.test(String(obj.status))) return obj;
+  return null;
 }
 
 function parsePrivateMessage(raw) {

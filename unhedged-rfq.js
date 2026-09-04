@@ -10,7 +10,8 @@
 // unhedged — do not record in-game RFQs even for paper/analytics.
 //
 // Fill-by-others: when an already-persisted pregame row's RFQ later fills
-// (Kalshi status filled/executed/accepted, or Polymarket confirm/fill), UPDATE
+// (Kalshi status filled/executed/accepted, or Polymarket CLOSED + accepted
+// quote / combo last-trade — there is no RFQ_STATUS_FILLED), UPDATE
 // that row to status=filled. Keep taker_* as the original RFQ. Do not insert
 // out-of-scope firehose just to count fills. No public-tape crawl of open RFQs.
 // If findStartedEvent says a leg started, do not fill-update (no status=filled,
@@ -1002,9 +1003,18 @@ async function maybePersistUnhedgedFill(opts = {}) {
   return considered;
 }
 
-function isFillLookupReady({ status, closedMs, now, padMs = FILL_TAPE_PAD_MS }) {
+function isClosedRfqStatus(status) {
+  return bareFillStatus(status) === 'closed';
+}
+
+function isFillLookupReady({ status, closedMs, now, padMs = FILL_TAPE_PAD_MS, venue }) {
   const s = bareFillStatus(status);
   if (s === 'open') return false;
+  // Polymarket RFQs are only OPEN/CLOSED — no public tape pad. CLOSED is
+  // ready immediately (quote list / combo last-trade), not after 45s.
+  if (venue === 'polymarket') {
+    return s === 'closed' || isUnhedgedFillStatus(status) || closedMs != null;
+  }
   if (closedMs != null && now < closedMs + padMs) return false;
   if (status == null && closedMs == null) return false;
   return true;
@@ -1070,17 +1080,74 @@ async function resolveUnhedgedFill(row, {
         reason: 'rfq',
       };
     }
+    // Poly has no RFQ_STATUS_FILLED. CLOSED + a visible fill price (from
+    // listQuotes / GET rfq / last-trade stamped onto the RFQ object) is a fill.
+    if (row.venue === 'polymarket' && isClosedRfqStatus(rfq.status)) {
+      const px = extractFillPrices(rfq);
+      if (px.yes != null || px.no != null) {
+        return {
+          retry: false,
+          patch: buildUnhedgedFillPatch({
+            filled: true,
+            yes: px.yes,
+            no: px.no,
+            american: px.american,
+            filledAt: extractFilledAt(rfq) || extractFilledAt(row) || null,
+          }, { venue: row.venue, rfqId: row.rfq_id }),
+          reason: 'rfq',
+        };
+      }
+    }
   }
 
   const closedMs = rfqClosedMsForFill(rfq) || row.closedMs || null;
   const status = (rfq && rfq.status) || (row.status !== 'seen' && row.status !== 'started' ? row.status : null);
-  if (!isFillLookupReady({ status, closedMs, now, padMs })) {
+  // Sweeped Poly rows that are still OPEN were never closed — do not retry.
+  if (row.venue === 'polymarket' && row.fromSweep && bareFillStatus(status) === 'open') {
+    return { retry: false, patch: null, reason: 'still_open' };
+  }
+  if (!isFillLookupReady({ status, closedMs, now, padMs, venue: row.venue })) {
     return { retry: true };
   }
 
-  // Kalshi public tape only. Polymarket retail RFQs resolve via event / RFQ
-  // GET (or a Poly-specific fetchTrades). Never hit Kalshi /markets/trades
-  // with a Poly ticker.
+  // Polymarket combo last-trade (never Kalshi /markets/trades). Kalshi public
+  // tape stays on the count-matched path below.
+  if (typeof fetchTrades === 'function' && row.venue === 'polymarket') {
+    const ticker = tickerOfFillRfq(rfq, row) || row.symbol || null;
+    if (ticker) {
+      let trades;
+      try {
+        trades = await fetchTrades(ticker, null, null, {
+          ...row,
+          rfq: rfq || row.rfq,
+          symbol: ticker,
+        });
+      } catch (e) {
+        return { retry: true, error: e };
+      }
+      const hit = (trades || []).find((t) => t && (
+        t.yesPrice != null || t.buyPrice != null || t.px != null
+        || t.noPrice != null || t.sellPrice != null
+      ));
+      if (hit) {
+        const yes = numOrNull(hit.yesPrice != null ? hit.yesPrice : (hit.buyPrice != null ? hit.buyPrice : hit.px));
+        const no = numOrNull(hit.noPrice != null ? hit.noPrice : hit.sellPrice);
+        const american = yes != null && yes > 0 && yes < 1 ? americanFromProb(yes) : null;
+        const filledAt = extractFilledAt(hit) || extractFilledAt(rfq) || extractFilledAt(row) || null;
+        return {
+          retry: false,
+          patch: buildUnhedgedFillPatch(
+            { filled: true, yes, no, american, filledAt },
+            { venue: row.venue, rfqId: row.rfq_id }
+          ),
+          reason: 'tape',
+        };
+      }
+    }
+    return { retry: false, patch: null, reason: 'not_filled' };
+  }
+
+  // Kalshi public tape only. Never hit Kalshi /markets/trades with a Poly ticker.
   if (typeof fetchTrades === 'function' && row.venue !== 'polymarket') {
     const ticker = tickerOfFillRfq(rfq, row);
     if (ticker) {
@@ -1140,9 +1207,10 @@ function createUnhedgedFillTracker(opts = {}) {
   async function hydrateOpen() {
     const { data, error } = await opts.supabase
       .from('unhedged_rfqs')
-      .select('venue,rfq_id,status,contracts')
+      .select('venue,rfq_id,status,contracts,market_ticker,created_at')
       .eq('status', 'seen')
-      .limit(500);
+      .order('created_at', { ascending: false })
+      .limit(2000);
     if (error) {
       console.error('[UNHEDGED] fill hydrate failed', error.message);
       return;
@@ -1185,7 +1253,7 @@ function createUnhedgedFillTracker(opts = {}) {
     if (opts.supabase) await persistUnhedgedFill(opts.supabase, patch);
   }
 
-  async function onClosed({ venue, rfqId, extra, rfq, now } = {}) {
+  async function onClosed({ venue, rfqId, extra, rfq, now, symbol } = {}) {
     if (!isUnhedgedRfqShadow(env || opts.env)) return fail('flag_off');
     if (!rfqId || (venue !== 'kalshi' && venue !== 'polymarket')) return fail('bad_rfq');
     if (isUnhedgedStarted(rfq, extra, now)) return fail('game_started');
@@ -1210,12 +1278,56 @@ function createUnhedgedFillTracker(opts = {}) {
       rfq,
       closedMs: now != null ? now : Date.now(),
       contracts: rfq && (rfq.contracts != null ? rfq.contracts : rfq.contracts_fp),
-      market_ticker: rfq && (rfq.market_ticker || rfq.ticker || rfq.symbol),
+      market_ticker: symbol
+        || (rfq && (rfq.market_ticker || rfq.ticker || rfq.symbol))
+        || null,
+      symbol: symbol
+        || (rfq && (rfq.symbol || rfq.ticker || rfq.market_ticker))
+        || null,
     });
     return { persist: false, reason: 'queued', status: null, row: null };
   }
 
+  let lastPolySweepMs = 0;
+
+  async function sweepRecentPolymarket(now) {
+    if (!opts.supabase || typeof opts.supabase.from !== 'function') return;
+    if (pending.size >= 80) return;
+    if (lastPolySweepMs && now - lastPolySweepMs < 60000) return;
+    lastPolySweepMs = now;
+    const since = new Date(now - 2 * 60 * 60 * 1000).toISOString();
+    try {
+      const { data, error } = await opts.supabase
+        .from('unhedged_rfqs')
+        .select('rfq_id,venue,status,contracts,market_ticker,created_at')
+        .eq('venue', 'polymarket')
+        .eq('status', 'seen')
+        .gte('created_at', since)
+        .order('created_at', { ascending: false })
+        .limit(40);
+      if (error) return;
+      for (const r of data || []) {
+        if (!r || !r.rfq_id) continue;
+        const key = knownKey('polymarket', r.rfq_id);
+        if (filled.has(key) || pending.has(key)) continue;
+        remember(r);
+        pending.set(key, {
+          venue: 'polymarket',
+          rfq_id: r.rfq_id,
+          extra: {},
+          rfq: { ...r, rfq_id: r.rfq_id },
+          closedMs: now - FILL_TAPE_PAD_MS,
+          contracts: Number(r.contracts) || 0,
+          market_ticker: r.market_ticker,
+          symbol: r.market_ticker,
+          fromSweep: true,
+        });
+      }
+    } catch (_) { /* ignore sweep errors */ }
+  }
+
   async function tick(now = Date.now()) {
+    await sweepRecentPolymarket(now);
     if (!pending.size) return;
     const fetchRfq = opts.fetchRfq;
     const fetchTrades = opts.fetchTrades;

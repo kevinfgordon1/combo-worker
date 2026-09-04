@@ -586,6 +586,17 @@ async function hydrateRfq(http, raw) {
   return rfq;
 }
 
+const PM_QUOTE_FILL_STATUSES = [
+  'QUOTE_STATUS_EXECUTED',
+  'QUOTE_STATUS_CONFIRMED',
+  'QUOTE_STATUS_ACCEPTED',
+];
+
+function isPmRfqClosed(status) {
+  const s = String(status == null ? '' : status).trim().toLowerCase().replace(/-/g, '_');
+  return s === 'closed' || s === 'rfq_status_closed';
+}
+
 function pickPolymarketRfqRow(rows, rfqId) {
   const list = Array.isArray(rows) ? rows : [];
   const matches = list.filter((x) => {
@@ -594,7 +605,9 @@ function pickPolymarketRfqRow(rows, rfqId) {
     return id == null || String(id) === String(rfqId);
   });
   const pool = matches.length ? matches : list;
-  return pool.find((x) => x && isUnhedgedFillStatus(x.status)) || pool[0] || null;
+  return pool.find((x) => x && (isUnhedgedFillStatus(x.status) || isPmRfqClosed(x.status)))
+    || pool[0]
+    || null;
 }
 
 function pickPmFillPrice(src, keys) {
@@ -614,15 +627,18 @@ function pickPmFilledAt(src) {
 }
 
 // Object extractUnhedgedFill can read as filled (status + buyPrice/sellPrice/filled_at).
+// Polymarket RFQs are only OPEN/CLOSED — there is no RFQ_STATUS_FILLED.
+// A closed RFQ that others filled is stamped via an accepted/confirmed/executed
+// quote (when visible) or a combo last-trade in the RFQ window.
 function polyUnhedgedFillObject(rfqId, rfq, quote) {
-  const buy = pickPmFillPrice(quote, ['buyPrice', 'buy_price', 'price', 'yesPrice', 'yes_price'])
-    ?? pickPmFillPrice(rfq, ['buyPrice', 'buy_price', 'yesPrice', 'yes_price']);
+  const buy = pickPmFillPrice(quote, ['buyPrice', 'buy_price', 'price', 'yesPrice', 'yes_price', 'px'])
+    ?? pickPmFillPrice(rfq, ['buyPrice', 'buy_price', 'yesPrice', 'yes_price', 'px']);
   const sell = pickPmFillPrice(quote, ['sellPrice', 'sell_price', 'noPrice', 'no_price'])
     ?? pickPmFillPrice(rfq, ['sellPrice', 'sell_price', 'noPrice', 'no_price']);
   const filledAt = pickPmFilledAt(quote) || pickPmFilledAt(rfq) || null;
-  const status = (rfq && isUnhedgedFillStatus(rfq.status) && rfq.status)
-    || (quote && isUnhedgedFillStatus(quote.status) && quote.status)
-    || 'RFQ_STATUS_FILLED';
+  const status = (quote && isUnhedgedFillStatus(quote.status) && quote.status)
+    || (rfq && isUnhedgedFillStatus(rfq.status) && rfq.status)
+    || 'QUOTE_STATUS_EXECUTED';
   return {
     ...(rfq || {}),
     id: rfqId,
@@ -634,26 +650,124 @@ function polyUnhedgedFillObject(rfqId, rfq, quote) {
   };
 }
 
+function quotesFromListed(listed) {
+  if (!listed || typeof listed !== 'object') return [];
+  const rows = listed.quotes || listed.data;
+  return Array.isArray(rows) ? rows : [];
+}
+
+// Unfiltered GET often returns only ACTIVE quotes (empty after close).
+// Retry terminal statuses. As a non-requester we may still see nothing —
+// that is a venue visibility rule, not a skip of the lookup.
+async function listPolymarketFillQuotes(http, rfqId) {
+  if (!http || typeof http.listQuotes !== 'function' || rfqId == null || rfqId === '') {
+    return [];
+  }
+  const queries = [
+    { rfqId },
+    ...PM_QUOTE_FILL_STATUSES.map((status) => ({ rfqId, status })),
+  ];
+  const found = [];
+  for (const query of queries) {
+    try {
+      const quotes = quotesFromListed(await http.listQuotes(query));
+      for (const q of quotes) {
+        if (q && isUnhedgedFillStatus(q.status)) found.push(q);
+      }
+      if (found.length) return found;
+    } catch (_) {}
+  }
+  return found;
+}
+
+function pickPmLastTrade(body) {
+  const src = (body && (body.marketData || body.market || body)) || {};
+  const last = src.lastTradePx || src.last_trade_px || src.lastPriceSample || src.last_price_sample;
+  let px = null;
+  let ts = null;
+  if (last && typeof last === 'object') {
+    px = last.value != null ? last.value
+      : (last.longPx && last.longPx.value != null ? last.longPx.value : last.px);
+    ts = last.ts || last.tradeTime || last.transactTime || last.updatedTime || null;
+  } else if (last != null && last !== '') {
+    px = last;
+  }
+  if (px == null) px = src.lastTradePx || src.currentPx || null;
+  if (px && typeof px === 'object') px = px.value;
+  return { px, ts };
+}
+
+function pmTradeInRfqWindow(trade, rfq) {
+  if (!trade || trade.px == null) return false;
+  const tradeMs = trade.ts != null && trade.ts !== '' ? Date.parse(trade.ts) : NaN;
+  const createdMs = parseTsish(rfq && (rfq.createdTime || rfq.created_time || rfq.created_ts));
+  const updatedMs = parseTsish(rfq && (rfq.updatedTime || rfq.updated_time || rfq.updated_ts));
+  if (Number.isFinite(tradeMs)) {
+    if (Number.isFinite(createdMs) && tradeMs < createdMs - 2000) return false;
+    if (Number.isFinite(updatedMs) && tradeMs > updatedMs + 60000) return false;
+    return true;
+  }
+  // No trade ts: only trust lastTradePx when the RFQ just closed (this tick).
+  return Number.isFinite(updatedMs) && (Date.now() - updatedMs) < 5 * 60 * 1000;
+}
+
+function parseTsish(v) {
+  if (v == null || v === '') return NaN;
+  if (typeof v === 'number') return v < 1e12 ? v * 1000 : v;
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? t : NaN;
+}
+
+async function fetchPolymarketComboLastTrade(http, symbol) {
+  if (!http || !symbol) return null;
+  if (typeof http.getMarketBbo === 'function') {
+    try {
+      const trade = pickPmLastTrade(await http.getMarketBbo(symbol));
+      if (trade && trade.px != null) return { ...trade, symbol };
+    } catch (_) {}
+  }
+  if (typeof http.request !== 'function') return null;
+  const paths = [
+    `/v1/markets/${encodeURIComponent(symbol)}/bbo`,
+    `/v1/market/slug/${encodeURIComponent(symbol)}`,
+  ];
+  for (const path of paths) {
+    try {
+      const res = await http.request('GET', path);
+      if (!res || res.statusCode === 404 || !(res.statusCode < 400)) continue;
+      const trade = pickPmLastTrade(res.json);
+      if (trade && trade.px != null) return { ...trade, symbol };
+    } catch (_) {}
+  }
+  return null;
+}
+
+async function fetchPolymarketUnhedgedTrades(http, symbol, _minTs, _maxTs, row) {
+  const rfq = row && (row.rfq || row);
+  const slug = symbol || (rfq && (rfq.symbol || rfq.ticker || rfq.market_ticker)) || null;
+  const trade = await fetchPolymarketComboLastTrade(http, slug);
+  if (!trade || !pmTradeInRfqWindow(trade, rfq)) return [];
+  return [{
+    yesPrice: trade.px,
+    buyPrice: trade.px,
+    px: trade.px,
+    tradeTs: trade.ts || null,
+    symbol: slug,
+  }];
+}
+
 // Concrete Poly fill lookup. Never Kalshi tape. Never POST/confirm.
-// 1) GET /v1/rfqs/:id
-// 2) If status is not filled/executed/accepted/confirmed, GET listQuotes({ rfqId })
-// 3) Accepted/confirmed/executed quote → object extractUnhedgedFill reads as filled.
+// Polymarket RFQ status is only OPEN/CLOSED (no RFQ_STATUS_FILLED).
+// 1) GET /v1/rfqs?rfqId= (documented). GET /v1/rfqs/:id is DELETE-only.
+// 2) listQuotes({ rfqId }) plus ACCEPTED/CONFIRMED/EXECUTED — unfiltered
+//    lists are often ACTIVE-only and empty after close. Observers may see
+//    only their own quote (empty while UNHEDGED_RFQ_LIVE is off).
+// 3) CLOSED + buyPrice on the RFQ, or combo last-trade in the RFQ window.
 async function fetchPolymarketUnhedgedRfq(http, rfqId) {
   if (!http || rfqId == null || rfqId === '') return null;
 
   let rfq = null;
-  if (typeof http.request === 'function') {
-    try {
-      const res = await http.request('GET', `/v1/rfqs/${encodeURIComponent(rfqId)}`);
-      if (res && res.statusCode !== 404) {
-        const j = res.json;
-        const got = (j && (j.rfq || j)) || null;
-        if (got && typeof got === 'object' && !Array.isArray(got)) rfq = got;
-      }
-    } catch (_) {}
-  }
-
-  if (!rfq && typeof http.listRfqs === 'function') {
+  if (typeof http.listRfqs === 'function') {
     try {
       const listed = await http.listRfqs({ rfqId });
       const rows = (listed && (listed.rfqs || listed.data)) || [];
@@ -661,17 +775,43 @@ async function fetchPolymarketUnhedgedRfq(http, rfqId) {
     } catch (_) {}
   }
 
+  if (!rfq && typeof http.request === 'function') {
+    try {
+      const res = await http.request('GET', `/v1/rfqs/${encodeURIComponent(rfqId)}`);
+      if (res && res.statusCode !== 404) {
+        const j = res.json;
+        const nested = j && j.rfq;
+        const got = (nested && typeof nested === 'object' && !Array.isArray(nested))
+          ? nested
+          : (j && typeof j === 'object' && !Array.isArray(j) && (j.status || j.id || j.rfqId) && !j.rfqs
+            ? j
+            : null);
+        if (got) rfq = got;
+      }
+    } catch (_) {}
+  }
+
   if (rfq && isUnhedgedFillStatus(rfq.status)) {
     return polyUnhedgedFillObject(rfqId, rfq, null);
   }
 
-  if (typeof http.listQuotes === 'function') {
-    try {
-      const listed = await http.listQuotes({ rfqId });
-      const quotes = (listed && (listed.quotes || listed.data)) || [];
-      const q = quotes.find((x) => x && isUnhedgedFillStatus(x.status)) || null;
-      if (q) return polyUnhedgedFillObject(rfqId, rfq, q);
-    } catch (_) {}
+  const quotes = await listPolymarketFillQuotes(http, rfqId);
+  const q = quotes[0] || null;
+  if (q) return polyUnhedgedFillObject(rfqId, rfq, q);
+
+  if (rfq && isPmRfqClosed(rfq.status)) {
+    const priced = pickPmFillPrice(rfq, ['buyPrice', 'buy_price', 'yesPrice', 'yes_price'])
+      ?? pickPmFillPrice(rfq, ['sellPrice', 'sell_price', 'noPrice', 'no_price']);
+    if (priced != null) return polyUnhedgedFillObject(rfqId, rfq, q);
+    const symbol = rfq.symbol || rfq.ticker || rfq.market_ticker;
+    const trade = await fetchPolymarketComboLastTrade(http, symbol);
+    if (trade && pmTradeInRfqWindow(trade, rfq)) {
+      return polyUnhedgedFillObject(rfqId, {
+        ...rfq,
+        buyPrice: trade.px,
+        filled_at: trade.ts || rfq.updatedTime || rfq.updated_time || rfq.createdTime || null,
+      }, q);
+    }
   }
 
   return rfq;
@@ -681,9 +821,32 @@ function startPolymarketRfqLoop(ctx = {}) {
   const env = ctx.env || process.env;
   const keyId = env.POLYMARKET_KEY_ID;
   const secretKey = env.POLYMARKET_SECRET_KEY;
+  const http = ctx.http || ((keyId && secretKey)
+    ? createPolymarketHttp({ keyId, secretKey, requestFn: ctx.requestFn })
+    : null);
+
+  async function fetchUnhedgedPmRfq(rfqId) {
+    if (typeof ctx.fetchUnhedgedRfq === 'function') return ctx.fetchUnhedgedRfq(rfqId);
+    if (!http) return null;
+    return fetchPolymarketUnhedgedRfq(http, rfqId);
+  }
+
+  async function fetchUnhedgedPmTrades(symbol, minTs, maxTs, row) {
+    if (typeof ctx.fetchUnhedgedTrades === 'function') {
+      return ctx.fetchUnhedgedTrades(symbol, minTs, maxTs, row);
+    }
+    if (!http) return [];
+    return fetchPolymarketUnhedgedTrades(http, symbol, minTs, maxTs, row);
+  }
+
   if (!keyId || !secretKey) {
     console.log(`[${MODE}] skipped — missing POLYMARKET_KEY_ID or POLYMARKET_SECRET_KEY`);
-    return { stop() {} };
+    return {
+      stop() { try { http && http.close && http.close(); } catch (_) {} },
+      fetchUnhedgedRfq: fetchUnhedgedPmRfq,
+      fetchUnhedgedTrades: fetchUnhedgedPmTrades,
+      unhedgedFills: ctx.unhedgedFills || null,
+    };
   }
 
   const live = isPolymarketRfqLive(env);
@@ -693,7 +856,6 @@ function startPolymarketRfqLoop(ctx = {}) {
   let reserveSeq = 0;
   let stopped = false;
 
-  const http = ctx.http || createPolymarketHttp({ keyId, secretKey, requestFn: ctx.requestFn });
   const marketCache = ctx.marketCache || createMarketCache({
     fetchMarket: ctx.fetchMarket || ((slug) => http.getMarketBySlug(slug)),
   });
@@ -712,18 +874,13 @@ function startPolymarketRfqLoop(ctx = {}) {
     unhedgedPrices.setPmFetch(ctx.fetchMarket || ((slug) => http.getMarketBySlug(slug)));
   }
 
-  async function fetchUnhedgedPmRfq(rfqId) {
-    if (typeof ctx.fetchUnhedgedRfq === 'function') return ctx.fetchUnhedgedRfq(rfqId);
-    return fetchPolymarketUnhedgedRfq(http, rfqId);
-  }
-
   const ownFills = !ctx.unhedgedFills;
   const unhedgedFills = ctx.unhedgedFills || createUnhedgedFillTracker({
     supabase: ctx.supabase,
     persist: ctx.persistUnhedged,
     env,
     fetchRfq: fetchUnhedgedPmRfq,
-    fetchTrades: ctx.fetchUnhedgedTrades,
+    fetchTrades: fetchUnhedgedPmTrades,
   });
   if (ownFills && typeof unhedgedFills.hydrate === 'function') {
     unhedgedFills.hydrate().catch((e) => console.error('[UNHEDGED] fill hydrate', e && e.message));
@@ -1025,6 +1182,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       rfqId,
       extra: evt,
       rfq,
+      symbol: rfq.symbol || rfq.ticker,
     }).catch((e) => console.error('[UNHEDGED] fill close', e && e.message));
   }
 
@@ -1038,6 +1196,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       rfqId,
       extra: evt,
       rfq,
+      symbol: rfq.symbol || quote.symbol || rfq.ticker,
     }).catch((e) => console.error('[UNHEDGED] fill event', e && e.message));
   }
 
@@ -1217,6 +1376,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     marketCache,
     unhedgedFills,
     fetchUnhedgedRfq: fetchUnhedgedPmRfq,
+    fetchUnhedgedTrades: fetchUnhedgedPmTrades,
   };
 }
 
@@ -1242,4 +1402,9 @@ module.exports = {
   acceptedFromEvent,
   startPolymarketRfqLoop,
   fetchPolymarketUnhedgedRfq,
+  fetchPolymarketUnhedgedTrades,
+  fetchPolymarketComboLastTrade,
+  listPolymarketFillQuotes,
+  isPmRfqClosed,
+  PM_QUOTE_FILL_STATUSES,
 };
