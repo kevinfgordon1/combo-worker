@@ -1,0 +1,363 @@
+From 89622efdec913ad338428a0829c07910a1ed974f Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Fri, 4 Sep 2026 00:26:11 +0000
+Subject: [PATCH] Speed up the Unhedged blotter: 90s visible-tab refresh and
+ slimmer queries.
+
+Stop the 20s auto-refresh, select blotter columns instead of *, prefer
+filled_at (+ updated_at) for Today/24h/7d, and keep head counts on the
+filtered filled set so millions of seen rows are never downloaded.
+---
+ src/UnhedgedTape.jsx     | 10 +++-
+ src/unhedgedTape.js      | 98 ++++++++++++++++++++++++++--------------
+ src/unhedgedTape.test.js | 31 +++++++++----
+ 3 files changed, 97 insertions(+), 42 deletions(-)
+
+diff --git a/src/UnhedgedTape.jsx b/src/UnhedgedTape.jsx
+index ecf8966..6ab27a3 100644
+--- a/src/UnhedgedTape.jsx
++++ b/src/UnhedgedTape.jsx
+@@ -6,6 +6,8 @@
+ // Summary + tape are MLB and NFL moneylines only. Default date chip is Today.
+ // Today / 24h / 7d stay one page. Month / All time page only after that chip
+ // is selected. Tiles use head counts (same window + venue + beat-fill).
++// Auto-refresh is 90s and only while the tab is visible; manual Refresh is enough.
++// Suggested index: unhedged_rfqs (status, filled_at desc).
+ // Legs cell is a per-leg Fair / Kalshi / Poly breakdown plus sport + event date.
+ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+ import { createClient } from "@supabase/supabase-js";
+@@ -25,6 +27,7 @@ import {
+   unhedgedDateRangeLabel,
+   unhedgedDateRangePages,
+   unhedgedRefreshLabel,
++  UNHEDGED_AUTO_REFRESH_MS,
+   visibleUnhedgedRows,
+ } from "./unhedgedTape";
+ 
+@@ -382,7 +385,12 @@ export default function UnhedgedTape({ user }) {
+   useEffect(() => { reloadCounts(); }, [reloadCounts]);
+   useEffect(() => {
+     if (!owner || missingTable || unhedgedDateRangePages(dateRange)) return undefined;
+-    const t = setInterval(() => { reloadRows(); reloadCounts(); }, 20000);
++    const tick = () => {
++      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
++      reloadRows();
++      reloadCounts();
++    };
++    const t = setInterval(tick, UNHEDGED_AUTO_REFRESH_MS);
+     return () => clearInterval(t);
+   }, [reloadRows, reloadCounts, owner, missingTable, dateRange]);
+ 
+diff --git a/src/unhedgedTape.js b/src/unhedgedTape.js
+index 326bae5..233c716 100644
+--- a/src/unhedgedTape.js
++++ b/src/unhedgedTape.js
+@@ -6,10 +6,11 @@
+ // Default date chip is Today (America/New_York calendar day). Today / 24h / 7d
+ // stay a single 1000-row page — do not walk Month or All time until that chip
+ // is selected. Month / All time then paginate that window (1000-row PostgREST
+-// pages). Tile counts use select(*, { count: "exact", head: true }) with the
+-// same window / venue / beat-fill filters when PostgREST can express them —
+-// never download-every-row-then-count. If the status filter fails, client-
+-// filter filled as fallback. Do not list seen / started / would_quote. Never
++// pages). Tile counts use select("rfq_id", { count: "exact", head: true })
++// on the filtered filled set — never select(*) and never download seen rows.
++// Same window / venue / beat-fill filters when PostgREST can express them.
++// If the status filter fails, client-filter filled as fallback. Do not list
++// seen / started / would_quote. Never
+ // list live / in-game RFQs — not even paper. Hide skip_reason game_started,
+ // status started, or any leg that already started when that field exists.
+ // Venue and would-quote-beat-fill chips filter the fetched date window on the
+@@ -25,11 +26,11 @@
+ // Missing-column retry only helps when the column does not exist. The tab is
+ // already owner-gated in the UI. Do not invent user_ids client-side.
+ //
+-// Today membership is activity (any of filled_at / updated_at / created_at
+-// in the ET day). If updated_at is missing from the schema, drop it from the
+-// OR and retry — do not keep OR-ing a nonexistent column. Combo-worker fill
+-// patches should set updated_at; otherwise a late UPDATE whose filled_at /
+-// created_at stay on the original RFQ never enters Today's OR.
++// Today membership for filled queries prefers filled_at, plus updated_at so
++// a late fill patch still hits Today when tape tradeTs is stale. created_at
++// is only a degrade fallback if updated_at is missing from the schema.
++// Combo-worker fill patches should set updated_at.
++// Suggested Supabase index: unhedged_rfqs (status, filled_at desc).
+ //
+ // Worker statuses: seen, started, would_quote, filled. A row with
+ // our_quote_american is would_quote even if status is still seen (mapping
+@@ -51,7 +52,40 @@ export const UNHEDGED_MAX_PAGES = 100;
+ export const UNHEDGED_LIGHT_DATE_KEYS = ["today", "24h", "7d"];
+ export const UNHEDGED_HEAVY_DATE_KEYS = ["month", "all"];
+ export const UNHEDGED_COUNT_SELECT_OPTS = { count: "exact", head: true };
++export const UNHEDGED_COUNT_HEAD_COL = "rfq_id";
++export const UNHEDGED_DATE_OR_COLS = ["filled_at", "updated_at"];
++export const UNHEDGED_AUTO_REFRESH_MS = 90_000;
++export const UNHEDGED_BLOTTER_COL_LIST = [
++  "id",
++  "rfq_id",
++  "venue",
++  "status",
++  "skip_reason",
++  "legs",
++  "market_ticker",
++  "contracts",
++  "cash_size",
++  "taker_american",
++  "taker_yes_price",
++  "taker_no_price",
++  "our_fair_american",
++  "our_quote_american",
++  "fill_american",
++  "fill_yes_price",
++  "fill_no_price",
++  "filled_at",
++  "updated_at",
++  "created_at",
++];
++export const UNHEDGED_BLOTTER_COLS = UNHEDGED_BLOTTER_COL_LIST.join(",");
+ export const UNHEDGED_BEAT_FILL_COLS = "our_quote_american,fill_american";
++
++export function unhedgedBlotterSelect(dateCols = UNHEDGED_DATE_OR_COLS, orderByUpdatedAt = true) {
++  const drop = new Set();
++  if (!orderByUpdatedAt && !(dateCols || []).includes("updated_at")) drop.add("updated_at");
++  if (!(dateCols || []).includes("filled_at")) drop.add("filled_at");
++  return UNHEDGED_BLOTTER_COL_LIST.filter((c) => !drop.has(c)).join(",");
++}
+ export const UNHEDGED_STATUSES = ["seen", "started", "would_quote", "quoted", "filled"];
+ export const UNHEDGED_ML_LEAGUES = ["mlb", "nfl"];
+ export const UNHEDGED_TZ = "America/New_York";
+@@ -559,16 +593,13 @@ export function unhedgedDateRangeLabel(value) {
+   return hit ? hit.label : "Today";
+ }
+ 
+-// Date chips are "when the fill landed on our tape": same activity clock as
+-// TIME ET (latest of filled_at / updated_at / created_at).
+-// PostgREST cannot max() those columns, so the query ORs them (a row matches
+-// if any stamp intersects the window) and we then keep rows whose latest
+-// stamp is actually in range. Preferring filled_at alone would hide late
+-// writes whose tape tradeTs is an older fill stamp.
+-// If updated_at is missing from the schema, drop it from the OR — do not keep
+-// OR-ing a nonexistent column. Combo-worker fill patches should set
+-// updated_at; a late UPDATE that leaves filled_at / created_at on the original
+-// RFQ (e.g. Sep 2 11:11pm ET) will not enter Today's window without it.
++// Date chips are "when the fill landed on our tape". Filled queries OR
++// filled_at (preferred) and updated_at (late patch with a stale tape stamp).
++// PostgREST cannot max() those columns, so the query ORs them and we then
++// keep rows whose latest activity stamp is actually in range.
++// Preferring filled_at alone would hide late writes whose tape tradeTs is
++// an older fill stamp. If updated_at is missing from the schema, drop it
++// and fall back to created_at — do not keep OR-ing a nonexistent column.
+ // today = America/New_York calendar day [start, next midnight).
+ // 24h / 7d / month = rolling lookback (month = 30d). all = no bound.
+ export function unhedgedDateWindow(range, now = new Date()) {
+@@ -588,7 +619,7 @@ export function unhedgedDateWindow(range, now = new Date()) {
+   return { preset, from: from.toISOString(), to: null };
+ }
+ 
+-export function unhedgedDateOrFilter(window, cols = ["filled_at", "updated_at", "created_at"]) {
++export function unhedgedDateOrFilter(window, cols = UNHEDGED_DATE_OR_COLS) {
+   if (!window || window.preset === "all" || (!window.from && !window.to)) return null;
+   const use = (cols || []).filter(Boolean);
+   if (!use.length) return null;
+@@ -1544,7 +1575,7 @@ function applyUnhedgedFilters(q, {
+   userId: _userId,
+   filterStatus = true,
+   dateWindow = null,
+-  dateCols = ["filled_at", "updated_at", "created_at"],
++  dateCols = UNHEDGED_DATE_OR_COLS,
+   venue = "all",
+   quoteNotNull = false,
+ }) {
+@@ -1566,9 +1597,9 @@ async function runSelect(client, {
+   orderByUpdatedAt = true,
+   filterStatus = true,
+   dateWindow = null,
+-  dateCols = ["filled_at", "updated_at", "created_at"],
++  dateCols = UNHEDGED_DATE_OR_COLS,
+ }) {
+-  let q = client.from(UNHEDGED_TABLE).select("*");
++  let q = client.from(UNHEDGED_TABLE).select(unhedgedBlotterSelect(dateCols, orderByUpdatedAt));
+   q = applyUnhedgedFilters(q, { userId, filterStatus, dateWindow, dateCols });
+   if (typeof q.order === "function") {
+     // Newest activity first. Prefer updated_at; if that column is missing,
+@@ -1586,11 +1617,11 @@ async function runCount(client, {
+   userId,
+   filterStatus = true,
+   dateWindow = null,
+-  dateCols = ["filled_at", "updated_at", "created_at"],
++  dateCols = UNHEDGED_DATE_OR_COLS,
+   venue = "all",
+   quoteNotNull = false,
+ }) {
+-  let q = client.from(UNHEDGED_TABLE).select("*", UNHEDGED_COUNT_SELECT_OPTS);
++  let q = client.from(UNHEDGED_TABLE).select(UNHEDGED_COUNT_HEAD_COL, UNHEDGED_COUNT_SELECT_OPTS);
+   return applyUnhedgedFilters(q, {
+     userId,
+     filterStatus,
+@@ -1605,7 +1636,7 @@ async function runBeatFillSelect(client, {
+   userId,
+   filterStatus = true,
+   dateWindow = null,
+-  dateCols = ["filled_at", "updated_at", "created_at"],
++  dateCols = UNHEDGED_DATE_OR_COLS,
+   venue = "all",
+   limit = UNHEDGED_PAGE_SIZE,
+   offset = 0,
+@@ -1698,6 +1729,7 @@ function applySelectKind(kind, flags) {
+   else if (kind === "missing_updated_at") {
+     flags.orderByUpdatedAt = false;
+     flags.dateCols = (flags.dateCols || []).filter((c) => c !== "updated_at");
++    if (!flags.dateCols.includes("created_at")) flags.dateCols.push("created_at");
+   } else if (kind === "missing_filled_at") {
+     flags.dateCols = (flags.dateCols || []).filter((c) => c !== "filled_at");
+   } else if (kind === "missing_venue") {
+@@ -1754,7 +1786,7 @@ function newUnhedgedFlags(_userId) {
+     scopedUserId: null,
+     orderByUpdatedAt: true,
+     filterStatus: true,
+-    dateCols: ["filled_at", "updated_at", "created_at"],
++    dateCols: UNHEDGED_DATE_OR_COLS.slice(),
+     venue: "all",
+     venueDropped: false,
+     quoteNotNull: true,
+@@ -1787,12 +1819,12 @@ async function resolveOnce(runFn, flags, extra = {}) {
+   return { error: { message: "retries exhausted" } };
+ }
+ 
+-// Select * of filled rows RLS already allows. Do not scope by user_id — the
+-// Unhedged tab is owner-gated and combo-worker does not write user_id.
+-// A missing table is an empty blotter, not a crash. status=eq.filled.
+-// Date chips add an OR of filled_at / updated_at / created_at intersecting
+-// the window (see unhedgedDateWindow). If updated_at is missing, drop it
+-// from the OR (and from order) and retry. Today / 24h / 7d take one page.
++// Slim blotter columns of filled rows RLS already allows. Do not select(*).
++// Do not scope by user_id — the Unhedged tab is owner-gated and combo-worker
++// does not write user_id. A missing table is an empty blotter, not a crash.
++// status=eq.filled. Date chips OR filled_at / updated_at intersecting the
++// window (see unhedgedDateWindow). If updated_at is missing, drop it from
++// the OR (and from order), fall back to created_at, and retry.
+ // Month / All time page until a short page — only after that chip is on.
+ // Prefer updated_at desc. userId on the options object is ignored.
+ export async function fetchUnhedgedRfqs(client, {
+diff --git a/src/unhedgedTape.test.js b/src/unhedgedTape.test.js
+index ffde3b4..e112a7f 100644
+--- a/src/unhedgedTape.test.js
++++ b/src/unhedgedTape.test.js
+@@ -54,6 +54,10 @@ import {
+   isMissingQuoteAmericanColumn,
+   isMissingFillAmericanColumn,
+   UNHEDGED_COUNT_SELECT_OPTS,
++  UNHEDGED_COUNT_HEAD_COL,
++  UNHEDGED_DATE_OR_COLS,
++  UNHEDGED_AUTO_REFRESH_MS,
++  UNHEDGED_BLOTTER_COLS,
+   UNHEDGED_BEAT_FILL_COLS,
+   UNHEDGED_LIGHT_DATE_KEYS,
+   UNHEDGED_HEAVY_DATE_KEYS,
+@@ -412,6 +416,12 @@ assert.match(unhedgedVenueOrFilter("kalshi"), /venue\.ilike\.kalshi/);
+ assert.match(unhedgedVenueOrFilter("polymarket"), /venue\.eq\.poly/);
+ assert.equal(unhedgedVenueOrFilter("all"), null);
+ assert.deepEqual(UNHEDGED_COUNT_SELECT_OPTS, { count: "exact", head: true });
++assert.equal(UNHEDGED_COUNT_HEAD_COL, "rfq_id");
++assert.deepEqual(UNHEDGED_DATE_OR_COLS, ["filled_at", "updated_at"]);
++assert.ok(UNHEDGED_AUTO_REFRESH_MS >= 60000 && UNHEDGED_AUTO_REFRESH_MS <= 120000);
++assert.match(UNHEDGED_BLOTTER_COLS, /rfq_id/);
++assert.match(UNHEDGED_BLOTTER_COLS, /filled_at/);
++assert.doesNotMatch(UNHEDGED_BLOTTER_COLS, /^\*$/);
+ assert.equal(UNHEDGED_BEAT_FILL_COLS, "our_quote_american,fill_american");
+ {
+   const noonEt = etLocalToUtc("2026-09-03", 14, 40);
+@@ -441,7 +451,7 @@ assert.equal(UNHEDGED_BEAT_FILL_COLS, "our_quote_american,fill_american");
+   assert.match(orToday, /filled_at\.gte\.2026-09-03T04:00:00.000Z/);
+   assert.match(orToday, /filled_at\.lt\.2026-09-04T04:00:00.000Z/);
+   assert.match(orToday, /updated_at\.gte\./);
+-  assert.match(orToday, /created_at\.gte\./);
++  assert.doesNotMatch(orToday, /created_at\.gte\./);
+   assert.equal(unhedgedDateOrFilter(all), null);
+   const or24h = unhedgedDateOrFilter(rolling, ["filled_at", "updated_at"]);
+   assert.match(or24h, /filled_at\.gte\./);
+@@ -1425,7 +1435,7 @@ function assertCreatedAtOnlyBeforeLimit(call) {
+   assert.ok(orderAt < limitAt, "expected .order() before .limit()");
+ }
+ 
+-// ── Select * is not scoped by user_id (worker rows are NULL / unset) ──
++// ── Slim blotter select is not scoped by user_id (worker rows are NULL / unset) ──
+ {
+   const rows = [{ id: "1", user_id: null, status: "filled", fill_american: -110 }];
+   const client = createSequenceClient([{ data: rows, error: null }]);
+@@ -1433,7 +1443,8 @@ function assertCreatedAtOnlyBeforeLimit(call) {
+   assert.equal(result.missingTable, false);
+   assert.deepEqual(result.rows, rows);
+   assert.equal(client.calls[0].table, UNHEDGED_TABLE);
+-  assert.equal(client.calls[0].select, "*");
++  assert.equal(client.calls[0].select, UNHEDGED_BLOTTER_COLS);
++  assert.notEqual(client.calls[0].select, "*");
+   assert.equal(hasEq(client.calls[0], "user_id", "u1"), false);
+   assert.equal((client.calls[0].eqs || []).some((e) => e.col === "user_id"), false);
+   assertStatusFilledEq(client.calls[0]);
+@@ -1638,7 +1649,7 @@ function assertCreatedAtOnlyBeforeLimit(call) {
+   assert.equal(result.error.code, "42501");
+ }
+ 
+-// ── Date window is server-side: today ORs filled_at/updated_at/created_at ──
++// ── Date window is server-side: today ORs filled_at/updated_at ──
+ {
+   const now = etLocalToUtc("2026-09-03", 14, 40);
+   const rows = [{ id: "1", user_id: "u1", status: "filled", fill_american: -110, updated_at: "2026-09-03T18:30:00.000Z" }];
+@@ -1647,7 +1658,7 @@ function assertCreatedAtOnlyBeforeLimit(call) {
+   assert.deepEqual(result.rows.map((r) => r.id), ["1"]);
+   assert.match(client.calls[0].or, /and\(filled_at\.gte\./);
+   assert.match(client.calls[0].or, /updated_at\.gte\./);
+-  assert.match(client.calls[0].or, /created_at\.gte\./);
++  assert.doesNotMatch(client.calls[0].or, /created_at\.gte\./);
+   assert.match(client.calls[0].or, /filled_at\.lt\./);
+   assert.equal(client.calls[0].range.from, 0);
+   assert.equal(client.calls[0].range.to, UNHEDGED_PAGE_SIZE - 1);
+@@ -1737,7 +1748,7 @@ function assertCreatedAtOnlyBeforeLimit(call) {
+ 
+ // ── Worker rows (null user_id) are visible; Today uses activity stamps ──
+ // Combo-worker buildUnhedgedRow / fill patches do not set user_id. Today is
+-// ET midnight–midnight. Server OR is filled_at / updated_at / created_at;
++// ET midnight–midnight. Server OR is filled_at / updated_at;
+ // client keeps the latest stamp. A stale filled_at (early tape / RFQ create)
+ // plus a later updated_at is Today. Stale filled_at alone is not — without
+ // updated_at on the fill patch, combo-worker must set it or the row stays
+@@ -1781,7 +1792,7 @@ function assertCreatedAtOnlyBeforeLimit(call) {
+   assert.equal((fetchClient.calls[0].eqs || []).some((e) => e.col === "user_id"), false);
+   assert.match(fetchClient.calls[0].or, /filled_at\.gte\./);
+   assert.match(fetchClient.calls[0].or, /updated_at\.gte\./);
+-  assert.match(fetchClient.calls[0].or, /created_at\.gte\./);
++  assert.doesNotMatch(fetchClient.calls[0].or, /created_at\.gte\./);
+ 
+   const allClient = createSequenceClient([{ data: [workerToday, workerStaleOnly, workerOld], error: null }]);
+   const allTime = await fetchUnhedgedRfqs(allClient, { userId: "owner-id", dateRange: "all" });
+@@ -1819,6 +1830,7 @@ function assertCreatedAtOnlyBeforeLimit(call) {
+   assert.deepEqual(result.rows.map((r) => r.id), ["created-today"]);
+   assert.equal(client.calls.length, 2);
+   assert.match(client.calls[0].or, /updated_at\.gte\./);
++  assert.doesNotMatch(client.calls[0].or, /created_at/);
+   assert.doesNotMatch(client.calls[1].or, /updated_at/);
+   assert.match(client.calls[1].or, /filled_at\.gte\./);
+   assert.match(client.calls[1].or, /created_at\.gte\./);
+@@ -1842,7 +1854,7 @@ function assertCreatedAtOnlyBeforeLimit(call) {
+   assert.equal(result.beatFill, 1);
+   assert.equal(result.missingTable, false);
+   assert.equal(client.calls.length, 3);
+-  assert.equal(client.calls[0].select, "*");
++  assert.equal(client.calls[0].select, UNHEDGED_COUNT_HEAD_COL);
+   assert.deepEqual(client.calls[0].selectOpts, UNHEDGED_COUNT_SELECT_OPTS);
+   assert.deepEqual(client.calls[1].selectOpts, UNHEDGED_COUNT_SELECT_OPTS);
+   assert.equal(client.calls[0].range, undefined);
+@@ -2023,6 +2035,9 @@ function assertCreatedAtOnlyBeforeLimit(call) {
+   assert.match(page, /reloadRows\(\{ button: true \}\)/);
+   assert.match(page, /reloadCounts\(\)/);
+   assert.match(page, /dateRange,/);
++  assert.match(page, /UNHEDGED_AUTO_REFRESH_MS/);
++  assert.match(page, /visibilityState/);
++  assert.doesNotMatch(page, /,\s*20000\s*\)/);
+   assert.doesNotMatch(page, /Would-quote \/ Fair/);
+   assert.doesNotMatch(page, /NCAAF|ncaaf/);
+   assert.doesNotMatch(page, /location\.reload|window\.location/);
+-- 
+2.43.0
+
