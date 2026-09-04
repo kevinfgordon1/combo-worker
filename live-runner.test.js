@@ -86,8 +86,16 @@ assert.ok(
 );
 assert.ok(!/polyLoop\.fetchUnhedgedRfq/.test(liveSrc));
 assert.ok(
+  !/from\('unhedged_rfqs'\)[\s\S]{0,160}\.select\([^)]*market_ticker/.test(liveSrc),
+  'live-runner must not select market_ticker from unhedged_rfqs'
+);
+assert.ok(
   /http:\s*polyUnhedgedHttp \|\| undefined/.test(liveSrc),
   'quoting loop should reuse the same Poly HTTP the fill tracker already has'
+);
+assert.ok(
+  /UNHEDGED_RFQ_LIVE=\$\{isUnhedgedRfqLive\(process\.env\) \? 'on' : 'off'\}/.test(liveSrc),
+  'UNHEDGED_RFQ_LIVE must stay off unless explicitly enabled'
 );
 
 console.log('live-runner.test.js ok');

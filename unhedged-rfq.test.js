@@ -96,6 +96,10 @@ assert.ok(!SCOPE_LEAGUES.has('ncaaf'));
   assert.ok(!/polyLoop\.fetchUnhedgedRfq/.test(liveSrc));
   assert.ok(!/if \(row && row\.venue === 'polymarket'\) return \[\]/.test(liveSrc));
   assert.ok(!/createUnhedgedFillTracker\(\{[\s\S]*fetchRfq:\s*fetchSkipRfq/.test(liveSrc));
+  assert.ok(
+    !/\.select\([^)]*market_ticker/.test(src),
+    'unhedged_rfqs selects must use real columns only — market_ticker is not in the schema'
+  );
 }
 
 const mlbCws = parseKalshiUnhedgedTicker('KXMLBGAME-26AUG141840CWSDET-CWS:yes');
@@ -1274,6 +1278,35 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(polyLastTrade.patch.fill_yes_price, 0.34);
     assert.ok(polyLastTrade.patch.filled_at);
 
+    // Sweep/hydrate rows have no market_ticker column. Last-trade uses GET RFQ symbol.
+    let lastTradeTicker = null;
+    const polyLastTradeFromRfq = await resolveUnhedgedFill({
+      venue: 'polymarket',
+      rfq_id: 'rfq-poly-last-rfq-symbol',
+      closedMs: padClosed,
+      fromSweep: true,
+    }, {
+      now: padClosed + 1000,
+      fetchRfq: async () => ({
+        id: 'rfq-poly-last-rfq-symbol',
+        status: 'RFQ_STATUS_CLOSED',
+        symbol: 'aec-mlb-cws-det-2026-08-14-cws',
+        updatedTime: new Date(padClosed).toISOString(),
+      }),
+      fetchTrades: async (ticker) => {
+        lastTradeTicker = ticker;
+        return [{
+          yesPrice: 0.36,
+          buyPrice: 0.36,
+          px: 0.36,
+          tradeTs: new Date(padClosed).toISOString(),
+        }];
+      },
+    });
+    assert.strictEqual(lastTradeTicker, 'aec-mlb-cws-det-2026-08-14-cws');
+    assert.strictEqual(polyLastTradeFromRfq.reason, 'tape');
+    assert.strictEqual(polyLastTradeFromRfq.patch.fill_yes_price, 0.36);
+
     const polyClosedPriced = await resolveUnhedgedFill({
       venue: 'polymarket',
       rfq_id: 'rfq-poly-closed-px',
@@ -1333,6 +1366,26 @@ function pmRfq(id, symbols, extra = {}) {
     } finally {
       console.log = origFillLog;
     }
+
+    // Live rfqClosed still stamps symbol in-memory — no DB column required.
+    const symbolTracker = createUnhedgedFillTracker({
+      persist: async () => {},
+      fetchRfq: async () => ({ id: 'rfq-poly-symbol', status: 'RFQ_STATUS_OPEN' }),
+    });
+    symbolTracker.remember({ venue: 'polymarket', rfq_id: 'rfq-poly-symbol', status: 'seen' });
+    const queuedSymbol = await symbolTracker.onClosed({
+      venue: 'polymarket',
+      rfqId: 'rfq-poly-symbol',
+      extra: { type: 'rfqClosed', rfq: { id: 'rfq-poly-symbol', symbol: 'aec-mlb-cws-det-2026-08-14-cws' } },
+      rfq: { id: 'rfq-poly-symbol', symbol: 'aec-mlb-cws-det-2026-08-14-cws' },
+      symbol: 'aec-mlb-cws-det-2026-08-14-cws',
+      now: Date.parse('2026-08-14T20:06:00Z'),
+    });
+    assert.strictEqual(queuedSymbol.reason, 'queued');
+    const pendingSymbol = symbolTracker.pending.get('polymarket:rfq-poly-symbol');
+    assert.ok(pendingSymbol);
+    assert.strictEqual(pendingSymbol.symbol, 'aec-mlb-cws-det-2026-08-14-cws');
+    assert.strictEqual(pendingSymbol.market_ticker, 'aec-mlb-cws-det-2026-08-14-cws');
 
     // Kalshi tape path is unchanged (still matches after pad).
     const kalshiStillTape = await resolveUnhedgedFill({
@@ -1423,19 +1476,38 @@ function pmRfq(id, symbols, extra = {}) {
       },
     };
     await createUnhedgedFillTracker({ supabase: hydrateShapeDb }).hydrate();
+    assert.ok(hydrateQuery.some((c) => c.select === 'venue,rfq_id,status,contracts,created_at'));
+    assert.ok(!hydrateQuery.some((c) => c.select && String(c.select).includes('market_ticker')));
     assert.ok(hydrateQuery.some((c) => c.eq && c.eq[0] === 'status' && c.eq[1] === 'seen'));
     assert.ok(hydrateQuery.some((c) => c.order && c.order[0] === 'created_at' && c.order[1] && c.order[1].ascending === false));
     assert.ok(hydrateQuery.some((c) => c.limit === 2000), 'seen hydrate must take the newest 2000, not 500 unordered');
 
     // Recent Poly seen rows are swept into pending so missed rfqClosed still resolve.
+    // unhedged_rfqs has no market_ticker column — symbol comes from GET RFQ.
     const sweepNow = Date.parse('2026-08-14T21:00:00Z');
+    const sweepQuery = [];
+    const sweepShapeDb = {
+      from() {
+        const chain = {
+          select(cols) { sweepQuery.push({ select: cols }); return chain; },
+          eq(k, v) { sweepQuery.push({ eq: [k, v] }); return chain; },
+          gte(k, v) { sweepQuery.push({ gte: [k, v] }); return chain; },
+          order(col, opts) { sweepQuery.push({ order: [col, opts] }); return chain; },
+          limit(n) { sweepQuery.push({ limit: n }); return Promise.resolve({ data: [], error: null }); },
+        };
+        return chain;
+      },
+    };
+    await createUnhedgedFillTracker({ supabase: sweepShapeDb }).tick(sweepNow);
+    assert.ok(sweepQuery.some((c) => c.select === 'rfq_id,venue,status,contracts,created_at'));
+    assert.ok(!sweepQuery.some((c) => c.select && String(c.select).includes('market_ticker')));
+
     const sweepDb = createMemSupabase([
       {
         venue: 'polymarket',
         rfq_id: 'rfq-poly-sweep',
         status: 'seen',
         contracts: 8,
-        market_ticker: 'aec-mlb-cws-det-2026-08-14-cws',
         created_at: new Date(sweepNow - 30 * 60 * 1000).toISOString(),
       },
       {
@@ -1466,6 +1538,47 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(sweepPatches[0].rfq_id, 'rfq-poly-sweep');
     assert.strictEqual(sweepPatches[0].status, 'filled');
     assert.strictEqual(sweepPatches[0].fill_yes_price, 0.41);
+
+    const sweepTapeDb = createMemSupabase([
+      {
+        venue: 'polymarket',
+        rfq_id: 'rfq-poly-sweep-tape',
+        status: 'seen',
+        contracts: 8,
+        created_at: new Date(sweepNow - 20 * 60 * 1000).toISOString(),
+      },
+    ]);
+    const sweepTapePatches = [];
+    let sweepTapeTicker = null;
+    const sweepTapeTracker = createUnhedgedFillTracker({
+      supabase: sweepTapeDb,
+      persist: async (row, meta) => { if (meta && meta.mode === 'fill') sweepTapePatches.push(row); },
+      fetchRfq: async (id) => ({
+        id,
+        status: 'RFQ_STATUS_CLOSED',
+        symbol: 'aec-mlb-cws-det-2026-08-14-cws',
+        updatedTime: new Date(sweepNow).toISOString(),
+      }),
+      fetchTrades: async (ticker) => {
+        sweepTapeTicker = ticker;
+        return [{
+          yesPrice: 0.38,
+          buyPrice: 0.38,
+          px: 0.38,
+          tradeTs: new Date(sweepNow).toISOString(),
+        }];
+      },
+    });
+    await sweepTapeTracker.tick(sweepNow);
+    const sweptPending = sweepTapeTracker.pending.get('polymarket:rfq-poly-sweep-tape');
+    if (sweptPending) {
+      assert.strictEqual(sweptPending.symbol, null);
+      assert.strictEqual(sweptPending.market_ticker, null);
+    }
+    if (!sweepTapePatches.length) await sweepTapeTracker.tick(sweepNow + 1000);
+    assert.strictEqual(sweepTapeTicker, 'aec-mlb-cws-det-2026-08-14-cws');
+    assert.strictEqual(sweepTapePatches.length, 1);
+    assert.strictEqual(sweepTapePatches[0].fill_yes_price, 0.38);
     assert.ok(hydrateTracker.filled.has('kalshi:rfq-already-filled'));
     assert.ok(!hydrateTracker.filled.has('kalshi:rfq-open-hydrate'));
     const skipFilled = await hydrateTracker.onClosed({

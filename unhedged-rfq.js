@@ -1021,8 +1021,8 @@ function isFillLookupReady({ status, closedMs, now, padMs = FILL_TAPE_PAD_MS, ve
 }
 
 function tickerOfFillRfq(rfq, row) {
-  return (row && row.market_ticker)
-    || (rfq && (rfq.market_ticker || rfq.ticker || rfq.symbol))
+  return (rfq && (rfq.symbol || rfq.ticker || rfq.market_ticker))
+    || (row && (row.symbol || row.market_ticker))
     || null;
 }
 
@@ -1207,7 +1207,7 @@ function createUnhedgedFillTracker(opts = {}) {
   async function hydrateOpen() {
     const { data, error } = await opts.supabase
       .from('unhedged_rfqs')
-      .select('venue,rfq_id,status,contracts,market_ticker,created_at')
+      .select('venue,rfq_id,status,contracts,created_at')
       .eq('status', 'seen')
       .order('created_at', { ascending: false })
       .limit(2000);
@@ -1299,7 +1299,7 @@ function createUnhedgedFillTracker(opts = {}) {
     try {
       const { data, error } = await opts.supabase
         .from('unhedged_rfqs')
-        .select('rfq_id,venue,status,contracts,market_ticker,created_at')
+        .select('rfq_id,venue,status,contracts,created_at')
         .eq('venue', 'polymarket')
         .eq('status', 'seen')
         .gte('created_at', since)
@@ -1318,8 +1318,8 @@ function createUnhedgedFillTracker(opts = {}) {
           rfq: { ...r, rfq_id: r.rfq_id },
           closedMs: now - FILL_TAPE_PAD_MS,
           contracts: Number(r.contracts) || 0,
-          market_ticker: r.market_ticker,
-          symbol: r.market_ticker,
+          market_ticker: null,
+          symbol: null,
           fromSweep: true,
         });
       }
