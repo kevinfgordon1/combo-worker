@@ -821,9 +821,32 @@ function startPolymarketRfqLoop(ctx = {}) {
   const env = ctx.env || process.env;
   const keyId = env.POLYMARKET_KEY_ID;
   const secretKey = env.POLYMARKET_SECRET_KEY;
+  const http = ctx.http || ((keyId && secretKey)
+    ? createPolymarketHttp({ keyId, secretKey, requestFn: ctx.requestFn })
+    : null);
+
+  async function fetchUnhedgedPmRfq(rfqId) {
+    if (typeof ctx.fetchUnhedgedRfq === 'function') return ctx.fetchUnhedgedRfq(rfqId);
+    if (!http) return null;
+    return fetchPolymarketUnhedgedRfq(http, rfqId);
+  }
+
+  async function fetchUnhedgedPmTrades(symbol, minTs, maxTs, row) {
+    if (typeof ctx.fetchUnhedgedTrades === 'function') {
+      return ctx.fetchUnhedgedTrades(symbol, minTs, maxTs, row);
+    }
+    if (!http) return [];
+    return fetchPolymarketUnhedgedTrades(http, symbol, minTs, maxTs, row);
+  }
+
   if (!keyId || !secretKey) {
     console.log(`[${MODE}] skipped — missing POLYMARKET_KEY_ID or POLYMARKET_SECRET_KEY`);
-    return { stop() {} };
+    return {
+      stop() { try { http && http.close && http.close(); } catch (_) {} },
+      fetchUnhedgedRfq: fetchUnhedgedPmRfq,
+      fetchUnhedgedTrades: fetchUnhedgedPmTrades,
+      unhedgedFills: ctx.unhedgedFills || null,
+    };
   }
 
   const live = isPolymarketRfqLive(env);
@@ -833,7 +856,6 @@ function startPolymarketRfqLoop(ctx = {}) {
   let reserveSeq = 0;
   let stopped = false;
 
-  const http = ctx.http || createPolymarketHttp({ keyId, secretKey, requestFn: ctx.requestFn });
   const marketCache = ctx.marketCache || createMarketCache({
     fetchMarket: ctx.fetchMarket || ((slug) => http.getMarketBySlug(slug)),
   });
@@ -850,18 +872,6 @@ function startPolymarketRfqLoop(ctx = {}) {
   const unhedgedPrices = ctx.unhedgedPrices || null;
   if (unhedgedPrices && typeof unhedgedPrices.setPmFetch === 'function') {
     unhedgedPrices.setPmFetch(ctx.fetchMarket || ((slug) => http.getMarketBySlug(slug)));
-  }
-
-  async function fetchUnhedgedPmRfq(rfqId) {
-    if (typeof ctx.fetchUnhedgedRfq === 'function') return ctx.fetchUnhedgedRfq(rfqId);
-    return fetchPolymarketUnhedgedRfq(http, rfqId);
-  }
-
-  async function fetchUnhedgedPmTrades(symbol, minTs, maxTs, row) {
-    if (typeof ctx.fetchUnhedgedTrades === 'function') {
-      return ctx.fetchUnhedgedTrades(symbol, minTs, maxTs, row);
-    }
-    return fetchPolymarketUnhedgedTrades(http, symbol, minTs, maxTs, row);
   }
 
   const ownFills = !ctx.unhedgedFills;

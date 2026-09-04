@@ -82,7 +82,18 @@ assert.ok(!SCOPE_LEAGUES.has('ncaaf'));
   );
   assert.ok(liveSrc.includes('fetchUnhedgedVenueRfq'));
   assert.ok(liveSrc.includes('fetchUnhedgedVenueTrades'));
-  assert.ok(liveSrc.includes('polyLoop.fetchUnhedgedTrades'));
+  assert.ok(liveSrc.includes('fetchPolymarketUnhedgedRfq'));
+  assert.ok(liveSrc.includes('fetchPolymarketUnhedgedTrades'));
+  assert.ok(liveSrc.includes('createPolymarketHttp'));
+  assert.ok(
+    /polyUnhedgedHttp = createPolyUnhedgedHttp\(\);\s*unhedgedFills = createUnhedgedFillTracker\(/.test(liveSrc),
+    'Poly HTTP for fill lookup must exist before the shared tracker ticks'
+  );
+  assert.ok(
+    /fetchUnhedgedVenueRfq[\s\S]*fetchPolymarketUnhedgedRfq\(polyUnhedgedHttp/.test(liveSrc),
+    'Poly fill GET must call fetchPolymarketUnhedgedRfq directly — not polyLoop.fetchUnhedgedRfq'
+  );
+  assert.ok(!/polyLoop\.fetchUnhedgedRfq/.test(liveSrc));
   assert.ok(!/if \(row && row\.venue === 'polymarket'\) return \[\]/.test(liveSrc));
   assert.ok(!/createUnhedgedFillTracker\(\{[\s\S]*fetchRfq:\s*fetchSkipRfq/.test(liveSrc));
 }

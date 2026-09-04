@@ -713,6 +713,15 @@ const loopOff = startPolymarketRfqLoop({
   reconcileMs: 60 * 60 * 1000,
 });
 assert.strictEqual(loopOff.live, false);
+assert.strictEqual(typeof loopOff.fetchUnhedgedRfq, 'function');
+assert.strictEqual(typeof loopOff.fetchUnhedgedTrades, 'function');
+
+{
+  const skipped = startPolymarketRfqLoop({ env: {}, startWs: false });
+  assert.strictEqual(typeof skipped.fetchUnhedgedRfq, 'function');
+  assert.strictEqual(typeof skipped.fetchUnhedgedTrades, 'function');
+  skipped.stop();
+}
 
 Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.strictEqual(out.post, false);
