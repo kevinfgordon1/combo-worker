@@ -674,6 +674,50 @@ return live.refresh().then(async () => {
   assert.ok(!polyQuotes.some((q) => q.venue === 'kalshi'));
   polyOnly.stop();
 
+  // Live Retail RFQ: game slug (no pick). selection is long/yes, not the day.
+  {
+    const gameCache = createUnhedgedPriceCache({
+      intervalMs: 60 * 60 * 1000,
+      fetchPmMarket: async (slug) => {
+        if (slug === 'aec-mlb-mia-kc-2026-09-03') {
+          return twoOutcomeGame(slug, 'mia', 'kc', 0.55, 0.48, '2026-09-03');
+        }
+        if (slug === 'aec-mlb-bos-nyy-2026-09-03') {
+          return twoOutcomeGame(slug, 'bos', 'nyy', 0.52, 0.50, '2026-09-03');
+        }
+        return null;
+      },
+    });
+    const gameLegs = [
+      { symbol: 'aec-mlb-mia-kc-2026-09-03', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-bos-nyy-2026-09-03', side: 'SIDE_BUY' },
+    ];
+    gameCache.watch('polymarket', gameLegs);
+    await gameCache.refresh();
+    const gamePriced = classifyUnhedgedRfq({
+      rfqId: 'rfq-pm-game-priced',
+      status: 'RFQ_STATUS_OPEN',
+      qtyDecimal: '10',
+      comboLegs: gameLegs,
+      legs: gameLegs,
+      isCombo: true,
+    }, {
+      venue: 'polymarket',
+      priceCache: gameCache,
+      now: Date.parse('2026-09-03T16:00:00Z'),
+    });
+    assert.strictEqual(gamePriced.persist, true);
+    const miaLeg = gamePriced.legs.find((l) => l.selection === 'mia');
+    const bosLeg = gamePriced.legs.find((l) => l.selection === 'bos');
+    assert.ok(miaLeg, 'game slug must select mia, not 03');
+    assert.ok(bosLeg);
+    assert.ok(!gamePriced.legs.some((l) => /^\d+$/.test(l.selection)));
+    assert.strictEqual(miaLeg.poly_opponent_american, feeIncludedAmerican(0.48, POLY_TAKER_THETA));
+    assert.strictEqual(bosLeg.poly_opponent_american, feeIncludedAmerican(0.50, POLY_TAKER_THETA));
+    assert.ok(gamePriced.our_quote_american != null, 'would-quote when both books exist');
+    gameCache.stop();
+  }
+
   // CIN vs Reds: watch list is codes; fetchPmMarket is called with those slugs.
   const cinFetched = [];
   const cinCache = createUnhedgedPriceCache({

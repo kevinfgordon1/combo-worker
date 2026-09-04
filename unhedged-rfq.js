@@ -257,17 +257,25 @@ function parsePmUnhedgedSlug(symbol, sideOverride) {
   const dateM = s.match(PM_DATE_RE);
   const date = dateM ? `${dateM[1]}-${dateM[2]}-${dateM[3]}` : null;
   const dateIdx = dateM ? tokens.indexOf(dateM[1]) : -1;
+  const leagueIdx = tokens.findIndex((t) => LEAGUE_TOKENS[t] === league);
+  const start = leagueIdx >= 0 ? leagueIdx + 1 : 1;
+  // Production game slug: aec-{league}-{t1}-{t2}-{YYYY-MM-DD} (no pick).
+  // Poly outcomes[0] is the first slug team (long/yes). Suffixed …-{pick}
+  // slugs remain for tests. Never treat a date fragment (03, 2026) as selection.
   let teamTokens = [];
+  let afterDate = [];
   if (dateIdx > 0) {
-    const leagueIdx = tokens.findIndex((t) => LEAGUE_TOKENS[t] === league);
-    const start = leagueIdx >= 0 ? leagueIdx + 1 : 1;
     teamTokens = tokens.slice(start, dateIdx);
+    afterDate = tokens.slice(dateIdx + 3);
   } else {
-    teamTokens = tokens.slice(2, -1);
+    teamTokens = tokens.slice(start);
   }
-  const selection = tokens[tokens.length - 1] || '';
-  const teams = [...new Set(teamTokens.filter((t) => t && !/^\d+$/.test(t)))].sort();
-  if (selection && !teams.includes(selection) && !/^\d+$/.test(selection)) {
+  const orderedTeams = teamTokens.filter((t) => t && !/^\d+$/.test(t));
+  const pick = afterDate.find((t) => t && !/^\d+$/.test(t)) || '';
+  let selection = pick || orderedTeams[0] || '';
+  if (/^\d+$/.test(selection)) selection = '';
+  const teams = [...new Set(orderedTeams)];
+  if (selection && !teams.includes(selection)) {
     // selection is a team; game identity uses the pair, not the pick
   }
   if (teams.length < 2 && selection) teams.push(selection);
@@ -279,7 +287,7 @@ function parsePmUnhedgedSlug(symbol, sideOverride) {
     league,
     date,
     teams: uniq,
-    selection: selection || uniq[0],
+    selection: selection || uniq.find((t) => t && !/^\d+$/.test(t)) || uniq[0],
     side,
     marketType: 'moneyline',
     symbol: raw,

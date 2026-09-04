@@ -116,7 +116,42 @@ assert.ok(ncaafOsu.teams.includes('tex'));
 const pmMlb = parsePmUnhedgedSlug('aec-mlb-cws-det-2026-08-14-cws', 'yes');
 assert.ok(pmMlb);
 assert.strictEqual(pmMlb.league, 'mlb');
+assert.strictEqual(pmMlb.selection, 'cws');
 assert.deepStrictEqual(pmMlb.teams, ['cws', 'det']);
+assert.strictEqual(pmMlb.side, 'yes');
+
+const pmPickDet = parsePmUnhedgedSlug('aec-mlb-cws-det-2026-08-14-det', 'yes');
+assert.ok(pmPickDet);
+assert.strictEqual(pmPickDet.selection, 'det');
+assert.deepStrictEqual(pmPickDet.teams, ['cws', 'det']);
+
+// Production Retail RFQ combo legs use the game slug (no pick). Poly
+// outcomes[0] is the first slug team (long/yes). Last token is the day.
+const pmGame = parsePmUnhedgedSlug('aec-mlb-mia-kc-2026-09-03', 'yes');
+assert.ok(pmGame);
+assert.strictEqual(pmGame.league, 'mlb');
+assert.strictEqual(pmGame.date, '2026-09-03');
+assert.strictEqual(pmGame.selection, 'mia');
+assert.ok(pmGame.teams.includes('mia'));
+assert.ok(pmGame.teams.includes('kc'));
+assert.deepStrictEqual(pmGame.teams, ['kc', 'mia']);
+assert.strictEqual(pmGame.side, 'yes');
+assert.ok(!/^\d+$/.test(pmGame.selection));
+
+const pmGameNo = parsePmUnhedgedSlug('aec-mlb-mia-kc-2026-09-03', 'no');
+assert.ok(pmGameNo);
+assert.strictEqual(pmGameNo.selection, 'mia', 'SIDE_SELL / no still selects long/yes team');
+assert.strictEqual(pmGameNo.side, 'no');
+
+for (const slug of [
+  'aec-mlb-mia-kc-2026-09-03',
+  'aec-mlb-mia-kc-2026-09-03-03',
+  'aec-nfl-buf-kc-2026-09-07',
+]) {
+  const p = parsePmUnhedgedSlug(slug, 'yes');
+  assert.ok(p && !p.skip, slug);
+  assert.ok(p.selection && !/^\d+$/.test(p.selection), `numeric selection for ${slug}: ${p.selection}`);
+}
 
 assert.strictEqual(parsePmUnhedgedSlug('aec-atp-djokovic-alcaraz-2026-08-14-djokovic').reason, 'tennis');
 assert.strictEqual(parsePmUnhedgedSlug('asc-mlb-cws-det-2026-08-14-cws').reason, 'not_moneyline');
@@ -300,6 +335,38 @@ function pmRfq(id, symbols, extra = {}) {
   assert.strictEqual(out.persist, true, '3-leg PM MLB ML should persist');
   assert.strictEqual(out.status, 'seen');
   assert.strictEqual(out.legs.length, 3);
+}
+
+// Live Retail RFQ combo legs: game slugs, SIDE_BUY/SELL (no pick suffix).
+{
+  const rfq = {
+    rfqId: 'rfq-pm-game-slugs',
+    status: 'RFQ_STATUS_OPEN',
+    qtyDecimal: '10',
+    comboLegs: [
+      { symbol: 'aec-mlb-mia-kc-2026-09-03', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-bos-nyy-2026-09-03', side: 'SIDE_SELL' },
+    ],
+    legs: [
+      { symbol: 'aec-mlb-mia-kc-2026-09-03', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-bos-nyy-2026-09-03', side: 'SIDE_SELL' },
+    ],
+    isCombo: true,
+  };
+  const out = classifyUnhedgedRfq(rfq, { venue: 'polymarket', now: Date.parse('2026-09-03T16:00:00Z') });
+  assert.strictEqual(out.persist, true, 'production game slugs should persist');
+  assert.strictEqual(out.status, 'seen');
+  assert.strictEqual(out.legs.length, 2);
+  const mia = findLeg(out.legs, 'mia');
+  const bos = findLeg(out.legs, 'bos');
+  assert.ok(mia, 'MIA long/yes must be selection, not day token 03');
+  assert.ok(bos);
+  assert.strictEqual(mia.selection, 'mia');
+  assert.strictEqual(mia.side, 'yes');
+  assert.strictEqual(bos.selection, 'bos');
+  assert.strictEqual(bos.side, 'no');
+  assert.ok(mia.teams.includes('mia') && mia.teams.includes('kc'));
+  assert.ok(!out.legs.some((l) => /^\d+$/.test(l.selection)));
 }
 
 // same-game skip (SGP — both sides of one MLB game)
