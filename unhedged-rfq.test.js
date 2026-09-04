@@ -52,11 +52,13 @@ assert.strictEqual(isUnhedgedRfqLive({ UNHEDGED_RFQ_LIVE: 'true' }), true);
 assert.ok(SCOPE_LEAGUES.has('mlb'));
 assert.ok(SCOPE_LEAGUES.has('nfl'));
 assert.ok(!SCOPE_LEAGUES.has('ncaaf'));
-assert.ok(isUnhedgedFillStatus('filled'));
-assert.ok(isUnhedgedFillStatus('RFQ_STATUS_EXECUTED'));
-assert.ok(isUnhedgedFillStatus('accepted'));
-assert.ok(!isUnhedgedFillStatus('open'));
-assert.ok(!isUnhedgedFillStatus('closed'));
+  assert.ok(isUnhedgedFillStatus('filled'));
+  assert.ok(isUnhedgedFillStatus('RFQ_STATUS_EXECUTED'));
+  assert.ok(isUnhedgedFillStatus('QUOTE_STATUS_EXECUTED'));
+  assert.ok(isUnhedgedFillStatus('accepted'));
+  assert.ok(!isUnhedgedFillStatus('open'));
+  assert.ok(!isUnhedgedFillStatus('closed'));
+  assert.ok(!isUnhedgedFillStatus('RFQ_STATUS_CLOSED'));
 
 // Combo Locks Miss tape / quote path stay unwired from this module.
 {
@@ -80,6 +82,8 @@ assert.ok(!isUnhedgedFillStatus('closed'));
   );
   assert.ok(liveSrc.includes('fetchUnhedgedVenueRfq'));
   assert.ok(liveSrc.includes('fetchUnhedgedVenueTrades'));
+  assert.ok(liveSrc.includes('polyLoop.fetchUnhedgedTrades'));
+  assert.ok(!/if \(row && row\.venue === 'polymarket'\) return \[\]/.test(liveSrc));
   assert.ok(!/createUnhedgedFillTracker\(\{[\s\S]*fetchRfq:\s*fetchSkipRfq/.test(liveSrc));
 }
 
@@ -136,6 +140,9 @@ function createMemSupabase(initRows = [], { rejectCols = [] } = {}) {
     for (const [k, arr] of state.in) {
       if (!arr.includes(row[k])) return false;
     }
+    for (const [k, v] of state.gte) {
+      if (row[k] == null || String(row[k]) < String(v)) return false;
+    }
     return true;
   }
 
@@ -171,6 +178,18 @@ function createMemSupabase(initRows = [], { rejectCols = [] } = {}) {
       }
       return { data: updated, error: null };
     }
+    if (state.orderCol) {
+      found.sort((a, b) => {
+        const av = a[state.orderCol];
+        const bv = b[state.orderCol];
+        if (av == null && bv == null) return 0;
+        if (av == null) return 1;
+        if (bv == null) return -1;
+        if (av < bv) return state.orderAsc ? -1 : 1;
+        if (av > bv) return state.orderAsc ? 1 : -1;
+        return 0;
+      });
+    }
     const limited = state.limit != null ? found.slice(0, state.limit) : found;
     return { data: limited, error: null };
   }
@@ -178,7 +197,7 @@ function createMemSupabase(initRows = [], { rejectCols = [] } = {}) {
   return {
     _rows: rows,
     from() {
-      const state = { op: 'select', payload: null, eq: [], neq: [], in: [], limit: null };
+      const state = { op: 'select', payload: null, eq: [], neq: [], in: [], gte: [], limit: null, orderCol: null, orderAsc: true };
       const q = {
         select() { return q; },
         insert(row) { state.op = 'insert'; state.payload = row; return q; },
@@ -186,7 +205,12 @@ function createMemSupabase(initRows = [], { rejectCols = [] } = {}) {
         eq(k, v) { state.eq.push([k, v]); return q; },
         neq(k, v) { state.neq.push([k, v]); return q; },
         in(k, arr) { state.in.push([k, arr]); return q; },
-        order() { return q; },
+        gte(k, v) { state.gte.push([k, v]); return q; },
+        order(col, opts) {
+          state.orderCol = col;
+          state.orderAsc = !(opts && opts.ascending === false);
+          return q;
+        },
         limit(n) { state.limit = n; return q; },
         then(resolve, reject) {
           try { resolve(exec(state)); } catch (e) { (reject || ((err) => { throw err; }))(e); }
@@ -1187,7 +1211,7 @@ function pmRfq(id, symbols, extra = {}) {
       closedMs: padClosed,
       market_ticker: 'aec-mlb-cws-det-2026-08-14-cws',
     }, {
-      now: padClosed + 45000,
+      now: padClosed + 1000,
       fetchRfq: async () => ({ id: 'rfq-poly-closed', status: 'RFQ_STATUS_CLOSED' }),
       fetchTrades: async () => {
         polyTapeCalls += 1;
@@ -1200,10 +1224,75 @@ function pmRfq(id, symbols, extra = {}) {
         }];
       },
     });
-    assert.strictEqual(polyTapeCalls, 0, 'Poly must not use Kalshi tape');
+    assert.strictEqual(polyTapeCalls, 1, 'Poly may call venue last-trade, not Kalshi /markets/trades');
     assert.strictEqual(polyClosed.retry, false);
-    assert.strictEqual(polyClosed.patch, null);
+    assert.strictEqual(polyClosed.patch, null, 'Kalshi block-trade shape must not fill a Poly RFQ');
     assert.strictEqual(polyClosed.reason, 'not_filled');
+
+    // CLOSED + combo last-trade (yesPrice/px) stamps the same filled fields Kalshi tape does.
+    const polyLastTrade = await resolveUnhedgedFill({
+      venue: 'polymarket',
+      rfq_id: 'rfq-poly-last',
+      closedMs: padClosed,
+      market_ticker: 'aec-mlb-cws-det-2026-08-14-cws',
+      symbol: 'aec-mlb-cws-det-2026-08-14-cws',
+    }, {
+      now: padClosed + 1000,
+      fetchRfq: async () => ({
+        id: 'rfq-poly-last',
+        status: 'RFQ_STATUS_CLOSED',
+        symbol: 'aec-mlb-cws-det-2026-08-14-cws',
+        updatedTime: new Date(padClosed).toISOString(),
+      }),
+      fetchTrades: async (ticker, _min, _max, row) => {
+        assert.strictEqual(row.venue, 'polymarket');
+        assert.strictEqual(ticker, 'aec-mlb-cws-det-2026-08-14-cws');
+        return [{
+          yesPrice: 0.34,
+          buyPrice: 0.34,
+          px: 0.34,
+          tradeTs: new Date(padClosed).toISOString(),
+        }];
+      },
+    });
+    assert.strictEqual(polyLastTrade.retry, false);
+    assert.strictEqual(polyLastTrade.reason, 'tape');
+    assert.ok(polyLastTrade.patch);
+    assert.strictEqual(polyLastTrade.patch.venue, 'polymarket');
+    assert.strictEqual(polyLastTrade.patch.status, 'filled');
+    assert.strictEqual(polyLastTrade.patch.fill_yes_price, 0.34);
+    assert.ok(polyLastTrade.patch.filled_at);
+
+    const polyClosedPriced = await resolveUnhedgedFill({
+      venue: 'polymarket',
+      rfq_id: 'rfq-poly-closed-px',
+      closedMs: padClosed,
+    }, {
+      now: padClosed + 1000,
+      fetchRfq: async () => ({
+        id: 'rfq-poly-closed-px',
+        status: 'RFQ_STATUS_CLOSED',
+        buyPrice: 0.29,
+        sellPrice: 0.71,
+        updatedTime: '2026-08-14T20:10:00Z',
+      }),
+      fetchTrades: async () => { throw new Error('priced CLOSED RFQ must not need tape'); },
+    });
+    assert.strictEqual(polyClosedPriced.reason, 'rfq');
+    assert.strictEqual(polyClosedPriced.patch.fill_yes_price, 0.29);
+
+    const polySweepOpen = await resolveUnhedgedFill({
+      venue: 'polymarket',
+      rfq_id: 'rfq-poly-sweep-open',
+      fromSweep: true,
+    }, {
+      now: padClosed + 1000,
+      fetchRfq: async () => ({ id: 'rfq-poly-sweep-open', status: 'RFQ_STATUS_OPEN' }),
+      fetchTrades: async () => { throw new Error('still-open sweep must not tape'); },
+    });
+    assert.strictEqual(polySweepOpen.retry, false);
+    assert.strictEqual(polySweepOpen.patch, null);
+    assert.strictEqual(polySweepOpen.reason, 'still_open');
 
     const polyLogs = [];
     const origFillLog = console.log;
@@ -1308,6 +1397,64 @@ function pmRfq(id, symbols, extra = {}) {
     await hydrateTracker.hydrate();
     assert.ok(hydrateTracker.known.has('kalshi:rfq-open-hydrate'));
     assert.ok(hydrateTracker.known.has('kalshi:rfq-already-filled'));
+
+    // Newest-first 2000-row hydrate (not 500 unordered from millions of seen).
+    const hydrateQuery = [];
+    const hydrateShapeDb = {
+      from() {
+        const chain = {
+          select(cols) { hydrateQuery.push({ select: cols }); return chain; },
+          eq(k, v) { hydrateQuery.push({ eq: [k, v] }); return chain; },
+          order(col, opts) { hydrateQuery.push({ order: [col, opts] }); return chain; },
+          limit(n) { hydrateQuery.push({ limit: n }); return Promise.resolve({ data: [], error: null }); },
+        };
+        return chain;
+      },
+    };
+    await createUnhedgedFillTracker({ supabase: hydrateShapeDb }).hydrate();
+    assert.ok(hydrateQuery.some((c) => c.eq && c.eq[0] === 'status' && c.eq[1] === 'seen'));
+    assert.ok(hydrateQuery.some((c) => c.order && c.order[0] === 'created_at' && c.order[1] && c.order[1].ascending === false));
+    assert.ok(hydrateQuery.some((c) => c.limit === 2000), 'seen hydrate must take the newest 2000, not 500 unordered');
+
+    // Recent Poly seen rows are swept into pending so missed rfqClosed still resolve.
+    const sweepNow = Date.parse('2026-08-14T21:00:00Z');
+    const sweepDb = createMemSupabase([
+      {
+        venue: 'polymarket',
+        rfq_id: 'rfq-poly-sweep',
+        status: 'seen',
+        contracts: 8,
+        market_ticker: 'aec-mlb-cws-det-2026-08-14-cws',
+        created_at: new Date(sweepNow - 30 * 60 * 1000).toISOString(),
+      },
+      {
+        venue: 'kalshi',
+        rfq_id: 'rfq-kalshi-not-swept',
+        status: 'seen',
+        created_at: new Date(sweepNow - 10 * 60 * 1000).toISOString(),
+      },
+    ]);
+    const sweepPatches = [];
+    const sweepTracker = createUnhedgedFillTracker({
+      supabase: sweepDb,
+      persist: async (row, meta) => { if (meta && meta.mode === 'fill') sweepPatches.push(row); },
+      fetchRfq: async (id) => ({
+        id,
+        status: 'RFQ_STATUS_CLOSED',
+        buyPrice: 0.41,
+        updatedTime: new Date(sweepNow).toISOString(),
+      }),
+      fetchTrades: async () => { throw new Error('sweep priced CLOSED must not tape'); },
+    });
+    await sweepTracker.tick(sweepNow);
+    assert.ok(sweepTracker.pending.has('polymarket:rfq-poly-sweep') || sweepPatches.length === 1);
+    assert.ok(!sweepTracker.pending.has('kalshi:rfq-kalshi-not-swept'));
+    if (!sweepPatches.length) await sweepTracker.tick(sweepNow + 1000);
+    assert.strictEqual(sweepPatches.length, 1);
+    assert.strictEqual(sweepPatches[0].venue, 'polymarket');
+    assert.strictEqual(sweepPatches[0].rfq_id, 'rfq-poly-sweep');
+    assert.strictEqual(sweepPatches[0].status, 'filled');
+    assert.strictEqual(sweepPatches[0].fill_yes_price, 0.41);
     assert.ok(hydrateTracker.filled.has('kalshi:rfq-already-filled'));
     assert.ok(!hydrateTracker.filled.has('kalshi:rfq-open-hydrate'));
     const skipFilled = await hydrateTracker.onClosed({

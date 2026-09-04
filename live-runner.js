@@ -672,7 +672,12 @@ async function fetchUnhedgedVenueRfq(rfqId, row) {
 }
 
 async function fetchUnhedgedVenueTrades(ticker, minTs, maxTs, row) {
-  if (row && row.venue === 'polymarket') return [];
+  if (row && row.venue === 'polymarket') {
+    if (polyLoop && typeof polyLoop.fetchUnhedgedTrades === 'function') {
+      return polyLoop.fetchUnhedgedTrades(ticker, minTs, maxTs, row);
+    }
+    return [];
+  }
   return fetchSkipTrades(ticker, minTs, maxTs);
 }
 

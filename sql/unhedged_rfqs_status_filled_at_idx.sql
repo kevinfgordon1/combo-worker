@@ -1,0 +1,8 @@
+-- Suggested Supabase index for the Unhedged blotter (filled Today / 24h / 7d)
+-- and worker fill hydrate. Do not apply blindly — review in the SQL editor.
+--
+-- Blotter queries: status = 'filled' ORDER BY filled_at DESC (and date predicates
+-- on filled_at). Worker hydrateFilled already orders by filled_at desc.
+--
+-- create index concurrently if not exists unhedged_rfqs_status_filled_at_idx
+--   on public.unhedged_rfqs (status, filled_at desc);
