@@ -70,7 +70,9 @@ const MLB_CODES = [
 
 const LEAGUE_TEAM_CODES = { nfl: NFL_CODES, mlb: MLB_CODES };
 
-const DT_RE = /^(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})(\d{4})(.*)$/i;
+const DT_TIME_RE = /^(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})(\d{4})(.*)$/i;
+// NFL GAME tickers are often date-only: 26SEP13ARILAC (no HHMM).
+const DT_DATE_RE = /^(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})(?!\d)(.*)$/i;
 
 function normTeam(league, code) {
   const raw = String(code || '').trim().toLowerCase();
@@ -93,6 +95,33 @@ function leagueFromParticipant(id) {
   const prefix = s.slice(0, i);
   if (prefix === 'mlb' || prefix === 'nba' || prefix === 'nfl' || prefix === 'nhl') return prefix;
   return '';
+}
+
+function etDateFromYmd(year, month, day) {
+  if (!year || !month || !day) return null;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function parseKalshiDateRest(rest) {
+  const timed = DT_TIME_RE.exec(String(rest || ''));
+  if (timed) {
+    const hour = parseInt(timed[4].slice(0, 2), 10);
+    const minute = parseInt(timed[4].slice(2, 4), 10);
+    if (hour <= 23 && minute <= 59) {
+      const startMs = parseKalshiTickerStart(timed[1] + timed[2] + timed[3] + timed[4]);
+      const date = etDateFromMs(startMs);
+      if (date) return { date, teamsBlob: timed[5] || '' };
+    }
+  }
+  const dated = DT_DATE_RE.exec(String(rest || ''));
+  if (!dated) return null;
+  const year = 2000 + parseInt(dated[1], 10);
+  const month = MONTHS[dated[2].toUpperCase()];
+  const day = parseInt(dated[3], 10);
+  const date = etDateFromYmd(year, month, day);
+  if (!date) return null;
+  return { date, teamsBlob: dated[4] || '' };
 }
 
 function etDateFromMs(ms) {
@@ -214,13 +243,11 @@ function kalshiTickerPieces(text, sideOverride) {
   const spec = SERIES[series];
   if (!spec) return null;
 
-  const m = DT_RE.exec(rest);
-  if (!m) return null;
-  const startMs = parseKalshiTickerStart(m[1] + m[2] + m[3] + m[4]);
-  const date = etDateFromMs(startMs);
-  if (!date) return null;
+  const parsed = parseKalshiDateRest(rest);
+  if (!parsed) return null;
+  const date = parsed.date;
 
-  let teamsBlob = m[5] || '';
+  let teamsBlob = parsed.teamsBlob || '';
   let selection = '';
   const selDash = teamsBlob.lastIndexOf('-');
   if (selDash > 0) {

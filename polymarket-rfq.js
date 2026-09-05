@@ -280,7 +280,8 @@ function logActiveLockIdentityFails(parlays, log = console.log) {
     const lock = identitiesFromParlay(p);
     if (lock.ok) continue;
     const label = (p && (p.label || p.id)) || '?';
-    log(`[${MODE}] lock-identity-fail label=${label}`);
+    const keys = kalshiMlTickersFromParlay(p);
+    log(`[${MODE}] lock-identity-fail label=${label} keys=${keys.join('|') || '(none)'}`);
     n += 1;
   }
   return n;

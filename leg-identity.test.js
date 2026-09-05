@@ -178,6 +178,42 @@ assert.strictEqual(texLaaLock.keys.length, 2);
 assert.ok(texLaaLock.keys.some((k) => k.includes('tb+tex') && k.endsWith('|tex|yes')));
 assert.ok(texLaaLock.keys.some((k) => k.includes('laa+pit') && k.endsWith('|laa|yes')));
 
+// Production NFL Combo Locks tickers are date-only (no HHMM): 26SEP13ARILAC.
+const ariDateOnly = parseKalshiTicker('KXNFLGAME-26SEP13ARILAC-ARI:yes');
+assert.ok(ariDateOnly);
+assert.strictEqual(ariDateOnly.league, 'nfl');
+assert.strictEqual(ariDateOnly.date, '2026-09-13');
+assert.deepStrictEqual(ariDateOnly.teams, ['ari', 'lac']);
+assert.strictEqual(ariDateOnly.selection, 'ari');
+const jacDateOnly = parseKalshiTicker('KXNFLGAME-26SEP13CLEJAC-JAC:yes');
+assert.ok(jacDateOnly);
+assert.deepStrictEqual(jacDateOnly.teams, ['cle', 'jax']);
+assert.strictEqual(jacDateOnly.selection, 'jax');
+const ariJacLock = identitiesFromParlay({
+  label: 'Arizona + Jacksonville',
+  leg_keys: [
+    'KXNFLGAME-26SEP13ARILAC-ARI:yes',
+    'KXNFLGAME-26SEP13CLEJAC-JAC:yes',
+  ],
+});
+assert.ok(ariJacLock.ok);
+const ariJacSlugs = identitiesFromPolymarketSlugs([
+  { symbol: 'aec-nfl-ari-lac-2026-09-13', side: 'SIDE_BUY' },
+  { symbol: 'aec-nfl-cle-jax-2026-09-13', side: 'SIDE_SELL' },
+]);
+assert.ok(ariJacSlugs.ok);
+assert.ok(sameIdentitySet(ariJacSlugs.keys, ariJacLock.keys));
+const ariJacOpp = identitiesFromPolymarketSlugs([
+  { symbol: 'aec-nfl-ari-lac-2026-09-13', side: 'SIDE_SELL' },
+  { symbol: 'aec-nfl-cle-jax-2026-09-13', side: 'SIDE_SELL' },
+]);
+assert.ok(ariJacOpp.ok);
+assert.ok(!sameIdentitySet(ariJacOpp.keys, ariJacLock.keys));
+const neSeaDateOnly = parseKalshiTicker('KXNFLGAME-26SEP09NESEA-NE:yes');
+assert.ok(neSeaDateOnly);
+assert.strictEqual(neSeaDateOnly.date, '2026-09-09');
+assert.deepStrictEqual(neSeaDateOnly.teams, ['ne', 'sea']);
+
 assert.strictEqual(parseKalshiTicker('KXMVESPORTSMULTIGAMEEXTENDED-S2026FF'), null);
 assert.strictEqual(parseKalshiTicker('KXMLBGAME-26AUG141840CWSDET-CWS:yes').side, 'yes');
 

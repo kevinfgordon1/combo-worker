@@ -663,6 +663,55 @@ const detCleLock = {
 assert.strictEqual(couldMatchActiveLocks(dhRfq, [detCleLock]), false);
 assert.strictEqual(explainLockOverlapMiss(dhRfq, [detCleLock]).code, 'doubleheader');
 
+// Kevin's live fixture: date-only NFL tickers + Poly jax (not jac) slugs.
+const ariJacSept13Lock = {
+  id: '98d3e355-4a1d-4f60-91ed-a7c1517c60ad',
+  user_id: 'u1',
+  label: 'Arizona + Jacksonville',
+  parlay_stake: 100,
+  parlay_american: 250,
+  fill_american: 400,
+  hedge_mode: '1x',
+  max_contracts: 150,
+  starts_at: '2026-09-13T17:00:00.000Z',
+  leg_keys: [
+    'KXNFLGAME-26SEP13ARILAC-ARI:yes',
+    'KXNFLGAME-26SEP13CLEJAC-JAC:yes',
+  ],
+  legs: [],
+};
+const ariJacQuoteRfq = {
+  id: 'rfq_ari_jac_quote',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'aec-nfl-ari-lac-2026-09-13', side: 'SIDE_BUY' },
+    { symbol: 'aec-nfl-cle-jax-2026-09-13', side: 'SIDE_SELL' },
+  ],
+};
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(ariJacQuoteRfq), [ariJacSept13Lock]), true);
+const ariJacEval = evaluatePolymarketRfq({
+  rfq: ariJacQuoteRfq,
+  parlays: [ariJacSept13Lock],
+  now: Date.parse('2026-09-05T18:30:00Z'),
+});
+assert.strictEqual(ariJacEval.action, 'quoteable');
+assert.strictEqual(ariJacEval.parlay.id, '98d3e355-4a1d-4f60-91ed-a7c1517c60ad');
+
+const ariJacOppRfq = normalizePolymarketRfq({
+  id: 'rfq_ari_jac_both_sell',
+  comboLegs: [
+    { symbol: 'aec-nfl-ari-lac-2026-09-13', side: 'SIDE_SELL' },
+    { symbol: 'aec-nfl-cle-jax-2026-09-13', side: 'SIDE_SELL' },
+  ],
+});
+assert.strictEqual(couldMatchActiveLocks(ariJacOppRfq, [ariJacSept13Lock]), false);
+assert.strictEqual(
+  explainLockOverlapMiss(ariJacOppRfq, [ariJacSept13Lock]).code,
+  'same_games_no_match'
+);
+assert.strictEqual(logActiveLockIdentityFails([ariJacSept13Lock], () => {}), 0);
+
 const hist = {};
 tallyReconcileOutcome(hist, { post: true, reason: 'quoted' });
 tallyReconcileOutcome(hist, {
@@ -706,7 +755,10 @@ const unparseableMl = {
   leg_keys: ['KXMLBGAME-26SEP031840XXXXX-XXX:yes'],
 };
 assert.strictEqual(logActiveLockIdentityFails([unparseableMl], (m) => identityFailLogs.push(m)), 1);
-assert.ok(identityFailLogs.some((l) => l.includes('[POLY] lock-identity-fail label=Garbage ML lock')));
+assert.ok(identityFailLogs.some((l) => (
+  l.includes('[POLY] lock-identity-fail label=Garbage ML lock')
+  && l.includes('keys=KXMLBGAME-26SEP031840XXXXX-XXX:yes')
+)));
 
 const quoteable = evaluatePolymarketRfq({
   rfq: pmRfq,
