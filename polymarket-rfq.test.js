@@ -663,7 +663,9 @@ const detCleLock = {
 assert.strictEqual(couldMatchActiveLocks(dhRfq, [detCleLock]), false);
 assert.strictEqual(explainLockOverlapMiss(dhRfq, [detCleLock]).code, 'doubleheader');
 
-// Kevin's live fixture: date-only NFL tickers + Poly jax (not jac) slugs.
+// Production smoking gun 2026-09-05 18:14Z:
+// `[POLY] lock-identity-fail label=Arizona + Jacksonville`
+// combo_parlays 98d3e355 — date-only NFL GAME tickers (no HHMM).
 const ariJacSept13Lock = {
   id: '98d3e355-4a1d-4f60-91ed-a7c1517c60ad',
   user_id: 'u1',
@@ -678,7 +680,24 @@ const ariJacSept13Lock = {
     'KXNFLGAME-26SEP13ARILAC-ARI:yes',
     'KXNFLGAME-26SEP13CLEJAC-JAC:yes',
   ],
-  legs: [],
+  legs: [
+    {
+      game: 'Arizona vs Los Angeles C',
+      side: 'yes',
+      type: 'side',
+      label: 'Arizona',
+      ticker: 'KXNFLGAME-26SEP13ARILAC-ARI',
+      gameKey: 'nfl:26SEP13ARILAC',
+    },
+    {
+      game: 'Cleveland vs Jacksonville',
+      side: 'yes',
+      type: 'side',
+      label: 'Jacksonville',
+      ticker: 'KXNFLGAME-26SEP13CLEJAC-JAC',
+      gameKey: 'nfl:26SEP13CLEJAC',
+    },
+  ],
 };
 const ariJacQuoteRfq = {
   id: 'rfq_ari_jac_quote',
@@ -710,7 +729,13 @@ assert.strictEqual(
   explainLockOverlapMiss(ariJacOppRfq, [ariJacSept13Lock]).code,
   'same_games_no_match'
 );
-assert.strictEqual(logActiveLockIdentityFails([ariJacSept13Lock], () => {}), 0);
+const ariJacIdLogs = [];
+assert.strictEqual(logActiveLockIdentityFails([ariJacSept13Lock], (m) => ariJacIdLogs.push(m)), 0);
+assert.ok(!ariJacIdLogs.some((l) => l.includes('[POLY] lock-identity-fail label=Arizona + Jacksonville')));
+assert.strictEqual(
+  logActiveLockIdentityFails([{ ...ariJacSept13Lock, leg_keys: undefined }], (m) => ariJacIdLogs.push(m)),
+  0
+);
 
 const hist = {};
 tallyReconcileOutcome(hist, { post: true, reason: 'quoted' });

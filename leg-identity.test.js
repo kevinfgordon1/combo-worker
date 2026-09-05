@@ -213,6 +213,20 @@ const neSeaDateOnly = parseKalshiTicker('KXNFLGAME-26SEP09NESEA-NE:yes');
 assert.ok(neSeaDateOnly);
 assert.strictEqual(neSeaDateOnly.date, '2026-09-09');
 assert.deepStrictEqual(neSeaDateOnly.teams, ['ne', 'sea']);
+const timedNfl = parseKalshiTicker('KXNFLGAME-26SEP071330BUFKC-KC:yes');
+assert.ok(timedNfl);
+assert.strictEqual(timedNfl.date, '2026-09-07');
+assert.deepStrictEqual(timedNfl.teams, ['buf', 'kc']);
+assert.strictEqual(timedNfl.selection, 'kc');
+const ariJacFromLegs = identitiesFromParlay({
+  label: 'Arizona + Jacksonville',
+  legs: [
+    { ticker: 'KXNFLGAME-26SEP13ARILAC-ARI', side: 'yes' },
+    { ticker: 'KXNFLGAME-26SEP13CLEJAC-JAC', side: 'yes' },
+  ],
+});
+assert.ok(ariJacFromLegs.ok);
+assert.ok(sameIdentitySet(ariJacFromLegs.keys, ariJacLock.keys));
 
 assert.strictEqual(parseKalshiTicker('KXMVESPORTSMULTIGAMEEXTENDED-S2026FF'), null);
 assert.strictEqual(parseKalshiTicker('KXMLBGAME-26AUG141840CWSDET-CWS:yes').side, 'yes');
