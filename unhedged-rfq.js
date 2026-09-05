@@ -286,7 +286,7 @@ function parsePmUnhedgedSlug(symbol, sideOverride) {
     teamTokens = tokens.slice(start);
   }
   const orderedTeams = teamTokens.filter((t) => t && !/^\d+$/.test(t));
-  const pick = afterDate.find((t) => t && !/^\d+$/.test(t)) || '';
+  const pick = afterDate.find((t) => t && !/^\d+$/.test(t) && !/^dh\d+$/i.test(t)) || '';
   let selection = pick || orderedTeams[0] || '';
   if (/^\d+$/.test(selection)) selection = '';
   const teams = [...new Set(orderedTeams)];
@@ -558,7 +558,7 @@ function priceClassified({ venue, legs, priceCache, getOurTrue, getYesProb, env,
   };
 }
 
-function buildUnhedgedRow(classified, rfq) {
+function buildUnhedgedRow(classified, rfq, opts = {}) {
   if (!classified || !classified.persist || !classified.rfqId) return null;
   const size = classified.size || extractSize(rfq || {});
   const taker = classified.taker || { yes: null, no: null, american: null };
@@ -574,7 +574,7 @@ function buildUnhedgedRow(classified, rfq) {
     our_fair_american: classified.our_fair_american == null ? null : classified.our_fair_american,
     our_quote_american: classified.our_quote_american == null ? null : classified.our_quote_american,
     status: classified.status,
-    skip_reason: classified.reason || null,
+    skip_reason: opts.lockSkipReason || classified.reason || null,
   };
 }
 
@@ -635,7 +635,7 @@ function considerUnhedgedRfq(rfq, opts = {}) {
   if (!isUnhedgedRfqShadow(opts.env)) return fail('flag_off');
   const classified = classifyUnhedgedRfq(rfq, opts);
   if (!classified.persist) return classified;
-  const row = buildUnhedgedRow(classified, rfq);
+  const row = buildUnhedgedRow(classified, rfq, opts);
   if (!row) return fail('bad_rfq');
   return { ...classified, row };
 }

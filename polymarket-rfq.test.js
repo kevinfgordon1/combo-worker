@@ -18,6 +18,12 @@ const {
   normalizePolymarketRfq,
   couldMatchActiveLocks,
   logActiveLockIdentityFails,
+  logUnpriceablePolyLocks,
+  explainLockOverlapMiss,
+  tallyReconcileOutcome,
+  formatReasonTally,
+  countPriceableLocks,
+  lockSkipReasonOf,
   cheapDirectMatch,
   matchPolymarketParlay,
   matchPolymarketParlayDetailed,
@@ -128,10 +134,31 @@ const pmRfq = {
   ],
 };
 
-const skipped = evaluatePolymarketRfq({ rfq: pmRfq, parlays: [kalshiParlay] });
-assert.strictEqual(skipped.action, 'skip');
-assert.strictEqual(skipped.reason, 'missing_metadata');
-assert.strictEqual(matchPolymarketParlay(normalizePolymarketRfq(pmRfq), [kalshiParlay]), null);
+const skipped = evaluatePolymarketRfq({
+  rfq: pmRfq,
+  parlays: [kalshiParlay],
+  now: Date.parse('2026-08-14T20:00:00Z'),
+});
+assert.strictEqual(skipped.action, 'quoteable');
+assert.strictEqual(skipped.parlay.id, P);
+assert.strictEqual(
+  matchPolymarketParlay(normalizePolymarketRfq(pmRfq), [kalshiParlay]).id,
+  P
+);
+const noSlugMetaMiss = evaluatePolymarketRfq({
+  rfq: {
+    id: 'rfq_opaque',
+    status: 'RFQ_STATUS_OPEN',
+    qtyDecimal: '10',
+    comboLegs: [
+      { symbol: 'cond-opaque-one', side: 'SIDE_BUY' },
+      { symbol: 'cond-opaque-two', side: 'SIDE_BUY' },
+    ],
+  },
+  parlays: [kalshiParlay],
+});
+assert.strictEqual(noSlugMetaMiss.action, 'skip');
+assert.strictEqual(noSlugMetaMiss.reason, 'missing_metadata');
 
 const cwsMeta = {
   metadata: {
@@ -529,6 +556,219 @@ assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(twoOfThreeRfq), 
 assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(exactThreeRfq), [threeLegLock]), true);
 assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(astatcPropRfq), [threeLegLock]), false);
 
+// Production Poly RFQs use game slugs (no pick). SIDE_SELL on tb-tex is TEX yes.
+const texLaaGameRfq = {
+  id: 'rfq_tex_laa_game',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'aec-mlb-laa-pit-2026-09-04', side: 'SIDE_BUY' },
+    { symbol: 'aec-mlb-tb-tex-2026-09-04', side: 'SIDE_SELL' },
+  ],
+};
+const texLaaSept4Lock = {
+  id: 'tex-laa-sept4',
+  user_id: 'u1',
+  label: 'Texas Rangers ML + Los Angeles Angels ML',
+  parlay_stake: 100,
+  parlay_american: 400,
+  fill_american: 550,
+  hedge_mode: '1x',
+  max_contracts: 150,
+  starts_at: '2026-09-04T22:46:00.000Z',
+  leg_keys: [
+    'KXMLBGAME-26SEP041845LAAPIT-LAA:yes',
+    'KXMLBGAME-26SEP042005TBTEX-TEX:yes',
+  ],
+  legs: [],
+};
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(texLaaGameRfq), [texLaaSept4Lock]), true);
+const texLaaEval = evaluatePolymarketRfq({
+  rfq: texLaaGameRfq,
+  parlays: [texLaaSept4Lock],
+  now: Date.parse('2026-09-04T18:00:00Z'),
+});
+assert.strictEqual(texLaaEval.action, 'quoteable');
+assert.strictEqual(texLaaEval.parlay.id, 'tex-laa-sept4');
+
+const pitTbGameRfq = {
+  id: 'rfq_pit_tb_game',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'aec-mlb-laa-pit-2026-09-04', side: 'SIDE_SELL' },
+    { symbol: 'aec-mlb-tb-tex-2026-09-04', side: 'SIDE_BUY' },
+  ],
+};
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(pitTbGameRfq), [texLaaSept4Lock]), false);
+assert.strictEqual(
+  evaluatePolymarketRfq({ rfq: pitTbGameRfq, parlays: [texLaaSept4Lock] }).reason,
+  'unmatched'
+);
+const pitTbMiss = explainLockOverlapMiss(
+  normalizePolymarketRfq(pitTbGameRfq),
+  [texLaaSept4Lock]
+);
+assert.strictEqual(pitTbMiss.code, 'same_games_no_match');
+
+// Production 2026-09-04 21:00 window: 2-leg RFQs that named both lock
+// games were LAA yes + TB yes (wrong TEX side) — mapping near-miss, not volume.
+const prodLaaTbYesRfq = normalizePolymarketRfq({
+  id: 'rfq_prod_laa_tb_yes',
+  comboLegs: [
+    { symbol: 'aec-mlb-laa-pit-2026-09-04', side: 'SIDE_BUY' },
+    { symbol: 'aec-mlb-tb-tex-2026-09-04', side: 'SIDE_BUY' },
+  ],
+});
+assert.strictEqual(couldMatchActiveLocks(prodLaaTbYesRfq, [texLaaSept4Lock]), false);
+assert.strictEqual(
+  explainLockOverlapMiss(prodLaaTbYesRfq, [texLaaSept4Lock]).code,
+  'same_games_no_match'
+);
+assert.strictEqual(
+  lockSkipReasonOf({
+    reason: 'no_lock_overlap',
+    overlap: explainLockOverlapMiss(prodLaaTbYesRfq, [texLaaSept4Lock]),
+  }),
+  'no_lock_overlap:same_games_no_match'
+);
+
+const prodExtraLegRfq = normalizePolymarketRfq({
+  id: 'rfq_prod_3leg',
+  comboLegs: [
+    { symbol: 'aec-mlb-chc-mia-2026-09-04', side: 'SIDE_BUY' },
+    { symbol: 'aec-mlb-laa-pit-2026-09-04', side: 'SIDE_SELL' },
+    { symbol: 'aec-mlb-tb-tex-2026-09-04', side: 'SIDE_BUY' },
+  ],
+});
+assert.strictEqual(
+  explainLockOverlapMiss(prodExtraLegRfq, [texLaaSept4Lock]).code,
+  'leg_count'
+);
+
+const dhRfq = normalizePolymarketRfq({
+  id: 'rfq_dh1',
+  comboLegs: [
+    { symbol: 'aec-mlb-det-cle-2026-09-04-dh1', side: 'SIDE_BUY' },
+    { symbol: 'aec-mlb-laa-pit-2026-09-04', side: 'SIDE_BUY' },
+  ],
+});
+const detCleLock = {
+  label: 'Tigers + Angels',
+  leg_keys: [
+    'KXMLBGAME-26SEP041845DETCLE-DET:yes',
+    'KXMLBGAME-26SEP041845LAAPIT-LAA:yes',
+  ],
+};
+assert.strictEqual(couldMatchActiveLocks(dhRfq, [detCleLock]), false);
+assert.strictEqual(explainLockOverlapMiss(dhRfq, [detCleLock]).code, 'doubleheader');
+
+// Production smoking gun 2026-09-05 18:14Z:
+// `[POLY] lock-identity-fail label=Arizona + Jacksonville`
+// combo_parlays 98d3e355 — date-only NFL GAME tickers (no HHMM).
+const ariJacSept13Lock = {
+  id: '98d3e355-4a1d-4f60-91ed-a7c1517c60ad',
+  user_id: 'u1',
+  label: 'Arizona + Jacksonville',
+  parlay_stake: 100,
+  parlay_american: 250,
+  fill_american: 400,
+  hedge_mode: '1x',
+  max_contracts: 150,
+  starts_at: '2026-09-13T17:00:00.000Z',
+  leg_keys: [
+    'KXNFLGAME-26SEP13ARILAC-ARI:yes',
+    'KXNFLGAME-26SEP13CLEJAC-JAC:yes',
+  ],
+  legs: [
+    {
+      game: 'Arizona vs Los Angeles C',
+      side: 'yes',
+      type: 'side',
+      label: 'Arizona',
+      ticker: 'KXNFLGAME-26SEP13ARILAC-ARI',
+      gameKey: 'nfl:26SEP13ARILAC',
+    },
+    {
+      game: 'Cleveland vs Jacksonville',
+      side: 'yes',
+      type: 'side',
+      label: 'Jacksonville',
+      ticker: 'KXNFLGAME-26SEP13CLEJAC-JAC',
+      gameKey: 'nfl:26SEP13CLEJAC',
+    },
+  ],
+};
+const ariJacQuoteRfq = {
+  id: 'rfq_ari_jac_quote',
+  status: 'RFQ_STATUS_OPEN',
+  qtyDecimal: '10',
+  comboLegs: [
+    { symbol: 'aec-nfl-ari-lac-2026-09-13', side: 'SIDE_BUY' },
+    { symbol: 'aec-nfl-cle-jax-2026-09-13', side: 'SIDE_SELL' },
+  ],
+};
+assert.strictEqual(couldMatchActiveLocks(normalizePolymarketRfq(ariJacQuoteRfq), [ariJacSept13Lock]), true);
+const ariJacEval = evaluatePolymarketRfq({
+  rfq: ariJacQuoteRfq,
+  parlays: [ariJacSept13Lock],
+  now: Date.parse('2026-09-05T18:30:00Z'),
+});
+assert.strictEqual(ariJacEval.action, 'quoteable');
+assert.strictEqual(ariJacEval.parlay.id, '98d3e355-4a1d-4f60-91ed-a7c1517c60ad');
+
+const ariJacOppRfq = normalizePolymarketRfq({
+  id: 'rfq_ari_jac_both_sell',
+  comboLegs: [
+    { symbol: 'aec-nfl-ari-lac-2026-09-13', side: 'SIDE_SELL' },
+    { symbol: 'aec-nfl-cle-jax-2026-09-13', side: 'SIDE_SELL' },
+  ],
+});
+assert.strictEqual(couldMatchActiveLocks(ariJacOppRfq, [ariJacSept13Lock]), false);
+assert.strictEqual(
+  explainLockOverlapMiss(ariJacOppRfq, [ariJacSept13Lock]).code,
+  'same_games_no_match'
+);
+const ariJacIdLogs = [];
+assert.strictEqual(logActiveLockIdentityFails([ariJacSept13Lock], (m) => ariJacIdLogs.push(m)), 0);
+assert.ok(!ariJacIdLogs.some((l) => l.includes('[POLY] lock-identity-fail label=Arizona + Jacksonville')));
+assert.strictEqual(
+  logActiveLockIdentityFails([{ ...ariJacSept13Lock, leg_keys: undefined }], (m) => ariJacIdLogs.push(m)),
+  0
+);
+
+const hist = {};
+tallyReconcileOutcome(hist, { post: true, reason: 'quoted' });
+tallyReconcileOutcome(hist, {
+  action: 'skip',
+  reason: 'no_lock_overlap',
+  overlap: { code: 'no_shared_game' },
+});
+tallyReconcileOutcome(hist, {
+  action: 'skip',
+  reason: 'no_lock_overlap',
+  overlap: { code: 'same_games_no_match' },
+});
+assert.strictEqual(hist.quoted, 1);
+assert.strictEqual(hist.no_lock_overlap, 2);
+assert.strictEqual(hist.no_shared_game, 1);
+assert.strictEqual(hist.same_games_no_match, 1);
+assert.ok(formatReasonTally(hist).includes('no_lock_overlap=2'));
+
+const ncaafSpreadLock = {
+  id: 'ncaaf-spread',
+  label: 'Baylor Bears +7.5 + Mercyhurst Lakers +28.5',
+  leg_keys: [
+    'KXNCAAFSPREAD-26SEP05BAYAUB-AUB8:no',
+    'KXNCAAFSPREAD-26SEP05MHUNMSU-NMSU29:no',
+  ],
+};
+const unpriceableLogs = [];
+assert.strictEqual(logUnpriceablePolyLocks([ncaafSpreadLock, texLaaSept4Lock], (m) => unpriceableLogs.push(m)), 1);
+assert.ok(unpriceableLogs.some((l) => l.includes('lock-unpriceable-on-poly reason=not_moneyline')));
+assert.ok(unpriceableLogs.some((l) => l.includes('Baylor Bears')));
+assert.strictEqual(countPriceableLocks([texLaaSept4Lock, ncaafSpreadLock]), 1);
+
 const identityFailLogs = [];
 assert.strictEqual(logActiveLockIdentityFails([kalshiParlay, texLaaLock], (m) => identityFailLogs.push(m)), 0);
 assert.deepStrictEqual(identityFailLogs, []);
@@ -540,7 +780,10 @@ const unparseableMl = {
   leg_keys: ['KXMLBGAME-26SEP031840XXXXX-XXX:yes'],
 };
 assert.strictEqual(logActiveLockIdentityFails([unparseableMl], (m) => identityFailLogs.push(m)), 1);
-assert.ok(identityFailLogs.some((l) => l.includes('[POLY] lock-identity-fail label=Garbage ML lock')));
+assert.ok(identityFailLogs.some((l) => (
+  l.includes('[POLY] lock-identity-fail label=Garbage ML lock')
+  && l.includes('keys=KXMLBGAME-26SEP031840XXXXX-XXX:yes')
+)));
 
 const quoteable = evaluatePolymarketRfq({
   rfq: pmRfq,
@@ -564,7 +807,7 @@ assert.ok(!('account' in quoteBodyFromEval(quoteable)));
 
 assert.deepStrictEqual(shouldPostNow(quoteable, { live: false }), { post: false, reason: 'live_off' });
 assert.deepStrictEqual(shouldPostNow(quoteable, { live: true }), { post: true, reason: null });
-assert.deepStrictEqual(shouldPostNow(skipped, { live: true }), { post: false, reason: 'missing_metadata' });
+assert.deepStrictEqual(shouldPostNow(noSlugMetaMiss, { live: true }), { post: false, reason: 'missing_metadata' });
 
 assert.strictEqual(shouldConfirmPolymarketAccept('SIDE_BUY'), true);
 assert.strictEqual(shouldConfirmPolymarketAccept('SIDE_SELL'), false);
@@ -1004,6 +1247,7 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     pendingQuotes: new Map(),
     reconcileMs: 60 * 60 * 1000,
   });
+  await new Promise((r) => setTimeout(r, 30));
   const listAfterStart = firehoseList;
 
   const logs = [];
@@ -1627,7 +1871,8 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
       { symbol: 'aec-mlb-bos-pit-2026-08-14-bos', side: 'SIDE_BUY' },
     ],
   });
-  assert.strictEqual(unmatchedOpp.reason, 'unmatched');
+  assert.strictEqual(unmatchedOpp.reason, 'no_lock_overlap');
+  assert.strictEqual(unmatchedOpp.overlap && unmatchedOpp.overlap.code, 'same_games_no_match');
   await new Promise((r) => setTimeout(r, 20));
   assert.ok(ingestRows.some((r) => r.rfq_id === 'rfq_lock_miss_unmatched'));
   ingestLoop.stop();
@@ -1720,6 +1965,68 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.strictEqual(priced.legs[0].fair_american, invertAmerican(priced.legs[0].best_opponent_american));
   assert.ok(priced.our_fair_american !== polyLegAm);
   pricedLoop.stop();
+
+  const gamePosts = [];
+  const gameLogs = [];
+  const origGameLog = console.log;
+  console.log = (...args) => { gameLogs.push(args.join(' ')); origGameLog(...args); };
+  const gameHttp = {
+    async getUserId() { return { rfqUserId: 'rfquser_test' }; },
+    async listRfqs(query) {
+      if (query && query.status === 'RFQ_STATUS_OPEN') {
+        return { rfqs: [texLaaGameRfq, pitTbGameRfq, tennisRfq] };
+      }
+      return { rfqs: [] };
+    },
+    async listQuotes() { return { quotes: [] }; },
+    async getCombo() { return { combos: [] }; },
+    async createQuote(body) {
+      gamePosts.push(body);
+      return { quoteId: 'quote_game_slug' };
+    },
+    async confirmQuote() { return {}; },
+    async deleteQuote() { return { statusCode: 200 }; },
+    close() {},
+  };
+  const gameLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    http: gameHttp,
+    startWs: false,
+    getParlays: () => [texLaaSept4Lock],
+    fetchMarket: async () => null,
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+  });
+  try {
+    await new Promise((r) => setTimeout(r, 30));
+    assert.strictEqual(gamePosts.length, 1);
+    assert.ok(gameLogs.some((l) => l.includes('[POLY] QUOTED') && l.includes('Texas Rangers')));
+    assert.ok(gameLogs.some((l) => (
+      l.includes('[POLY] SKIP no_lock_overlap') && l.includes('code=same_games_no_match')
+    )));
+    assert.ok(gameLogs.some((l) => (
+      l.includes('[POLY] reconcile open=3 locks=1 priceable=1 live=true')
+      && l.includes('quoted=1')
+      && l.includes('no_lock_overlap=2')
+      && l.includes('same_games_no_match=1')
+      && l.includes('no_shared_game=1')
+    )));
+    assert.ok(!gameLogs.some((l) => l.includes('SKIP unmatched') && l.includes('aec-atp')));
+
+    const tennisQuiet = await gameLoop.handleRfq({ ...tennisRfq, id: 'rfq_tennis_quiet' });
+    assert.strictEqual(tennisQuiet.reason, 'no_lock_overlap');
+    assert.ok(!gameLogs.some((l) => l.includes('SKIP no_lock_overlap') && l.includes('rfq_tennis_quiet')));
+  } finally {
+    console.log = origGameLog;
+    gameLoop.stop();
+  }
 
   const parsed = parsePrivateMessage(JSON.stringify({
     requestId: 'rfq-sub-1',

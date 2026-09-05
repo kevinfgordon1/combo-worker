@@ -5,6 +5,8 @@ const {
   kalshiTickerPieces,
   identitiesFromParlay,
   identityFromMarket,
+  identityFromPolymarketSlug,
+  identitiesFromPolymarketSlugs,
   identitiesFromPolymarketLegs,
   identityKey,
   sameIdentitySet,
@@ -176,6 +178,56 @@ assert.strictEqual(texLaaLock.keys.length, 2);
 assert.ok(texLaaLock.keys.some((k) => k.includes('tb+tex') && k.endsWith('|tex|yes')));
 assert.ok(texLaaLock.keys.some((k) => k.includes('laa+pit') && k.endsWith('|laa|yes')));
 
+// Production NFL Combo Locks tickers are date-only (no HHMM): 26SEP13ARILAC.
+const ariDateOnly = parseKalshiTicker('KXNFLGAME-26SEP13ARILAC-ARI:yes');
+assert.ok(ariDateOnly);
+assert.strictEqual(ariDateOnly.league, 'nfl');
+assert.strictEqual(ariDateOnly.date, '2026-09-13');
+assert.deepStrictEqual(ariDateOnly.teams, ['ari', 'lac']);
+assert.strictEqual(ariDateOnly.selection, 'ari');
+const jacDateOnly = parseKalshiTicker('KXNFLGAME-26SEP13CLEJAC-JAC:yes');
+assert.ok(jacDateOnly);
+assert.deepStrictEqual(jacDateOnly.teams, ['cle', 'jax']);
+assert.strictEqual(jacDateOnly.selection, 'jax');
+const ariJacLock = identitiesFromParlay({
+  label: 'Arizona + Jacksonville',
+  leg_keys: [
+    'KXNFLGAME-26SEP13ARILAC-ARI:yes',
+    'KXNFLGAME-26SEP13CLEJAC-JAC:yes',
+  ],
+});
+assert.ok(ariJacLock.ok);
+const ariJacSlugs = identitiesFromPolymarketSlugs([
+  { symbol: 'aec-nfl-ari-lac-2026-09-13', side: 'SIDE_BUY' },
+  { symbol: 'aec-nfl-cle-jax-2026-09-13', side: 'SIDE_SELL' },
+]);
+assert.ok(ariJacSlugs.ok);
+assert.ok(sameIdentitySet(ariJacSlugs.keys, ariJacLock.keys));
+const ariJacOpp = identitiesFromPolymarketSlugs([
+  { symbol: 'aec-nfl-ari-lac-2026-09-13', side: 'SIDE_SELL' },
+  { symbol: 'aec-nfl-cle-jax-2026-09-13', side: 'SIDE_SELL' },
+]);
+assert.ok(ariJacOpp.ok);
+assert.ok(!sameIdentitySet(ariJacOpp.keys, ariJacLock.keys));
+const neSeaDateOnly = parseKalshiTicker('KXNFLGAME-26SEP09NESEA-NE:yes');
+assert.ok(neSeaDateOnly);
+assert.strictEqual(neSeaDateOnly.date, '2026-09-09');
+assert.deepStrictEqual(neSeaDateOnly.teams, ['ne', 'sea']);
+const timedNfl = parseKalshiTicker('KXNFLGAME-26SEP071330BUFKC-KC:yes');
+assert.ok(timedNfl);
+assert.strictEqual(timedNfl.date, '2026-09-07');
+assert.deepStrictEqual(timedNfl.teams, ['buf', 'kc']);
+assert.strictEqual(timedNfl.selection, 'kc');
+const ariJacFromLegs = identitiesFromParlay({
+  label: 'Arizona + Jacksonville',
+  legs: [
+    { ticker: 'KXNFLGAME-26SEP13ARILAC-ARI', side: 'yes' },
+    { ticker: 'KXNFLGAME-26SEP13CLEJAC-JAC', side: 'yes' },
+  ],
+});
+assert.ok(ariJacFromLegs.ok);
+assert.ok(sameIdentitySet(ariJacFromLegs.keys, ariJacLock.keys));
+
 assert.strictEqual(parseKalshiTicker('KXMVESPORTSMULTIGAMEEXTENDED-S2026FF'), null);
 assert.strictEqual(parseKalshiTicker('KXMLBGAME-26AUG141840CWSDET-CWS:yes').side, 'yes');
 
@@ -194,8 +246,13 @@ assert.strictEqual(identityKey(buyCws.identity), identityKey(cwsId));
 
 const sellCws = identityFromMarket(cwsMarket, 'no');
 assert.ok(sellCws.identity);
-assert.strictEqual(sellCws.identity.side, 'no');
+assert.strictEqual(sellCws.identity.side, 'yes');
+assert.strictEqual(sellCws.identity.selection, 'det');
 assert.notStrictEqual(identityKey(sellCws.identity), identityKey(cwsId));
+assert.strictEqual(
+  identityKey(sellCws.identity),
+  'mlb|2026-08-14|cws+det|moneyline|full|det|yes'
+);
 
 const retail = identityFromMarket({
   sportsMarketType: 'moneyline',
@@ -235,8 +292,70 @@ const noMeta = identitiesFromPolymarketLegs([
   { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'SIDE_BUY' },
   { symbol: 'aec-mlb-bos-pit-2026-08-14-pit', side: 'SIDE_BUY' },
 ], new Map());
-assert.strictEqual(noMeta.ok, false);
-assert.strictEqual(noMeta.reason, 'missing_metadata');
+assert.ok(noMeta.ok, 'game/pick slugs match Combo Locks without market HTTP');
+assert.ok(sameIdentitySet(noMeta.keys, lock.keys));
+
+const texYes = parseKalshiTicker('KXMLBGAME-26SEP031840TBTEX-TEX:yes');
+const gameSellTex = identityFromPolymarketSlug('aec-mlb-tb-tex-2026-09-03', 'no');
+assert.ok(gameSellTex);
+assert.strictEqual(identityKey(gameSellTex), identityKey(texYes));
+const gameBuyTb = identityFromPolymarketSlug('aec-mlb-tb-tex-2026-09-03', 'yes');
+assert.strictEqual(gameBuyTb.selection, 'tb');
+assert.notStrictEqual(identityKey(gameBuyTb), identityKey(texYes));
+
+const tbTexMarket = {
+  metadata: {
+    event_id: 'mlb-tb-tex-2026-09-03',
+    event_start_time: '2026-09-03T22:40:00Z',
+    event_subcategory: 'BASEBALL',
+    market_sport_type: 'baseball_team_full_game_winner',
+    long_participant_id: 'mlb-tb',
+    short_participant_id: 'mlb-tex',
+  },
+};
+const metaSellTex = identityFromMarket(tbTexMarket, 'no');
+assert.ok(metaSellTex.identity);
+assert.strictEqual(identityKey(metaSellTex.identity), identityKey(texYes));
+
+const laaTexSlugs = identitiesFromPolymarketSlugs([
+  { symbol: 'aec-mlb-laa-pit-2026-09-04', side: 'SIDE_BUY' },
+  { symbol: 'aec-mlb-tb-tex-2026-09-04', side: 'SIDE_SELL' },
+]);
+const laaTexLock = identitiesFromParlay({
+  leg_keys: [
+    'KXMLBGAME-26SEP041845LAAPIT-LAA:yes',
+    'KXMLBGAME-26SEP042005TBTEX-TEX:yes',
+  ],
+});
+assert.ok(laaTexSlugs.ok);
+assert.ok(laaTexLock.ok);
+assert.ok(sameIdentitySet(laaTexSlugs.keys, laaTexLock.keys));
+
+const pitTbSlugs = identitiesFromPolymarketSlugs([
+  { symbol: 'aec-mlb-laa-pit-2026-09-04', side: 'SIDE_SELL' },
+  { symbol: 'aec-mlb-tb-tex-2026-09-04', side: 'SIDE_BUY' },
+]);
+assert.ok(pitTbSlugs.ok);
+assert.ok(!sameIdentitySet(pitTbSlugs.keys, laaTexLock.keys));
+
+// Kalshi D-backs are AZ; Poly slugs use ari.
+const azLock = parseKalshiTicker('KXMLBGAME-26SEP012140PHIAZ-AZ:yes');
+assert.ok(azLock);
+assert.strictEqual(azLock.selection, 'az');
+assert.deepStrictEqual(azLock.teams, ['az', 'phi']);
+const ariSlug = identityFromPolymarketSlug('aec-mlb-ari-phi-2026-09-01', 'yes');
+assert.ok(ariSlug);
+assert.strictEqual(ariSlug.selection, 'az');
+assert.deepStrictEqual(ariSlug.teams, ['az', 'phi']);
+assert.strictEqual(identityKey(azLock), identityKey(ariSlug));
+
+const dhSlug = identityFromPolymarketSlug('aec-mlb-det-cle-2026-09-04-dh1', 'yes');
+assert.ok(dhSlug);
+assert.strictEqual(dhSlug.selection, 'det');
+assert.strictEqual(dhSlug.period, 'full-dh1');
+const detYes = parseKalshiTicker('KXMLBGAME-26SEP041845DETCLE-DET:yes');
+assert.ok(detYes);
+assert.notStrictEqual(identityKey(dhSlug), identityKey(detYes));
 
 const wrongDate = identitiesFromPolymarketLegs([
   { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'SIDE_BUY' },

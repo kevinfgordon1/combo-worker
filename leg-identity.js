@@ -7,9 +7,11 @@
 // site-side polymarket_symbol column.
 //
 // Polymarket identity comes from market metadata (market_sport_type,
-// event_start_time, long/short_participant_id), NOT from parsing the slug.
-// Skip when metadata is missing, the market type is not a full-game moneyline
-// Combo Locks can price, or more than one parlay matches.
+// event_start_time, long/short_participant_id) when present. Production
+// combo RFQs use game slugs `aec-{league}-{t1}-{t2}-{YYYY-MM-DD}` with
+// BUY = first team and SELL = second; those parse without HTTP. Skip when
+// the market type is not a full-game moneyline Combo Locks can price, or
+// more than one parlay matches. TEAM:no canonicalizes to opponent:yes.
 'use strict';
 const { parseKalshiTickerStart, parseTs } = require('./started');
 
@@ -41,7 +43,10 @@ const SUBCATEGORY_LEAGUE = {
 
 // League-scoped aliases only — do not invent cross-league maps (CHI is Cubs, not Sox).
 const TEAM_ALIASES = {
-  mlb: { chw: 'cws', wsh: 'was', tbr: 'tb', sdp: 'sd', sfg: 'sf', kcr: 'kc', oak: 'ath' },
+  mlb: {
+    chw: 'cws', wsh: 'was', tbr: 'tb', sdp: 'sd', sfg: 'sf', sfo: 'sf',
+    kcr: 'kc', oak: 'ath', ari: 'az',
+  },
   nfl: { gnb: 'gb', jac: 'jax', wsh: 'was' },
   nba: { uta: 'utah', pho: 'phx', gsw: 'gs', nyk: 'ny', nop: 'no' },
   nhl: {},
@@ -65,7 +70,9 @@ const MLB_CODES = [
 
 const LEAGUE_TEAM_CODES = { nfl: NFL_CODES, mlb: MLB_CODES };
 
-const DT_RE = /^(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})(\d{4})(.*)$/i;
+const DT_TIME_RE = /^(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})(\d{4})(.*)$/i;
+// NFL GAME tickers are often date-only: 26SEP13ARILAC (no HHMM).
+const DT_DATE_RE = /^(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})(?!\d)(.*)$/i;
 
 function normTeam(league, code) {
   const raw = String(code || '').trim().toLowerCase();
@@ -88,6 +95,33 @@ function leagueFromParticipant(id) {
   const prefix = s.slice(0, i);
   if (prefix === 'mlb' || prefix === 'nba' || prefix === 'nfl' || prefix === 'nhl') return prefix;
   return '';
+}
+
+function etDateFromYmd(year, month, day) {
+  if (!year || !month || !day) return null;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function parseKalshiDateRest(rest) {
+  const timed = DT_TIME_RE.exec(String(rest || ''));
+  if (timed) {
+    const hour = parseInt(timed[4].slice(0, 2), 10);
+    const minute = parseInt(timed[4].slice(2, 4), 10);
+    if (hour <= 23 && minute <= 59) {
+      const startMs = parseKalshiTickerStart(timed[1] + timed[2] + timed[3] + timed[4]);
+      const date = etDateFromMs(startMs);
+      if (date) return { date, teamsBlob: timed[5] || '' };
+    }
+  }
+  const dated = DT_DATE_RE.exec(String(rest || ''));
+  if (!dated) return null;
+  const year = 2000 + parseInt(dated[1], 10);
+  const month = MONTHS[dated[2].toUpperCase()];
+  const day = parseInt(dated[3], 10);
+  const date = etDateFromYmd(year, month, day);
+  if (!date) return null;
+  return { date, teamsBlob: dated[4] || '' };
 }
 
 function etDateFromMs(ms) {
@@ -163,6 +197,21 @@ function makeIdentity(partial) {
     const uniq = [...new Set(id.teams)].sort();
     id.teams = uniq;
   }
+  // 2-way ML: TEAM:no is the opponent winning. Combo Locks keys are always
+  // the winner at :yes so Kalshi TEX:yes matches a Poly game-slug SELL
+  // (long=tb / first slug team, side=no).
+  if (
+    id.marketType === 'moneyline'
+    && id.side === 'no'
+    && id.teams.length === 2
+    && id.selection
+  ) {
+    const other = id.teams.find((t) => t !== id.selection);
+    if (other) {
+      id.selection = other;
+      id.side = 'yes';
+    }
+  }
   return identityKey(id) ? id : null;
 }
 
@@ -194,13 +243,11 @@ function kalshiTickerPieces(text, sideOverride) {
   const spec = SERIES[series];
   if (!spec) return null;
 
-  const m = DT_RE.exec(rest);
-  if (!m) return null;
-  const startMs = parseKalshiTickerStart(m[1] + m[2] + m[3] + m[4]);
-  const date = etDateFromMs(startMs);
-  if (!date) return null;
+  const parsed = parseKalshiDateRest(rest);
+  if (!parsed) return null;
+  const date = parsed.date;
 
-  let teamsBlob = m[5] || '';
+  let teamsBlob = parsed.teamsBlob || '';
   let selection = '';
   const selDash = teamsBlob.lastIndexOf('-');
   if (selDash > 0) {
@@ -414,6 +461,98 @@ function identityFromMarket(marketRaw, rfqSide) {
   return { identity: id, reason: null };
 }
 
+const SLUG_LEAGUE = {
+  mlb: 'mlb',
+  baseball: 'mlb',
+  nfl: 'nfl',
+  nba: 'nba',
+  basketball: 'nba',
+  nhl: 'nhl',
+  hockey: 'nhl',
+  ncaaf: 'ncaaf',
+  cfb: 'ncaaf',
+};
+
+function polymarketYesNo(sideRaw) {
+  const side = String(sideRaw == null ? 'yes' : sideRaw).toLowerCase().replace(/^side_/, '');
+  if (side === 'sell' || side === 'no' || side === 'short') return 'no';
+  if (side === 'buy' || side === 'yes' || side === 'long') return 'yes';
+  return null;
+}
+
+// Production combo RFQs use game slugs `aec-{league}-{t1}-{t2}-{YYYY-MM-DD}`
+// (no pick). BUY = first slug team; SELL = second. Suffixed `…-{pick}` slugs
+// still appear in tests. astatc / asc / other prefixes are not Combo Locks ML.
+function identityFromPolymarketSlug(symbol, rfqSide) {
+  if (symbol == null || symbol === '') return null;
+  const s = String(symbol).trim().toLowerCase();
+  const tokens = s.split(/[-_./]/).filter(Boolean);
+  if (!tokens.length || tokens[0] !== 'aec') return null;
+  const yesNo = polymarketYesNo(rfqSide);
+  if (!yesNo) return null;
+
+  let league = null;
+  let leagueIdx = -1;
+  for (let i = 0; i < tokens.length; i += 1) {
+    if (SLUG_LEAGUE[tokens[i]]) {
+      league = SLUG_LEAGUE[tokens[i]];
+      leagueIdx = i;
+      break;
+    }
+  }
+  if (!league || leagueIdx < 0) return null;
+
+  const dateM = s.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (!dateM) return null;
+  const date = `${dateM[1]}-${dateM[2]}-${dateM[3]}`;
+  const dateIdx = tokens.indexOf(dateM[1]);
+  if (dateIdx < 0 || dateIdx <= leagueIdx) return null;
+
+  const teamTokens = tokens.slice(leagueIdx + 1, dateIdx).filter((t) => t && !/^\d+$/.test(t));
+  const afterDate = tokens.slice(dateIdx + 3).filter((t) => t && !/^\d+$/.test(t));
+  if (teamTokens.length < 2) return null;
+
+  // dh1 / dh2 mark a doubleheader game, not a team pick. Production persist
+  // used to store selection=dh1; Combo Locks must not treat that as a team.
+  const dh = afterDate.find((t) => /^dh\d+$/i.test(t));
+  const pick = afterDate.find((t) => teamTokens.includes(t)) || '';
+  let selection;
+  if (pick) {
+    selection = yesNo === 'yes' ? pick : teamTokens.find((t) => t !== pick);
+  } else {
+    selection = yesNo === 'yes' ? teamTokens[0] : teamTokens[1];
+  }
+  if (!selection) return null;
+
+  return makeIdentity({
+    league,
+    date,
+    teams: teamTokens,
+    marketType: 'moneyline',
+    period: dh ? `full-${String(dh).toLowerCase()}` : 'full',
+    selection,
+    side: 'yes',
+  });
+}
+
+function identitiesFromPolymarketSlugs(legs) {
+  if (!Array.isArray(legs) || !legs.length) {
+    return { ok: false, reason: 'no_legs', identities: [], keys: [] };
+  }
+  const out = [];
+  for (const leg of legs) {
+    const symbol = (leg && (leg.symbol || leg.slug || leg.market_slug)) || (typeof leg === 'string' ? leg : '');
+    const yesNo = polymarketYesNo(leg && typeof leg === 'object' ? (leg.side || 'SIDE_BUY') : 'yes');
+    if (!yesNo) return { ok: false, reason: 'unmatched_leg', identities: out, keys: [] };
+    const id = identityFromPolymarketSlug(symbol, yesNo);
+    if (!id) return { ok: false, reason: 'unmatched_leg', identities: out, keys: [] };
+    out.push(id);
+  }
+  const keys = out.map(identityKey).filter(Boolean).sort();
+  if (keys.length !== out.length) return { ok: false, reason: 'unmatched_leg', identities: out, keys };
+  return { ok: true, reason: null, identities: out, keys };
+}
+
 function identitiesFromPolymarketLegs(legs, markets) {
   if (!Array.isArray(legs) || !legs.length) {
     return { ok: false, reason: 'no_legs', identities: [], keys: [] };
@@ -421,15 +560,21 @@ function identitiesFromPolymarketLegs(legs, markets) {
   const out = [];
   for (const leg of legs) {
     const symbol = (leg && (leg.symbol || leg.slug || leg.market_slug)) || '';
-    const sideRaw = leg && (leg.side || 'SIDE_BUY');
-    const side = String(sideRaw).toLowerCase().replace(/^side_/, '');
-    const yesNo = side === 'sell' || side === 'no' || side === 'short' ? 'no' : (side === 'buy' || side === 'yes' || side === 'long' ? 'yes' : null);
+    const yesNo = polymarketYesNo(leg && (leg.side || 'SIDE_BUY'));
     if (!yesNo) return { ok: false, reason: 'unmatched_leg', identities: out, keys: [] };
 
-    const market = (leg && (leg.market || leg.metadata && { metadata: leg.metadata }))
-      || (markets && (markets.get && markets.get(symbol) || markets[symbol]));
+    const market = (leg && (leg.market || (leg.metadata && { metadata: leg.metadata })))
+      || (markets && ((markets.get && markets.get(symbol)) || markets[symbol]));
     const got = identityFromMarket(market, yesNo);
     if (!got.identity) {
+      if (got.reason === 'not_priceable') {
+        return { ok: false, reason: 'not_priceable', identities: out, keys: [] };
+      }
+      const fromSlug = identityFromPolymarketSlug(symbol, yesNo);
+      if (fromSlug) {
+        out.push(fromSlug);
+        continue;
+      }
       return { ok: false, reason: got.reason || 'missing_metadata', identities: out, keys: [] };
     }
     out.push(got.identity);
@@ -461,7 +606,10 @@ module.exports = {
   identityFromLockFields,
   identitiesFromParlay,
   identityFromMarket,
+  identityFromPolymarketSlug,
+  identitiesFromPolymarketSlugs,
   identitiesFromPolymarketLegs,
+  polymarketYesNo,
   sameIdentitySet,
   etDateFromValue,
   etDateFromMs,
