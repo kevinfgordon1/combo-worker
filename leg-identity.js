@@ -43,7 +43,10 @@ const SUBCATEGORY_LEAGUE = {
 
 // League-scoped aliases only — do not invent cross-league maps (CHI is Cubs, not Sox).
 const TEAM_ALIASES = {
-  mlb: { chw: 'cws', wsh: 'was', tbr: 'tb', sdp: 'sd', sfg: 'sf', kcr: 'kc', oak: 'ath' },
+  mlb: {
+    chw: 'cws', wsh: 'was', tbr: 'tb', sdp: 'sd', sfg: 'sf', sfo: 'sf',
+    kcr: 'kc', oak: 'ath', ari: 'az',
+  },
   nfl: { gnb: 'gb', jac: 'jax', wsh: 'was' },
   nba: { uta: 'utah', pho: 'phx', gsw: 'gs', nyk: 'ny', nop: 'no' },
   nhl: {},
@@ -482,6 +485,9 @@ function identityFromPolymarketSlug(symbol, rfqSide) {
   const afterDate = tokens.slice(dateIdx + 3).filter((t) => t && !/^\d+$/.test(t));
   if (teamTokens.length < 2) return null;
 
+  // dh1 / dh2 mark a doubleheader game, not a team pick. Production persist
+  // used to store selection=dh1; Combo Locks must not treat that as a team.
+  const dh = afterDate.find((t) => /^dh\d+$/i.test(t));
   const pick = afterDate.find((t) => teamTokens.includes(t)) || '';
   let selection;
   if (pick) {
@@ -496,7 +502,7 @@ function identityFromPolymarketSlug(symbol, rfqSide) {
     date,
     teams: teamTokens,
     marketType: 'moneyline',
-    period: 'full',
+    period: dh ? `full-${String(dh).toLowerCase()}` : 'full',
     selection,
     side: 'yes',
   });

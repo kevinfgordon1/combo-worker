@@ -161,6 +161,12 @@ for (const slug of [
   assert.ok(p.selection && !/^\d+$/.test(p.selection), `numeric selection for ${slug}: ${p.selection}`);
 }
 
+const pmDh = parsePmUnhedgedSlug('aec-mlb-det-cle-2026-09-04-dh1', 'yes');
+assert.ok(pmDh && !pmDh.skip);
+assert.strictEqual(pmDh.selection, 'det');
+assert.deepStrictEqual(pmDh.teams, ['cle', 'det']);
+assert.ok(pmDh.selection !== 'dh1');
+
 assert.strictEqual(parsePmUnhedgedSlug('aec-atp-djokovic-alcaraz-2026-08-14-djokovic').reason, 'tennis');
 assert.strictEqual(parsePmUnhedgedSlug('asc-mlb-cws-det-2026-08-14-cws').reason, 'not_moneyline');
 
@@ -600,11 +606,25 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(rows[0].venue, 'polymarket');
     assert.strictEqual(rows[0].rfq_id, 'rfq-persist-pass');
     assert.strictEqual(rows[0].status, 'seen');
+    assert.strictEqual(rows[0].skip_reason, null);
     assert.strictEqual(rows[0].our_fair_american, null);
     assert.strictEqual(rows[0].legs.length, 3);
     assertNullLegOdds(rows[0].legs[0]);
     assertNullLegOdds(rows[0].legs[1]);
     assertNullLegOdds(rows[0].legs[2]);
+
+    const mapped = await maybePersistUnhedged(pmRfq('rfq-lock-skip', [
+      'aec-mlb-cws-det-2026-08-14-cws',
+      'aec-mlb-bos-pit-2026-08-14-pit',
+    ]), {
+      venue: 'polymarket',
+      now: Date.parse('2026-08-14T20:00:00Z'),
+      lockSkipReason: 'no_lock_overlap:same_games_no_match',
+      persist: async (row) => { rows.push(row); },
+    });
+    assert.strictEqual(mapped.persist, true);
+    assert.strictEqual(rows[1].rfq_id, 'rfq-lock-skip');
+    assert.strictEqual(rows[1].skip_reason, 'no_lock_overlap:same_games_no_match');
 
     const tennis = pmRfq('rfq-persist-tennis', [
       'aec-atp-djokovic-alcaraz-2026-08-14-djokovic',
@@ -615,7 +635,7 @@ function pmRfq(id, symbols, extra = {}) {
       persist: async (row) => { rows.push(row); },
     });
     assert.strictEqual(tennisOut.persist, false);
-    assert.strictEqual(rows.length, 1);
+    assert.strictEqual(rows.length, 2);
 
     // Started MLB GAME is not inserted (same silent family as tennis).
     const startedIns = await maybePersistUnhedged(kalshiRfq('rfq-started-no-insert', [
@@ -628,7 +648,7 @@ function pmRfq(id, symbols, extra = {}) {
     });
     assert.strictEqual(startedIns.persist, false);
     assert.strictEqual(startedIns.reason, 'game_started');
-    assert.strictEqual(rows.length, 1);
+    assert.strictEqual(rows.length, 2);
     assert.ok(!rows.some((r) => r.rfq_id === 'rfq-started-no-insert'));
 
     // Kevin: opponent +118 → our -118 (not -114); opponent -140 → our +140.

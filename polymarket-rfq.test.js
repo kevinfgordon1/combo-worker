@@ -20,6 +20,10 @@ const {
   logActiveLockIdentityFails,
   logUnpriceablePolyLocks,
   explainLockOverlapMiss,
+  tallyReconcileOutcome,
+  formatReasonTally,
+  countPriceableLocks,
+  lockSkipReasonOf,
   cheapDirectMatch,
   matchPolymarketParlay,
   matchPolymarketParlayDetailed,
@@ -607,6 +611,76 @@ const pitTbMiss = explainLockOverlapMiss(
 );
 assert.strictEqual(pitTbMiss.code, 'same_games_no_match');
 
+// Production 2026-09-04 21:00 window: 2-leg RFQs that named both lock
+// games were LAA yes + TB yes (wrong TEX side) — mapping near-miss, not volume.
+const prodLaaTbYesRfq = normalizePolymarketRfq({
+  id: 'rfq_prod_laa_tb_yes',
+  comboLegs: [
+    { symbol: 'aec-mlb-laa-pit-2026-09-04', side: 'SIDE_BUY' },
+    { symbol: 'aec-mlb-tb-tex-2026-09-04', side: 'SIDE_BUY' },
+  ],
+});
+assert.strictEqual(couldMatchActiveLocks(prodLaaTbYesRfq, [texLaaSept4Lock]), false);
+assert.strictEqual(
+  explainLockOverlapMiss(prodLaaTbYesRfq, [texLaaSept4Lock]).code,
+  'same_games_no_match'
+);
+assert.strictEqual(
+  lockSkipReasonOf({
+    reason: 'no_lock_overlap',
+    overlap: explainLockOverlapMiss(prodLaaTbYesRfq, [texLaaSept4Lock]),
+  }),
+  'no_lock_overlap:same_games_no_match'
+);
+
+const prodExtraLegRfq = normalizePolymarketRfq({
+  id: 'rfq_prod_3leg',
+  comboLegs: [
+    { symbol: 'aec-mlb-chc-mia-2026-09-04', side: 'SIDE_BUY' },
+    { symbol: 'aec-mlb-laa-pit-2026-09-04', side: 'SIDE_SELL' },
+    { symbol: 'aec-mlb-tb-tex-2026-09-04', side: 'SIDE_BUY' },
+  ],
+});
+assert.strictEqual(
+  explainLockOverlapMiss(prodExtraLegRfq, [texLaaSept4Lock]).code,
+  'leg_count'
+);
+
+const dhRfq = normalizePolymarketRfq({
+  id: 'rfq_dh1',
+  comboLegs: [
+    { symbol: 'aec-mlb-det-cle-2026-09-04-dh1', side: 'SIDE_BUY' },
+    { symbol: 'aec-mlb-laa-pit-2026-09-04', side: 'SIDE_BUY' },
+  ],
+});
+const detCleLock = {
+  label: 'Tigers + Angels',
+  leg_keys: [
+    'KXMLBGAME-26SEP041845DETCLE-DET:yes',
+    'KXMLBGAME-26SEP041845LAAPIT-LAA:yes',
+  ],
+};
+assert.strictEqual(couldMatchActiveLocks(dhRfq, [detCleLock]), false);
+assert.strictEqual(explainLockOverlapMiss(dhRfq, [detCleLock]).code, 'doubleheader');
+
+const hist = {};
+tallyReconcileOutcome(hist, { post: true, reason: 'quoted' });
+tallyReconcileOutcome(hist, {
+  action: 'skip',
+  reason: 'no_lock_overlap',
+  overlap: { code: 'no_shared_game' },
+});
+tallyReconcileOutcome(hist, {
+  action: 'skip',
+  reason: 'no_lock_overlap',
+  overlap: { code: 'same_games_no_match' },
+});
+assert.strictEqual(hist.quoted, 1);
+assert.strictEqual(hist.no_lock_overlap, 2);
+assert.strictEqual(hist.no_shared_game, 1);
+assert.strictEqual(hist.same_games_no_match, 1);
+assert.ok(formatReasonTally(hist).includes('no_lock_overlap=2'));
+
 const ncaafSpreadLock = {
   id: 'ncaaf-spread',
   label: 'Baylor Bears +7.5 + Mercyhurst Lakers +28.5',
@@ -619,6 +693,7 @@ const unpriceableLogs = [];
 assert.strictEqual(logUnpriceablePolyLocks([ncaafSpreadLock, texLaaSept4Lock], (m) => unpriceableLogs.push(m)), 1);
 assert.ok(unpriceableLogs.some((l) => l.includes('lock-unpriceable-on-poly reason=not_moneyline')));
 assert.ok(unpriceableLogs.some((l) => l.includes('Baylor Bears')));
+assert.strictEqual(countPriceableLocks([texLaaSept4Lock, ncaafSpreadLock]), 1);
 
 const identityFailLogs = [];
 assert.strictEqual(logActiveLockIdentityFails([kalshiParlay, texLaaLock], (m) => identityFailLogs.push(m)), 0);
@@ -1095,6 +1170,7 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     pendingQuotes: new Map(),
     reconcileMs: 60 * 60 * 1000,
   });
+  await new Promise((r) => setTimeout(r, 30));
   const listAfterStart = firehoseList;
 
   const logs = [];
@@ -1859,9 +1935,11 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
       l.includes('[POLY] SKIP no_lock_overlap') && l.includes('code=same_games_no_match')
     )));
     assert.ok(gameLogs.some((l) => (
-      l.includes('[POLY] reconcile open=3 live=true')
+      l.includes('[POLY] reconcile open=3 locks=1 priceable=1 live=true')
       && l.includes('quoted=1')
       && l.includes('no_lock_overlap=2')
+      && l.includes('same_games_no_match=1')
+      && l.includes('no_shared_game=1')
     )));
     assert.ok(!gameLogs.some((l) => l.includes('SKIP unmatched') && l.includes('aec-atp')));
 

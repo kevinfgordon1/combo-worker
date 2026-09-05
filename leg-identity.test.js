@@ -288,6 +288,25 @@ const pitTbSlugs = identitiesFromPolymarketSlugs([
 assert.ok(pitTbSlugs.ok);
 assert.ok(!sameIdentitySet(pitTbSlugs.keys, laaTexLock.keys));
 
+// Kalshi D-backs are AZ; Poly slugs use ari.
+const azLock = parseKalshiTicker('KXMLBGAME-26SEP012140PHIAZ-AZ:yes');
+assert.ok(azLock);
+assert.strictEqual(azLock.selection, 'az');
+assert.deepStrictEqual(azLock.teams, ['az', 'phi']);
+const ariSlug = identityFromPolymarketSlug('aec-mlb-ari-phi-2026-09-01', 'yes');
+assert.ok(ariSlug);
+assert.strictEqual(ariSlug.selection, 'az');
+assert.deepStrictEqual(ariSlug.teams, ['az', 'phi']);
+assert.strictEqual(identityKey(azLock), identityKey(ariSlug));
+
+const dhSlug = identityFromPolymarketSlug('aec-mlb-det-cle-2026-09-04-dh1', 'yes');
+assert.ok(dhSlug);
+assert.strictEqual(dhSlug.selection, 'det');
+assert.strictEqual(dhSlug.period, 'full-dh1');
+const detYes = parseKalshiTicker('KXMLBGAME-26SEP041845DETCLE-DET:yes');
+assert.ok(detYes);
+assert.notStrictEqual(identityKey(dhSlug), identityKey(detYes));
+
 const wrongDate = identitiesFromPolymarketLegs([
   { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'SIDE_BUY' },
   { symbol: 'aec-mlb-bos-pit-2026-08-14-pit', side: 'SIDE_BUY' },

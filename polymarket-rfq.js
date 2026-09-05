@@ -6,8 +6,10 @@
 // Like Kalshi, only RFQs that could match the current parlays() snapshot
 // hydrate extra HTTP, fetch market metadata, quote, or write verbose skip logs.
 // Unmatched firehose RFQs are a cheap no-op — no seenRfqs / market-cache growth.
-// Reconcile always prints a reason histogram. Near-miss no_lock_overlap
-// (same games, wrong side / leg count) logs SKIP with a reason code.
+// Reconcile always prints a reason histogram plus overlap codes
+// (no_shared_game vs same_games_no_match / leg_count / missing_team /
+// doubleheader) so volume-vs-mapping is one line. Near-miss SKIP logs
+// those codes. Unhedged persist writes skip_reason=no_lock_overlap:<code>.
 // Live POSTs (create quote, confirm) require POLYMARKET_RFQ_LIVE to be truthy.
 // quoteExecuted means paired orders were submitted — not a fill.
 // START GATE: never quote or confirm once any lock leg has started (first pitch
@@ -284,7 +286,12 @@ function logActiveLockIdentityFails(parlays, log = console.log) {
   return n;
 }
 
-const NEAR_MISS_CODES = new Set(['leg_count', 'missing_team', 'same_games_no_match']);
+const NEAR_MISS_CODES = new Set([
+  'leg_count',
+  'missing_team',
+  'same_games_no_match',
+  'doubleheader',
+]);
 
 function explainLockOverlapMiss(rfq, parlays) {
   const tokens = rfqSlugTokenSet(rfq);
@@ -319,6 +326,17 @@ function explainLockOverlapMiss(rfq, parlays) {
         code: 'missing_team',
         lock: label,
         detail: `miss=${missTeam.map((id) => (id.teams || []).join('+')).join(',')}`,
+      };
+    }
+
+    if (
+      slugIds.ok
+      && slugIds.identities.some((id) => /^full-dh\d+$/i.test(id.period || ''))
+    ) {
+      return {
+        code: 'doubleheader',
+        lock: label,
+        detail: `rfq=${slugIds.keys.join(',')} lock=${lock.keys.join(',')}`,
       };
     }
 
@@ -361,6 +379,37 @@ function formatReasonTally(reasons) {
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .map(([k, n]) => `${k}=${n}`)
     .join(' ');
+}
+
+function countPriceableLocks(parlays) {
+  let n = 0;
+  for (const p of parlays || []) {
+    if (identitiesFromParlay(p).ok) n += 1;
+  }
+  return n;
+}
+
+function lockSkipReasonOf(evaluation) {
+  if (!evaluation) return null;
+  if (evaluation.reason === 'no_lock_overlap' && evaluation.overlap && evaluation.overlap.code) {
+    return `no_lock_overlap:${evaluation.overlap.code}`;
+  }
+  return evaluation.reason || null;
+}
+
+// Reconcile histogram: keep the coarse reason (no_lock_overlap) AND the
+// overlap code (no_shared_game vs same_games_no_match / leg_count / …)
+// so volume-vs-mapping is one log line.
+function tallyReconcileOutcome(reasons, out) {
+  if (out && out.post) {
+    tallyReason(reasons, 'quoted');
+    return;
+  }
+  const reason = (out && out.reason) || (out && out.action) || 'unknown';
+  tallyReason(reasons, reason);
+  if (reason === 'no_lock_overlap' && out.overlap && out.overlap.code) {
+    tallyReason(reasons, out.overlap.code);
+  }
 }
 
 // Cheap over-approximation of evaluate/match: no HTTP, no metadata.
@@ -964,9 +1013,10 @@ function startPolymarketRfqLoop(ctx = {}) {
     unhedgedFills.hydrate().catch((e) => console.error('[UNHEDGED] fill hydrate', e && e.message));
   }
 
-  function persistUnhedgedShadow(rfq) {
+  function persistUnhedgedShadow(rfq, extra = {}) {
     shadowUnhedgedMiss(rfq, {
       venue: 'polymarket',
+      lockSkipReason: extra.skipReason || null,
       supabase: ctx.supabase,
       persist: async (row, meta) => {
         unhedgedFills.remember(row);
@@ -1032,7 +1082,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     let rfq = normalizePolymarketRfq(raw);
     if (!rfq || !rfq.rfqId) return { action: 'skip', reason: 'bad_rfq' };
     if (!locks.length) {
-      persistUnhedgedShadow(rfq);
+      persistUnhedgedShadow(rfq, { skipReason: 'no_locks' });
       return { action: 'skip', reason: 'no_locks' };
     }
 
@@ -1042,7 +1092,6 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
 
     if (!couldMatchActiveLocks(rfq, locks)) {
-      persistUnhedgedShadow(rfq);
       const overlap = explainLockOverlapMiss(rfq, locks);
       const evaluation = {
         action: 'skip',
@@ -1050,6 +1099,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         rfq,
         overlap,
       };
+      persistUnhedgedShadow(rfq, { skipReason: lockSkipReasonOf(evaluation) });
       if (overlap && NEAR_MISS_CODES.has(overlap.code)) {
         logSkip(evaluation);
       }
@@ -1082,7 +1132,9 @@ function startPolymarketRfqLoop(ctx = {}) {
         || evaluation.reason === 'no_legs'
         || evaluation.reason === 'no_locks'
       ) {
-        persistUnhedgedShadow(evaluation.rfq || rfq);
+        persistUnhedgedShadow(evaluation.rfq || rfq, {
+          skipReason: lockSkipReasonOf(evaluation),
+        });
       }
       if (evaluation.reason === 'game_started' && evaluation.parlay) {
         try {
@@ -1344,25 +1396,27 @@ function startPolymarketRfqLoop(ctx = {}) {
 
   async function reconcileOpenRfqs() {
     const locks = parlays();
-    if (!locks.length) {
-      console.log(`[${MODE}] reconcile open=0 locks=0 live=${live}`);
-      return;
-    }
+    const priceable = countPriceableLocks(locks);
     logActiveLockIdentityFails(locks);
     logUnpriceablePolyLocks(locks);
     try {
       const listed = await http.listRfqs({ status: 'RFQ_STATUS_OPEN', limit: 100 });
       const rows = (listed && listed.rfqs) || [];
+      if (!locks.length) {
+        console.log(
+          `[${MODE}] reconcile open=${rows.length} locks=0 priceable=0 live=${live} skip=no_locks`
+        );
+        return;
+      }
       const reasons = {};
       for (const row of rows) {
         if (stopped) return;
         const out = await handleRfq(row);
-        const key = (out && out.post) ? 'quoted' : ((out && out.reason) || (out && out.action) || 'unknown');
-        tallyReason(reasons, key);
+        tallyReconcileOutcome(reasons, out);
       }
       const hist = formatReasonTally(reasons);
       console.log(
-        `[${MODE}] reconcile open=${rows.length} live=${live}` +
+        `[${MODE}] reconcile open=${rows.length} locks=${locks.length} priceable=${priceable} live=${live}` +
         (hist ? ` ${hist}` : '')
       );
     } catch (e) {
@@ -1492,6 +1546,10 @@ module.exports = {
   logActiveLockIdentityFails,
   logUnpriceablePolyLocks,
   explainLockOverlapMiss,
+  tallyReconcileOutcome,
+  formatReasonTally,
+  countPriceableLocks,
+  lockSkipReasonOf,
   isKalshiMoneylineLock,
   matchPolymarketParlay,
   matchPolymarketParlayDetailed,
