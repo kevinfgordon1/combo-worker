@@ -23,6 +23,12 @@ const {
   resolveUnhedgedFill,
   parseKalshiUnhedgedTicker,
   parsePmUnhedgedSlug,
+  DEFAULT_FILL_MAX_PENDING,
+  DEFAULT_FILL_MAX_PER_TICK,
+  DEFAULT_FILL_TICK_MS,
+  HYDRATE_SEEN_LIMIT,
+  isKalshiCancelNotFilled,
+  fillTickerFromSources,
 } = require('./unhedged-rfq');
 const { createUnhedgedPriceCache } = require('./unhedged-price-cache');
 const { americanFromProb } = require('./engine');
@@ -107,6 +113,22 @@ assert.ok(!SCOPE_LEAGUES.has('ncaaf'));
   assert.ok(
     !/maxPerTick != null \? opts.maxPerTick : 5/.test(src),
     'fill tick default must keep up with Kalshi close volume'
+  );
+  assert.ok(DEFAULT_FILL_MAX_PENDING >= 2000, 'cap must hold ~45s of known Kalshi closes');
+  assert.ok(DEFAULT_FILL_MAX_PER_TICK >= 30);
+  assert.ok(DEFAULT_FILL_TICK_MS <= 1000, '1s fill tick so newest closes are looked at');
+  assert.ok(HYDRATE_SEEN_LIMIT >= 15000);
+  assert.ok(
+    /FILL_TICK_MS/.test(liveSrc) && /unhedgedFills\.tick\(\)[\s\S]{0,80}FILL_TICK_MS/.test(liveSrc),
+    'fill tracker must tick faster than skip-tape (15s)'
+  );
+  assert.ok(
+    /market_ticker:\s*rfq\.marketTicker/.test(liveSrc),
+    'remember MVE ticker from rfq_created so GET 404 can still tape'
+  );
+  assert.ok(
+    src.includes('[UNHEDGED] fill queue') && src.includes('closed=${closed}'),
+    'minute fill-queue line must count rfq_deleted arrivals vs queued vs taped'
   );
 }
 
@@ -1142,7 +1164,10 @@ function pmRfq(id, symbols, extra = {}) {
         is_block_trade: true,
       }],
     });
-    assert.strictEqual(tapeResolve.retry, true, '45s pad must elapse');
+    assert.strictEqual(tapeResolve.retry, false, 'Kalshi tape must run immediately when ticker is known');
+    assert.strictEqual(tapeResolve.reason, 'tape');
+    assert.ok(tapeResolve.patch);
+    assert.strictEqual(tapeResolve.patch.fill_yes_price, 0.19);
     const tapeReady = await resolveUnhedgedFill({
       venue: 'kalshi',
       rfq_id: 'rfq-tape-one',
@@ -1555,7 +1580,7 @@ function pmRfq(id, symbols, extra = {}) {
     assert.ok(!hydrateQuery.some((c) => c.select && String(c.select).includes('market_ticker')));
     assert.ok(hydrateQuery.some((c) => c.eq && c.eq[0] === 'status' && c.eq[1] === 'seen'));
     assert.ok(hydrateQuery.some((c) => c.order && c.order[0] === 'created_at' && c.order[1] && c.order[1].ascending === false));
-    assert.ok(hydrateQuery.some((c) => c.limit === 2000), 'seen hydrate must take the newest 2000, not 500 unordered');
+    assert.ok(hydrateQuery.some((c) => c.limit === HYDRATE_SEEN_LIMIT), 'seen hydrate must take the newest 15000, not 500 unordered');
 
     // Recent Poly seen rows are swept into pending so missed rfqClosed still resolve.
     // unhedged_rfqs has no market_ticker column — symbol comes from GET RFQ.
@@ -1780,6 +1805,155 @@ function pmRfq(id, symbols, extra = {}) {
     assert.strictEqual(startedFetched, 0);
     assert.strictEqual(startedPatches.length, 0);
 
+    // GET 404 after delete + rfq_deleted market_ticker still tapes (Kalshi
+    // GET status is only open|closed; executed RFQs 404).
+    {
+      assert.strictEqual(
+        fillTickerFromSources(
+          null,
+          { type: 'rfq_deleted', msg: { id: 'rfq-ws-ticker', market_ticker: 'KXMVE-WS', contracts_fp: '12.00' } },
+          { rfqId: 'rfq-ws-ticker', raw: { market_ticker: 'KXMVE-WS' } }
+        ),
+        'KXMVE-WS'
+      );
+      assert.ok(isKalshiCancelNotFilled('manually cancelled'));
+      assert.ok(isKalshiCancelNotFilled('close cancelled'));
+      assert.ok(!isKalshiCancelNotFilled('expired'));
+
+      const wsTape = await resolveUnhedgedFill({
+        venue: 'kalshi',
+        rfq_id: 'rfq-ws-404',
+        contracts: 10,
+        market_ticker: 'KXMVE-WS',
+        closedMs: padClosed,
+      }, {
+        now: padClosed + 1000,
+        extra: { type: 'rfq_deleted', msg: { id: 'rfq-ws-404', market_ticker: 'KXMVE-WS' } },
+        fetchRfq: async () => null,
+        fetchTrades: async (ticker) => {
+          assert.strictEqual(ticker, 'KXMVE-WS');
+          return [{
+            count_fp: '10.00',
+            yes_price_dollars: '0.33',
+            no_price_dollars: '0.67',
+            created_time: padClosed,
+            is_block_trade: true,
+          }];
+        },
+      });
+      assert.strictEqual(wsTape.retry, false);
+      assert.strictEqual(wsTape.reason, 'tape');
+      assert.strictEqual(wsTape.patch.fill_yes_price, 0.33);
+
+      const missThenRetry = await resolveUnhedgedFill({
+        venue: 'kalshi',
+        rfq_id: 'rfq-tape-miss',
+        market_ticker: 'KXMVE-MISS',
+        closedMs: padClosed,
+      }, {
+        now: padClosed + 1000,
+        fetchRfq: async () => null,
+        fetchTrades: async () => [],
+      });
+      assert.strictEqual(missThenRetry.retry, true, 'tape miss inside pad must retry');
+      const missGiveUp = await resolveUnhedgedFill({
+        venue: 'kalshi',
+        rfq_id: 'rfq-tape-miss',
+        market_ticker: 'KXMVE-MISS',
+        closedMs: padClosed,
+      }, {
+        now: padClosed + 45000,
+        fetchRfq: async () => null,
+        fetchTrades: async () => [],
+      });
+      assert.strictEqual(missGiveUp.retry, false);
+      assert.strictEqual(missGiveUp.reason, 'not_filled');
+
+      const cancelled = await resolveUnhedgedFill({
+        venue: 'kalshi',
+        rfq_id: 'rfq-user-cancel',
+        market_ticker: 'KXMVE-CXL',
+        closedMs: padClosed,
+        cancellation_reason: 'manually cancelled',
+      }, {
+        now: padClosed + 1000,
+        fetchRfq: async () => ({ status: 'closed', cancellation_reason: 'manually cancelled', market_ticker: 'KXMVE-CXL' }),
+        fetchTrades: async () => { throw new Error('must not tape a user cancel'); },
+      });
+      assert.strictEqual(cancelled.reason, 'cancelled');
+      assert.strictEqual(cancelled.patch, null);
+    }
+
+    // Tracker copies rfq_deleted msg.market_ticker; unknown seen row is looked up.
+    {
+      const tracked = [];
+      const tapeTicker = [];
+      const trackerDb = createMemSupabase([{
+        venue: 'kalshi',
+        rfq_id: 'rfq-db-seen',
+        status: 'seen',
+        contracts: 8,
+      }]);
+      const closeTracker = createUnhedgedFillTracker({
+        supabase: trackerDb,
+        persist: async (row, meta) => { if (meta && meta.mode === 'fill') tracked.push(row); },
+        fetchRfq: async () => null,
+        fetchTrades: async (ticker) => {
+          tapeTicker.push(ticker);
+          return [{
+            count_fp: '8.00',
+            yes_price_dollars: '0.41',
+            no_price_dollars: '0.59',
+            created_time: padClosed,
+            is_block_trade: true,
+          }];
+        },
+      });
+      const queued = await closeTracker.onClosed({
+        venue: 'kalshi',
+        rfqId: 'rfq-db-seen',
+        extra: {
+          type: 'rfq_deleted',
+          msg: { id: 'rfq-db-seen', market_ticker: 'KXMVE-DB', contracts_fp: '8.00' },
+        },
+        now: padClosed,
+      });
+      assert.strictEqual(queued.reason, 'queued');
+      assert.strictEqual(closeTracker.pending.get('kalshi:rfq-db-seen').market_ticker, 'KXMVE-DB');
+      await closeTracker.tick(padClosed + 1000);
+      assert.deepStrictEqual(tapeTicker, ['KXMVE-DB']);
+      assert.strictEqual(tracked.length, 1);
+      assert.strictEqual(tracked[0].fill_yes_price, 0.41);
+    }
+
+    // Pad-ready delayed print is looked up before a newer in-pad close.
+    {
+      const fetched = [];
+      const orderTracker = createUnhedgedFillTracker({
+        maxPending: 8,
+        maxPerTick: 1,
+        persist: async () => {},
+        fetchRfq: async () => null,
+        fetchTrades: async (ticker) => { fetched.push(ticker); return []; },
+      });
+      orderTracker.remember({ venue: 'kalshi', rfq_id: 'rfq-old-ready', status: 'seen', market_ticker: 'KXMVE-OLD' });
+      orderTracker.remember({ venue: 'kalshi', rfq_id: 'rfq-new-hot', status: 'seen', market_ticker: 'KXMVE-NEW' });
+      await orderTracker.onClosed({
+        venue: 'kalshi',
+        rfqId: 'rfq-old-ready',
+        extra: { type: 'rfq_deleted', msg: { id: 'rfq-old-ready', market_ticker: 'KXMVE-OLD' } },
+        now: padClosed,
+      });
+      await orderTracker.onClosed({
+        venue: 'kalshi',
+        rfqId: 'rfq-new-hot',
+        extra: { type: 'rfq_deleted', msg: { id: 'rfq-new-hot', market_ticker: 'KXMVE-NEW' } },
+        now: padClosed + 60000,
+      });
+      await orderTracker.tick(padClosed + 60000);
+      assert.deepStrictEqual(fetched, ['KXMVE-OLD']);
+    }
+
     // Kalshi close volume: keep newest pending, tick newest first.
     {
       const fetched = [];
@@ -1810,7 +1984,7 @@ function pmRfq(id, symbols, extra = {}) {
       assert.ok(capTracker.pending.has('kalshi:rfq-cap-4'));
       assert.ok(capTracker.pending.has('kalshi:rfq-cap-7'));
       await capTracker.tick(t0 + 60_000);
-      assert.deepStrictEqual(fetched, ['rfq-cap-7']);
+      assert.deepStrictEqual(fetched, ['rfq-cap-4']);
     }
 
     // Kalshi flood must not skip the Poly seen sweep (old gate was pending.size >= 80).

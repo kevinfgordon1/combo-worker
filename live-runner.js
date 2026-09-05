@@ -73,6 +73,7 @@ const {
   persistUnhedgedRfq,
   shadowUnhedgedMiss,
   createUnhedgedFillTracker,
+  DEFAULT_FILL_TICK_MS,
 } = require('./unhedged-rfq');
 const { createUnhedgedPriceCache } = require('./unhedged-price-cache');
 
@@ -152,6 +153,7 @@ const COL_ERR = /Could not find the '([^']+)' column/i;
 const SKIP_TAPE_LOOKBACK_MS = 24 * 3600 * 1000;
 const SKIP_TAPE_TICK_MS = 15000;
 const SKIP_TAPE_MAX_PER_TICK = 5;
+const FILL_TICK_MS = DEFAULT_FILL_TICK_MS;
 
 async function refresh() {
   try {
@@ -1022,7 +1024,14 @@ async function onRfq(rfq, env) {
       supabase,
       env: process.env,
       priceCache: unhedgedPrices,
-      onPersisted: (row) => { if (unhedgedFills) unhedgedFills.remember(row); },
+      onPersisted: (row) => {
+        if (unhedgedFills) {
+          unhedgedFills.remember({
+            ...row,
+            market_ticker: rfq.marketTicker || rfq.market_ticker || null,
+          });
+        }
+      },
     });
     return;
   }
@@ -1236,7 +1245,7 @@ async function main() {
   unhedgedFills.hydrate().catch((e) => console.error('[UNHEDGED] fill hydrate', e && e.message));
   setInterval(() => {
     unhedgedFills.tick().catch((e) => console.error('[UNHEDGED] fill tick', e && e.message));
-  }, SKIP_TAPE_TICK_MS);
+  }, FILL_TICK_MS);
 
   // Step 2 — pre-warm + keep warm
   await warmConnection();

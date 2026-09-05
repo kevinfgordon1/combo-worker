@@ -24,11 +24,13 @@
 // updated_at) sees same-day patches when filled_at is stale. Missing column
 // degrades — fills still persist. Re-see of an already-filled RFQ must not
 // flip status back to seen/started.
-// Kalshi communications WS closes tens of thousands of unmatched combos / min.
-// An unbounded FIFO pending map + 5 lookups / 15s never reaches today's
-// closes — aibetbuilder All/Kalshi Today filters status=filled AND filled_at
-// in the ET day. Cap pending to the newest N, tick newest first, evict
-// oldest Kalshi when over cap so the Poly seen sweep is not starved.
+// Kalshi GET /communications/rfqs/{id} status is only open|closed (or 404
+// after delete). There is no RFQ_STATUS_FILLED. Witnessing others' fills is
+// public tape on the MVE market_ticker from rfq_created / rfq_deleted.
+// #53 newest-first + 45s pad never taped: newest closes are always in-pad,
+// so they retry forever while ready rows are evicted. Tape immediately when
+// a ticker is known; retry misses until the pad elapses; copy WS ticker so
+// a 404 GET still resolves. Cap holds ~45s of known closes.
 //
 // Fair is inverse-bet ourTrue (Promo Builder / EV): convert opponent YES to
 // a fee-included American with the series taker coeff (KXMLBGAME 0.035,
@@ -61,10 +63,13 @@ const {
 const SCOPE_LEAGUES = new Set(['mlb', 'nfl']);
 // Same pad as Combo Locks skip-tape / quote-watcher. Copied — do not import skip-tape.
 const FILL_TAPE_PAD_MS = 45000;
-// Kalshi rfq_deleted volume dwarfs lookup capacity. Keep the newest closes
-// (Today's fills) and drop the oldest unmatched Kalshi when over cap.
-const DEFAULT_FILL_MAX_PER_TICK = 20;
-const DEFAULT_FILL_MAX_PENDING = 120;
+// Kalshi rfq_deleted volume dwarfs lookup capacity. Keep enough closes to
+// survive the tape pad, tick newest + pad-ready, evict oldest Kalshi first
+// so a flood cannot starve Poly sweep rows.
+const DEFAULT_FILL_MAX_PER_TICK = 30;
+const DEFAULT_FILL_MAX_PENDING = 2000;
+const DEFAULT_FILL_TICK_MS = 1000;
+const HYDRATE_SEEN_LIMIT = 15000;
 const POLY_SWEEP_PENDING_CAP = 80;
 const FILL_STATUSES = new Set(['filled', 'executed', 'accepted', 'confirmed']);
 const SILENT_SKIP = new Set(['tennis', 'lol', 'cs2']);
@@ -654,6 +659,39 @@ async function maybePersistUnhedged(rfq, opts = {}) {
 // firehose. One count line per minute. Filled logs stay per-row.
 const SEEN_STARTED_LOG_MS = 60_000;
 const seenStartedCounts = { seen: 0, started: 0, timer: null };
+const fillTickCounts = {
+  closed: 0, queued: 0, looked: 0, taped: 0, retry: 0, drop: 0,
+  unknown: 0, started: 0, timer: null,
+};
+
+function flushFillTickLog() {
+  fillTickCounts.timer = null;
+  const { closed, queued, looked, taped, retry, drop, unknown, started } = fillTickCounts;
+  fillTickCounts.closed = 0;
+  fillTickCounts.queued = 0;
+  fillTickCounts.looked = 0;
+  fillTickCounts.taped = 0;
+  fillTickCounts.retry = 0;
+  fillTickCounts.drop = 0;
+  fillTickCounts.unknown = 0;
+  fillTickCounts.started = 0;
+  if (closed || queued || looked || taped || retry || drop || unknown || started) {
+    console.log(
+      `[UNHEDGED] fill queue closed=${closed} queued=${queued} looked=${looked}` +
+      ` taped=${taped} retry=${retry} drop=${drop} unknown=${unknown}` +
+      ` started=${started} /min`
+    );
+  }
+}
+
+function noteFillTick(field) {
+  if (!Object.prototype.hasOwnProperty.call(fillTickCounts, field) || field === 'timer') return;
+  fillTickCounts[field] += 1;
+  if (!fillTickCounts.timer) {
+    fillTickCounts.timer = setTimeout(flushFillTickLog, SEEN_STARTED_LOG_MS);
+    if (fillTickCounts.timer.unref) fillTickCounts.timer.unref();
+  }
+}
 
 function flushSeenStartedLog() {
   seenStartedCounts.timer = null;
@@ -1025,7 +1063,34 @@ function isClosedRfqStatus(status) {
   return bareFillStatus(status) === 'closed';
 }
 
-function isFillLookupReady({ status, closedMs, now, padMs = FILL_TAPE_PAD_MS, venue }) {
+function isKalshiCancelNotFilled(reason) {
+  const r = normalizeFillStatus(reason).replace(/\s+/g, '_');
+  return (
+    r === 'manually_cancelled' || r === 'close_cancelled'
+    || r === 'user_cancelled' || r === 'cancelled' || r === 'canceled'
+  );
+}
+
+function fillTickerFromSources(row, extra, rfq) {
+  const msg = extra && extra.msg;
+  const raw = rfq && rfq.raw;
+  return tickerOfFillRfq(rfq, row)
+    || (raw && (raw.market_ticker || raw.ticker || raw.symbol))
+    || (msg && (msg.market_ticker || msg.ticker || msg.symbol))
+    || (extra && (extra.market_ticker || extra.ticker || extra.symbol))
+    || (row && (row.symbol || row.market_ticker))
+    || null;
+}
+
+function fillContractsFromSources(row, extra, rfq) {
+  const msg = extra && extra.msg;
+  const raw = rfq && rfq.raw;
+  return rfqCountForFillTape(rfq, row && row.contracts)
+    || rfqCountForFillTape(raw, null)
+    || rfqCountForFillTape(msg, null);
+}
+
+function isFillLookupReady({ status, closedMs, now, padMs = FILL_TAPE_PAD_MS, venue, hasTicker }) {
   const s = bareFillStatus(status);
   if (s === 'open') return false;
   // Polymarket RFQs are only OPEN/CLOSED — no public tape pad. CLOSED is
@@ -1033,14 +1098,19 @@ function isFillLookupReady({ status, closedMs, now, padMs = FILL_TAPE_PAD_MS, ve
   if (venue === 'polymarket') {
     return s === 'closed' || isUnhedgedFillStatus(status) || closedMs != null;
   }
+  // Kalshi GET is only open|closed. Tape prints at close — try as soon as
+  // we have a ticker. Pad only gates how long we retry a miss.
+  if (hasTicker && (s === 'closed' || isUnhedgedFillStatus(status) || closedMs != null || status == null)) {
+    return true;
+  }
   if (closedMs != null && now < closedMs + padMs) return false;
   if (status == null && closedMs == null) return false;
   return true;
 }
 
 function tickerOfFillRfq(rfq, row) {
-  return (rfq && (rfq.symbol || rfq.ticker || rfq.market_ticker))
-    || (row && (row.symbol || row.market_ticker))
+  return (rfq && (rfq.symbol || rfq.ticker || rfq.market_ticker || rfq.marketTicker))
+    || (row && (row.symbol || row.market_ticker || row.marketTicker))
     || null;
 }
 
@@ -1118,13 +1188,27 @@ async function resolveUnhedgedFill(row, {
     }
   }
 
-  const closedMs = rfqClosedMsForFill(rfq) || row.closedMs || null;
+  const cancelReason = (rfq && rfq.cancellation_reason)
+    || (extra && extra.msg && extra.msg.cancellation_reason)
+    || row.cancellation_reason
+    || null;
+  if (row.venue !== 'polymarket' && isKalshiCancelNotFilled(cancelReason)) {
+    return { retry: false, patch: null, reason: 'cancelled' };
+  }
+
+  const ticker = fillTickerFromSources(row, extra || row.extra, rfq);
+  const closedMs = rfqClosedMsForFill(rfq)
+    || parseTs(row.deleted_ts)
+    || row.closedMs
+    || null;
   const status = (rfq && rfq.status) || (row.status !== 'seen' && row.status !== 'started' ? row.status : null);
   // Sweeped Poly rows that are still OPEN were never closed — do not retry.
   if (row.venue === 'polymarket' && row.fromSweep && bareFillStatus(status) === 'open') {
     return { retry: false, patch: null, reason: 'still_open' };
   }
-  if (!isFillLookupReady({ status, closedMs, now, padMs, venue: row.venue })) {
+  if (!isFillLookupReady({
+    status, closedMs, now, padMs, venue: row.venue, hasTicker: !!ticker,
+  })) {
     return { retry: true };
   }
 
@@ -1166,8 +1250,8 @@ async function resolveUnhedgedFill(row, {
   }
 
   // Kalshi public tape only. Never hit Kalshi /markets/trades with a Poly ticker.
+  // GET 404 after delete is expected — use the WS / remembered ticker.
   if (typeof fetchTrades === 'function' && row.venue !== 'polymarket') {
-    const ticker = tickerOfFillRfq(rfq, row);
     if (ticker) {
       const created = parseTs(rfq && (rfq.created_ts || rfq.createdTime)) || row.createdMs || null;
       const minTs = Math.max(0, Math.floor((created || closedMs || now) / 1000) - 1);
@@ -1181,7 +1265,7 @@ async function resolveUnhedgedFill(row, {
       const normalized = (trades || []).map((t) => normalizeTrade(t, parseTs))
         .filter((t) => t.ts == null || (t.ts >= windowStart - 1000 && t.ts <= windowEnd + 1000));
       const result = matchTapeTrades(normalized, {
-        rfqCount: rfqCountForFillTape(rfq, row.contracts),
+        rfqCount: fillContractsFromSources(row, extra || row.extra, rfq),
         closedMs,
       });
       if (result && result.match === 'matched') {
@@ -1201,6 +1285,11 @@ async function resolveUnhedgedFill(row, {
           result,
         };
       }
+      if (closedMs != null && now < closedMs + padMs) {
+        return { retry: true, reason: 'pad' };
+      }
+    } else if (closedMs != null && now < closedMs + padMs) {
+      return { retry: true, reason: 'pad' };
     }
   }
 
@@ -1211,6 +1300,7 @@ function createUnhedgedFillTracker(opts = {}) {
   const known = new Set();
   const filled = new Set();
   const pending = new Map();
+  const tickers = new Map();
   const env = opts.env;
   const maxPerTick = opts.maxPerTick != null ? opts.maxPerTick : DEFAULT_FILL_MAX_PER_TICK;
   const maxPending = opts.maxPending != null ? opts.maxPending : DEFAULT_FILL_MAX_PENDING;
@@ -1248,6 +1338,8 @@ function createUnhedgedFillTracker(opts = {}) {
     const key = knownKey(row.venue, row.rfq_id);
     known.add(key);
     if (row.status === 'filled') filled.add(key);
+    const ticker = row.market_ticker || row.marketTicker || row.symbol || null;
+    if (ticker) tickers.set(key, ticker);
   }
 
   async function hydrateOpen() {
@@ -1256,7 +1348,7 @@ function createUnhedgedFillTracker(opts = {}) {
       .select('venue,rfq_id,status,contracts,created_at')
       .eq('status', 'seen')
       .order('created_at', { ascending: false })
-      .limit(2000);
+      .limit(HYDRATE_SEEN_LIMIT);
     if (error) {
       console.error('[UNHEDGED] fill hydrate failed', error.message);
       return;
@@ -1302,33 +1394,69 @@ function createUnhedgedFillTracker(opts = {}) {
   async function onClosed({ venue, rfqId, extra, rfq, now, symbol } = {}) {
     if (!isUnhedgedRfqShadow(env || opts.env)) return fail('flag_off');
     if (!rfqId || (venue !== 'kalshi' && venue !== 'polymarket')) return fail('bad_rfq');
-    if (isUnhedgedStarted(rfq, extra, now)) return fail('game_started');
+    noteFillTick('closed');
+    if (isUnhedgedStarted(rfq, extra, now)) {
+      noteFillTick('started');
+      return fail('game_started');
+    }
     const key = knownKey(venue, rfqId);
-    if (!known.has(key)) return fail('unknown_row');
+    if (!known.has(key)) {
+      const existing = await lookupKnownUnhedgedRow({ supabase: opts.supabase }, venue, rfqId);
+      if (!existing) {
+        noteFillTick('unknown');
+        return fail('unknown_row');
+      }
+      if (existing.status === 'started') {
+        noteFillTick('started');
+        return fail('game_started');
+      }
+      if (existing.status === 'filled') {
+        remember({ venue, rfq_id: rfqId, status: 'filled' });
+        return fail('already_filled');
+      }
+      remember({ venue, rfq_id: rfqId, status: existing.status || 'seen' });
+    }
     if (filled.has(key)) return fail('already_filled');
 
     const immediate = considerUnhedgedFill({
       venue, rfqId, extra, rfq, env: env || opts.env, now, known: true,
     });
-    if (immediate.reason === 'game_started') return immediate;
+    if (immediate.reason === 'game_started') {
+      noteFillTick('started');
+      return immediate;
+    }
     if (immediate.persist && immediate.row) {
       await applyPatch(immediate.row);
       pending.delete(knownKey(venue, rfqId));
       return immediate;
     }
 
+    const ticker = symbol
+      || fillTickerFromSources(null, extra, rfq)
+      || tickers.get(key)
+      || null;
+    const contracts = fillContractsFromSources(
+      { contracts: rfq && (rfq.contracts != null ? rfq.contracts : rfq.contracts_fp) },
+      extra,
+      rfq
+    );
+    if (ticker) tickers.set(key, ticker);
+    const msg = extra && extra.msg;
+    noteFillTick('queued');
     enqueue(knownKey(venue, rfqId), {
       venue,
       rfq_id: rfqId,
       extra,
       rfq,
       closedMs: now != null ? now : Date.now(),
-      contracts: rfq && (rfq.contracts != null ? rfq.contracts : rfq.contracts_fp),
-      market_ticker: symbol
-        || (rfq && (rfq.market_ticker || rfq.ticker || rfq.symbol))
+      contracts,
+      market_ticker: ticker,
+      symbol: ticker,
+      deleted_ts: (rfq && (rfq.deletedTs || rfq.deleted_ts))
+        || (msg && (msg.deleted_ts || msg.expired_ts || msg.closed_ts))
         || null,
-      symbol: symbol
-        || (rfq && (rfq.symbol || rfq.ticker || rfq.market_ticker))
+      cancellation_reason: (rfq && rfq.cancellation_reason)
+        || (msg && msg.cancellation_reason)
         || null,
     });
     return { persist: false, reason: 'queued', status: null, row: null };
@@ -1372,48 +1500,85 @@ function createUnhedgedFillTracker(opts = {}) {
     } catch (_) { /* ignore sweep errors */ }
   }
 
-  async function tick(now = Date.now()) {
-    await sweepRecentPolymarket(now);
-    if (!pending.size) return;
-    const fetchRfq = opts.fetchRfq;
-    const fetchTrades = opts.fetchTrades;
-    let looked = 0;
-    // Newest first — live closes sit at the Map tail. FIFO oldest-first
-    // never reached Today's fills under Kalshi delete volume.
+  function pickTickKeys(now) {
+    if (maxPerTick <= 0) return [];
+    const keys = [];
+    const picked = new Set();
+    for (const [key, row] of pending) {
+      if (!row) continue;
+      if (filled.has(key) || isUnhedgedStarted(row.rfq, row.extra, now)) {
+        pending.delete(key);
+        continue;
+      }
+      const readyAt = (row.closedMs || 0) + FILL_TAPE_PAD_MS;
+      if (now >= readyAt) {
+        keys.push(key);
+        picked.add(key);
+        if (keys.length >= maxPerTick) return keys;
+      }
+    }
     for (const key of [...pending.keys()].reverse()) {
+      if (picked.has(key)) continue;
       const row = pending.get(key);
       if (!row) continue;
-      if (filled.has(key)) {
+      if (filled.has(key) || isUnhedgedStarted(row.rfq, row.extra, now)) {
         pending.delete(key);
         continue;
       }
-      if (isUnhedgedStarted(row.rfq, row.extra, now)) {
-        pending.delete(key);
-        continue;
+      keys.push(key);
+      if (keys.length >= maxPerTick) break;
+    }
+    return keys;
+  }
+
+  async function resolveOne(key, now) {
+    const row = pending.get(key);
+    if (!row) return;
+    if (filled.has(key) || isUnhedgedStarted(row.rfq, row.extra, now)) {
+      pending.delete(key);
+      return;
+    }
+    try {
+      noteFillTick('looked');
+      const out = await resolveUnhedgedFill(row, {
+        fetchRfq: opts.fetchRfq, fetchTrades: opts.fetchTrades, now, extra: row.extra,
+      });
+      if (out.retry) {
+        noteFillTick('retry');
+        return;
       }
-      if (looked >= maxPerTick) break;
-      looked += 1;
-      try {
-        const out = await resolveUnhedgedFill(row, {
-          fetchRfq, fetchTrades, now, extra: row.extra,
-        });
-        if (out.retry) continue;
-        pending.delete(key);
-        if (out.patch) {
-          await applyPatch(out.patch);
-          console.log(
-            `[UNHEDGED] filled ${out.patch.venue} rfq=${out.patch.rfq_id}` +
-            (out.patch.fill_american != null ? ` fill=${out.patch.fill_american}` : '') +
-            (out.reason ? ` via=${out.reason}` : '')
-          );
-        }
-      } catch (e) {
-        console.error('[UNHEDGED] fill tick', row.rfq_id, e && e.message);
+      pending.delete(key);
+      if (out.patch) {
+        noteFillTick('taped');
+        await applyPatch(out.patch);
+        console.log(
+          `[UNHEDGED] filled ${out.patch.venue} rfq=${out.patch.rfq_id}` +
+          (out.patch.fill_american != null ? ` fill=${out.patch.fill_american}` : '') +
+          (out.reason ? ` via=${out.reason}` : '')
+        );
+      } else {
+        noteFillTick('drop');
       }
+    } catch (e) {
+      console.error('[UNHEDGED] fill tick', row.rfq_id, e && e.message);
     }
   }
 
-  return { remember, hydrate, onClosed, tick, known, filled, pending };
+  let ticking = false;
+  async function tick(now = Date.now()) {
+    if (ticking) return;
+    ticking = true;
+    try {
+      await sweepRecentPolymarket(now);
+      if (!pending.size) return;
+      const keys = pickTickKeys(now);
+      await Promise.all(keys.map((key) => resolveOne(key, now)));
+    } finally {
+      ticking = false;
+    }
+  }
+
+  return { remember, hydrate, onClosed, tick, known, filled, pending, tickers };
 }
 
 function shadowUnhedgedFill(opts = {}) {
@@ -1437,7 +1602,11 @@ module.exports = {
   FILL_TAPE_PAD_MS,
   DEFAULT_FILL_MAX_PER_TICK,
   DEFAULT_FILL_MAX_PENDING,
+  DEFAULT_FILL_TICK_MS,
+  HYDRATE_SEEN_LIMIT,
   POLY_SWEEP_PENDING_CAP,
+  isKalshiCancelNotFilled,
+  fillTickerFromSources,
   isUnhedgedRfqShadow,
   isUnhedgedRfqLive,
   isUnhedgedFillStatus,

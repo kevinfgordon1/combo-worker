@@ -97,5 +97,12 @@ assert.ok(
   /UNHEDGED_RFQ_LIVE=\$\{isUnhedgedRfqLive\(process\.env\) \? 'on' : 'off'\}/.test(liveSrc),
   'UNHEDGED_RFQ_LIVE must stay off unless explicitly enabled'
 );
+assert.ok(
+  /unhedgedFills\.tick\(\)[\s\S]{0,120}FILL_TICK_MS/.test(liveSrc),
+  'unhedged fill tick must not share the 15s skip-tape interval'
+);
+assert.ok(
+  !/unhedgedFills\.tick\(\)[\s\S]{0,80}SKIP_TAPE_TICK_MS/.test(liveSrc)
+);
 
 console.log('live-runner.test.js ok');
