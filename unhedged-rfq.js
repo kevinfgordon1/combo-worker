@@ -659,6 +659,35 @@ async function maybePersistUnhedged(rfq, opts = {}) {
 // firehose. One count line per minute. Filled logs stay per-row.
 const SEEN_STARTED_LOG_MS = 60_000;
 const seenStartedCounts = { seen: 0, started: 0, timer: null };
+const fillTickCounts = {
+  queued: 0, looked: 0, taped: 0, retry: 0, drop: 0, unknown: 0, timer: null,
+};
+
+function flushFillTickLog() {
+  fillTickCounts.timer = null;
+  const { queued, looked, taped, retry, drop, unknown } = fillTickCounts;
+  fillTickCounts.queued = 0;
+  fillTickCounts.looked = 0;
+  fillTickCounts.taped = 0;
+  fillTickCounts.retry = 0;
+  fillTickCounts.drop = 0;
+  fillTickCounts.unknown = 0;
+  if (queued || looked || taped || retry || drop || unknown) {
+    console.log(
+      `[UNHEDGED] fill queue queued=${queued} looked=${looked} taped=${taped}` +
+      ` retry=${retry} drop=${drop} unknown=${unknown} /min`
+    );
+  }
+}
+
+function noteFillTick(field) {
+  if (!Object.prototype.hasOwnProperty.call(fillTickCounts, field) || field === 'timer') return;
+  fillTickCounts[field] += 1;
+  if (!fillTickCounts.timer) {
+    fillTickCounts.timer = setTimeout(flushFillTickLog, SEEN_STARTED_LOG_MS);
+    if (fillTickCounts.timer.unref) fillTickCounts.timer.unref();
+  }
+}
 
 function flushSeenStartedLog() {
   seenStartedCounts.timer = null;
@@ -1365,7 +1394,10 @@ function createUnhedgedFillTracker(opts = {}) {
     const key = knownKey(venue, rfqId);
     if (!known.has(key)) {
       const existing = await lookupKnownUnhedgedRow({ supabase: opts.supabase }, venue, rfqId);
-      if (!existing) return fail('unknown_row');
+      if (!existing) {
+        noteFillTick('unknown');
+        return fail('unknown_row');
+      }
       if (existing.status === 'started') return fail('game_started');
       if (existing.status === 'filled') {
         remember({ venue, rfq_id: rfqId, status: 'filled' });
@@ -1396,6 +1428,7 @@ function createUnhedgedFillTracker(opts = {}) {
     );
     if (ticker) tickers.set(key, ticker);
     const msg = extra && extra.msg;
+    noteFillTick('queued');
     enqueue(knownKey(venue, rfqId), {
       venue,
       rfq_id: rfqId,
@@ -1492,18 +1525,25 @@ function createUnhedgedFillTracker(opts = {}) {
       return;
     }
     try {
+      noteFillTick('looked');
       const out = await resolveUnhedgedFill(row, {
         fetchRfq: opts.fetchRfq, fetchTrades: opts.fetchTrades, now, extra: row.extra,
       });
-      if (out.retry) return;
+      if (out.retry) {
+        noteFillTick('retry');
+        return;
+      }
       pending.delete(key);
       if (out.patch) {
+        noteFillTick('taped');
         await applyPatch(out.patch);
         console.log(
           `[UNHEDGED] filled ${out.patch.venue} rfq=${out.patch.rfq_id}` +
           (out.patch.fill_american != null ? ` fill=${out.patch.fill_american}` : '') +
           (out.reason ? ` via=${out.reason}` : '')
         );
+      } else {
+        noteFillTick('drop');
       }
     } catch (e) {
       console.error('[UNHEDGED] fill tick', row.rfq_id, e && e.message);

@@ -126,6 +126,10 @@ assert.ok(!SCOPE_LEAGUES.has('ncaaf'));
     /market_ticker:\s*rfq\.marketTicker/.test(liveSrc),
     'remember MVE ticker from rfq_created so GET 404 can still tape'
   );
+  assert.ok(
+    src.includes('[UNHEDGED] fill queue'),
+    'minute fill-queue line so we can see queued/looked/taped after deploy'
+  );
 }
 
 const mlbCws = parseKalshiUnhedgedTicker('KXMLBGAME-26AUG141840CWSDET-CWS:yes');
