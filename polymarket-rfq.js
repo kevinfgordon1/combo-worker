@@ -2,9 +2,12 @@
 //
 // Maker only: subscribe / poll open RFQs, map comboLegs onto matchParlay,
 // price from Combo Locks fill odds, share remaining with Kalshi via reserve.js.
+// Production RFQs are game slugs; SIDE_SELL is the second team (TEX on tb-tex).
 // Like Kalshi, only RFQs that could match the current parlays() snapshot
 // hydrate extra HTTP, fetch market metadata, quote, or write verbose skip logs.
 // Unmatched firehose RFQs are a cheap no-op — no seenRfqs / market-cache growth.
+// Reconcile always prints a reason histogram. Near-miss no_lock_overlap
+// (same games, wrong side / leg count) logs SKIP with a reason code.
 // Live POSTs (create quote, confirm) require POLYMARKET_RFQ_LIVE to be truthy.
 // quoteExecuted means paired orders were submitted — not a fill.
 // START GATE: never quote or confirm once any lock leg has started (first pitch
@@ -35,6 +38,7 @@ const { createMarketCache } = require('./polymarket-market-cache');
 const {
   identitiesFromParlay,
   identitiesFromPolymarketLegs,
+  identitiesFromPolymarketSlugs,
   sameIdentitySet,
   TEAM_ALIASES,
   SERIES,
@@ -210,22 +214,6 @@ function identityHitsTokens(id, tokens) {
   return teams.every((team) => teamInTokens(id.league, team, tokens));
 }
 
-function rfqSides(rfq) {
-  return ((rfq && rfq.legKeys) || [])
-    .map((k) => splitLegKey(k).side)
-    .filter((s) => s === 'yes' || s === 'no')
-    .sort();
-}
-
-function identitySides(identities) {
-  return (identities || []).map((id) => id.side).filter(Boolean).sort();
-}
-
-function sameSides(a, b) {
-  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-  return a.every((x, i) => x === b[i]);
-}
-
 function cheapDirectMatch(rfq, parlays) {
   if (!rfq || !rfq.legKeys || !rfq.legKeys.length || !Array.isArray(parlays)) return null;
   const asRfq = { ...rfq, legKeys: upperKeys(rfq.legKeys) };
@@ -296,9 +284,91 @@ function logActiveLockIdentityFails(parlays, log = console.log) {
   return n;
 }
 
+const NEAR_MISS_CODES = new Set(['leg_count', 'missing_team', 'same_games_no_match']);
+
+function explainLockOverlapMiss(rfq, parlays) {
+  const tokens = rfqSlugTokenSet(rfq);
+  const keys = (rfq && rfq.legKeys) || [];
+  if (!tokens.size && !keys.length) return { code: 'no_rfq_tokens' };
+
+  const slugIds = identitiesFromPolymarketSlugs((rfq && (rfq.comboLegs || rfq.legs)) || []);
+
+  for (const p of parlays || []) {
+    const lock = identitiesFromParlay(p);
+    if (!lock.ok || !lock.identities.length) continue;
+    const label = (p && (p.label || p.id)) || '?';
+    const shared = lock.identities.filter((id) => {
+      const leagueTokens = LEAGUE_SLUG_TOKENS[id.league] || (id.league ? [id.league] : []);
+      return leagueTokens.some((t) => tokens.has(t)) && tokensHaveDate(tokens, id.date);
+    });
+    if (!shared.length) continue;
+
+    if (keys.length && keys.length !== lock.identities.length) {
+      return {
+        code: 'leg_count',
+        lock: label,
+        detail: `rfqLegs=${keys.length} lockLegs=${lock.identities.length}`,
+      };
+    }
+
+    const missTeam = lock.identities.filter((id) => (
+      !id.teams.every((team) => teamInTokens(id.league, team, tokens))
+    ));
+    if (missTeam.length && shared.length < lock.identities.length) {
+      return {
+        code: 'missing_team',
+        lock: label,
+        detail: `miss=${missTeam.map((id) => (id.teams || []).join('+')).join(',')}`,
+      };
+    }
+
+    if (slugIds.ok && !sameIdentitySet(slugIds.keys, lock.keys)) {
+      return {
+        code: 'same_games_no_match',
+        lock: label,
+        detail: `rfq=${slugIds.keys.join(',')} lock=${lock.keys.join(',')}`,
+      };
+    }
+
+    return { code: 'same_games_no_match', lock: label };
+  }
+  return { code: 'no_shared_game' };
+}
+
+function logUnpriceablePolyLocks(parlays, log = console.log) {
+  if (!Array.isArray(parlays) || !parlays.length) return 0;
+  let n = 0;
+  for (const p of parlays) {
+    const lock = identitiesFromParlay(p);
+    if (lock.ok) continue;
+    const tickers = kalshiMlTickersFromParlay(p);
+    const series = tickers.map((t) => String(t).split('-')[0].split(':')[0].toUpperCase());
+    if (!series.some((s) => /SPREAD|TOTAL|PROP/.test(s))) continue;
+    const label = (p && (p.label || p.id)) || '?';
+    log(`[${MODE}] lock-unpriceable-on-poly reason=not_moneyline label=${label}`);
+    n += 1;
+  }
+  return n;
+}
+
+function tallyReason(reasons, key) {
+  const k = key || 'unknown';
+  reasons[k] = (reasons[k] || 0) + 1;
+}
+
+function formatReasonTally(reasons) {
+  return Object.entries(reasons)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([k, n]) => `${k}=${n}`)
+    .join(' ');
+}
+
 // Cheap over-approximation of evaluate/match: no HTTP, no metadata.
-// True = this RFQ could be one of the current Combo Locks (exact PM keys
-// or slug tokens covering each lock identity). False = firehose no-op.
+// True = this RFQ could be one of the current Combo Locks (exact PM keys,
+// slug-derived identities including game-slug SELL = second team, or slug
+// tokens covering each lock identity). False = firehose no-op.
+// Do not compare raw BUY/SELL lists to Kalshi :yes — production game slugs
+// express the short team as SIDE_SELL.
 function couldMatchActiveLocks(rfq, parlays, { partial = false } = {}) {
   if (!rfq || !Array.isArray(parlays) || !parlays.length) return false;
   const keys = rfq.legKeys || [];
@@ -307,17 +377,19 @@ function couldMatchActiveLocks(rfq, parlays, { partial = false } = {}) {
 
   const tokens = rfqSlugTokenSet(rfq);
   if (!tokens.size) return false;
-  const sides = rfqSides(rfq);
+  const slugIds = identitiesFromPolymarketSlugs(rfq.comboLegs || rfq.legs);
 
   for (const p of parlays) {
     const lock = identitiesFromParlay(p);
     if (!lock.ok || !lock.identities.length) continue;
     if (!partial && keys.length && keys.length !== lock.identities.length) continue;
-    if (!partial && sides.length && !sameSides(sides, identitySides(lock.identities))) continue;
+    if (!partial && slugIds.ok && sameIdentitySet(slugIds.keys, lock.keys)) return true;
     const hits = partial
       ? lock.identities.some((id) => identityHitsTokens(id, tokens))
       : lock.identities.every((id) => identityHitsTokens(id, tokens));
-    if (hits) return true;
+    if (!hits) continue;
+    if (!partial && slugIds.ok && !sameIdentitySet(slugIds.keys, lock.keys)) continue;
+    return true;
   }
   return false;
 }
@@ -531,6 +603,7 @@ function logSkip(evaluation, extra) {
     evaluation.reason === 'unmatched' || evaluation.reason === 'unmatched_leg'
     || evaluation.reason === 'no_legs' || evaluation.reason === 'missing_metadata'
     || evaluation.reason === 'not_priceable' || evaluation.reason === 'ambiguous'
+    || evaluation.reason === 'no_lock_overlap'
   ) {
     bits.push(`legs=${symbols || '(none)'} keys=${(rfq.legKeys || []).join('|') || '(none)'}`);
     if (evaluation.identityKeys && evaluation.identityKeys.length) {
@@ -542,6 +615,11 @@ function logSkip(evaluation, extra) {
   }
   if (evaluation.reason === 'game_started' && evaluation.started) {
     bits.push(`source=${evaluation.started.source} at=${evaluation.started.at}`);
+  }
+  if (evaluation.overlap) {
+    bits.push(`code=${evaluation.overlap.code || '?'}`);
+    if (evaluation.overlap.lock) bits.push(`lock=${evaluation.overlap.lock}`);
+    if (evaluation.overlap.detail) bits.push(evaluation.overlap.detail);
   }
   if (extra) bits.push(extra);
   console.log(bits.join(' '));
@@ -965,7 +1043,17 @@ function startPolymarketRfqLoop(ctx = {}) {
 
     if (!couldMatchActiveLocks(rfq, locks)) {
       persistUnhedgedShadow(rfq);
-      return { action: 'skip', reason: 'no_lock_overlap' };
+      const overlap = explainLockOverlapMiss(rfq, locks);
+      const evaluation = {
+        action: 'skip',
+        reason: 'no_lock_overlap',
+        rfq,
+        overlap,
+      };
+      if (overlap && NEAR_MISS_CODES.has(overlap.code)) {
+        logSkip(evaluation);
+      }
+      return evaluation;
     }
 
     if (seenRfqs.has(rfq.rfqId)) return { action: 'skip', reason: 'seen' };
@@ -1256,16 +1344,27 @@ function startPolymarketRfqLoop(ctx = {}) {
 
   async function reconcileOpenRfqs() {
     const locks = parlays();
-    if (!locks.length) return;
+    if (!locks.length) {
+      console.log(`[${MODE}] reconcile open=0 locks=0 live=${live}`);
+      return;
+    }
     logActiveLockIdentityFails(locks);
+    logUnpriceablePolyLocks(locks);
     try {
       const listed = await http.listRfqs({ status: 'RFQ_STATUS_OPEN', limit: 100 });
       const rows = (listed && listed.rfqs) || [];
-      console.log(`[${MODE}] reconcile open=${rows.length} live=${live}`);
+      const reasons = {};
       for (const row of rows) {
         if (stopped) return;
-        await handleRfq(row);
+        const out = await handleRfq(row);
+        const key = (out && out.post) ? 'quoted' : ((out && out.reason) || (out && out.action) || 'unknown');
+        tallyReason(reasons, key);
       }
+      const hist = formatReasonTally(reasons);
+      console.log(
+        `[${MODE}] reconcile open=${rows.length} live=${live}` +
+        (hist ? ` ${hist}` : '')
+      );
     } catch (e) {
       console.error(`[${MODE}] reconcile rfqs`, e.message);
     }
@@ -1391,6 +1490,8 @@ module.exports = {
   cheapDirectMatch,
   couldMatchActiveLocks,
   logActiveLockIdentityFails,
+  logUnpriceablePolyLocks,
+  explainLockOverlapMiss,
   isKalshiMoneylineLock,
   matchPolymarketParlay,
   matchPolymarketParlayDetailed,

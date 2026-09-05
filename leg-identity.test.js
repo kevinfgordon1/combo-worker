@@ -5,6 +5,8 @@ const {
   kalshiTickerPieces,
   identitiesFromParlay,
   identityFromMarket,
+  identityFromPolymarketSlug,
+  identitiesFromPolymarketSlugs,
   identitiesFromPolymarketLegs,
   identityKey,
   sameIdentitySet,
@@ -194,8 +196,13 @@ assert.strictEqual(identityKey(buyCws.identity), identityKey(cwsId));
 
 const sellCws = identityFromMarket(cwsMarket, 'no');
 assert.ok(sellCws.identity);
-assert.strictEqual(sellCws.identity.side, 'no');
+assert.strictEqual(sellCws.identity.side, 'yes');
+assert.strictEqual(sellCws.identity.selection, 'det');
 assert.notStrictEqual(identityKey(sellCws.identity), identityKey(cwsId));
+assert.strictEqual(
+  identityKey(sellCws.identity),
+  'mlb|2026-08-14|cws+det|moneyline|full|det|yes'
+);
 
 const retail = identityFromMarket({
   sportsMarketType: 'moneyline',
@@ -235,8 +242,51 @@ const noMeta = identitiesFromPolymarketLegs([
   { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'SIDE_BUY' },
   { symbol: 'aec-mlb-bos-pit-2026-08-14-pit', side: 'SIDE_BUY' },
 ], new Map());
-assert.strictEqual(noMeta.ok, false);
-assert.strictEqual(noMeta.reason, 'missing_metadata');
+assert.ok(noMeta.ok, 'game/pick slugs match Combo Locks without market HTTP');
+assert.ok(sameIdentitySet(noMeta.keys, lock.keys));
+
+const texYes = parseKalshiTicker('KXMLBGAME-26SEP031840TBTEX-TEX:yes');
+const gameSellTex = identityFromPolymarketSlug('aec-mlb-tb-tex-2026-09-03', 'no');
+assert.ok(gameSellTex);
+assert.strictEqual(identityKey(gameSellTex), identityKey(texYes));
+const gameBuyTb = identityFromPolymarketSlug('aec-mlb-tb-tex-2026-09-03', 'yes');
+assert.strictEqual(gameBuyTb.selection, 'tb');
+assert.notStrictEqual(identityKey(gameBuyTb), identityKey(texYes));
+
+const tbTexMarket = {
+  metadata: {
+    event_id: 'mlb-tb-tex-2026-09-03',
+    event_start_time: '2026-09-03T22:40:00Z',
+    event_subcategory: 'BASEBALL',
+    market_sport_type: 'baseball_team_full_game_winner',
+    long_participant_id: 'mlb-tb',
+    short_participant_id: 'mlb-tex',
+  },
+};
+const metaSellTex = identityFromMarket(tbTexMarket, 'no');
+assert.ok(metaSellTex.identity);
+assert.strictEqual(identityKey(metaSellTex.identity), identityKey(texYes));
+
+const laaTexSlugs = identitiesFromPolymarketSlugs([
+  { symbol: 'aec-mlb-laa-pit-2026-09-04', side: 'SIDE_BUY' },
+  { symbol: 'aec-mlb-tb-tex-2026-09-04', side: 'SIDE_SELL' },
+]);
+const laaTexLock = identitiesFromParlay({
+  leg_keys: [
+    'KXMLBGAME-26SEP041845LAAPIT-LAA:yes',
+    'KXMLBGAME-26SEP042005TBTEX-TEX:yes',
+  ],
+});
+assert.ok(laaTexSlugs.ok);
+assert.ok(laaTexLock.ok);
+assert.ok(sameIdentitySet(laaTexSlugs.keys, laaTexLock.keys));
+
+const pitTbSlugs = identitiesFromPolymarketSlugs([
+  { symbol: 'aec-mlb-laa-pit-2026-09-04', side: 'SIDE_SELL' },
+  { symbol: 'aec-mlb-tb-tex-2026-09-04', side: 'SIDE_BUY' },
+]);
+assert.ok(pitTbSlugs.ok);
+assert.ok(!sameIdentitySet(pitTbSlugs.keys, laaTexLock.keys));
 
 const wrongDate = identitiesFromPolymarketLegs([
   { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'SIDE_BUY' },
