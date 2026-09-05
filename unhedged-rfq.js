@@ -660,22 +660,26 @@ async function maybePersistUnhedged(rfq, opts = {}) {
 const SEEN_STARTED_LOG_MS = 60_000;
 const seenStartedCounts = { seen: 0, started: 0, timer: null };
 const fillTickCounts = {
-  queued: 0, looked: 0, taped: 0, retry: 0, drop: 0, unknown: 0, timer: null,
+  closed: 0, queued: 0, looked: 0, taped: 0, retry: 0, drop: 0,
+  unknown: 0, started: 0, timer: null,
 };
 
 function flushFillTickLog() {
   fillTickCounts.timer = null;
-  const { queued, looked, taped, retry, drop, unknown } = fillTickCounts;
+  const { closed, queued, looked, taped, retry, drop, unknown, started } = fillTickCounts;
+  fillTickCounts.closed = 0;
   fillTickCounts.queued = 0;
   fillTickCounts.looked = 0;
   fillTickCounts.taped = 0;
   fillTickCounts.retry = 0;
   fillTickCounts.drop = 0;
   fillTickCounts.unknown = 0;
-  if (queued || looked || taped || retry || drop || unknown) {
+  fillTickCounts.started = 0;
+  if (closed || queued || looked || taped || retry || drop || unknown || started) {
     console.log(
-      `[UNHEDGED] fill queue queued=${queued} looked=${looked} taped=${taped}` +
-      ` retry=${retry} drop=${drop} unknown=${unknown} /min`
+      `[UNHEDGED] fill queue closed=${closed} queued=${queued} looked=${looked}` +
+      ` taped=${taped} retry=${retry} drop=${drop} unknown=${unknown}` +
+      ` started=${started} /min`
     );
   }
 }
@@ -1390,7 +1394,11 @@ function createUnhedgedFillTracker(opts = {}) {
   async function onClosed({ venue, rfqId, extra, rfq, now, symbol } = {}) {
     if (!isUnhedgedRfqShadow(env || opts.env)) return fail('flag_off');
     if (!rfqId || (venue !== 'kalshi' && venue !== 'polymarket')) return fail('bad_rfq');
-    if (isUnhedgedStarted(rfq, extra, now)) return fail('game_started');
+    noteFillTick('closed');
+    if (isUnhedgedStarted(rfq, extra, now)) {
+      noteFillTick('started');
+      return fail('game_started');
+    }
     const key = knownKey(venue, rfqId);
     if (!known.has(key)) {
       const existing = await lookupKnownUnhedgedRow({ supabase: opts.supabase }, venue, rfqId);
@@ -1398,7 +1406,10 @@ function createUnhedgedFillTracker(opts = {}) {
         noteFillTick('unknown');
         return fail('unknown_row');
       }
-      if (existing.status === 'started') return fail('game_started');
+      if (existing.status === 'started') {
+        noteFillTick('started');
+        return fail('game_started');
+      }
       if (existing.status === 'filled') {
         remember({ venue, rfq_id: rfqId, status: 'filled' });
         return fail('already_filled');
@@ -1410,7 +1421,10 @@ function createUnhedgedFillTracker(opts = {}) {
     const immediate = considerUnhedgedFill({
       venue, rfqId, extra, rfq, env: env || opts.env, now, known: true,
     });
-    if (immediate.reason === 'game_started') return immediate;
+    if (immediate.reason === 'game_started') {
+      noteFillTick('started');
+      return immediate;
+    }
     if (immediate.persist && immediate.row) {
       await applyPatch(immediate.row);
       pending.delete(knownKey(venue, rfqId));

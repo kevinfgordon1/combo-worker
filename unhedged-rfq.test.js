@@ -127,8 +127,8 @@ assert.ok(!SCOPE_LEAGUES.has('ncaaf'));
     'remember MVE ticker from rfq_created so GET 404 can still tape'
   );
   assert.ok(
-    src.includes('[UNHEDGED] fill queue'),
-    'minute fill-queue line so we can see queued/looked/taped after deploy'
+    src.includes('[UNHEDGED] fill queue') && src.includes('closed=${closed}'),
+    'minute fill-queue line must count rfq_deleted arrivals vs queued vs taped'
   );
 }
 
