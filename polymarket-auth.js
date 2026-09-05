@@ -148,13 +148,16 @@ function classifyPolymarketAuthError({ statusCode, json, text } = {}) {
   const publicMessage = redactAuthText(raw || text || '');
   const lower = publicMessage.toLowerCase();
   let reason = statusCode === 403 ? 'forbidden' : 'unauthorized';
-  if (/timestamp|clock|skew|too old|too new|stale/.test(lower)) reason = 'clock_skew';
+  if (/missing required api key|missing.*headers/.test(lower)) reason = 'missing_headers';
+  else if (/timestamp|clock|skew|too old|too new|stale/.test(lower)) reason = 'clock_skew';
   else if (/signature|invalid sig|ed25519|signing/.test(lower)) reason = 'bad_signature';
-  else if (/unknown key|invalid key|access.key|revoked|disabled/.test(lower)) reason = 'invalid_key';
-  else if (/rfq|beta|not enabled|not authorized/.test(lower)) reason = 'rfq_not_enabled';
+  else if (/api key not found|key not found|unknown key|invalid key|access.key|revoked|disabled/.test(lower)) {
+    reason = 'invalid_key';
+  } else if (/rfq|beta|not enabled|not authorized/.test(lower)) reason = 'rfq_not_enabled';
   const needsRotate = reason === 'invalid_key'
     || reason === 'bad_signature'
     || reason === 'rfq_not_enabled'
+    || reason === 'missing_headers'
     || (reason === 'unauthorized' && statusCode === 401);
   return {
     reason,

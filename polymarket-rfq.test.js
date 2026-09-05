@@ -111,6 +111,20 @@ assert.strictEqual(authHeaders({
   assert.ok(!leaked.publicMessage.includes(SEED_B64));
   assert.ok(leaked.publicMessage.includes('[redacted]'));
 
+  const missingHeaders = classifyPolymarketAuthError({
+    statusCode: 401,
+    text: 'Missing required API key headers',
+  });
+  assert.strictEqual(missingHeaders.reason, 'missing_headers');
+  assert.strictEqual(missingHeaders.needsRotate, true);
+
+  const keyNotFound = classifyPolymarketAuthError({
+    statusCode: 401,
+    text: 'API key not found\n',
+  });
+  assert.strictEqual(keyNotFound.reason, 'invalid_key');
+  assert.strictEqual(keyNotFound.needsRotate, true);
+
   const bare401 = classifyPolymarketAuthError({ statusCode: 401, text: '' });
   assert.strictEqual(bare401.reason, 'unauthorized');
   assert.strictEqual(bare401.needsRotate, true);
