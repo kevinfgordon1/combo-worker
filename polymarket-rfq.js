@@ -34,7 +34,13 @@ const {
   shouldPostPolymarketQuote,
   shouldConfirmPolymarketAccept,
 } = require('./polymarket-quote');
-const { isPolymarketRfqLive } = require('./polymarket-auth');
+const {
+  isPolymarketRfqLive,
+  inspectPolymarketCreds,
+  classifyPolymarketAuthError,
+  formatAuthFailure,
+  ROTATE_HINT,
+} = require('./polymarket-auth');
 const { createPolymarketHttp, createPolymarketRfqWs } = require('./polymarket-client');
 const { createMarketCache } = require('./polymarket-market-cache');
 const {
@@ -978,11 +984,14 @@ function startPolymarketRfqLoop(ctx = {}) {
   }
 
   const live = isPolymarketRfqLive(env);
+  const creds = inspectPolymarketCreds({ keyId, secretKey }, env);
   const pendingQuotes = ctx.pendingQuotes || new Map();
   const confirmingQuotes = ctx.confirmingQuotes || new Set();
   const seenRfqs = new Map();
   let reserveSeq = 0;
   let stopped = false;
+  let authFailCount = 0;
+  let lastAuthFailLog = 0;
 
   const marketCache = ctx.marketCache || createMarketCache({
     fetchMarket: ctx.fetchMarket || ((slug) => http.getMarketBySlug(slug)),
@@ -996,6 +1005,14 @@ function startPolymarketRfqLoop(ctx = {}) {
     `UNHEDGED_RFQ_LIVE=${isUnhedgedRfqLive(env) ? 'on' : 'off'}) ` +
     `persists in-scope unmatched MLB/NFL ML combos — never posts.`
   );
+  console.log(
+    `[${MODE}] creds keyId=${creds.keyIdLooksUuid ? 'uuid' : (creds.keyIdPresent ? 'not_uuid' : 'missing')} ` +
+    `secretFormat=${creds.secretFormat} seedBytes=${creds.secretSeedBytes}` +
+    (creds.clobEnvKeys.length ? ` ignoredClobEnv=${creds.clobEnvKeys.join(',')}` : '')
+  );
+  if (creds.needsRotate) {
+    console.error(`[${MODE}] Retail creds look invalid — ${ROTATE_HINT}`);
+  }
 
   const unhedgedPrices = ctx.unhedgedPrices || null;
   if (unhedgedPrices && typeof unhedgedPrices.setPmFetch === 'function') {
@@ -1421,7 +1438,27 @@ function startPolymarketRfqLoop(ctx = {}) {
         (hist ? ` ${hist}` : '')
       );
     } catch (e) {
-      console.error(`[${MODE}] reconcile rfqs`, e.message);
+      logReconcileAuthFailure(e);
+    }
+  }
+
+  function logReconcileAuthFailure(err) {
+    authFailCount += 1;
+    const now = Date.now();
+    const classify = (err && err.auth) || classifyPolymarketAuthError({
+      statusCode: err && err.statusCode,
+      text: err && err.message,
+    });
+    const detail = formatAuthFailure({
+      statusCode: (err && err.statusCode) || 401,
+      classify,
+      creds,
+      signMode: err && err.signMode,
+      includeStatus: false,
+    });
+    if (authFailCount === 1 || now - lastAuthFailLog >= 15000) {
+      lastAuthFailLog = now;
+      console.error(`[${MODE}] reconcile rfqs ${err && err.message} ${detail} n=${authFailCount}`);
     }
   }
 
@@ -1486,7 +1523,21 @@ function startPolymarketRfqLoop(ctx = {}) {
     const id = j && (j.rfqUserId || j.rfq_user_id);
     console.log(`[${MODE}] auth ok rfqUserId=${id || '(none)'} live=${live}`);
   }).catch((e) => {
-    console.error(`[${MODE}] user-id failed`, e.message);
+    const classify = (e && e.auth) || classifyPolymarketAuthError({
+      statusCode: e && e.statusCode,
+      text: e && e.message,
+    });
+    console.error(
+      `[${MODE}] user-id failed`,
+      e && e.message,
+      formatAuthFailure({
+        statusCode: (e && e.statusCode) || 401,
+        classify,
+        creds,
+        signMode: e && e.signMode,
+        includeStatus: false,
+      })
+    );
   });
 
   reconcileOpenRfqs().catch((e) => console.error(`[${MODE}] initial reconcile`, e.message));

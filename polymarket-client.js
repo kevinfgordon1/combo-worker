@@ -5,7 +5,11 @@
 'use strict';
 const { Client } = require('undici');
 const WebSocket = require('ws');
-const { authHeaders } = require('./polymarket-auth');
+const {
+  authHeaders,
+  normalizeCred,
+  classifyPolymarketAuthError,
+} = require('./polymarket-auth');
 
 const DEFAULT_BASE = 'https://api.polymarket.us';
 const DEFAULT_WS = 'wss://api.polymarket.us/v1/ws/private';
@@ -22,6 +26,28 @@ function queryString(query) {
   return s ? `?${s}` : '';
 }
 
+function queryHasKeys(query) {
+  if (!query || typeof query !== 'object') return false;
+  return Object.entries(query).some(([, v]) => v != null && v !== '');
+}
+
+function throwHttpError(method, path, res, extra = {}) {
+  const classify = classifyPolymarketAuthError({
+    statusCode: res.statusCode,
+    json: res.json,
+    text: res.text,
+  });
+  const bits = [`Polymarket ${method} ${path} ${res.statusCode}`];
+  if (classify.reason && classify.reason !== 'unauthorized') bits.push(classify.reason);
+  if (classify.publicMessage) bits.push(classify.publicMessage);
+  if (extra.signMode) bits.push(`sign=${extra.signMode}`);
+  const err = new Error(bits.join(' '));
+  err.statusCode = res.statusCode;
+  err.auth = classify;
+  err.signMode = extra.signMode || null;
+  throw err;
+}
+
 function createPolymarketHttp({
   keyId,
   secretKey,
@@ -29,22 +55,52 @@ function createPolymarketHttp({
   requestFn,
 } = {}) {
   const origin = String(baseUrl || DEFAULT_BASE).replace(/\/$/, '');
+  const accessKey = normalizeCred(keyId);
+  const secret = normalizeCred(secretKey);
   const http = requestFn ? null : new Client(origin, {
     keepAliveTimeout: 60_000,
     keepAliveMaxTimeout: 600_000,
   });
+  // Official Retail docs sign pathname only. Some gateways verify RequestURI
+  // (path + query). Auto: try pathname, then one path+query retry on 401.
+  let signModeLatched = null;
+  let querySignTried = false;
 
-  async function request(method, path, { query, body, ts } = {}) {
-    const signPath = path;
+  async function requestOnce(method, path, { query, body, ts, signMode = 'path' } = {}) {
+    const qs = queryString(query);
+    const fullPath = `${path}${qs}`;
+    const includeQuery = signMode === 'path+query';
+    const signedPath = includeQuery ? fullPath : path;
     const headers = {
-      ...authHeaders({ keyId, secretKey, method, path: signPath, ts }),
+      ...authHeaders({
+        keyId: accessKey,
+        secretKey: secret,
+        method,
+        path: signedPath,
+        ts,
+        includeQuery,
+      }),
+      'Content-Type': 'application/json',
     };
     const payload = body == null ? undefined : JSON.stringify(body);
-    if (payload != null) headers['Content-Type'] = 'application/json';
-    const fullPath = `${path}${queryString(query)}`;
 
     if (requestFn) {
-      return requestFn({ method, path, signPath, fullPath, headers, body, payload });
+      const out = await requestFn({
+        method,
+        path,
+        signPath: signedPath,
+        signedPath,
+        signMode,
+        fullPath,
+        headers,
+        body,
+        payload,
+      }) || {};
+      return {
+        ...out,
+        signMode: out.signMode || signMode,
+        signedPath: out.signedPath || signedPath,
+      };
     }
 
     const { statusCode, body: resBody } = await http.request({
@@ -58,13 +114,40 @@ function createPolymarketHttp({
     if (text) {
       try { json = JSON.parse(text); } catch (_) { json = null; }
     }
-    return { statusCode, text, json };
+    return { statusCode, text, json, signMode, signedPath };
+  }
+
+  async function request(method, path, { query, body, ts, signMode } = {}) {
+    const mode = signMode || signModeLatched || 'path';
+    const res = await requestOnce(method, path, { query, body, ts, signMode: mode });
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      if (!signModeLatched) signModeLatched = mode;
+      return res;
+    }
+    if (
+      res.statusCode === 401
+      && queryHasKeys(query)
+      && !signMode
+      && signModeLatched !== 'path+query'
+      && mode === 'path'
+      && !querySignTried
+    ) {
+      querySignTried = true;
+      const retry = await requestOnce(method, path, {
+        query, body, ts, signMode: 'path+query',
+      });
+      if (retry.statusCode >= 200 && retry.statusCode < 300) {
+        signModeLatched = 'path+query';
+        return retry;
+      }
+    }
+    return res;
   }
 
   async function getJson(path, query) {
     const res = await request('GET', path, { query });
     if (res.statusCode < 200 || res.statusCode >= 300) {
-      throw new Error(`Polymarket GET ${path} ${res.statusCode}`);
+      throwHttpError('GET', path, res, { signMode: res.signMode || signModeLatched || 'path' });
     }
     return res.json;
   }
@@ -80,7 +163,7 @@ function createPolymarketHttp({
       const res = await request('GET', path);
       if (res.statusCode === 404) return null;
       if (res.statusCode < 200 || res.statusCode >= 300) {
-        throw new Error(`Polymarket GET ${path} ${res.statusCode}`);
+        throwHttpError('GET', path, res, { signMode: res.signMode });
       }
       const j = res.json;
       return (j && j.market) || j;
@@ -88,7 +171,7 @@ function createPolymarketHttp({
     async createQuote(body) {
       const res = await request('POST', '/v1/rfqs/quotes', { body });
       if (res.statusCode < 200 || res.statusCode >= 300) {
-        throw new Error(`Polymarket create quote failed ${res.statusCode}`);
+        throwHttpError('POST', '/v1/rfqs/quotes', res, { signMode: res.signMode });
       }
       return res.json;
     },
@@ -96,7 +179,7 @@ function createPolymarketHttp({
       const path = `/v1/rfqs/${rfqId}/quotes/${quoteId}/confirm`;
       const res = await request('PUT', path, { body: {} });
       if (res.statusCode < 200 || res.statusCode >= 300) {
-        throw new Error(`Polymarket confirm failed ${res.statusCode}`);
+        throwHttpError('PUT', path, res, { signMode: res.signMode });
       }
       return res.json;
     },
@@ -105,10 +188,11 @@ function createPolymarketHttp({
       const res = await request('DELETE', path);
       if (res.statusCode === 404) return { statusCode: 404 };
       if (res.statusCode < 200 || res.statusCode >= 300) {
-        throw new Error(`Polymarket delete quote failed ${res.statusCode}`);
+        throwHttpError('DELETE', path, res, { signMode: res.signMode });
       }
       return { statusCode: res.statusCode, json: res.json };
     },
+    getSignMode: () => signModeLatched,
     close() {
       if (http) {
         try { http.close(); } catch (_) {}
@@ -176,6 +260,8 @@ function createPolymarketRfqWs({
   onStatus,
   subscribeOrders = false,
 } = {}) {
+  keyId = normalizeCred(keyId);
+  secretKey = normalizeCred(secretKey);
   let ws = null;
   let pingTimer = null;
   let backoff = 1000;
@@ -248,6 +334,7 @@ function createPolymarketRfqWs({
 module.exports = {
   DEFAULT_BASE,
   DEFAULT_WS,
+  queryString,
   createPolymarketHttp,
   createPolymarketRfqWs,
   parsePrivateMessage,
