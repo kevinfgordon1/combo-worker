@@ -100,6 +100,14 @@ assert.ok(!SCOPE_LEAGUES.has('ncaaf'));
     !/\.select\([^)]*market_ticker/.test(src),
     'unhedged_rfqs selects must use real columns only — market_ticker is not in the schema'
   );
+  assert.ok(
+    !/pending\.size >= 80/.test(src),
+    'Poly sweep gate must count Poly pending only — a Kalshi flood must not skip it'
+  );
+  assert.ok(
+    !/maxPerTick != null \? opts.maxPerTick : 5/.test(src),
+    'fill tick default must keep up with Kalshi close volume'
+  );
 }
 
 const mlbCws = parseKalshiUnhedgedTicker('KXMLBGAME-26AUG141840CWSDET-CWS:yes');
@@ -1771,6 +1779,72 @@ function pmRfq(id, symbols, extra = {}) {
     assert.ok(!startedTracker.pending.has('kalshi:rfq-pending-started'));
     assert.strictEqual(startedFetched, 0);
     assert.strictEqual(startedPatches.length, 0);
+
+    // Kalshi close volume: keep newest pending, tick newest first.
+    {
+      const fetched = [];
+      const capTracker = createUnhedgedFillTracker({
+        maxPending: 4,
+        maxPerTick: 1,
+        persist: async () => {},
+        fetchRfq: async (id) => {
+          fetched.push(id);
+          return { id, status: 'closed' };
+        },
+        fetchTrades: async () => [],
+      });
+      const t0 = Date.parse('2026-09-05T16:00:00Z');
+      for (let i = 0; i < 8; i++) {
+        const id = `rfq-cap-${i}`;
+        capTracker.remember({ venue: 'kalshi', rfq_id: id, status: 'seen' });
+        await capTracker.onClosed({
+          venue: 'kalshi',
+          rfqId: id,
+          extra: { type: 'rfq_deleted', msg: { id } },
+          now: t0 + i * 1000,
+        });
+      }
+      assert.strictEqual(capTracker.pending.size, 4);
+      assert.ok(!capTracker.pending.has('kalshi:rfq-cap-0'));
+      assert.ok(!capTracker.pending.has('kalshi:rfq-cap-3'));
+      assert.ok(capTracker.pending.has('kalshi:rfq-cap-4'));
+      assert.ok(capTracker.pending.has('kalshi:rfq-cap-7'));
+      await capTracker.tick(t0 + 60_000);
+      assert.deepStrictEqual(fetched, ['rfq-cap-7']);
+    }
+
+    // Kalshi flood must not skip the Poly seen sweep (old gate was pending.size >= 80).
+    {
+      const floodNow = Date.parse('2026-08-14T21:00:00Z');
+      const floodDb = createMemSupabase([{
+        venue: 'polymarket',
+        rfq_id: 'rfq-poly-after-kalshi-flood',
+        status: 'seen',
+        contracts: 8,
+        created_at: new Date(floodNow - 30 * 60 * 1000).toISOString(),
+      }]);
+      const floodTracker = createUnhedgedFillTracker({
+        supabase: floodDb,
+        maxPending: 200,
+        maxPerTick: 0,
+        persist: async () => {},
+        fetchRfq: async () => ({ id: 'x', status: 'open' }),
+      });
+      for (let i = 0; i < 90; i++) {
+        floodTracker.pending.set(`kalshi:rfq-flood-${i}`, {
+          venue: 'kalshi',
+          rfq_id: `rfq-flood-${i}`,
+          extra: {},
+          rfq: {},
+          closedMs: floodNow,
+        });
+      }
+      await floodTracker.tick(floodNow);
+      assert.ok(
+        floodTracker.pending.has('polymarket:rfq-poly-after-kalshi-flood'),
+        'Kalshi flood must not skip the Poly seen sweep'
+      );
+    }
 
     // Later of next vs prev filled_at wins (not blindly next).
     const restartFilledAt = '2026-09-02T17:57:00.000Z'; // 1:57 PM ET

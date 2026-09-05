@@ -24,6 +24,11 @@
 // updated_at) sees same-day patches when filled_at is stale. Missing column
 // degrades — fills still persist. Re-see of an already-filled RFQ must not
 // flip status back to seen/started.
+// Kalshi communications WS closes tens of thousands of unmatched combos / min.
+// An unbounded FIFO pending map + 5 lookups / 15s never reaches today's
+// closes — aibetbuilder All/Kalshi Today filters status=filled AND filled_at
+// in the ET day. Cap pending to the newest N, tick newest first, evict
+// oldest Kalshi when over cap so the Poly seen sweep is not starved.
 //
 // Fair is inverse-bet ourTrue (Promo Builder / EV): convert opponent YES to
 // a fee-included American with the series taker coeff (KXMLBGAME 0.035,
@@ -56,6 +61,11 @@ const {
 const SCOPE_LEAGUES = new Set(['mlb', 'nfl']);
 // Same pad as Combo Locks skip-tape / quote-watcher. Copied — do not import skip-tape.
 const FILL_TAPE_PAD_MS = 45000;
+// Kalshi rfq_deleted volume dwarfs lookup capacity. Keep the newest closes
+// (Today's fills) and drop the oldest unmatched Kalshi when over cap.
+const DEFAULT_FILL_MAX_PER_TICK = 20;
+const DEFAULT_FILL_MAX_PENDING = 120;
+const POLY_SWEEP_PENDING_CAP = 80;
 const FILL_STATUSES = new Set(['filled', 'executed', 'accepted', 'confirmed']);
 const SILENT_SKIP = new Set(['tennis', 'lol', 'cs2']);
 
@@ -1202,7 +1212,35 @@ function createUnhedgedFillTracker(opts = {}) {
   const filled = new Set();
   const pending = new Map();
   const env = opts.env;
-  const maxPerTick = opts.maxPerTick != null ? opts.maxPerTick : 5;
+  const maxPerTick = opts.maxPerTick != null ? opts.maxPerTick : DEFAULT_FILL_MAX_PER_TICK;
+  const maxPending = opts.maxPending != null ? opts.maxPending : DEFAULT_FILL_MAX_PENDING;
+
+  function evictOldestKalshiFirst() {
+    for (const [key, row] of pending) {
+      if (!row || row.venue !== 'polymarket') {
+        pending.delete(key);
+        return;
+      }
+    }
+    const first = pending.keys().next().value;
+    if (first != null) pending.delete(first);
+  }
+
+  // Newest at the Map tail. Re-queue moves an id to the tail. Over cap,
+  // drop oldest Kalshi so a Kalshi firehose cannot evict Poly sweep rows.
+  function enqueue(key, row) {
+    if (pending.has(key)) pending.delete(key);
+    pending.set(key, row);
+    while (pending.size > maxPending) evictOldestKalshiFirst();
+  }
+
+  function polyPendingCount() {
+    let n = 0;
+    for (const row of pending.values()) {
+      if (row && row.venue === 'polymarket') n += 1;
+    }
+    return n;
+  }
 
   function remember(row) {
     if (!row || !row.venue || !row.rfq_id) return;
@@ -1279,7 +1317,7 @@ function createUnhedgedFillTracker(opts = {}) {
       return immediate;
     }
 
-    pending.set(knownKey(venue, rfqId), {
+    enqueue(knownKey(venue, rfqId), {
       venue,
       rfq_id: rfqId,
       extra,
@@ -1300,7 +1338,7 @@ function createUnhedgedFillTracker(opts = {}) {
 
   async function sweepRecentPolymarket(now) {
     if (!opts.supabase || typeof opts.supabase.from !== 'function') return;
-    if (pending.size >= 80) return;
+    if (polyPendingCount() >= POLY_SWEEP_PENDING_CAP) return;
     if (lastPolySweepMs && now - lastPolySweepMs < 60000) return;
     lastPolySweepMs = now;
     const since = new Date(now - 2 * 60 * 60 * 1000).toISOString();
@@ -1319,7 +1357,7 @@ function createUnhedgedFillTracker(opts = {}) {
         const key = knownKey('polymarket', r.rfq_id);
         if (filled.has(key) || pending.has(key)) continue;
         remember(r);
-        pending.set(key, {
+        enqueue(key, {
           venue: 'polymarket',
           rfq_id: r.rfq_id,
           extra: {},
@@ -1340,7 +1378,11 @@ function createUnhedgedFillTracker(opts = {}) {
     const fetchRfq = opts.fetchRfq;
     const fetchTrades = opts.fetchTrades;
     let looked = 0;
-    for (const [key, row] of pending) {
+    // Newest first — live closes sit at the Map tail. FIFO oldest-first
+    // never reached Today's fills under Kalshi delete volume.
+    for (const key of [...pending.keys()].reverse()) {
+      const row = pending.get(key);
+      if (!row) continue;
       if (filled.has(key)) {
         pending.delete(key);
         continue;
@@ -1393,6 +1435,9 @@ function shadowUnhedgedFill(opts = {}) {
 module.exports = {
   SCOPE_LEAGUES,
   FILL_TAPE_PAD_MS,
+  DEFAULT_FILL_MAX_PER_TICK,
+  DEFAULT_FILL_MAX_PENDING,
+  POLY_SWEEP_PENDING_CAP,
   isUnhedgedRfqShadow,
   isUnhedgedRfqLive,
   isUnhedgedFillStatus,
