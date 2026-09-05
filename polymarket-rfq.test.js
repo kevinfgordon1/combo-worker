@@ -9,6 +9,11 @@ const {
   authHeaders,
   signPath,
   isPolymarketRfqLive,
+  normalizeCred,
+  inspectPolymarketCreds,
+  classifyPolymarketAuthError,
+  formatAuthFailure,
+  ROTATE_HINT,
 } = require('./polymarket-auth');
 const { parsePrivateMessage } = require('./polymarket-client');
 const {
@@ -46,6 +51,81 @@ const EXPECTED_SIG = 'pczC6rEQ8RqRZznY8PNfSp8AWmWzRq582bIKIZSIfJqT6NoO181hx1SI+P
 assert.strictEqual(signPath('/v1/rfqs?status=RFQ_STATUS_OPEN'), '/v1/rfqs');
 assert.strictEqual(sign(SEED_B64, TS, 'GET', SIGN_PATH), EXPECTED_SIG);
 assert.strictEqual(sign(SEED_B64, TS, 'get', `${SIGN_PATH}?x=1`), EXPECTED_SIG);
+assert.notStrictEqual(
+  sign(SEED_B64, TS, 'GET', '/v1/rfqs?status=RFQ_STATUS_OPEN', { includeQuery: true }),
+  sign(SEED_B64, TS, 'GET', '/v1/rfqs', { includeQuery: true })
+);
+assert.strictEqual(normalizeCred('  key-id-fixture \n'), 'key-id-fixture');
+assert.strictEqual(normalizeCred('"quoted-secret"'), 'quoted-secret');
+assert.strictEqual(authHeaders({
+  keyId: '  key-id-fixture  ',
+  secretKey: ` ${SEED_B64} `,
+  method: 'GET',
+  path: SIGN_PATH,
+  ts: Number(TS),
+})['X-PM-Access-Key'], 'key-id-fixture');
+
+{
+  const hexish = inspectPolymarketCreds({
+    keyId: 'not-a-uuid',
+    secretKey: '0x' + 'ab'.repeat(32),
+  });
+  assert.strictEqual(hexish.secretFormat, 'hex');
+  assert.strictEqual(hexish.needsRotate, true);
+  assert.strictEqual(hexish.keyIdLooksUuid, false);
+
+  const retail = inspectPolymarketCreds({
+    keyId: '550e8400-e29b-41d4-a716-446655440000',
+    secretKey: SEED_B64,
+  }, { POLY_API_KEY: 'clob-should-be-ignored' });
+  assert.strictEqual(retail.secretFormat, 'ed25519');
+  assert.strictEqual(retail.secretSeedBytes, 32);
+  assert.strictEqual(retail.needsRotate, false);
+  assert.deepStrictEqual(retail.clobEnvKeys, ['POLY_API_KEY']);
+
+  const quoted = inspectPolymarketCreds({
+    keyId: '"550e8400-e29b-41d4-a716-446655440000"',
+    secretKey: `"${SEED_B64}"`,
+  });
+  assert.strictEqual(quoted.secretFormat, 'ed25519');
+  assert.strictEqual(quoted.keyIdLooksUuid, true);
+
+  const clock = classifyPolymarketAuthError({
+    statusCode: 401,
+    json: { message: 'timestamp too old' },
+  });
+  assert.strictEqual(clock.reason, 'clock_skew');
+  assert.strictEqual(clock.needsRotate, false);
+
+  const badSig = classifyPolymarketAuthError({
+    statusCode: 401,
+    json: { error: 'invalid signature' },
+  });
+  assert.strictEqual(badSig.reason, 'bad_signature');
+  assert.strictEqual(badSig.needsRotate, true);
+
+  const leaked = classifyPolymarketAuthError({
+    statusCode: 401,
+    json: { message: `secret ${SEED_B64} rejected` },
+  });
+  assert.ok(!leaked.publicMessage.includes(SEED_B64));
+  assert.ok(leaked.publicMessage.includes('[redacted]'));
+
+  const bare401 = classifyPolymarketAuthError({ statusCode: 401, text: '' });
+  assert.strictEqual(bare401.reason, 'unauthorized');
+  assert.strictEqual(bare401.needsRotate, true);
+  const formatted = formatAuthFailure({
+    statusCode: 401,
+    classify: bare401,
+    creds: hexish,
+    signMode: 'path',
+  });
+  assert.ok(formatted.includes('401'));
+  assert.ok(formatted.includes('reason=unauthorized'));
+  assert.ok(formatted.includes('sign=path'));
+  assert.ok(formatted.includes(ROTATE_HINT));
+  assert.ok(!formatted.includes(SEED_B64));
+}
 
 const headers = authHeaders({
   keyId: 'key-id-fixture',
@@ -2026,6 +2106,125 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   } finally {
     console.log = origGameLog;
     gameLoop.stop();
+  }
+
+  const ariJacPosts = [];
+  const ariJacLogs = [];
+  const ariJacErrs = [];
+  const origAriLog = console.log;
+  const origAriErr = console.error;
+  console.log = (...args) => { ariJacLogs.push(args.join(' ')); origAriLog(...args); };
+  console.error = (...args) => { ariJacErrs.push(args.join(' ')); origAriErr(...args); };
+  const ariJacHttp = {
+    async getUserId() { return { rfqUserId: 'rfquser_arijac' }; },
+    async listRfqs(query) {
+      if (query && query.status === 'RFQ_STATUS_OPEN') {
+        return { rfqs: [ariJacQuoteRfq, { ...ariJacOppRfq, id: 'rfq_ari_jac_both_sell', status: 'RFQ_STATUS_OPEN', qtyDecimal: '10' }] };
+      }
+      return { rfqs: [] };
+    },
+    async listQuotes() { return { quotes: [] }; },
+    async getCombo() { return { combos: [] }; },
+    async createQuote(body) {
+      ariJacPosts.push(body);
+      return { quoteId: 'quote_ari_jac' };
+    },
+    async confirmQuote() { return {}; },
+    async deleteQuote() { return { statusCode: 200 }; },
+    close() {},
+  };
+  const ariJacLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: '550e8400-e29b-41d4-a716-446655440000',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    http: ariJacHttp,
+    startWs: false,
+    getParlays: () => [ariJacSept13Lock],
+    fetchMarket: async () => null,
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+  });
+  try {
+    await new Promise((r) => setTimeout(r, 30));
+    assert.strictEqual(ariJacPosts.length, 1);
+    assert.strictEqual(ariJacPosts[0].rfqId, 'rfq_ari_jac_quote');
+    assert.ok(ariJacLogs.some((l) => l.includes('[POLY] QUOTED') && l.includes('Arizona + Jacksonville')));
+    assert.ok(ariJacLogs.some((l) => (
+      l.includes('[POLY] SKIP no_lock_overlap')
+      && l.includes('code=same_games_no_match')
+      && l.includes('Arizona + Jacksonville')
+    )));
+    assert.ok(ariJacLogs.some((l) => (
+      l.includes('[POLY] reconcile open=2 locks=1 priceable=1 live=true')
+      && l.includes('quoted=1')
+      && l.includes('same_games_no_match=1')
+    )));
+    assert.ok(!ariJacLogs.some((l) => l.includes('lock-identity-fail')));
+  } finally {
+    ariJacLoop.stop();
+  }
+
+  const auth401 = Object.assign(new Error('Polymarket GET /v1/rfqs 401'), {
+    statusCode: 401,
+    auth: classifyPolymarketAuthError({ statusCode: 401, json: { message: 'invalid signature' } }),
+    signMode: 'path',
+  });
+  let list401 = 0;
+  const fail401Http = {
+    async getUserId() { throw auth401; },
+    async listRfqs() {
+      list401 += 1;
+      throw auth401;
+    },
+    async listQuotes() { return { quotes: [] }; },
+    async getCombo() { return { combos: [] }; },
+    async createQuote() { throw new Error('must not POST after 401'); },
+    async confirmQuote() { return {}; },
+    async deleteQuote() { return { statusCode: 200 }; },
+    close() {},
+  };
+  const fail401Loop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: '550e8400-e29b-41d4-a716-446655440000',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    http: fail401Http,
+    startWs: false,
+    getParlays: () => [ariJacSept13Lock],
+    fetchMarket: async () => null,
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+  });
+  try {
+    await new Promise((r) => setTimeout(r, 30));
+    assert.ok(list401 >= 1);
+    assert.ok(ariJacErrs.some((l) => l.includes('[POLY] reconcile rfqs') && l.includes('401')));
+    assert.ok(ariJacErrs.some((l) => l.includes('reason=bad_signature')));
+    assert.ok(ariJacErrs.some((l) => l.includes(ROTATE_HINT)));
+    assert.ok(!ariJacErrs.join('\n').includes(SEED_B64));
+    const wsSkip = await fail401Loop.handleRfq({
+      ...ariJacOppRfq,
+      id: 'rfq_ari_jac_ws_opp',
+      status: 'RFQ_STATUS_OPEN',
+      qtyDecimal: '10',
+    });
+    assert.strictEqual(wsSkip.reason, 'no_lock_overlap');
+    assert.ok(ariJacLogs.some((l) => (
+      l.includes('SKIP no_lock_overlap') && l.includes('rfq_ari_jac_ws_opp') && l.includes('same_games_no_match')
+    )));
+  } finally {
+    console.log = origAriLog;
+    console.error = origAriErr;
+    fail401Loop.stop();
   }
 
   const parsed = parsePrivateMessage(JSON.stringify({
