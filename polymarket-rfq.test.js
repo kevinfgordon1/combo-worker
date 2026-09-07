@@ -49,7 +49,7 @@ assert.ok(polySrc.includes('createPolyMissTape'), 'reconcile must persist Combo 
 assert.ok(polySrc.includes('persistLockTape'), 'SKIP/QUOTE path must go through persistLockTape');
 assert.ok(
   /persistLockTape\(evaluation, 'declined', \{ locks \}\)/.test(polySrc),
-  'no_lock_overlap SKIPs must write Miss tape against the lock'
+  'no_lock_overlap SKIPs still go through persistLockTape (tape drops them)'
 );
 assert.ok(
   /persistLockTape\(evaluation, 'quoted'/.test(polySrc),
@@ -2320,21 +2320,15 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     await new Promise((r) => setTimeout(r, 40));
     assert.ok(missLoop.missTape);
     const quoted = missRows.filter((r) => r.status === 'quoted');
-    const nearMiss = missRows.filter((r) => r.skip_reason === 'no_lock_overlap:same_games_no_match');
-    const noise = missRows.filter((r) => r.skip_reason && String(r.skip_reason).startsWith('no_lock_overlap:no_shared_game'));
+    const overlap = missRows.filter((r) => r.skip_reason && String(r.skip_reason).startsWith('no_lock_overlap'));
     assert.strictEqual(quoted.length, 1);
     assert.strictEqual(quoted[0].parlay_id, ariJacSept13Lock.id);
     assert.strictEqual(quoted[0].rfq_id, 'rfq_ari_jac_quote');
     assert.strictEqual(quoted[0].quote_id, 'quote_miss_tape');
     assert.strictEqual(quoted[0].skip_reason, null);
-    assert.strictEqual(nearMiss.length, 1);
-    assert.strictEqual(nearMiss[0].parlay_id, ariJacSept13Lock.id);
-    assert.strictEqual(nearMiss[0].status, 'declined');
-    assert.strictEqual(nearMiss[0].label, 'Arizona + Jacksonville');
-    assert.strictEqual(noise.length, 1, '40 tennis RFQs coalesce to one aggregate');
-    assert.ok(noise[0].skip_reason.includes('x40'));
+    assert.strictEqual(overlap.length, 0, 'no_lock_overlap SKIPs must not insert Miss-tape rows');
     assert.ok(missRows.every((r) => r.parlay_id === ariJacSept13Lock.id));
-    assert.ok(missRows.length <= 4, 'reconcile must not insert one row per firehose RFQ');
+    assert.strictEqual(missRows.length, 1, 'reconcile tapes the matched quote only');
 
     const beforeReplay = missRows.length;
     await missLoop.handleRfq({
@@ -2387,6 +2381,55 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
       assert.strictEqual(startedRows[0].parlay_id, ariJacSept13Lock.id);
     } finally {
       startedLoop.stop();
+    }
+
+    const sizeRows = [];
+    const sizeLoop = startPolymarketRfqLoop({
+      env: {
+        POLYMARKET_KEY_ID: '550e8400-e29b-41d4-a716-446655440000',
+        POLYMARKET_SECRET_KEY: SEED_B64,
+        POLYMARKET_RFQ_LIVE: 'true',
+      },
+      http: {
+        async getUserId() { return { rfqUserId: 'rfquser_size' }; },
+        async listRfqs() { return { rfqs: [] }; },
+        async listQuotes() { return { quotes: [] }; },
+        async getCombo() { return { combos: [] }; },
+        async createQuote() { throw new Error('oversized lock must not quote'); },
+        async confirmQuote() { return {}; },
+        async deleteQuote() { return { statusCode: 200 }; },
+        close() {},
+      },
+      startWs: false,
+      getParlays: () => [ariJacSept13Lock],
+      fetchMarket: async () => null,
+      startedFor: () => ({ started: false }),
+      filledSoFarFor: () => 0,
+      getOutstanding: () => 0,
+      pendingQuotes: new Map(),
+      reconcileMs: 60 * 60 * 1000,
+      logAsync: (p, rfq, d, status, extra = {}) => {
+        sizeRows.push({
+          parlay_id: p.id,
+          rfq_id: rfq.rfqId,
+          status,
+          skip_reason: extra.skip_reason || null,
+        });
+      },
+    });
+    try {
+      const oversized = await sizeLoop.handleRfq({
+        ...ariJacQuoteRfq,
+        id: 'rfq_ari_jac_oversized',
+        qtyDecimal: '8000',
+      });
+      assert.strictEqual(oversized.action, 'skip');
+      assert.strictEqual(oversized.reason, 'rfq_too_large');
+      assert.strictEqual(sizeRows.length, 1);
+      assert.strictEqual(sizeRows[0].status, 'declined');
+      assert.strictEqual(sizeRows[0].skip_reason, 'oversized');
+    } finally {
+      sizeLoop.stop();
     }
   } finally {
     missLoop.stop();

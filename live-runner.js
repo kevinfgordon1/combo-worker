@@ -17,7 +17,7 @@
 // SKIP TAPE: oversized / limit_reached skips persist a distinct reason on
 //   combo_submissions, then one RFQ+ticker tape lookup after close (or pad).
 //   Poly Combo Locks reconcile SKIP/QUOTE also insert here (venue=polymarket)
-//   via persistLockTape — not Railway-only. no_shared_game is aggregated.
+//   via persistLockTape — not Railway-only. no_lock_overlap* is not taped.
 //   Underfunded quote create/confirm (insufficient_balance) also persist a
 //   declined combo_submissions row for the lock card. Telegram stays silent.
 //   No public-tape lookup. Precision rejects stay console + unfilled.

@@ -10,9 +10,9 @@
 // (no_shared_game vs same_games_no_match / leg_count / missing_team /
 // doubleheader) so volume-vs-mapping is one line. Near-miss SKIP logs
 // those codes. Unhedged persist writes skip_reason=no_lock_overlap:<code>.
-// Combo Locks Miss tape (combo_submissions) gets quotes + matched skips +
-// near-misses once per rfq+lock+reason. no_shared_game is aggregated, not
-// inserted per RFQ — reconcile is a 100-row / 3s firehose.
+// Combo Locks Miss tape (combo_submissions) gets quotes + matched-lock
+// declines (oversized / limit_reached / game_started / insufficient_balance).
+// no_lock_overlap* SKIPs stay in the engine — they are not taped.
 // Live POSTs (create quote, confirm) require POLYMARKET_RFQ_LIVE to be truthy.
 // quoteExecuted means paired orders were submitted — not a fill.
 // START GATE: never quote or confirm once any lock leg has started (first pitch

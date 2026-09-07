@@ -4,8 +4,8 @@ const { decideAtFill } = require('./engine');
 const {
   NEAR_MISS_CODES,
   NOISE_CODES,
-  MAX_NEAR_MISS_PER_WINDOW,
   DEDUPE_MAX,
+  isOverlapSkipReason,
   polySkipReason,
   missTapeKind,
   parlayForMiss,
@@ -17,11 +17,10 @@ const {
 const lock = {
   id: '98d3e355-4a1d-4f60-91ed-a7c1517c60ad',
   user_id: 'u1',
-  label: 'Arizona + Jacksonville',
-  fill_american: 400,
+  label: 'Chicago Bears + Eagles + Rams',
 };
 
-function nearMissEval(rfqId, code = 'same_games_no_match') {
+function overlapEval(rfqId, code = 'same_games_no_match') {
   return {
     action: 'skip',
     reason: 'no_lock_overlap',
@@ -42,18 +41,47 @@ function quoteEval(rfqId) {
   };
 }
 
+function oversizedDecision() {
+  return decideAtFill({
+    parlayStake: 100,
+    parlayAmerican: 400,
+    fillAmerican: 350,
+    hedgeMode: '1x',
+    maxContracts: 116,
+    rfqContracts: 8000,
+  });
+}
+
+function capDecision() {
+  return decideAtFill({
+    parlayStake: 100,
+    parlayAmerican: 400,
+    fillAmerican: 350,
+    hedgeMode: '1x',
+    maxContracts: 10,
+    filledSoFar: 10,
+    rfqContracts: 5,
+  });
+}
+
 {
   assert.ok(NEAR_MISS_CODES.includes('same_games_no_match'));
   assert.ok(NEAR_MISS_CODES.includes('leg_count'));
   assert.ok(NOISE_CODES.includes('no_shared_game'));
+  assert.ok(isOverlapSkipReason('no_lock_overlap'));
+  assert.ok(isOverlapSkipReason('no_lock_overlap:leg_count'));
+  assert.ok(isOverlapSkipReason('no_lock_overlap:no_shared_game x80'));
+  assert.ok(!isOverlapSkipReason('oversized'));
+  assert.ok(!isOverlapSkipReason('game_started'));
   assert.strictEqual(missTapeKind(quoteEval('q1'), 'quoted'), 'quote');
   assert.strictEqual(missTapeKind(quoteEval('q1'), 'shadow'), 'quote');
   assert.strictEqual(missTapeKind(quoteEval('q1'), 'unfilled'), 'quote');
-  assert.strictEqual(missTapeKind(nearMissEval('n1'), 'declined'), 'near_miss');
+  assert.strictEqual(missTapeKind(overlapEval('n1'), 'declined'), 'overlap_skip');
+  assert.strictEqual(missTapeKind(overlapEval('n1', 'leg_count'), 'declined'), 'overlap_skip');
   assert.strictEqual(missTapeKind({
     reason: 'no_lock_overlap',
     overlap: { code: 'no_shared_game' },
-  }, 'declined'), 'noise');
+  }, 'declined'), 'overlap_skip');
   assert.strictEqual(missTapeKind({
     reason: 'game_started',
     parlay: lock,
@@ -64,26 +92,22 @@ function quoteEval(rfqId) {
 {
   assert.strictEqual(polySkipReason(quoteEval('q1'), 'quoted'), null);
   assert.strictEqual(
-    polySkipReason(nearMissEval('n1'), 'declined'),
+    polySkipReason(overlapEval('n1'), 'declined'),
     'no_lock_overlap:same_games_no_match'
   );
-  const oversized = decideAtFill({
-    parlayStake: 100,
-    parlayAmerican: 400,
-    fillAmerican: 350,
-    hedgeMode: '1x',
-    maxContracts: 116,
-    rfqContracts: 8000,
-  });
   assert.strictEqual(
-    polySkipReason({ reason: 'rfq_too_large', decision: oversized, parlay: lock }, 'declined'),
+    polySkipReason({ reason: 'rfq_too_large', decision: oversizedDecision(), parlay: lock }, 'declined'),
     'oversized'
+  );
+  assert.strictEqual(
+    polySkipReason({ reason: 'limit_reached', decision: capDecision(), parlay: lock }, 'declined'),
+    'limit_reached'
   );
   assert.strictEqual(
     polySkipReason({ reason: 'game_started', parlay: lock }, 'declined'),
     'game_started'
   );
-  assert.strictEqual(parlayForMiss(nearMissEval('n1')).id, lock.id);
+  assert.strictEqual(parlayForMiss(overlapEval('n1')).id, lock.id);
   assert.strictEqual(parlayForMiss({
     reason: 'no_lock_overlap',
     overlap: { code: 'leg_count', parlay: lock },
@@ -97,45 +121,60 @@ function quoteEval(rfqId) {
   assert.strictEqual(quote.parlay.id, lock.id);
   assert.strictEqual(quote.skipReason, null);
 
-  const miss = decidePolyMissWrite(nearMissEval('rfq_m'), 'declined');
-  assert.strictEqual(miss.write, true);
-  assert.strictEqual(miss.kind, 'near_miss');
-  assert.strictEqual(miss.skipReason, 'no_lock_overlap:same_games_no_match');
-
-  const noise = decidePolyMissWrite({
-    reason: 'no_lock_overlap',
-    overlap: { code: 'no_shared_game' },
-    rfq: { rfqId: 'rfq_noise' },
+  const oversized = decidePolyMissWrite({
+    reason: 'rfq_too_large',
+    decision: oversizedDecision(),
+    parlay: lock,
+    rfq: { rfqId: 'rfq_over' },
   }, 'declined');
-  assert.strictEqual(noise.write, false);
-  assert.strictEqual(noise.kind, 'noise');
-  assert.strictEqual(noise.aggregate, true);
+  assert.strictEqual(oversized.write, true);
+  assert.strictEqual(oversized.kind, 'matched_skip');
+  assert.strictEqual(oversized.skipReason, 'oversized');
 
-  const seen = new Set([miss.key]);
-  const again = decidePolyMissWrite(nearMissEval('rfq_m'), 'declined', { seen });
+  const cap = decidePolyMissWrite({
+    reason: 'limit_reached',
+    decision: capDecision(),
+    parlay: lock,
+    rfq: { rfqId: 'rfq_cap' },
+  }, 'declined');
+  assert.strictEqual(cap.write, true);
+  assert.strictEqual(cap.skipReason, 'limit_reached');
+
+  const started = decidePolyMissWrite({
+    reason: 'game_started',
+    parlay: lock,
+    rfq: { rfqId: 'rfq_started' },
+  }, 'declined');
+  assert.strictEqual(started.write, true);
+  assert.strictEqual(started.skipReason, 'game_started');
+
+  const funded = decidePolyMissWrite(quoteEval('rfq_fund'), 'declined', {}, {
+    skip_reason: 'insufficient_balance',
+  });
+  assert.strictEqual(funded.write, true);
+  assert.strictEqual(funded.skipReason, 'insufficient_balance');
+
+  for (const code of ['leg_count', 'no_shared_game', 'missing_team', 'same_games_no_match', 'doubleheader']) {
+    const miss = decidePolyMissWrite(overlapEval(`rfq_${code}`, code), 'declined');
+    assert.strictEqual(miss.write, false, `${code} must not persist`);
+    assert.strictEqual(miss.kind, 'overlap_skip');
+    assert.strictEqual(miss.reason, 'overlap_skip');
+  }
+
+  const forcedOverlap = decidePolyMissWrite(quoteEval('rfq_forced'), 'declined', {}, {
+    skip_reason: 'no_lock_overlap:leg_count',
+  });
+  assert.strictEqual(forcedOverlap.write, false);
+  assert.strictEqual(forcedOverlap.reason, 'overlap_skip');
+
+  const seen = new Set([quote.key]);
+  const again = decidePolyMissWrite(quoteEval('rfq_q'), 'quoted', { seen });
   assert.strictEqual(again.write, false);
   assert.strictEqual(again.reason, 'deduped');
-
-  const capped = decidePolyMissWrite(nearMissEval('rfq_cap'), 'declined', {
-    now: 5_000,
-    nearMissWindowStart: 4_000,
-    nearMissWindowCount: MAX_NEAR_MISS_PER_WINDOW,
-  });
-  assert.strictEqual(capped.write, false);
-  assert.strictEqual(capped.reason, 'capped');
-  assert.strictEqual(capped.aggregate, true);
-
-  const nextWindow = decidePolyMissWrite(nearMissEval('rfq_next'), 'declined', {
-    now: 8_000,
-    nearMissWindowStart: 4_000,
-    nearMissWindowCount: MAX_NEAR_MISS_PER_WINDOW,
-  });
-  assert.strictEqual(nextWindow.write, true);
 }
 
 {
   const rows = [];
-  let t = 1_000;
   const tape = createPolyMissTape({
     logAsync: (p, rfq, d, status, extra) => {
       rows.push({
@@ -151,8 +190,6 @@ function quoteEval(rfqId) {
         venue: 'polymarket',
       });
     },
-    now: () => t,
-    noiseWindowMs: 60_000,
   });
 
   assert.strictEqual(tape.persist(quoteEval('rfq_quote'), 'quoted', {
@@ -169,13 +206,31 @@ function quoteEval(rfqId) {
   assert.strictEqual(funded.skipReason, 'insufficient_balance');
   assert.strictEqual(funded.kind, 'matched_skip');
 
-  assert.strictEqual(tape.persist(nearMissEval('rfq_miss'), 'declined').persisted, true);
-  assert.strictEqual(tape.persist(nearMissEval('rfq_miss'), 'declined').persisted, false);
-  assert.strictEqual(
-    tape.persist(nearMissEval('rfq_miss', 'leg_count'), 'declined').persisted,
-    true,
-    'same rfq different reason is a new row'
-  );
+  assert.strictEqual(tape.persist({
+    reason: 'rfq_too_large',
+    decision: oversizedDecision(),
+    parlay: lock,
+    rfq: { rfqId: 'rfq_over' },
+  }, 'declined').persisted, true);
+
+  assert.strictEqual(tape.persist({
+    reason: 'limit_reached',
+    decision: capDecision(),
+    parlay: lock,
+    rfq: { rfqId: 'rfq_cap' },
+  }, 'declined').persisted, true);
+
+  assert.strictEqual(tape.persist({
+    reason: 'game_started',
+    parlay: lock,
+    rfq: { rfqId: 'rfq_started' },
+  }, 'declined').persisted, true);
+
+  for (const code of ['leg_count', 'no_shared_game', 'missing_team', 'same_games_no_match']) {
+    const out = tape.persist(overlapEval(`rfq_${code}`, code), 'declined', { locks: [lock] });
+    assert.strictEqual(out.persisted, false);
+    assert.strictEqual(out.reason, 'overlap_skip');
+  }
 
   const quoted = rows.find((r) => r.rfq_id === 'rfq_quote');
   assert.ok(quoted);
@@ -191,64 +246,26 @@ function quoteEval(rfqId) {
   assert.strictEqual(fundRow.skip_reason, 'insufficient_balance');
   assert.strictEqual(fundRow.contracts, 10);
 
-  const skipped = rows.find((r) => r.rfq_id === 'rfq_miss' && r.skip_reason === 'no_lock_overlap:same_games_no_match');
-  assert.ok(skipped);
-  assert.strictEqual(skipped.status, 'declined');
-  assert.strictEqual(skipped.label, 'Arizona + Jacksonville');
+  assert.strictEqual(rows.find((r) => r.rfq_id === 'rfq_over').skip_reason, 'oversized');
+  assert.strictEqual(rows.find((r) => r.rfq_id === 'rfq_cap').skip_reason, 'limit_reached');
+  assert.strictEqual(rows.find((r) => r.rfq_id === 'rfq_started').skip_reason, 'game_started');
+  assert.ok(!rows.some((r) => r.skip_reason && String(r.skip_reason).startsWith('no_lock_overlap')));
 
   const beforeNoise = rows.length;
   for (let i = 0; i < 80; i++) {
     const out = tape.persist({
       action: 'skip',
       reason: 'no_lock_overlap',
-      rfq: { rfqId: `rfq_tennis_${i}` },
-      overlap: { code: 'no_shared_game' },
+      rfq: { rfqId: `rfq_cfb_${i}` },
+      overlap: { code: 'leg_count' },
+      parlay: lock,
     }, 'declined', { locks: [lock] });
     assert.strictEqual(out.persisted, false);
-    assert.strictEqual(out.reason, 'noise');
+    assert.strictEqual(out.reason, 'overlap_skip');
   }
-  assert.strictEqual(rows.length, beforeNoise, 'noise RFQs must not insert per-row');
-  const flushed = tape.flushNoise();
-  assert.strictEqual(flushed.length, 1);
-  assert.ok(flushed[0].skipReason.startsWith('no_lock_overlap:no_shared_game'));
-  assert.ok(flushed[0].skipReason.includes('x80'));
-  assert.strictEqual(rows.length, beforeNoise + 1);
-  const agg = rows[rows.length - 1];
-  assert.strictEqual(agg.status, 'declined');
-  assert.strictEqual(agg.parlay_id, lock.id);
-  assert.ok(String(agg.rfq_id).startsWith('poly-agg:no_shared_game:'));
-
-  tape.flushNoise();
-  assert.strictEqual(rows.length, beforeNoise + 1, 'second flush inside window is a no-op');
-
-  t = 1_000 + 60_000;
-  for (let i = 0; i < 3; i++) {
-    tape.persist({
-      action: 'skip',
-      reason: 'no_lock_overlap',
-      rfq: { rfqId: `rfq_tennis_later_${i}` },
-      overlap: { code: 'no_shared_game' },
-    }, 'declined', { locks: [lock] });
-  }
-  tape.flushNoise();
-  assert.strictEqual(rows.length, beforeNoise + 2, 'one aggregate per lock per window');
-}
-
-{
-  const rows = [];
-  const tape = createPolyMissTape({
-    logAsync: (p, rfq, d, status, extra) => {
-      rows.push({ rfq_id: rfq.rfqId, skip_reason: extra && extra.skip_reason });
-    },
-    now: () => 10_000,
-  });
-  for (let i = 0; i < MAX_NEAR_MISS_PER_WINDOW + 8; i++) {
-    tape.persist(nearMissEval(`rfq_burst_${i}`), 'declined');
-  }
-  assert.strictEqual(rows.length, MAX_NEAR_MISS_PER_WINDOW);
-  const flushed = tape.flushNoise();
-  assert.strictEqual(flushed.length, 1);
-  assert.ok(flushed[0].skipReason.includes('x8'));
+  assert.strictEqual(rows.length, beforeNoise, 'overlap SKIPs must not insert per-row');
+  assert.deepStrictEqual(tape.flushNoise(), []);
+  assert.strictEqual(rows.length, beforeNoise, 'flushNoise must not insert overlap aggregates');
 }
 
 {
