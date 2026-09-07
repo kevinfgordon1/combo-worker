@@ -16,6 +16,8 @@
 //   findStartedEvent (polymarket-rfq.js) — date-only PM slugs are not starts.
 // SKIP TAPE: oversized / limit_reached skips persist a distinct reason on
 //   combo_submissions, then one RFQ+ticker tape lookup after close (or pad).
+//   Poly Combo Locks reconcile SKIP/QUOTE also insert here (venue=polymarket)
+//   via persistLockTape — not Railway-only. no_shared_game is aggregated.
 //   Quote-watcher stays parked. We do not write combo_matches or watcher_debug.
 // UNHEDGED SHADOW: unmatched in-scope MLB/NFL ML combos persist to
 //   unhedged_rfqs (UNHEDGED_RFQ_SHADOW, default on). Never POSTs. Combo Locks

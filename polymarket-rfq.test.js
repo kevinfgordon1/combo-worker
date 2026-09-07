@@ -1,6 +1,8 @@
 'use strict';
 const assert = require('assert');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { decideAtFill } = require('./engine');
 const { sumOutstanding } = require('./reserve');
 const { shouldConfirmPolymarketAccept } = require('./polymarket-quote');
@@ -41,6 +43,26 @@ const {
 } = require('./polymarket-rfq');
 const { createUnhedgedFillTracker, isUnhedgedFillStatus } = require('./unhedged-rfq');
 const { createMarketCache } = require('./polymarket-market-cache');
+
+const polySrc = fs.readFileSync(path.join(__dirname, 'polymarket-rfq.js'), 'utf8');
+assert.ok(polySrc.includes('createPolyMissTape'), 'reconcile must persist Combo Locks Miss tape');
+assert.ok(polySrc.includes('persistLockTape'), 'SKIP/QUOTE path must go through persistLockTape');
+assert.ok(
+  /persistLockTape\(evaluation, 'declined', \{ locks \}\)/.test(polySrc),
+  'no_lock_overlap SKIPs must write Miss tape against the lock'
+);
+assert.ok(
+  /persistLockTape\(evaluation, 'quoted'/.test(polySrc),
+  'live quotes must write Miss tape'
+);
+assert.ok(
+  !/UNHEDGED_RFQ_LIVE\s*=\s*['"]true['"]/.test(polySrc),
+  'UNHEDGED_RFQ_LIVE must stay off'
+);
+assert.ok(
+  /couldMatchActiveLocks\(rfq, locks\)/.test(polySrc),
+  'quote matching gate must stay couldMatchActiveLocks'
+);
 
 // Fixed seed / timestamp / path — do not rotate these; they are the signing fixture.
 const SEED_B64 = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
@@ -704,6 +726,7 @@ const pitTbMiss = explainLockOverlapMiss(
   [texLaaSept4Lock]
 );
 assert.strictEqual(pitTbMiss.code, 'same_games_no_match');
+assert.strictEqual(pitTbMiss.parlay && pitTbMiss.parlay.id, texLaaSept4Lock.id);
 
 // Production 2026-09-04 21:00 window: 2-leg RFQs that named both lock
 // games were LAA yes + TB yes (wrong TEX side) — mapping near-miss, not volume.
@@ -822,6 +845,10 @@ assert.strictEqual(couldMatchActiveLocks(ariJacOppRfq, [ariJacSept13Lock]), fals
 assert.strictEqual(
   explainLockOverlapMiss(ariJacOppRfq, [ariJacSept13Lock]).code,
   'same_games_no_match'
+);
+assert.strictEqual(
+  explainLockOverlapMiss(ariJacOppRfq, [ariJacSept13Lock]).parlay.id,
+  ariJacSept13Lock.id
 );
 const ariJacIdLogs = [];
 assert.strictEqual(logActiveLockIdentityFails([ariJacSept13Lock], (m) => ariJacIdLogs.push(m)), 0);
@@ -2239,6 +2266,130 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     console.log = origAriLog;
     console.error = origAriErr;
     fail401Loop.stop();
+  }
+
+  const missRows = [];
+  const missHttp = {
+    async getUserId() { return { rfqUserId: 'rfquser_miss' }; },
+    async listRfqs(query) {
+      if (query && query.status === 'RFQ_STATUS_OPEN') {
+        const noise = [];
+        for (let i = 0; i < 40; i++) {
+          noise.push({ ...tennisRfq, id: `rfq_tennis_flood_${i}`, status: 'RFQ_STATUS_OPEN', qtyDecimal: '10' });
+        }
+        return { rfqs: [ariJacQuoteRfq, { ...ariJacOppRfq, id: 'rfq_ari_jac_miss_tape', status: 'RFQ_STATUS_OPEN', qtyDecimal: '10' }, ...noise] };
+      }
+      return { rfqs: [] };
+    },
+    async listQuotes() { return { quotes: [] }; },
+    async getCombo() { return { combos: [] }; },
+    async createQuote(body) { return { quoteId: 'quote_miss_tape' }; },
+    async confirmQuote() { return {}; },
+    async deleteQuote() { return { statusCode: 200 }; },
+    close() {},
+  };
+  const missLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: '550e8400-e29b-41d4-a716-446655440000',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    http: missHttp,
+    startWs: false,
+    getParlays: () => [ariJacSept13Lock],
+    fetchMarket: async () => null,
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+    logAsync: (p, rfq, d, status, extra = {}) => {
+      missRows.push({
+        user_id: p.user_id,
+        parlay_id: p.id,
+        label: p.label,
+        rfq_id: rfq.rfqId,
+        status,
+        skip_reason: extra.skip_reason || null,
+        quote_id: extra.quote_id || null,
+        contracts: extra.contracts != null ? extra.contracts : rfq.contracts,
+      });
+    },
+  });
+  try {
+    await new Promise((r) => setTimeout(r, 40));
+    assert.ok(missLoop.missTape);
+    const quoted = missRows.filter((r) => r.status === 'quoted');
+    const nearMiss = missRows.filter((r) => r.skip_reason === 'no_lock_overlap:same_games_no_match');
+    const noise = missRows.filter((r) => r.skip_reason && String(r.skip_reason).startsWith('no_lock_overlap:no_shared_game'));
+    assert.strictEqual(quoted.length, 1);
+    assert.strictEqual(quoted[0].parlay_id, ariJacSept13Lock.id);
+    assert.strictEqual(quoted[0].rfq_id, 'rfq_ari_jac_quote');
+    assert.strictEqual(quoted[0].quote_id, 'quote_miss_tape');
+    assert.strictEqual(quoted[0].skip_reason, null);
+    assert.strictEqual(nearMiss.length, 1);
+    assert.strictEqual(nearMiss[0].parlay_id, ariJacSept13Lock.id);
+    assert.strictEqual(nearMiss[0].status, 'declined');
+    assert.strictEqual(nearMiss[0].label, 'Arizona + Jacksonville');
+    assert.strictEqual(noise.length, 1, '40 tennis RFQs coalesce to one aggregate');
+    assert.ok(noise[0].skip_reason.includes('x40'));
+    assert.ok(missRows.every((r) => r.parlay_id === ariJacSept13Lock.id));
+    assert.ok(missRows.length <= 4, 'reconcile must not insert one row per firehose RFQ');
+
+    const beforeReplay = missRows.length;
+    await missLoop.handleRfq({
+      ...ariJacOppRfq,
+      id: 'rfq_ari_jac_miss_tape',
+      status: 'RFQ_STATUS_OPEN',
+      qtyDecimal: '10',
+    });
+    assert.strictEqual(missRows.length, beforeReplay, 'same rfq+lock+reason is not re-inserted');
+
+    const startedRows = [];
+    const startedLoop = startPolymarketRfqLoop({
+      env: {
+        POLYMARKET_KEY_ID: '550e8400-e29b-41d4-a716-446655440000',
+        POLYMARKET_SECRET_KEY: SEED_B64,
+        POLYMARKET_RFQ_LIVE: 'true',
+      },
+      http: {
+        async getUserId() { return { rfqUserId: 'rfquser_started' }; },
+        async listRfqs() { return { rfqs: [] }; },
+        async listQuotes() { return { quotes: [] }; },
+        async getCombo() { return { combos: [] }; },
+        async createQuote() { throw new Error('started lock must not quote'); },
+        async confirmQuote() { return {}; },
+        async deleteQuote() { return { statusCode: 200 }; },
+        close() {},
+      },
+      startWs: false,
+      getParlays: () => [ariJacSept13Lock],
+      fetchMarket: async () => null,
+      startedFor: () => ({ started: true, source: 'starts_at', at: '2026-09-13T17:00:00.000Z' }),
+      filledSoFarFor: () => 0,
+      getOutstanding: () => 0,
+      pendingQuotes: new Map(),
+      reconcileMs: 60 * 60 * 1000,
+      logAsync: (p, rfq, d, status, extra = {}) => {
+        startedRows.push({
+          parlay_id: p.id,
+          rfq_id: rfq.rfqId,
+          status,
+          skip_reason: extra.skip_reason || null,
+        });
+      },
+    });
+    try {
+      await startedLoop.handleRfq({ ...ariJacQuoteRfq, id: 'rfq_ari_jac_started' });
+      assert.strictEqual(startedRows.length, 1);
+      assert.strictEqual(startedRows[0].status, 'declined');
+      assert.strictEqual(startedRows[0].skip_reason, 'game_started');
+      assert.strictEqual(startedRows[0].parlay_id, ariJacSept13Lock.id);
+    } finally {
+      startedLoop.stop();
+    }
+  } finally {
+    missLoop.stop();
   }
 
   const parsed = parsePrivateMessage(JSON.stringify({

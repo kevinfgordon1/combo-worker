@@ -10,6 +10,9 @@
 // (no_shared_game vs same_games_no_match / leg_count / missing_team /
 // doubleheader) so volume-vs-mapping is one line. Near-miss SKIP logs
 // those codes. Unhedged persist writes skip_reason=no_lock_overlap:<code>.
+// Combo Locks Miss tape (combo_submissions) gets quotes + matched skips +
+// near-misses once per rfq+lock+reason. no_shared_game is aggregated, not
+// inserted per RFQ — reconcile is a 100-row / 3s firehose.
 // Live POSTs (create quote, confirm) require POLYMARKET_RFQ_LIVE to be truthy.
 // quoteExecuted means paired orders were submitted — not a fill.
 // START GATE: never quote or confirm once any lock leg has started (first pitch
@@ -59,6 +62,11 @@ const {
   shadowUnhedgedMiss,
   createUnhedgedFillTracker,
 } = require('./unhedged-rfq');
+const {
+  NEAR_MISS_CODES,
+  isNearMissCode,
+  createPolyMissTape,
+} = require('./poly-miss-tape');
 
 const MODE = 'POLY';
 const RECONCILE_MS = 3000;
@@ -293,13 +301,6 @@ function logActiveLockIdentityFails(parlays, log = console.log) {
   return n;
 }
 
-const NEAR_MISS_CODES = new Set([
-  'leg_count',
-  'missing_team',
-  'same_games_no_match',
-  'doubleheader',
-]);
-
 function explainLockOverlapMiss(rfq, parlays) {
   const tokens = rfqSlugTokenSet(rfq);
   const keys = (rfq && rfq.legKeys) || [];
@@ -321,6 +322,7 @@ function explainLockOverlapMiss(rfq, parlays) {
       return {
         code: 'leg_count',
         lock: label,
+        parlay: p,
         detail: `rfqLegs=${keys.length} lockLegs=${lock.identities.length}`,
       };
     }
@@ -332,6 +334,7 @@ function explainLockOverlapMiss(rfq, parlays) {
       return {
         code: 'missing_team',
         lock: label,
+        parlay: p,
         detail: `miss=${missTeam.map((id) => (id.teams || []).join('+')).join(',')}`,
       };
     }
@@ -343,6 +346,7 @@ function explainLockOverlapMiss(rfq, parlays) {
       return {
         code: 'doubleheader',
         lock: label,
+        parlay: p,
         detail: `rfq=${slugIds.keys.join(',')} lock=${lock.keys.join(',')}`,
       };
     }
@@ -351,11 +355,12 @@ function explainLockOverlapMiss(rfq, parlays) {
       return {
         code: 'same_games_no_match',
         lock: label,
+        parlay: p,
         detail: `rfq=${slugIds.keys.join(',')} lock=${lock.keys.join(',')}`,
       };
     }
 
-    return { code: 'same_games_no_match', lock: label };
+    return { code: 'same_games_no_match', lock: label, parlay: p };
   }
   return { code: 'no_shared_game' };
 }
@@ -1031,6 +1036,15 @@ function startPolymarketRfqLoop(ctx = {}) {
     unhedgedFills.hydrate().catch((e) => console.error('[UNHEDGED] fill hydrate', e && e.message));
   }
 
+  const missTape = typeof ctx.logAsync === 'function'
+    ? createPolyMissTape({ logAsync: ctx.logAsync })
+    : null;
+
+  function persistLockTape(evaluation, status, extra) {
+    if (!missTape) return { persisted: false, reason: 'no_logger' };
+    return missTape.persist(evaluation, status, extra);
+  }
+
   function persistUnhedgedShadow(rfq, extra = {}) {
     shadowUnhedgedMiss(rfq, {
       venue: 'polymarket',
@@ -1116,11 +1130,13 @@ function startPolymarketRfqLoop(ctx = {}) {
         reason: 'no_lock_overlap',
         rfq,
         overlap,
+        parlay: (overlap && overlap.parlay) || null,
       };
       persistUnhedgedShadow(rfq, { skipReason: lockSkipReasonOf(evaluation) });
-      if (overlap && NEAR_MISS_CODES.has(overlap.code)) {
+      if (overlap && isNearMissCode(overlap.code)) {
         logSkip(evaluation);
       }
+      persistLockTape(evaluation, 'declined', { locks });
       return evaluation;
     }
 
@@ -1161,9 +1177,7 @@ function startPolymarketRfqLoop(ctx = {}) {
           console.error(`[${MODE}] cancel-on-start`, e.message);
         }
       }
-      if (evaluation.parlay && ctx.logAsync) {
-        ctx.logAsync(evaluation.parlay, { rfqId: rfq.rfqId, contracts: evaluation.quote && evaluation.quote.estimatedContracts }, evaluation.decision, 'declined');
-      }
+      persistLockTape(evaluation, 'declined');
       return evaluation;
     }
 
@@ -1178,7 +1192,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         `buy=${q.buyPrice} sell=${q.sellPrice} contracts=${q.estimatedContracts} ` +
         `reserved=${outstandingFor(p.id)}/${d.totalLimit} reason=${gate.reason}`
       );
-      if (ctx.logAsync) ctx.logAsync(p, { rfqId: rfq.rfqId, contracts: q.estimatedContracts }, d, 'shadow');
+      persistLockTape(evaluation, 'shadow');
       return { ...evaluation, post: false, reason: gate.reason };
     }
 
@@ -1197,16 +1211,14 @@ function startPolymarketRfqLoop(ctx = {}) {
         `buy=${q.buyPrice} sell=${q.sellPrice} contracts=${d.contracts} ` +
         `reserved=${outstandingFor(p.id)}/${d.totalLimit}`
       );
-      if (ctx.logAsync) {
-        ctx.logAsync(p, { rfqId: rfq.rfqId, contracts: d.contracts }, d, 'quoted', {
-          quote_id: quoteId, is_live: true, contracts: d.contracts,
-        });
-      }
+      persistLockTape(evaluation, 'quoted', {
+        quote_id: quoteId, is_live: true, contracts: d.contracts,
+      });
       return { ...evaluation, post: true, quoteId };
     } catch (e) {
       pendingQuotes.delete(reserveKey);
       console.error(`[${MODE}] POST FAILED ${p.label} rfq=${rfq.rfqId}`, e.message);
-      if (ctx.logAsync) ctx.logAsync(p, { rfqId: rfq.rfqId, contracts: d.contracts }, d, 'unfilled');
+      persistLockTape(evaluation, 'unfilled');
       return { ...evaluation, post: false, reason: 'post_failed', error: e.message };
     }
   }
@@ -1432,6 +1444,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         const out = await handleRfq(row);
         tallyReconcileOutcome(reasons, out);
       }
+      if (missTape) missTape.flushNoise();
       const hist = formatReasonTally(reasons);
       console.log(
         `[${MODE}] reconcile open=${rows.length} locks=${locks.length} priceable=${priceable} live=${live}` +
@@ -1577,6 +1590,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     cancelPendingIfStarted,
     pendingQuotes,
     seenRfqs,
+    missTape,
     live,
     marketCache,
     unhedgedFills,
@@ -1612,6 +1626,7 @@ module.exports = {
   quoteBodyFromEval,
   acceptedFromEvent,
   startPolymarketRfqLoop,
+  NEAR_MISS_CODES,
   fetchPolymarketUnhedgedRfq,
   fetchPolymarketUnhedgedTrades,
   fetchPolymarketComboLastTrade,
