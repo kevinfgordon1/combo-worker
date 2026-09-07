@@ -102,6 +102,47 @@ assert.ok(
   'UNHEDGED_RFQ_LIVE must stay off unless explicitly enabled'
 );
 assert.ok(
+  liveSrc.includes('quoteFailureSkipReason'),
+  'Kalshi POST/confirm must classify underfunded rejects'
+);
+assert.ok(
+  /if \(quoteFailureSkipReason\(e\.message\)\) \{[\s\S]*?logFundingSkip\(p, rfq, d\)/.test(liveSrc),
+  'underfunded Kalshi POST must persist declined + skip_reason, not silent unfilled'
+);
+assert.ok(
+  /logFundingSkip\(p, rfq, d\)/.test(liveSrc) && /logAsync\(p, rfq, d, 'unfilled'\)/.test(liveSrc),
+  'non-funding POST fails stay unfilled'
+);
+assert.ok(
+  /persistQuoteSkip\(quoteId, skipReason/.test(liveSrc),
+  'underfunded Kalshi confirm must stamp skip_reason on the quoted row'
+);
+assert.ok(
+  /CONFIRM FAILED[\s\S]*?if \(!isSilentQuoteFailure\(e\.message\)\) \{[\s\S]*?sendAlert/.test(liveSrc),
+  'underfunded confirm stays off Telegram; other confirm fails still alert'
+);
+assert.ok(
+  /persistQuoteSkip:\s*\(quoteId, skipReason, fallback\) =>\s*persistQuoteSkip\(quoteId, skipReason, fallback\)/.test(liveSrc),
+  'Poly loop must receive persistQuoteSkip so confirm can update the attempt'
+);
+
+{
+  const funded = logAsyncBody(parlay, rfq, { contracts: 10, worst: 2, fillAmerican: 350 }, 'declined', {
+    skip_reason: 'insufficient_balance', contracts: 10,
+  });
+  assert.strictEqual(funded.venue, 'kalshi');
+  assert.strictEqual(funded.status, 'declined');
+  assert.strictEqual(funded.skip_reason, 'insufficient_balance');
+  assert.strictEqual(funded.contracts, 10);
+
+  const polyFunded = polyLogAsyncBody(parlay, rfq, { contracts: 8 }, 'declined', {
+    skip_reason: 'insufficient_balance', contracts: 8,
+  });
+  assert.strictEqual(polyFunded.venue, 'polymarket');
+  assert.strictEqual(polyFunded.skip_reason, 'insufficient_balance');
+  assert.strictEqual(polyFunded.status, 'declined');
+}
+assert.ok(
   /unhedgedFills\.tick\(\)[\s\S]{0,120}FILL_TICK_MS/.test(liveSrc),
   'unhedged fill tick must not share the 15s skip-tape interval'
 );

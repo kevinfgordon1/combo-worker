@@ -90,11 +90,32 @@ function shouldPostQuote(size) {
   return !!(size && size.contracts > 0 && (size.source === 'contracts' || size.source === 'dollar'));
 }
 
-// Known Kalshi rejects from dollar-RFQ + yes_bid "0.00" sizing / precision.
-// Still console.error + write unfilled; do not Telegram.
+// Underfunded quote create/confirm — persist skip_reason=insufficient_balance
+// on combo_submissions (Combo Locks Miss tape / lock card). No pre-flight
+// balance poll; we label the exchange reject.
+//
+// Kalshi: error.code `insufficient_balance` / `INSUFFICIENT_BALANCE`.
+// Polymarket shapes seen on CLOB / Retail HTTP (message, error, code,
+// reason, or type — throwHttpError already concatenates these):
+//   "not enough balance / allowance"
+//   insufficient_funds / insufficient funds
+//   insufficient_collateral / insufficient collateral
+//   not enough funds | not enough collateral | underfunded
+function isInsufficientFundsFailure(message) {
+  const msg = String(message || '').toLowerCase();
+  return /insufficient[_ -]?balance|insufficient[_ -]?funds|insufficient[_ -]?collateral|not enough (?:balance|funds|collateral|allowance)|underfunded/.test(msg);
+}
+
+function quoteFailureSkipReason(message) {
+  return isInsufficientFundsFailure(message) ? 'insufficient_balance' : null;
+}
+
+// Telegram skip only. Funding still writes a declined skip_reason row.
+// Precision rejects (dollar-RFQ + yes_bid "0.00") stay console + unfilled.
 function isSilentQuoteFailure(message) {
   const msg = String(message || '');
-  return /insufficient_balance|invalid_yes_bid|invalid_dollar_precision/.test(msg);
+  if (isInsufficientFundsFailure(msg)) return true;
+  return /invalid_yes_bid|invalid_dollar_precision/.test(msg);
 }
 
 // Your fill is net of your maker fee. Recover the nominal exchange price you'd quote, and from it
@@ -191,4 +212,5 @@ module.exports = {
   YES_DECLINE, yesBidForQuote, impliedYesBid, quoteYesBid, isRealYesBid,
   shouldConfirmAccept, contractsFromQuoteResponse,
   buildQuoteBody, shouldPostQuote, isSilentQuoteFailure,
+  isInsufficientFundsFailure, quoteFailureSkipReason,
 };
