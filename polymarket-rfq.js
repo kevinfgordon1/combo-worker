@@ -22,7 +22,7 @@
 // and Kalshi ticker HHMM in leg_keys.
 'use strict';
 const { matchParlay } = require('./rfq');
-const { decideAtFill } = require('./engine');
+const { decideAtFill, quoteFailureSkipReason } = require('./engine');
 const { findStartedEvent } = require('./started');
 const {
   RESERVE_TTL_MS,
@@ -1218,8 +1218,16 @@ function startPolymarketRfqLoop(ctx = {}) {
     } catch (e) {
       pendingQuotes.delete(reserveKey);
       console.error(`[${MODE}] POST FAILED ${p.label} rfq=${rfq.rfqId}`, e.message);
-      persistLockTape(evaluation, 'unfilled');
-      return { ...evaluation, post: false, reason: 'post_failed', error: e.message };
+      const skipReason = quoteFailureSkipReason(e.message);
+      if (skipReason) {
+        persistLockTape(evaluation, 'declined', {
+          skip_reason: skipReason,
+          contracts: d.contracts,
+        });
+      } else {
+        persistLockTape(evaluation, 'unfilled');
+      }
+      return { ...evaluation, post: false, reason: skipReason || 'post_failed', error: e.message };
     }
   }
 
@@ -1330,7 +1338,26 @@ function startPolymarketRfqLoop(ctx = {}) {
       return { confirmed: true };
     } catch (e) {
       console.error(`[${MODE}] CONFIRM FAILED quote_id=${quoteId} rfq_id=${rfqId}`, e.message);
-      return { confirmed: false, reason: 'confirm_failed', error: e.message };
+      const skipReason = quoteFailureSkipReason(e.message);
+      if (skipReason) {
+        const parlay = parlayOfPending(pending);
+        const fallback = () => persistLockTape({
+          action: 'skip',
+          reason: skipReason,
+          parlay,
+          rfq: { rfqId, id: rfqId },
+        }, 'declined', {
+          skip_reason: skipReason,
+          quote_id: quoteId,
+          contracts: pending && pending.contracts,
+        });
+        if (typeof ctx.persistQuoteSkip === 'function') {
+          ctx.persistQuoteSkip(quoteId, skipReason, fallback);
+        } else {
+          fallback();
+        }
+      }
+      return { confirmed: false, reason: skipReason || 'confirm_failed', error: e.message };
     } finally {
       confirmingQuotes.delete(quoteId);
     }

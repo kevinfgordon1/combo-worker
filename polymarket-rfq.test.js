@@ -2392,6 +2392,126 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     missLoop.stop();
   }
 
+  const fundRows = [];
+  const fundSkips = [];
+  const fundHttp = {
+    async getUserId() { return { rfqUserId: 'rfquser_fund' }; },
+    async listRfqs() { return { rfqs: [] }; },
+    async listQuotes() { return { quotes: [] }; },
+    async getCombo() { return { combos: [] }; },
+    async createQuote() {
+      throw new Error('Polymarket POST /v1/rfqs/quotes 400 not enough balance / allowance');
+    },
+    async confirmQuote() {
+      throw new Error('Polymarket PUT confirm 400 insufficient_funds');
+    },
+    async deleteQuote() { return { statusCode: 200 }; },
+    close() {},
+  };
+  const fundPending = new Map();
+  const fundLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    http: fundHttp,
+    startWs: false,
+    getParlays: () => [pmParlay],
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: fundPending,
+    reconcileMs: 60 * 60 * 1000,
+    persistQuoteSkip: (quoteId, skipReason, fallback) => {
+      fundSkips.push({ quoteId, skipReason });
+      if (typeof fallback === 'function') fallback();
+    },
+    logAsync: (p, rfq, d, status, extra = {}) => {
+      fundRows.push({
+        parlay_id: p.id,
+        rfq_id: rfq.rfqId,
+        status,
+        skip_reason: extra.skip_reason || null,
+        contracts: extra.contracts != null ? extra.contracts : rfq.contracts,
+      });
+    },
+  });
+  try {
+    const underfunded = await fundLoop.handleRfq({ ...pmRfq, id: 'rfq_underfunded' });
+    assert.strictEqual(underfunded.post, false);
+    assert.strictEqual(underfunded.reason, 'insufficient_balance');
+    assert.strictEqual(fundPending.size, 0);
+    const fundRow = fundRows.find((r) => r.rfq_id === 'rfq_underfunded');
+    assert.ok(fundRow);
+    assert.strictEqual(fundRow.status, 'declined');
+    assert.strictEqual(fundRow.skip_reason, 'insufficient_balance');
+    assert.strictEqual(fundRow.parlay_id, 'pm-parlay');
+
+    fundPending.set('quote_fund', {
+      parlayId: 'pm-parlay',
+      contracts: 10,
+      maxContracts: 116,
+      rfqId: 'rfq_underfunded_confirm',
+      label: 'PM Sox/Pirates',
+    });
+    const confirmFund = await fundLoop.handleQuoteAccepted({
+      quote: { id: 'quote_fund', rfqId: 'rfq_underfunded_confirm', acceptedSide: 'SIDE_BUY' },
+    });
+    assert.strictEqual(confirmFund.confirmed, false);
+    assert.strictEqual(confirmFund.reason, 'insufficient_balance');
+    assert.ok(fundSkips.some((s) => s.quoteId === 'quote_fund' && s.skipReason === 'insufficient_balance'));
+    const confirmRow = fundRows.find((r) => r.rfq_id === 'rfq_underfunded_confirm');
+    assert.ok(confirmRow);
+    assert.strictEqual(confirmRow.status, 'declined');
+    assert.strictEqual(confirmRow.skip_reason, 'insufficient_balance');
+  } finally {
+    fundLoop.stop();
+  }
+
+  const otherFailRows = [];
+  const otherFailLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    http: {
+      async getUserId() { return { rfqUserId: 'rfquser_other' }; },
+      async listRfqs() { return { rfqs: [] }; },
+      async listQuotes() { return { quotes: [] }; },
+      async getCombo() { return { combos: [] }; },
+      async createQuote() { throw new Error('Polymarket POST /v1/rfqs/quotes 400 RFQ_CLOSED'); },
+      async confirmQuote() { return {}; },
+      async deleteQuote() { return { statusCode: 200 }; },
+      close() {},
+    },
+    startWs: false,
+    getParlays: () => [pmParlay],
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+    logAsync: (p, rfq, d, status, extra = {}) => {
+      otherFailRows.push({
+        rfq_id: rfq.rfqId,
+        status,
+        skip_reason: extra.skip_reason || null,
+      });
+    },
+  });
+  try {
+    const closed = await otherFailLoop.handleRfq({ ...pmRfq, id: 'rfq_closed_fail' });
+    assert.strictEqual(closed.post, false);
+    assert.strictEqual(closed.reason, 'post_failed');
+    assert.strictEqual(otherFailRows.length, 1);
+    assert.strictEqual(otherFailRows[0].status, 'unfilled');
+    assert.strictEqual(otherFailRows[0].skip_reason, null);
+  } finally {
+    otherFailLoop.stop();
+  }
+
   const parsed = parsePrivateMessage(JSON.stringify({
     requestId: 'rfq-sub-1',
     subscriptionType: 'SUBSCRIPTION_TYPE_RFQ',

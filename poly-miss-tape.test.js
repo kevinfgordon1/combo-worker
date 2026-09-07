@@ -162,6 +162,13 @@ function quoteEval(rfqId) {
     quote_id: 'q1', is_live: true, contracts: 10,
   }).persisted, false, 'quote deduped');
 
+  const funded = tape.persist(quoteEval('rfq_fund'), 'declined', {
+    skip_reason: 'insufficient_balance', contracts: 10,
+  });
+  assert.strictEqual(funded.persisted, true);
+  assert.strictEqual(funded.skipReason, 'insufficient_balance');
+  assert.strictEqual(funded.kind, 'matched_skip');
+
   assert.strictEqual(tape.persist(nearMissEval('rfq_miss'), 'declined').persisted, true);
   assert.strictEqual(tape.persist(nearMissEval('rfq_miss'), 'declined').persisted, false);
   assert.strictEqual(
@@ -177,6 +184,12 @@ function quoteEval(rfqId) {
   assert.strictEqual(quoted.quote_id, 'q1');
   assert.strictEqual(quoted.skip_reason, undefined);
   assert.strictEqual(quoted.venue, 'polymarket');
+
+  const fundRow = rows.find((r) => r.rfq_id === 'rfq_fund');
+  assert.ok(fundRow);
+  assert.strictEqual(fundRow.status, 'declined');
+  assert.strictEqual(fundRow.skip_reason, 'insufficient_balance');
+  assert.strictEqual(fundRow.contracts, 10);
 
   const skipped = rows.find((r) => r.rfq_id === 'rfq_miss' && r.skip_reason === 'no_lock_overlap:same_games_no_match');
   assert.ok(skipped);

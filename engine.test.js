@@ -2,6 +2,7 @@
 const assert = require('assert');
 const {
   decideAtFill, fillView, buildQuoteBody, yesBidForQuote, shouldPostQuote, isSilentQuoteFailure,
+  isInsufficientFundsFailure, quoteFailureSkipReason,
   YES_DECLINE, impliedYesBid, quoteYesBid, isRealYesBid, shouldConfirmAccept, contractsFromQuoteResponse,
 } = require('./engine');
 const { normalizeRfq } = require('./rfq');
@@ -170,6 +171,30 @@ assert.ok(isSilentQuoteFailure('Kalshi quote failed 400: invalid_dollar_precisio
 assert.ok(!isSilentQuoteFailure('Kalshi quote failed 400: RFQ_CLOSED'));
 assert.ok(!isSilentQuoteFailure('fetch failed'));
 assert.ok(!isSilentQuoteFailure('Kalshi quote failed 400: unexpected'));
+
+assert.ok(isInsufficientFundsFailure('Kalshi quote failed 400: {"error":{"code":"insufficient_balance"}}'));
+assert.ok(isInsufficientFundsFailure('Kalshi confirm failed 400: INSUFFICIENT_BALANCE'));
+assert.ok(isInsufficientFundsFailure('Polymarket POST /v1/rfqs/quotes 400 not enough balance / allowance'));
+assert.ok(isInsufficientFundsFailure('Polymarket PUT confirm 400 insufficient_funds'));
+assert.ok(isInsufficientFundsFailure('{"error":"insufficient collateral"}'));
+assert.ok(isInsufficientFundsFailure('not enough funds to back this quote'));
+assert.ok(isInsufficientFundsFailure('not enough collateral'));
+assert.ok(isInsufficientFundsFailure('underfunded'));
+assert.ok(!isInsufficientFundsFailure('Kalshi quote failed 400: invalid_yes_bid: invalid dollar precision: 0'));
+assert.ok(!isInsufficientFundsFailure('Kalshi quote failed 400: invalid_dollar_precision'));
+assert.ok(!isInsufficientFundsFailure('Kalshi quote failed 400: RFQ_CLOSED'));
+assert.ok(!isInsufficientFundsFailure('fetch failed'));
+
+assert.strictEqual(
+  quoteFailureSkipReason('Kalshi quote failed 400: {"error":{"code":"insufficient_balance"}}'),
+  'insufficient_balance'
+);
+assert.strictEqual(
+  quoteFailureSkipReason('Polymarket POST /v1/rfqs/quotes 400 not enough balance / allowance'),
+  'insufficient_balance'
+);
+assert.strictEqual(quoteFailureSkipReason('Kalshi quote failed 400: invalid_yes_bid'), null);
+assert.strictEqual(quoteFailureSkipReason('Kalshi quote failed 400: RFQ_CLOSED'), null);
 
 // Two-sided dollar quote: confirm only the NO side.
 assert.strictEqual(shouldConfirmAccept(YES_DECLINE, 'yes'), true);

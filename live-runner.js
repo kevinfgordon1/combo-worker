@@ -18,6 +18,9 @@
 //   combo_submissions, then one RFQ+ticker tape lookup after close (or pad).
 //   Poly Combo Locks reconcile SKIP/QUOTE also insert here (venue=polymarket)
 //   via persistLockTape — not Railway-only. no_shared_game is aggregated.
+//   Underfunded quote create/confirm (insufficient_balance) also persist a
+//   declined combo_submissions row for the lock card. Telegram stays silent.
+//   No public-tape lookup. Precision rejects stay console + unfilled.
 //   Quote-watcher stays parked. We do not write combo_matches or watcher_debug.
 // UNHEDGED SHADOW: unmatched in-scope MLB/NFL ML combos persist to
 //   unhedged_rfqs (UNHEDGED_RFQ_SHADOW, default on). Never POSTs. Combo Locks
@@ -43,7 +46,7 @@ const { Client } = require('undici');
 const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
-const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
+const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
 const { findStartedEvent } = require('./started');
 const {
   RESERVE_TTL_MS,
@@ -292,6 +295,68 @@ function logSkip(p, rfq, d, status, size) {
     marketTicker: rfq.marketTicker,
   });
   logAsync(p, rfq, d, status, extra).then((row) => trackSkipTape(row, extra, p, rfq));
+}
+
+function fundingSkipExtra(d, rfq, extra = {}) {
+  return skipPersistExtra({
+    skipReason: 'insufficient_balance',
+    contracts: extra.contracts != null ? extra.contracts
+      : d && d.contracts != null ? d.contracts
+        : rfq && rfq.contracts != null ? rfq.contracts : null,
+    remaining: extra.remaining != null ? extra.remaining
+      : d && d.remaining != null ? d.remaining : null,
+    marketTicker: extra.marketTicker || (rfq && rfq.marketTicker) || null,
+  });
+}
+
+function logFundingSkip(p, rfq, d, extra = {}) {
+  const persistExtra = fundingSkipExtra(d, rfq, extra);
+  logAsync(p, rfq, d, 'declined', persistExtra);
+}
+
+// Confirm already inserted a quoted row — stamp skip_reason on that attempt.
+// If the insert never landed, insert a declined funding row.
+function persistQuoteSkip(quoteId, skipReason, fallback) {
+  if (!skipReason) return Promise.resolve(null);
+  const body = stripUnknown({
+    skip_reason: skipReason,
+    status: 'declined',
+    is_live: false,
+  });
+  const insertFallback = () => {
+    if (!fallback || typeof fallback !== 'function') return Promise.resolve(null);
+    return Promise.resolve(fallback());
+  };
+  if (!quoteId || isReserveKey(quoteId)) return insertFallback();
+  return supabase.from('combo_submissions').update(body).eq('quote_id', quoteId).select('id')
+    .then(({ data, error }) => {
+      if (error) {
+        const m = String(error.message || '').match(COL_ERR);
+        if (m) {
+          unknownCols.add(m[1]);
+          console.warn(`[${MODE}] combo_submissions missing column ${m[1]} — degrading`);
+          const retry = { ...body };
+          delete retry[m[1]];
+          return supabase.from('combo_submissions').update(retry).eq('quote_id', quoteId).select('id')
+            .then(({ data: d2, error: e2 }) => {
+              if (e2) {
+                console.error(`[${MODE}] quote skip persist`, e2.message);
+                return insertFallback();
+              }
+              if (d2 && d2.length) return d2[0];
+              return insertFallback();
+            });
+        }
+        console.error(`[${MODE}] quote skip persist`, error.message);
+        return insertFallback();
+      }
+      if (data && data.length) return data[0];
+      return insertFallback();
+    })
+    .catch((e) => {
+      console.error(`[${MODE}] quote skip persist`, e.message);
+      return insertFallback();
+    });
 }
 
 async function postQuote(rfqId, noBid, yesBid = YES_DECLINE, restRemainder) {
@@ -892,11 +957,23 @@ async function onQuoteAccepted(evt) {
     );
   } catch (e) {
     console.error(`[${MODE}] CONFIRM FAILED quote_id=${quoteId} rfq_id=${rfqId}`, e.message);
-    sendAlert(
-      `❌ CONFIRM FAILED — ${pending ? pending.label : shortId(quoteId)}\n` +
-      `quote ${shortId(quoteId)} · rfq ${shortId(rfqId)}\n` +
-      `${e.message}`
-    ).catch(() => {});
+    const skipReason = quoteFailureSkipReason(e.message);
+    if (skipReason) {
+      persistQuoteSkip(quoteId, skipReason, () => {
+        const p = parlayFromPending(pending);
+        if (!p) return null;
+        return logFundingSkip(p, { rfqId, contracts: pending && pending.contracts }, null, {
+          contracts: pending && pending.contracts,
+        });
+      });
+    }
+    if (!isSilentQuoteFailure(e.message)) {
+      sendAlert(
+        `❌ CONFIRM FAILED — ${pending ? pending.label : shortId(quoteId)}\n` +
+        `quote ${shortId(quoteId)} · rfq ${shortId(rfqId)}\n` +
+        `${e.message}`
+      ).catch(() => {});
+    }
   } finally {
     confirmingQuotes.delete(quoteId);
   }
@@ -1179,7 +1256,11 @@ async function onRfq(rfq, env) {
       );
       counts.postFailed++;
       console.error(`[${MODE}] POST FAILED ${p.label} rfq=${rfq.rfqId}`, e.message);
-      logAsync(p, rfq, d, 'unfilled');
+      if (quoteFailureSkipReason(e.message)) {
+        logFundingSkip(p, rfq, d);
+      } else {
+        logAsync(p, rfq, d, 'unfilled');
+      }
       if (!isSilentQuoteFailure(e.message)) {
         sendAlert(`❌ QUOTE FAILED — ${p.label}\nrfq ${shortId(rfq.rfqId)}\n${e.message}`).catch(() => {});
       }
@@ -1265,6 +1346,8 @@ async function main() {
     startedFor: startedForParlay,
     logAsync: (p, rfq, d, status, extra = {}) =>
       logAsync(p, rfq, d, status, withVenue(extra, 'polymarket')),
+    persistQuoteSkip: (quoteId, skipReason, fallback) =>
+      persistQuoteSkip(quoteId, skipReason, fallback),
     sendAlert,
     counts,
     sessionFilledByParlay,
