@@ -73,6 +73,10 @@ assert.ok(
   'Poly loop logAsync wrapper must stamp venue polymarket'
 );
 assert.ok(
+  liveSrc.includes('persistLockTape — not Railway-only') || liveSrc.includes('venue=polymarket'),
+  'Kalshi runner comment must document Poly Miss tape writes'
+);
+assert.ok(
   /status:\s*'filled',[\s\S]*?venue:\s*'kalshi'/.test(liveSrc),
   'Kalshi filled insert-fallback must include venue kalshi'
 );
