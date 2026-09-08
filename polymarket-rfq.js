@@ -988,7 +988,9 @@ function startPolymarketRfqLoop(ctx = {}) {
     };
   }
 
-  const live = isPolymarketRfqLive(env);
+  const enableLocks = ctx.enableLocks !== false;
+  const enableUnhedged = ctx.enableUnhedged !== false;
+  const live = enableLocks && isPolymarketRfqLive(env);
   const creds = inspectPolymarketCreds({ keyId, secretKey }, env);
   const pendingQuotes = ctx.pendingQuotes || new Map();
   const confirmingQuotes = ctx.confirmingQuotes || new Set();
@@ -1003,12 +1005,17 @@ function startPolymarketRfqLoop(ctx = {}) {
   });
 
   console.log(
-    `[${MODE}] starting — live=${live}. ` +
-    `POST create-quote / confirm only when POLYMARKET_RFQ_LIVE is truthy. ` +
-    `Kalshi quoting keeps running. Remaining is shared via reserve.js. ` +
-    `Unhedged RFQ shadow (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(env) ? 'on' : 'off'}, ` +
-    `UNHEDGED_RFQ_LIVE=${isUnhedgedRfqLive(env) ? 'on' : 'off'}) ` +
-    `persists in-scope unmatched MLB/NFL ML combos — never posts.`
+    `[${MODE}] starting — live=${live} locks=${enableLocks ? 'on' : 'off'} ` +
+    `unhedged=${enableUnhedged ? 'on' : 'off'}. ` +
+    (enableLocks
+      ? 'POST create-quote / confirm only when POLYMARKET_RFQ_LIVE is truthy. ' +
+        'Kalshi quoting keeps running. Remaining is shared via reserve.js. '
+      : 'Combo Lock quote POST/confirm disabled (Unhedged job). ') +
+    (enableUnhedged
+      ? `Unhedged RFQ shadow (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(env) ? 'on' : 'off'}, ` +
+        `UNHEDGED_RFQ_LIVE=${isUnhedgedRfqLive(env) ? 'on' : 'off'}) ` +
+        'persists in-scope unmatched MLB/NFL ML combos — never posts.'
+      : 'Unhedged persist/fill tracker off on this process.')
   );
   console.log(
     `[${MODE}] creds keyId=${creds.keyIdLooksUuid ? 'uuid' : (creds.keyIdPresent ? 'not_uuid' : 'missing')} ` +
@@ -1019,50 +1026,53 @@ function startPolymarketRfqLoop(ctx = {}) {
     console.error(`[${MODE}] Retail creds look invalid — ${ROTATE_HINT}`);
   }
 
-  const unhedgedPrices = ctx.unhedgedPrices || null;
+  const unhedgedPrices = enableUnhedged ? (ctx.unhedgedPrices || null) : null;
   if (unhedgedPrices && typeof unhedgedPrices.setPmFetch === 'function') {
     unhedgedPrices.setPmFetch(ctx.fetchMarket || ((slug) => http.getMarketBySlug(slug)));
   }
 
-  const ownFills = !ctx.unhedgedFills;
-  const unhedgedFills = ctx.unhedgedFills || createUnhedgedFillTracker({
-    supabase: ctx.supabase,
-    persist: ctx.persistUnhedged,
-    env,
-    fetchRfq: fetchUnhedgedPmRfq,
-    fetchTrades: fetchUnhedgedPmTrades,
-  });
-  if (ownFills && typeof unhedgedFills.hydrate === 'function') {
+  const ownFills = enableUnhedged && !ctx.unhedgedFills;
+  const unhedgedFills = !enableUnhedged
+    ? null
+    : (ctx.unhedgedFills || createUnhedgedFillTracker({
+      supabase: ctx.supabase,
+      persist: ctx.persistUnhedged,
+      env,
+      fetchRfq: fetchUnhedgedPmRfq,
+      fetchTrades: fetchUnhedgedPmTrades,
+    }));
+  if (ownFills && unhedgedFills && typeof unhedgedFills.hydrate === 'function') {
     unhedgedFills.hydrate().catch((e) => console.error('[UNHEDGED] fill hydrate', e && e.message));
   }
 
-  const missTape = typeof ctx.logAsync === 'function'
+  const missTape = enableLocks && typeof ctx.logAsync === 'function'
     ? createPolyMissTape({ logAsync: ctx.logAsync })
     : null;
 
   function persistLockTape(evaluation, status, extra) {
-    if (!missTape) return { persisted: false, reason: 'no_logger' };
+    if (!enableLocks || !missTape) return { persisted: false, reason: 'no_logger' };
     return missTape.persist(evaluation, status, extra);
   }
 
   function persistUnhedgedShadow(rfq, extra = {}) {
+    if (!enableUnhedged) return;
     shadowUnhedgedMiss(rfq, {
       venue: 'polymarket',
       lockSkipReason: extra.skipReason || null,
       supabase: ctx.supabase,
       persist: async (row, meta) => {
-        unhedgedFills.remember(row);
+        if (unhedgedFills) unhedgedFills.remember(row);
         if (typeof ctx.persistUnhedged === 'function') await ctx.persistUnhedged(row, meta);
         else if (ctx.supabase) {
           const out = await persistUnhedgedRfq(ctx.supabase, row);
-          if (out && out.alreadyFilled) {
+          if (out && out.alreadyFilled && unhedgedFills) {
             unhedgedFills.remember({ venue: row.venue, rfq_id: row.rfq_id, status: 'filled' });
           }
         }
       },
       env,
       priceCache: unhedgedPrices,
-      onPersisted: (row) => unhedgedFills.remember(row),
+      onPersisted: (row) => { if (unhedgedFills) unhedgedFills.remember(row); },
     });
   }
 
@@ -1179,6 +1189,10 @@ function startPolymarketRfqLoop(ctx = {}) {
       }
       persistLockTape(evaluation, 'declined');
       return evaluation;
+    }
+
+    if (!enableLocks) {
+      return { ...evaluation, post: false, reason: 'locks_off' };
     }
 
     const gate = shouldPostNow(evaluation, { live });
@@ -1374,16 +1388,19 @@ function startPolymarketRfqLoop(ctx = {}) {
         `[${MODE}] RESERVE RELEASED closed ${quote.label || ''} quote_id=${id} rfq=${rfqId}`
       );
     }
-    unhedgedFills.onClosed({
-      venue: 'polymarket',
-      rfqId,
-      extra: evt,
-      rfq,
-      symbol: rfq.symbol || rfq.ticker,
-    }).catch((e) => console.error('[UNHEDGED] fill close', e && e.message));
+    if (enableUnhedged && unhedgedFills) {
+      unhedgedFills.onClosed({
+        venue: 'polymarket',
+        rfqId,
+        extra: evt,
+        rfq,
+        symbol: rfq.symbol || rfq.ticker,
+      }).catch((e) => console.error('[UNHEDGED] fill close', e && e.message));
+    }
   }
 
   function noteUnhedgedFillEvent(evt) {
+    if (!enableUnhedged || !unhedgedFills) return;
     const rfq = (evt && evt.rfq) || {};
     const quote = (evt && evt.quote) || {};
     const rfqId = rfq.id || rfq.rfqId || quote.rfqId || quote.rfq_id || (evt && evt.rfqId);
@@ -1589,7 +1606,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start`, e.message));
   }, 2000);
   let fillTimer = null;
-  if (ownFills) {
+  if (ownFills && unhedgedFills) {
     fillTimer = setInterval(() => {
       unhedgedFills.tick().catch((e) => console.error('[UNHEDGED] fill tick', e && e.message));
     }, ctx.unhedgedFillMs != null ? ctx.unhedgedFillMs : (ctx.startWs === false ? 60 * 60 * 1000 : 15000));
@@ -1619,6 +1636,8 @@ function startPolymarketRfqLoop(ctx = {}) {
     seenRfqs,
     missTape,
     live,
+    enableLocks,
+    enableUnhedged,
     marketCache,
     unhedgedFills,
     fetchUnhedgedRfq: fetchUnhedgedPmRfq,

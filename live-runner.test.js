@@ -84,22 +84,24 @@ assert.ok(
   /combo_submissions'\)\.insert\(\{[\s\S]*venue:\s*'kalshi'/.test(shadowSrc),
   'shadow-runner Combo Locks inserts must stamp venue kalshi'
 );
-assert.ok(
-  liveSrc.includes('fetchPolymarketUnhedgedRfq'),
-  'shared tracker Poly fetchRfq must call fetchPolymarketUnhedgedRfq, not wait for polyLoop'
-);
 assert.ok(!/polyLoop\.fetchUnhedgedRfq/.test(liveSrc));
 assert.ok(
   !/from\('unhedged_rfqs'\)[\s\S]{0,160}\.select\([^)]*market_ticker/.test(liveSrc),
   'live-runner must not select market_ticker from unhedged_rfqs'
 );
 assert.ok(
-  /http:\s*polyUnhedgedHttp \|\| undefined/.test(liveSrc),
-  'quoting loop should reuse the same Poly HTTP the fill tracker already has'
+  /enableUnhedged:\s*runUnhedged/.test(liveSrc) &&
+    /http:\s*\(runUnhedged && polyUnhedgedHttp\) \|\| undefined/.test(liveSrc),
+  'Poly quoting loop gets unhedged HTTP only when WORKER_MODE=all'
 );
 assert.ok(
   /UNHEDGED_RFQ_LIVE=\$\{isUnhedgedRfqLive\(process\.env\) \? 'on' : 'off'\}/.test(liveSrc),
   'UNHEDGED_RFQ_LIVE must stay off unless explicitly enabled'
+);
+assert.ok(
+  /require\('\.\/worker-mode'\)/.test(liveSrc) &&
+    /shouldRunUnhedged\(process\.env\)/.test(liveSrc),
+  'Combo Locks must resolve WORKER_MODE before scheduling unhedged work'
 );
 assert.ok(
   liveSrc.includes('quoteFailureSkipReason'),
@@ -304,8 +306,8 @@ assert.ok(
   'both REST pools must be warmed so the first quote POST is not a cold TLS'
 );
 assert.ok(
-  /setImmediate\(\(\) => \{[\s\S]*?shadowUnhedgedMiss\(missRfq/.test(liveSrc),
-  'unhedged miss persist must yield so a matched lock can POST first'
+  /if \(runUnhedged\) \{[\s\S]*?setImmediate\(\(\) => \{[\s\S]*?shadowUnhedgedMiss\(missRfq/.test(liveSrc),
+  'unhedged miss persist is WORKER_MODE=all only and must yield so a lock can POST first'
 );
 assert.ok(
   /setImmediate\(\(\) => \{[\s\S]*?RFQ-SAMPLE/.test(liveSrc) &&
@@ -317,17 +319,25 @@ assert.ok(
   /function unlessQuoteHot\(/.test(liveSrc) &&
     /setInterval\(unlessQuoteHot\(\(\) => \{ refresh\(\); \}\)/.test(liveSrc) &&
     /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?cancelUnacceptedQuotes/.test(liveSrc) &&
-    /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?reconcileSkipTapes/.test(liveSrc) &&
-    /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?unhedgedFills\.tick/.test(liveSrc),
-  'refresh / cancel / skip-tape / unhedged fill must pause while quote-hot'
+    /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?reconcileSkipTapes/.test(liveSrc),
+  'refresh / cancel / skip-tape must pause while quote-hot'
 );
 assert.ok(
-  /shouldPause:\s*\(\) => quoteHot\.inFlight/.test(liveSrc),
-  'unhedged /markets refresh must pause while a Combo Lock POST is in flight'
+  !/setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?unhedgedFills\.tick/.test(liveSrc),
+  'combo default must not schedule unhedged fill ticks on the Combo Locks timer'
 );
 assert.ok(
-  /Process-split \(unhedged as its own Railway job\) is the NEXT PR/.test(liveSrc),
-  'document that the unhedged service split is the next PR, not this one'
+  /if \(runUnhedged\) \{[\s\S]*?startUnhedgedSide\(/.test(liveSrc) &&
+    /shouldPause:\s*\(\) => quoteHot\.inFlight/.test(liveSrc),
+  'WORKER_MODE=all still boots unhedged via startUnhedgedSide and pauses /markets while quote-hot'
+);
+assert.ok(
+  /Unhedged \/markets, fill ticks, and shadow miss are off/.test(liveSrc),
+  'combo default startup log says unhedged is a separate Railway job'
+);
+assert.ok(
+  /WORKER_MODE=unhedged — use start-unhedged/.test(liveSrc),
+  'live-runner must refuse WORKER_MODE=unhedged (wrong entrypoint)'
 );
 assert.ok(
   /skip_reason: 'rfq_closed'/.test(liveSrc) &&
@@ -392,11 +402,12 @@ assert.ok(
 );
 
 assert.ok(
-  /unhedgedFills\.tick\(\)[\s\S]{0,120}FILL_TICK_MS/.test(liveSrc),
-  'unhedged fill tick must not share the 15s skip-tape interval'
+  !/unhedgedFills\.tick\(\)[\s\S]{0,80}SKIP_TAPE_TICK_MS/.test(liveSrc)
 );
 assert.ok(
-  !/unhedgedFills\.tick\(\)[\s\S]{0,80}SKIP_TAPE_TICK_MS/.test(liveSrc)
+  /enableLocks:\s*true/.test(liveSrc) &&
+    !/enableUnhedged:\s*true/.test(liveSrc),
+  'Combo Locks Poly path keeps lock quoting; unhedged is env-gated not hard-on'
 );
 
 console.log('live-runner.test.js ok');
