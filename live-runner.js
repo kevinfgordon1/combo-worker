@@ -18,7 +18,8 @@
 //   console. Quote pool is re-warmed every QUOTE_WARM_MS (not 45s) so an
 //   idle LB cannot leave a dead socket for the next auction. [LAT]
 //   match/pre/post/total ms on every attempt; 409 rfq_closed is logged as
-//   QUOTE LATE with that latency (null quote_id).
+//   QUOTE LATE with that latency (null quote_id). Successful QUOTED
+//   Telegram includes the same match→POST total ms as LATE.
 // START GATE: never quote (and cancel open quotes) once any leg's start <= now.
 //   Started still wins; the cap is a second gate.
 //   Polymarket confirm + resting-quote cancel uses the same startedFor /
@@ -1371,13 +1372,14 @@ async function onRfq(rfq, env) {
       const reservedContracts = size.source === 'dollar'
         ? contractsFromQuoteResponse(result, d.contracts)
         : d.contracts;
+      const totalMs = (t3 - t0).toFixed(1);
 
       // Step 0 — latency log
       console.log(formatQuoteLatency({
         matchMs: (t1 - t0).toFixed(1),
         preMs: (t2 - t1).toFixed(1),
         postMs: (t3 - t2).toFixed(1),
-        totalMs: (t3 - t0).toFixed(1),
+        totalMs,
         rfqId: rfq.rfqId,
         quoteId: result.id,
       }));
@@ -1412,6 +1414,7 @@ async function onRfq(rfq, env) {
       sendAlert(
         `✅ QUOTED — ${p.label}\n` +
         `rfq ${shortId(rfq.rfqId)} · quote ${shortId(result.id)}\n` +
+        `match→POST ${totalMs}ms\n` +
         `${reservedContracts} contracts · NO @ $${noBid}` +
         (size.source === 'dollar' ? ` · YES @ $${yesBid}` : '') +
         (p.fill_american != null ? ` · ${sgn(p.fill_american)}` : '')
