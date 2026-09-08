@@ -136,10 +136,10 @@ function createRateLimitedLogger({
 } = {}) {
   const buckets = new Map();
   function log(key, message, extra) {
-    const b = buckets.get(key) || { n: 0, lastAt: 0 };
+    const b = buckets.get(key) || { n: 0, lastAt: -Infinity };
     b.n += 1;
     const t = now();
-    if (b.n === 1 || t - b.lastAt >= intervalMs) {
+    if (t - b.lastAt >= intervalMs) {
       const suffix = b.n > 1 ? ` (${b.n} in ${intervalMs}ms)` : '';
       if (extra !== undefined) write(`${message}${suffix}`, extra);
       else write(`${message}${suffix}`);
