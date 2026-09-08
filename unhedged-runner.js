@@ -16,6 +16,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
+const { Agent, fetch: undiciFetch } = require('undici');
 const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, clockOffset, signedRequest } = require('./kalshi-auth');
 const { createKalshiClient } = require('./kalshi-http');
@@ -24,11 +25,33 @@ const { startPolymarketRfqLoop } = require('./polymarket-rfq');
 const { isUnhedgedRfqShadow, isUnhedgedRfqLive } = require('./unhedged-rfq');
 const { startUnhedgedSide, handleKalshiUnhedgedCreated } = require('./unhedged-boot');
 const { querySoftFailed, applyRefreshParlays } = require('./refresh-state');
+const {
+  createUnhedgedSupabaseClient,
+  isTransientSupabaseFailure,
+  formatSupabaseFailure,
+  createRateLimitedLogger,
+} = require('./supabase-http');
 
 const MODE = 'UNHEDGED';
 const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const supabase = createUnhedgedSupabaseClient({
+  createClient,
+  env: process.env,
+  fetch: undiciFetch,
+  Agent,
+});
+const unhandledLog = createRateLimitedLogger();
+process.on('unhandledRejection', (err) => {
+  if (isTransientSupabaseFailure(err) || /fetch failed/i.test(String(err && err.message))) {
+    unhandledLog.log(
+      'unhandled',
+      `[${MODE}] unhandled fetch ${formatSupabaseFailure(err)}`
+    );
+    return;
+  }
+  console.error(`[${MODE}] unhandledRejection`, err);
+});
 const kalshiHttp = createKalshiClient();
 const WARM_PATH = '/trade-api/v2/exchange/status';
 

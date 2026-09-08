@@ -43,6 +43,21 @@ Quote-watcher stays parked on both jobs.
 
 4. Combo Locks accounting tables stay shared and unchanged: `combo_parlays`, `combo_settings`, `combo_submissions`, `combo_fills`, `combo_worker_stats`. Unhedged reads `combo_parlays` (soft-fail retain) so lock-matched RFQs are skipped, and writes `unhedged_rfqs` only.
 
+## Unhedged persist / env re-check
+
+`unhedged-rfq` writes `public.unhedged_rfqs` through PostgREST (`SUPABASE_URL` + `SUPABASE_SERVICE_KEY`). `TypeError: fetch failed` is a **transport** error (undici connect / DNS / Cloudflare 520/522), not a schema or RLS error. A copied env from Combo Locks is usually correct; still confirm on the **unhedged-rfq** service (not Combo Locks):
+
+- `SUPABASE_URL` is `https://<project-ref>.supabase.co` (not a `postgresql://` URI, not wrapped in quotes)
+- `SUPABASE_SERVICE_KEY` is the **service_role** JWT (same value as Combo Locks). Anon/publishable keys fail RLS, they do not produce `fetch failed`.
+- `UNHEDGED_RFQ_LIVE` unset / `false` / `off` — paper/shadow only
+- `UNHEDGED_RFQ_SHADOW` unset or `true`
+- `WORKER_MODE` unset or `unhedged`
+- Start command: `npm run start:unhedged`
+
+Optional: `SUPABASE_FETCH_IPV4=1` forces IPv4 if Railway DNS/IPv6 to `*.supabase.co` is broken.
+
+The Unhedged job uses a dedicated undici Agent + bounded retries + rate-limited error logs. Combo Locks quoting is unchanged.
+
 ## Local
 
 ```bash

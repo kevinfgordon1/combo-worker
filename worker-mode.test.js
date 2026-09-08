@@ -69,6 +69,19 @@ assert.strictEqual(shouldRunUnhedged({ WORKER_MODE: 'all' }), true);
   assert.ok(/startUnhedgedSide/.test(unhedgedSrc));
   assert.ok(/handleKalshiUnhedgedCreated/.test(unhedgedSrc));
   assert.ok(/applyRefreshParlays/.test(unhedgedSrc), 'lock-skip snapshot must soft-fail retain parlays');
+  assert.ok(
+    /createUnhedgedSupabaseClient/.test(unhedgedSrc),
+    'Unhedged job uses a dedicated fetch/retry client for unhedged_rfqs'
+  );
+  assert.ok(/undiciFetch/.test(unhedgedSrc) || /createSupabaseFetch/.test(unhedgedSrc));
+
+  const liveSrc = fs.readFileSync(path.join(__dirname, 'live-runner.js'), 'utf8');
+  assert.ok(
+    /createClient\(process\.env\.SUPABASE_URL, process\.env\.SUPABASE_SERVICE_KEY\)/.test(liveSrc),
+    'Combo Locks quoting path keeps stock createClient — do not share the Unhedged Agent'
+  );
+  assert.ok(!/createUnhedgedSupabaseClient/.test(liveSrc));
+  assert.ok(!/require\('\.\/supabase-http'\)/.test(liveSrc));
 }
 
 console.log('worker-mode.test.js ok');
