@@ -70,6 +70,7 @@ function startClient(extra = {}) {
     stallMs: extra.stallMs != null ? extra.stallMs : 60_000,
     onStatus: (s, i) => statuses.push({ s, i }),
     onRfqCreated: extra.onRfqCreated,
+    onQuoteExecuted: extra.onQuoteExecuted,
   });
   client.start();
   return { client, statuses };
@@ -204,6 +205,28 @@ async function runAsync() {
     }));
     assert.strictEqual(created[created.length - 1], 'rfq-hot', 'non-deferred rfq_created stays sync');
     assert.strictEqual(created.filter((id) => id === 'rfq-hot').length, 1);
+    client.stop();
+  }
+
+  {
+    FakeWs.instances = [];
+    const executed = [];
+    const { client } = startClient({ onQuoteExecuted: (evt) => executed.push(evt) });
+    await wait(15);
+    FakeWs.instances[0].emit('message', JSON.stringify({
+      type: 'quote_executed',
+      msg: {
+        quote_id: '23e32a31-748d-4cc5-9bbb-6769ad52a8e1',
+        order_id: '01a081a8-4a08-7823-a57f-2273007cd403',
+        market_ticker: 'KXMVECROSSCATEGORY0-SHARD1-S20260E99CE0B6F9-BD36A940BEC',
+        contracts_fp: '98.00',
+      },
+    }));
+    assert.strictEqual(executed.length, 1);
+    assert.strictEqual(executed[0].quoteId, '23e32a31-748d-4cc5-9bbb-6769ad52a8e1');
+    assert.strictEqual(executed[0].orderId, '01a081a8-4a08-7823-a57f-2273007cd403');
+    assert.strictEqual(executed[0].contracts, 98);
+    assert.match(executed[0].marketTicker, /CROSSCATEGORY/);
     client.stop();
   }
 

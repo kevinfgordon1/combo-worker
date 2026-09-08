@@ -9,12 +9,13 @@
 // It also DMs you on a new real combo fill — this is the true "you actually got filled"
 // alert, distinct from the worker's "quote posted" alert.
 //
-// Attribution note: Kalshi's fills carry no quote/RFQ id, so a fill can't be tied to a
-// specific quote by id. We flag combo (MVE) maker fills and best-effort match a parlay
-// by collection prefix (ignoring -R/-S) or, if that misses, a unique active no_bid
-// match via fillView. Otherwise parlay_id is left null (still recorded) — never invent
-// remaining. When attributed, Telegram shows session filled/limit and remaining from
-// the DB sum of combo_fills after this upsert.
+// Attribution note: Kalshi's fills carry no quote/RFQ id. CROSSCATEGORY shard
+// tickers also miss mve_collection (KXMVESPORTSMULTIGAMEEXTENDED-R). We match:
+//   1) combo_submissions.order_id  2) live-runner combo_fills twin
+//   3) unique collection / no_bid  4) unique recent quote window (partial OK)
+// Never guess when two parlays still fit. ignoreDuplicates used to freeze
+// parlay_id=null; we UPDATE when a later poll can attribute. Attributed fills
+// also stamp combo_submissions status=filled + order_id (History / lock card).
 //
 // Env (set on the host — SAME values as the worker; read-only use):
 //   KALSHI_KEY_ID          public Key ID
@@ -29,7 +30,15 @@
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
-const { attributeParlay, sumFillCounts, formatRealFillAlert } = require('./fills-attr');
+const {
+  attributeComboFill,
+  sumAttributedFillCounts,
+  formatRealFillAlert,
+  existingFillNeedsParlay,
+  submissionFilledPatch,
+  canStampSubmission,
+  QUOTE_WINDOW_BEFORE_MS,
+} = require('./fills-attr');
 
 const MODE = 'FILLS';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -64,16 +73,69 @@ async function loadParlays() {
 }
 
 // Ground-truth filled contracts for a parlay (includes the row just upserted).
+// Dedupes live-runner order_id twins against the Kalshi fill_id row.
 async function filledSumForParlay(parlayId) {
   const { data, error } = await supabase
     .from('combo_fills')
-    .select('count')
+    .select('count,fill_id,order_id,raw')
     .eq('parlay_id', parlayId);
   if (error) {
     console.error(`[${MODE}] fill sum failed`, error.message);
     return null;
   }
-  return sumFillCounts(data || []);
+  return sumAttributedFillCounts(data || []);
+}
+
+async function loadRecentSubmissions() {
+  const cutoff = new Date(Date.now() - QUOTE_WINDOW_BEFORE_MS - 3600 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from('combo_submissions')
+    .select('id,parlay_id,quote_id,order_id,contracts,status,created_at,label')
+    .or('quote_id.not.is.null,order_id.not.is.null')
+    .gte('created_at', cutoff)
+    .limit(500);
+  if (error) {
+    console.error(`[${MODE}] submissions load failed`, error.message);
+    return [];
+  }
+  return data || [];
+}
+
+async function loadFillsByOrderId(orderId) {
+  if (!orderId) return [];
+  const { data, error } = await supabase
+    .from('combo_fills')
+    .select('fill_id,order_id,parlay_id,count,raw')
+    .eq('order_id', orderId);
+  if (error) {
+    console.error(`[${MODE}] fills-by-order failed`, error.message);
+    return [];
+  }
+  return data || [];
+}
+
+async function findExistingFill(fillId) {
+  const { data, error } = await supabase
+    .from('combo_fills')
+    .select('id,parlay_id')
+    .eq('fill_id', fillId)
+    .maybeSingle();
+  if (error) {
+    console.error(`[${MODE}] fill lookup failed`, error.message);
+    return null;
+  }
+  return data || null;
+}
+
+async function stampSubmissionFilled(attr, fill) {
+  if (!attr || !fill) return;
+  const sub = attr.submission;
+  if (!canStampSubmission(sub, fill)) return;
+  const { error } = await supabase
+    .from('combo_submissions')
+    .update(submissionFilledPatch(fill))
+    .eq('id', sub.id);
+  if (error) console.error(`[${MODE}] stamp submission failed`, error.message);
 }
 
 // Signed READ of the fills endpoint. No query string is signed (Kalshi signs ts+METHOD+path only).
@@ -121,28 +183,55 @@ async function poll() {
     if (!fills.length) return;
 
     let maxTs = lastTs;
+    let submissions = null;
     for (const raw of fills) {
       const row = normalizeFill(raw);
       if (!row.fill_id) continue;
       if (raw.ts && raw.ts > maxTs) maxTs = raw.ts;
 
-      const parlay = row.is_combo && !row.is_taker
-        ? attributeParlay(row.ticker, row, activeParlays)
-        : null;
+      let attr = null;
+      if (row.is_combo && !row.is_taker) {
+        if (!submissions) submissions = await loadRecentSubmissions();
+        const existingFills = await loadFillsByOrderId(row.order_id);
+        attr = attributeComboFill(row.ticker, row, activeParlays, {
+          submissions,
+          existingFills,
+        });
+      }
+      const parlay = attr && attr.parlay ? attr.parlay : null;
       row.parlay_id = parlay ? parlay.id : null;
 
-      // Upsert — ignore if we've already recorded this fill_id (dedupe across overlapping polls).
-      const { data: inserted, error } = await supabase
-        .from('combo_fills')
-        .upsert(row, { onConflict: 'fill_id', ignoreDuplicates: true })
-        .select('id');
-      if (error) { console.error(`[${MODE}] upsert failed`, error.message); continue; }
+      const existing = await findExistingFill(row.fill_id);
+      if (!existing) {
+        const { error } = await supabase.from('combo_fills').insert(row);
+        if (error) { console.error(`[${MODE}] insert failed`, error.message); continue; }
+        if (row.is_combo && !row.is_taker) {
+          console.log(`[${MODE}] NEW REAL FILL ${row.ticker} count=${row.count} ${parlay ? '→ ' + parlay.label : '(unattributed)'}`);
+          const filled = parlay ? await filledSumForParlay(parlay.id) : null;
+          await sendAlert(formatRealFillAlert({ parlay, row, filled }));
+        }
+      } else if (existingFillNeedsParlay(existing, row.parlay_id)) {
+        // First write often lands unattributed (shard ticker + nearby no_bids).
+        // ignoreDuplicates used to freeze parlay_id=null forever.
+        const { error } = await supabase
+          .from('combo_fills')
+          .update({
+            parlay_id: row.parlay_id,
+            ticker: row.ticker,
+            count: row.count,
+            order_id: row.order_id,
+            no_price: row.no_price,
+            yes_price: row.yes_price,
+          })
+          .eq('fill_id', row.fill_id);
+        if (error) console.error(`[${MODE}] reattribute failed`, error.message);
+        else {
+          console.log(`[${MODE}] REATTRIBUTED ${row.ticker} count=${row.count} → ${parlay.label || parlay.id}`);
+        }
+      }
 
-      // inserted is non-empty only when this was a genuinely NEW fill row.
-      if (inserted && inserted.length && row.is_combo && !row.is_taker) {
-        console.log(`[${MODE}] NEW REAL FILL ${row.ticker} count=${row.count} ${parlay ? '→ ' + parlay.label : '(unattributed)'}`);
-        const filled = parlay ? await filledSumForParlay(parlay.id) : null;
-        await sendAlert(formatRealFillAlert({ parlay, row, filled }));
+      if (row.is_combo && !row.is_taker && parlay) {
+        await stampSubmissionFilled(attr, row);
       }
     }
     if (maxTs > lastTs) lastTs = maxTs;

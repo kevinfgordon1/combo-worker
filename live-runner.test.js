@@ -81,6 +81,24 @@ assert.ok(
   'Kalshi filled insert-fallback must include venue kalshi'
 );
 assert.ok(
+  /require\('\.\/fills-attr'\)/.test(liveSrc) && /liveRunnerFillRow/.test(liveSrc),
+  'quote_executed must persist combo_fills via liveRunnerFillRow (parlay_id for Combo Locks)'
+);
+assert.ok(
+  /async function persistExecutedFill/.test(liveSrc)
+    && /combo_fills persist/.test(liveSrc)
+    && /onQuoteExecuted submission/.test(liveSrc),
+  'fill persist must not share a try/catch with submissions (Telegram used to fire after both failed)'
+);
+assert.ok(
+  /pendingFromSubmission/.test(liveSrc) && /recovered quote_id/.test(liveSrc),
+  'quote_executed after restart must recover the quote from combo_submissions'
+);
+assert.ok(
+  /alreadyFilled/.test(liveSrc),
+  'recovered quote_executed must not re-Telegram or re-count a row already stamped filled'
+);
+assert.ok(
   /combo_submissions'\)\.insert\(\{[\s\S]*venue:\s*'kalshi'/.test(shadowSrc),
   'shadow-runner Combo Locks inserts must stamp venue kalshi'
 );
