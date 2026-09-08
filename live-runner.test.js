@@ -308,6 +308,28 @@ assert.ok(
   'unhedged miss persist must yield so a matched lock can POST first'
 );
 assert.ok(
+  /setImmediate\(\(\) => \{[\s\S]*?RFQ-SAMPLE/.test(liveSrc) &&
+    /setImmediate\(\(\) => \{[\s\S]*?EMPTY-LEGS/.test(liveSrc) &&
+    /setImmediate\(\(\) => \{[\s\S]*?describeLockOverlap/.test(liveSrc),
+  'RFQ-SAMPLE / EMPTY-LEGS / LOCK-MISS logs must not run on the quote tick'
+);
+assert.ok(
+  /function unlessQuoteHot\(/.test(liveSrc) &&
+    /setInterval\(unlessQuoteHot\(\(\) => \{ refresh\(\); \}\)/.test(liveSrc) &&
+    /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?cancelUnacceptedQuotes/.test(liveSrc) &&
+    /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?reconcileSkipTapes/.test(liveSrc) &&
+    /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?unhedgedFills\.tick/.test(liveSrc),
+  'refresh / cancel / skip-tape / unhedged fill must pause while quote-hot'
+);
+assert.ok(
+  /shouldPause:\s*\(\) => quoteHot\.inFlight/.test(liveSrc),
+  'unhedged /markets refresh must pause while a Combo Lock POST is in flight'
+);
+assert.ok(
+  /Process-split \(unhedged as its own Railway job\) is the NEXT PR/.test(liveSrc),
+  'document that the unhedged service split is the next PR, not this one'
+);
+assert.ok(
   /skip_reason: 'rfq_closed'/.test(liveSrc) &&
     /QUOTE LATE/.test(liveSrc) &&
     /formatQuoteLatency/.test(liveSrc) &&

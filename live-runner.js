@@ -69,6 +69,10 @@
 //   (never wait on polyLoop, never Kalshi tape).
 //   When a persisted pregame row later fills, UPDATE status=filled.
 //   NCAAF is out of scope.
+//   Process-split (unhedged as its own Railway job) is the NEXT PR — not
+//   this one. Combo Locks stay one worker with Kalshi + Polymarket. This
+//   PR only pauses unhedged/skip-tape/cancel ticks while quote-hot and
+//   defers miss logs so they cannot steal the POST callback.
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
@@ -465,6 +469,16 @@ async function withQuoteHot(fn) {
   }
 }
 
+// Background timers (unhedged fill, /markets refresh, skip-tape, 20s
+// cancel) must not run on the same tick as a Combo Lock POST/confirm.
+// Full unhedged process-split is the next PR; this only yields.
+function unlessQuoteHot(fn) {
+  return () => {
+    if (quoteHot.inFlight) return;
+    return fn();
+  };
+}
+
 async function postQuote(rfqId, noBid, yesBid = YES_DECLINE, restRemainder) {
   return withQuoteHot(async () => {
     const body = JSON.stringify(buildQuoteBody(rfqId, noBid, yesBid, restRemainder));
@@ -665,12 +679,16 @@ function onRfqDeleted(evt, env) {
     noteReleased(id, quote, 'closed');
   }
   if (unhedgedFills && rfqId) {
-    unhedgedFills.onClosed({
-      venue: 'kalshi',
-      rfqId,
-      extra: env,
-      rfq: evt,
-    }).catch((e) => console.error('[UNHEDGED] fill close', e && e.message));
+    const closedEvt = evt;
+    const closedEnv = env;
+    setImmediate(() => {
+      unhedgedFills.onClosed({
+        venue: 'kalshi',
+        rfqId,
+        extra: closedEnv,
+        rfq: closedEvt,
+      }).catch((e) => console.error('[UNHEDGED] fill close', e && e.message));
+    });
   }
 }
 
@@ -1183,12 +1201,16 @@ async function onRfq(rfq, env) {
   if (rfq.targetCostDollars > 0) counts.dollarRfqs++;
   if (counts.combos <= 12) {
     const keys = rfq.legKeys || [];
-    console.log(
-      `[${MODE}] RFQ-SAMPLE n=${counts.combos} rfq=${rfq.rfqId} ` +
-      `contracts=${rfq.contracts != null ? rfq.contracts : '(none)'} ` +
-      `dollar=${rfq.targetCostDollars != null ? `$${rfq.targetCostDollars}` : '(none)'} ` +
-      `legs=${keys.length} keys=${keys.join('|') || '(none)'}`
-    );
+    const sampleN = counts.combos;
+    const sampleRfq = rfq;
+    setImmediate(() => {
+      console.log(
+        `[${MODE}] RFQ-SAMPLE n=${sampleN} rfq=${sampleRfq.rfqId} ` +
+        `contracts=${sampleRfq.contracts != null ? sampleRfq.contracts : '(none)'} ` +
+        `dollar=${sampleRfq.targetCostDollars != null ? `$${sampleRfq.targetCostDollars}` : '(none)'} ` +
+        `legs=${keys.length} keys=${keys.join('|') || '(none)'}`
+      );
+    });
   }
 
   const p = matchParlay(rfq, parlays);
@@ -1200,27 +1222,34 @@ async function onRfq(rfq, env) {
     if (!keys.length) {
       counts.emptyLegs++;
       if (counts.emptyLegs <= 8) {
+        const missRfq = rfq;
         const raw = env && env.msg && typeof env.msg === 'object' ? env.msg : {};
-        const nested = raw.rfq && typeof raw.rfq === 'object' ? raw.rfq : {};
-        console.log(
-          `[${MODE}] EMPTY-LEGS rfq=${rfq.rfqId} ` +
-          `msgKeys=${Object.keys(raw).join(',') || '(none)'} ` +
-          `nestedKeys=${Object.keys(nested).join(',') || '(none)'} ` +
-          `collection=${rfq.mveCollection || '(none)'} ` +
-          `contracts=${rfq.contracts != null ? rfq.contracts : '(none)'} ` +
-          `dollar=${rfq.targetCostDollars != null ? `$${rfq.targetCostDollars}` : '(none)'}`
-        );
+        setImmediate(() => {
+          const nested = raw.rfq && typeof raw.rfq === 'object' ? raw.rfq : {};
+          console.log(
+            `[${MODE}] EMPTY-LEGS rfq=${missRfq.rfqId} ` +
+            `msgKeys=${Object.keys(raw).join(',') || '(none)'} ` +
+            `nestedKeys=${Object.keys(nested).join(',') || '(none)'} ` +
+            `collection=${missRfq.mveCollection || '(none)'} ` +
+            `contracts=${missRfq.contracts != null ? missRfq.contracts : '(none)'} ` +
+            `dollar=${missRfq.targetCostDollars != null ? `$${missRfq.targetCostDollars}` : '(none)'}`
+          );
+        });
       }
     }
     counts.lockMiss++;
     if (counts.lockMiss <= 8 || counts.lockMiss % 2000 === 0) {
-      const overlap = describeLockOverlap(rfq, parlays);
-      console.log(
-        `[${MODE}] LOCK-MISS rfq=${rfq.rfqId} legs=${keys.length} ` +
-        `keys=${keys.join('|') || '(none)'} ` +
-        `active=${parlays.map((x) => x.label || x.id).join(',') || '(none)'}` +
-        (overlap ? ` overlap=${overlap}` : '')
-      );
+      const missRfq = rfq;
+      const missKeys = keys;
+      setImmediate(() => {
+        const overlap = describeLockOverlap(missRfq, parlays);
+        console.log(
+          `[${MODE}] LOCK-MISS rfq=${missRfq.rfqId} legs=${missKeys.length} ` +
+          `keys=${missKeys.join('|') || '(none)'} ` +
+          `active=${parlays.map((x) => x.label || x.id).join(',') || '(none)'}` +
+          (overlap ? ` overlap=${overlap}` : '')
+        );
+      });
     }
     // Combo Locks miss — shadow in-scope unhedged RFQs only. Never quotes.
     // Defer classify/price/persist so a later matched lock in this tick can
@@ -1501,6 +1530,7 @@ async function main() {
 
   unhedgedPrices = createUnhedgedPriceCache({
     env: process.env,
+    shouldPause: () => quoteHot.inFlight,
     fetchKalshiMarkets: async (series, cursor) => {
       const qs = new URLSearchParams({
         series_ticker: series,
@@ -1514,14 +1544,14 @@ async function main() {
   unhedgedPrices.start();
 
   await refresh();
-  setInterval(refresh, 30000);
-  setInterval(() => {
+  setInterval(unlessQuoteHot(() => { refresh(); }), 30000);
+  setInterval(unlessQuoteHot(() => {
     cancelUnacceptedQuotes().catch((e) => console.error(`[${MODE}] cancel-unaccepted tick`, e.message));
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start tick`, e.message));
-  }, 2000);
-  setInterval(() => {
+  }), 2000);
+  setInterval(unlessQuoteHot(() => {
     reconcileSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape tick`, e.message));
-  }, SKIP_TAPE_TICK_MS);
+  }), SKIP_TAPE_TICK_MS);
 
   polyUnhedgedHttp = createPolyUnhedgedHttp();
   unhedgedFills = createUnhedgedFillTracker({
@@ -1531,9 +1561,9 @@ async function main() {
     fetchTrades: fetchUnhedgedVenueTrades,
   });
   unhedgedFills.hydrate().catch((e) => console.error('[UNHEDGED] fill hydrate', e && e.message));
-  setInterval(() => {
+  setInterval(unlessQuoteHot(() => {
     unhedgedFills.tick().catch((e) => console.error('[UNHEDGED] fill tick', e && e.message));
-  }, FILL_TICK_MS);
+  }), FILL_TICK_MS);
 
   // Step 2 — pre-warm + keep warm (15s so LB idle-kill cannot cold-start POST)
   await warmConnection();
