@@ -104,6 +104,43 @@ function createRepeatGuard({
     }
   }
 
+  function peek(fingerprint, at) {
+    const t = at != null ? at : nowMs();
+    if (!fingerprint || isAnonymousFingerprint(fingerprint) || !(cooldownMs > 0)) {
+      return { skip: false, cooldownMs, gated: false };
+    }
+    const prev = map.get(fingerprint);
+    if (prev && t - prev.at < cooldownMs) {
+      return {
+        skip: true,
+        remainingMs: cooldownMs - (t - prev.at),
+        skipCount: prev.skipCount,
+        skipAlerted: prev.skipAlerted,
+        cooldownMs,
+        firstAt: prev.at,
+        gated: true,
+      };
+    }
+    return { skip: false, cooldownMs, gated: true };
+  }
+
+  function noteSkip(fingerprint, at) {
+    const seen = peek(fingerprint, at);
+    if (!seen.skip) return seen;
+    const prev = map.get(fingerprint);
+    prev.skipCount += 1;
+    const alert = !prev.skipAlerted;
+    prev.skipAlerted = true;
+    return {
+      ...seen,
+      skipCount: prev.skipCount,
+      alert,
+      gated: true,
+    };
+  }
+
+  // Start the window only after a successful quote POST. Claiming before
+  // send turned 409 rfq_closed into a 90s skip of the next live auction.
   function claim(fingerprint, at) {
     const t = at != null ? at : nowMs();
     if (!fingerprint || isAnonymousFingerprint(fingerprint) || !(cooldownMs > 0)) {
@@ -130,6 +167,8 @@ function createRepeatGuard({
   }
 
   return {
+    peek,
+    noteSkip,
     claim,
     get size() { return map.size; },
     cooldownMs,

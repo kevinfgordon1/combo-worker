@@ -110,8 +110,30 @@ function quoteFailureSkipReason(message) {
   return isInsufficientFundsFailure(message) ? 'insufficient_balance' : null;
 }
 
+// 409 after the auction already executed / expired. Distinct from funding
+// (declined + skip_reason=insufficient_balance) and precision rejects.
+// Persist as unfilled + skip_reason=rfq_closed (null quote_id).
+function isRfqClosedFailure(message) {
+  return /rfq[_-]?closed|already[_ -]?closed/i.test(String(message || ''));
+}
+
+function quotePostFailReason(message) {
+  if (isInsufficientFundsFailure(message)) return 'insufficient_balance';
+  if (isRfqClosedFailure(message)) return 'rfq_closed';
+  return null;
+}
+
+function formatQuoteLatency({
+  matchMs, preMs, postMs, totalMs, rfqId, quoteId, failReason,
+} = {}) {
+  const fail = failReason ? ` FAIL reason=${failReason}` : '';
+  const q = quoteId ? ` quote=${quoteId}` : '';
+  return `[LAT] match=${matchMs} pre=${preMs} post=${postMs} total=${totalMs}ms${fail} rfq=${rfqId}${q}`;
+}
+
 // Telegram skip only. Funding still writes a declined skip_reason row.
 // Precision rejects (dollar-RFQ + yes_bid "0.00") stay console + unfilled.
+// rfq_closed stays loud — that is the late-POST race we are measuring.
 function isSilentQuoteFailure(message) {
   const msg = String(message || '');
   if (isInsufficientFundsFailure(msg)) return true;
@@ -213,4 +235,5 @@ module.exports = {
   shouldConfirmAccept, contractsFromQuoteResponse,
   buildQuoteBody, shouldPostQuote, isSilentQuoteFailure,
   isInsufficientFundsFailure, quoteFailureSkipReason,
+  isRfqClosedFailure, quotePostFailReason, formatQuoteLatency,
 };
