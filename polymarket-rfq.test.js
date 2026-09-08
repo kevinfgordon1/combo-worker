@@ -60,6 +60,23 @@ assert.ok(
   'UNHEDGED_RFQ_LIVE must stay off'
 );
 assert.ok(
+  /quoteLocks = ctx\.quoteLocks !== false/.test(polySrc) &&
+    /unhedgedEnabled = ctx\.unhedgedEnabled !== false/.test(polySrc),
+  'Poly loop must honor process-split flags (default on for back-compat)'
+);
+assert.ok(
+  /if \(!quoteLocks\) \{[\s\S]*reason: 'unhedged_only'/.test(polySrc),
+  'unhedged-only Poly loop must not POST even when POLYMARKET_RFQ_LIVE is on'
+);
+assert.ok(
+  /missTape = quoteLocks && typeof ctx\.logAsync/.test(polySrc),
+  'Combo Locks Miss tape stays off the unhedged-only process'
+);
+assert.ok(
+  /if \(!unhedgedEnabled\) return/.test(polySrc),
+  'locks-only Poly loop must not persist unhedged shadow'
+);
+assert.ok(
   /couldMatchActiveLocks\(rfq, locks\)/.test(polySrc),
   'quote matching gate must stay couldMatchActiveLocks'
 );
@@ -1542,6 +1559,108 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.strictEqual(lockShadow.action, 'quoteable');
   await new Promise((r) => setTimeout(r, 20));
   assert.strictEqual(unhedgedRows.length, beforeLock);
+
+  // Locks-only: still quoteable, never persist unhedged.
+  const locksOnlyRows = [];
+  let locksOnlyPosts = 0;
+  const locksOnlyLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'false',
+    },
+    http: {
+      async getUserId() { return { rfqUserId: 'rfquser_test' }; },
+      async listRfqs() { return { rfqs: [] }; },
+      async listQuotes() { return { quotes: [] }; },
+      async getCombo() { return { combos: [] }; },
+      async createQuote() { locksOnlyPosts += 1; throw new Error('locks-only test must not POST'); },
+      async confirmQuote() { throw new Error('locks-only test must not confirm'); },
+      async deleteQuote() { return { statusCode: 200 }; },
+      close() {},
+    },
+    startWs: false,
+    getParlays: () => [kalshiParlay],
+    fetchMarket: async (slug) => lockMarkets.get(slug) || null,
+    persistUnhedged: async (row) => { locksOnlyRows.push(row); },
+    unhedgedEnabled: false,
+    quoteLocks: true,
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  const locksOnlyMiss = await locksOnlyLoop.handleRfq({
+    id: 'rfq_locks_only_mlb3',
+    status: 'RFQ_STATUS_OPEN',
+    qtyDecimal: '8',
+    comboLegs: [
+      { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-bos-pit-2026-08-14-pit', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-nyy-bal-2026-08-14-nyy', side: 'SIDE_BUY' },
+    ],
+  });
+  assert.strictEqual(locksOnlyMiss.reason, 'no_lock_overlap');
+  const locksOnlyHit = await locksOnlyLoop.handleRfq({ ...pmRfq, id: 'rfq_locks_only_hit' });
+  assert.strictEqual(locksOnlyHit.action, 'quoteable');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(locksOnlyRows.length, 0);
+  assert.strictEqual(locksOnlyPosts, 0);
+  locksOnlyLoop.stop();
+
+  // Unhedged-only: persist unmatched; never POST even if POLYMARKET_RFQ_LIVE is on.
+  const unhedgedOnlyRows = [];
+  let unhedgedOnlyPosts = 0;
+  const unhedgedOnlyLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    http: {
+      async getUserId() { return { rfqUserId: 'rfquser_test' }; },
+      async listRfqs() { return { rfqs: [] }; },
+      async listQuotes() { return { quotes: [] }; },
+      async getCombo() { throw new Error('unhedged-only must not hydrate lock quotes'); },
+      async createQuote() { unhedgedOnlyPosts += 1; throw new Error('unhedged-only must not POST'); },
+      async confirmQuote() { throw new Error('unhedged-only must not confirm'); },
+      async deleteQuote() { return { statusCode: 200 }; },
+      close() {},
+    },
+    startWs: false,
+    getParlays: () => [kalshiParlay],
+    fetchMarket: async (slug) => lockMarkets.get(slug) || null,
+    persistUnhedged: async (row) => { unhedgedOnlyRows.push(row); },
+    unhedgedEnabled: true,
+    quoteLocks: false,
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  const unhedgedOnlyMiss = await unhedgedOnlyLoop.handleRfq({
+    id: 'rfq_unhedged_only_mlb3',
+    status: 'RFQ_STATUS_OPEN',
+    qtyDecimal: '8',
+    comboLegs: [
+      { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-bos-pit-2026-08-14-pit', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-nyy-bal-2026-08-14-nyy', side: 'SIDE_BUY' },
+    ],
+  });
+  assert.strictEqual(unhedgedOnlyMiss.reason, 'no_lock_overlap');
+  const unhedgedOnlyHit = await unhedgedOnlyLoop.handleRfq({ ...pmRfq, id: 'rfq_unhedged_only_hit' });
+  assert.strictEqual(unhedgedOnlyHit.reason, 'unhedged_only');
+  assert.strictEqual(unhedgedOnlyHit.post, false);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(unhedgedOnlyRows.some((r) => r.rfq_id === 'rfq_unhedged_only_mlb3'));
+  assert.ok(!unhedgedOnlyRows.some((r) => r.rfq_id === 'rfq_unhedged_only_hit'));
+  assert.strictEqual(unhedgedOnlyPosts, 0);
+  unhedgedOnlyLoop.stop();
 
   // Already-persisted MLB row updates to filled; tennis/NCAAF never insert.
   const mergePersist = async (row, meta) => {

@@ -85,8 +85,8 @@ assert.ok(
   'shadow-runner Combo Locks inserts must stamp venue kalshi'
 );
 assert.ok(
-  liveSrc.includes('fetchPolymarketUnhedgedRfq'),
-  'shared tracker Poly fetchRfq must call fetchPolymarketUnhedgedRfq, not wait for polyLoop'
+  /require\('\.\/unhedged-runtime'\)/.test(liveSrc),
+  'in-process unhedged must use the shared runtime (same fill tracker as unhedged-runner)'
 );
 assert.ok(!/polyLoop\.fetchUnhedgedRfq/.test(liveSrc));
 assert.ok(
@@ -94,8 +94,8 @@ assert.ok(
   'live-runner must not select market_ticker from unhedged_rfqs'
 );
 assert.ok(
-  /http:\s*polyUnhedgedHttp \|\| undefined/.test(liveSrc),
-  'quoting loop should reuse the same Poly HTTP the fill tracker already has'
+  /http:\s*\(unhedged && unhedged\.polyHttp\) \|\| undefined/.test(liveSrc),
+  'quoting loop should reuse the same Poly HTTP the fill tracker already has when in-process'
 );
 assert.ok(
   /UNHEDGED_RFQ_LIVE=\$\{isUnhedgedRfqLive\(process\.env\) \? 'on' : 'off'\}/.test(liveSrc),
@@ -304,8 +304,8 @@ assert.ok(
   'both REST pools must be warmed so the first quote POST is not a cold TLS'
 );
 assert.ok(
-  /setImmediate\(\(\) => \{[\s\S]*?shadowUnhedgedMiss\(missRfq/.test(liveSrc),
-  'unhedged miss persist must yield so a matched lock can POST first'
+  /if \(unhedgedInProcess && unhedged\) \{[\s\S]*?setImmediate\(\(\) => \{[\s\S]*?shadowKalshiMiss/.test(liveSrc),
+  'in-process unhedged miss persist must yield so a matched lock can POST first'
 );
 assert.ok(
   /setImmediate\(\(\) => \{[\s\S]*?RFQ-SAMPLE/.test(liveSrc) &&
@@ -317,17 +317,21 @@ assert.ok(
   /function unlessQuoteHot\(/.test(liveSrc) &&
     /setInterval\(unlessQuoteHot\(\(\) => \{ refresh\(\); \}\)/.test(liveSrc) &&
     /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?cancelUnacceptedQuotes/.test(liveSrc) &&
-    /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?reconcileSkipTapes/.test(liveSrc) &&
-    /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?unhedgedFills\.tick/.test(liveSrc),
-  'refresh / cancel / skip-tape / unhedged fill must pause while quote-hot'
+    /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?reconcileSkipTapes/.test(liveSrc),
+  'refresh / cancel / skip-tape must pause while quote-hot'
+);
+assert.ok(
+  /if \(unhedged\) \{[\s\S]*?setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?unhedged\.tick/.test(liveSrc),
+  'in-process unhedged fill must pause while quote-hot; locks-only skips the timer'
 );
 assert.ok(
   /shouldPause:\s*\(\) => quoteHot\.inFlight/.test(liveSrc),
-  'unhedged /markets refresh must pause while a Combo Lock POST is in flight'
+  'in-process unhedged /markets refresh must pause while a Combo Lock POST is in flight'
 );
 assert.ok(
-  /Process-split \(unhedged as its own Railway job\) is the NEXT PR/.test(liveSrc),
-  'document that the unhedged service split is the next PR, not this one'
+  /unhedged-runner\.js is the dedicated Railway job/.test(liveSrc) &&
+    /UNHEDGED_IN_PROCESS=0/.test(liveSrc),
+  'document the process split and locks-only env gate'
 );
 assert.ok(
   /skip_reason: 'rfq_closed'/.test(liveSrc) &&
@@ -392,11 +396,17 @@ assert.ok(
 );
 
 assert.ok(
-  /unhedgedFills\.tick\(\)[\s\S]{0,120}FILL_TICK_MS/.test(liveSrc),
-  'unhedged fill tick must not share the 15s skip-tape interval'
+  /unhedged\.tick\(\)[\s\S]{0,120}FILL_TICK_MS/.test(liveSrc),
+  'in-process unhedged fill tick must not share the 15s skip-tape interval'
 );
 assert.ok(
-  !/unhedgedFills\.tick\(\)[\s\S]{0,80}SKIP_TAPE_TICK_MS/.test(liveSrc)
+  !/unhedged\.tick\(\)[\s\S]{0,80}SKIP_TAPE_TICK_MS/.test(liveSrc)
+);
+assert.ok(
+  /unhedgedEnabled:\s*unhedgedInProcess/.test(liveSrc) &&
+    /quoteLocks:\s*true/.test(liveSrc) &&
+    /startPolymarketRfqLoop/.test(liveSrc),
+  'Combo Locks keep Kalshi + Polymarket; Poly unhedged shadow follows the gate'
 );
 
 console.log('live-runner.test.js ok');

@@ -1,6 +1,13 @@
-// Start live quoter + read-only fills reader (Combo Locks Filled tab needs combo_fills).
+// Start Combo Locks live quoter + read-only fills reader (Filled tab needs combo_fills).
+// Does NOT start unhedged-runner — that is a second Railway service (start-unhedged.js).
 'use strict';
 const { spawn } = require('child_process');
+const { workerRole } = require('./unhedged-mode');
+
+if (workerRole(process.env) === 'unhedged') {
+  console.error('[start-live] WORKER_ROLE=unhedged — use start-unhedged.js');
+  process.exit(1);
+}
 
 function run(script) {
   const child = spawn(process.execPath, [script], { stdio: 'inherit' });
