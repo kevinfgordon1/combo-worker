@@ -42,8 +42,9 @@ assert.strictEqual(shouldRunUnhedged({ WORKER_MODE: 'all' }), true);
   assert.ok(/WORKER_MODE=unhedged/.test(startLive), 'start-live must refuse the Unhedged mode');
 
   assert.ok(startUnhedged.includes("require('./unhedged-runner')"));
-  assert.ok(!startUnhedged.includes('live-runner'));
-  assert.ok(!startUnhedged.includes('fills-reader'));
+  assert.ok(!startUnhedged.includes("require('./live-runner')"));
+  assert.ok(!startUnhedged.includes("require('./fills-reader')"));
+  assert.ok(!/run\(['"]fills-reader/.test(startUnhedged));
   assert.ok(startUnhedged.includes('WORKER_MODE_UNHEDGED'));
 
   assert.ok(startAll.includes("WORKER_MODE") && startAll.includes('all'));

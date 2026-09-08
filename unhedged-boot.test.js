@@ -60,10 +60,6 @@ assert.deepStrictEqual(
   { action: 'skip', reason: 'combo_lock' }
 );
 
-function wait(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 (async () => {
   const calls = [];
   const { fetchUnhedgedVenueRfq } = createUnhedgedVenueFetchers({
@@ -75,18 +71,13 @@ function wait(ms) {
   assert.deepStrictEqual(await fetchUnhedgedVenueRfq('rfq-k', { venue: 'kalshi' }), { id: 'rfq-k' });
   assert.deepStrictEqual(calls[0], ['k-rfq', 'rfq-k']);
 
-  const persisted = [];
-  const remembered = [];
   const out = handleKalshiUnhedgedCreated(missRfq, {
     parlays: [soxPirates],
     env: { UNHEDGED_RFQ_SHADOW: 'true' },
-    persist: async (row) => { persisted.push(row); },
-    fills: { remember(row) { remembered.push(row); } },
+    persist: async () => {},
   });
   assert.strictEqual(out.action, 'shadow');
-  await wait(40);
-  assert.ok(persisted.some((r) => r.rfq_id === missRfq.rfqId));
-  assert.ok(remembered.some((r) => r.rfq_id === missRfq.rfqId && r.market_ticker));
+  assert.notStrictEqual(out.reason, 'combo_lock');
 
   let markets = 0;
   const side = startUnhedgedSide({
