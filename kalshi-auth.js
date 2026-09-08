@@ -110,6 +110,7 @@ async function signedRequest(requestFn, {
   };
   let res = await run();
   if (isTimestampExpired(res && res.statusCode, res && res.text)) {
+    console.warn(`[kalshi-auth] ${method} ${signPath} header_timestamp_expired — resync + retry`);
     res = await run();
   }
   return res;
