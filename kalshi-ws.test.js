@@ -1,0 +1,181 @@
+'use strict';
+const assert = require('assert');
+const { EventEmitter } = require('events');
+const { generateKeyPairSync } = require('crypto');
+const { createKalshiWs, DEFAULT_STALL_MS, readStallMs } = require('./kalshi-ws');
+const { applyServerDate, resetClockOffset, signedNow, authHeaders } = require('./kalshi-auth');
+
+const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+const PEM = privateKey.export({ type: 'pkcs1', format: 'pem' });
+
+class FakeWs extends EventEmitter {
+  static instances = [];
+  static OPEN = 1;
+  static CONNECTING = 0;
+  static CLOSING = 2;
+  static CLOSED = 3;
+
+  constructor(url, opts) {
+    super();
+    this.url = url;
+    this.opts = opts || {};
+    this.readyState = FakeWs.CONNECTING;
+    this.sent = [];
+    this.terminated = false;
+    FakeWs.instances.push(this);
+    queueMicrotask(() => {
+      if (this.terminated || this.readyState === FakeWs.CLOSED) return;
+      if (FakeWs.rejectHandshake) {
+        const body = FakeWs.rejectBody || '{"error":"header_timestamp_expired"}';
+        const req = { destroy() { req.destroyed = true; } };
+        const res = new EventEmitter();
+        res.statusCode = FakeWs.rejectStatus || 401;
+        res.headers = { date: FakeWs.rejectDate || new Date().toUTCString() };
+        queueMicrotask(() => {
+          this.emit('unexpected-response', req, res);
+          queueMicrotask(() => {
+            res.emit('data', Buffer.from(body));
+            res.emit('end');
+          });
+        });
+        return;
+      }
+      this.readyState = FakeWs.OPEN;
+      this.emit('open');
+    });
+  }
+
+  send(payload) { this.sent.push(payload); }
+  ping() { this.pinged = true; }
+  close() {
+    this.readyState = FakeWs.CLOSED;
+    this.emit('close', 1000);
+  }
+  terminate() {
+    this.terminated = true;
+    this.readyState = FakeWs.CLOSED;
+  }
+}
+
+function wait(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function startClient(extra = {}) {
+  const statuses = [];
+  const client = createKalshiWs({
+    keyId: 'test-key',
+    pem: PEM,
+    WebSocket: FakeWs,
+    stallMs: extra.stallMs != null ? extra.stallMs : 60_000,
+    onStatus: (s, i) => statuses.push({ s, i }),
+    onRfqCreated: extra.onRfqCreated,
+  });
+  client.start();
+  return { client, statuses };
+}
+
+{
+  assert.strictEqual(DEFAULT_STALL_MS, 20_000);
+  assert.strictEqual(readStallMs(undefined, {}), 20_000);
+  assert.strictEqual(readStallMs(15_000, {}), 15_000);
+  assert.strictEqual(readStallMs(undefined, { KALSHI_WS_STALL_MS: '8000' }), 8000);
+}
+
+{
+  resetClockOffset();
+  const past = new Date(Date.now() - 12_000).toUTCString();
+  const offset = applyServerDate(past);
+  assert.ok(offset < -8000, `expected negative offset, got ${offset}`);
+  const ts = Number(authHeaders({
+    keyId: 'k', pem: PEM, method: 'GET', signPath: '/trade-api/ws/v2',
+  })['KALSHI-ACCESS-TIMESTAMP']);
+  assert.ok(Math.abs(ts - signedNow()) < 50);
+  resetClockOffset();
+}
+
+async function runAsync() {
+  FakeWs.instances = [];
+  FakeWs.rejectHandshake = false;
+
+  {
+    const { client, statuses } = startClient();
+    await wait(20);
+    assert.ok(FakeWs.instances.length >= 1);
+    const first = FakeWs.instances[0];
+    assert.ok(first.sent.some((s) => String(s).includes('communications')));
+    assert.ok(statuses.some((x) => x.s === 'subscribed'));
+    first.emit('message', JSON.stringify({
+      type: 'rfq_created',
+      msg: { id: 'rfq-1', contracts_fp: '10.00', mve_collection_ticker: 'KXMVE-X' },
+    }));
+    const h = client.health();
+    assert.ok(h.lastCommAt > 0);
+    client.stop();
+  }
+
+  {
+    FakeWs.instances = [];
+    FakeWs.rejectHandshake = true;
+    FakeWs.rejectStatus = 401;
+    FakeWs.rejectBody = '{"error":{"code":"header_timestamp_expired"}}';
+    const { client, statuses } = startClient();
+    await wait(40);
+    assert.ok(statuses.some((x) => x.s === 'error' && /handshake 401/.test(String(x.i && x.i.message))));
+    assert.ok(statuses.some((x) => x.s === 'reconnecting' && x.i && x.i.reason === 'auth_timestamp'));
+    FakeWs.rejectHandshake = false;
+    await wait(300);
+    assert.ok(FakeWs.instances.length >= 2, `expected reconnect instance, got ${FakeWs.instances.length}`);
+    assert.ok(statuses.some((x) => x.s === 'subscribed'), 'reconnect after 401 must subscribe');
+    client.stop();
+  }
+
+  {
+    FakeWs.instances = [];
+    FakeWs.rejectHandshake = false;
+    const { client, statuses } = startClient({ stallMs: 40 });
+    await wait(20);
+    const n0 = FakeWs.instances.length;
+    await wait(80);
+    assert.ok(statuses.some((x) => x.s === 'stalled'), 'silence must trip stall watchdog');
+    assert.ok(statuses.some((x) => x.s === 'reconnecting' && x.i && x.i.reason === 'stall'));
+    await wait(1100);
+    assert.ok(FakeWs.instances.length > n0, 'stall must open a new socket');
+    client.stop();
+  }
+
+  {
+    FakeWs.instances = [];
+    const { client, statuses } = startClient({ stallMs: 40 });
+    await wait(15);
+    const sock = FakeWs.instances[0];
+    for (let i = 0; i < 4; i++) {
+      sock.emit('message', JSON.stringify({
+        type: 'rfq_created',
+        msg: { id: `rfq-${i}`, contracts_fp: '5.00', mve_collection_ticker: 'KXMVE-X' },
+      }));
+      await wait(20);
+    }
+    assert.ok(!statuses.some((x) => x.s === 'stalled'), 'live communications must not stall');
+    client.stop();
+  }
+
+  {
+    FakeWs.instances = [];
+    const { client, statuses } = startClient();
+    await wait(15);
+    const sock = FakeWs.instances[0];
+    sock.emit('close', 1006);
+    sock.emit('close', 1006);
+    const reconnects = statuses.filter((x) => x.s === 'reconnecting');
+    assert.strictEqual(reconnects.length, 1, 'close storms must be single-flight');
+    client.stop();
+  }
+
+  console.log('kalshi-ws.test.js ok');
+}
+
+runAsync().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

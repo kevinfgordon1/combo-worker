@@ -18,6 +18,10 @@
 //   (matched, hedge does not lock). Tallies lockMiss + emptyLegs; sample
 //   logs include RFQ keys vs staged lock overlap. NFL date-only Combo
 //   Locks vs timed Kalshi tickers match via identity / HHMM strip.
+// WS STALL: Kalshi communications dies ~minutes after deploy if the
+//   handshake 401 (header_timestamp_expired) is ignored — ws does not
+//   emit close — or the socket stays OPEN with no messages. Watchdog
+//   + unexpected-response reconnect; do not confuse with a quiet book.
 // SKIP TAPE: oversized / limit_reached skips persist a distinct reason on
 //   combo_submissions, then one RFQ+ticker tape lookup after close (or pad).
 //   Poly Combo Locks reconcile SKIP/QUOTE also insert here (venue=polymarket)
@@ -48,7 +52,7 @@
 const { createClient } = require('@supabase/supabase-js');
 const { Client } = require('undici');
 const { createKalshiWs } = require('./kalshi-ws');
-const { normalizePem, authHeaders } = require('./kalshi-auth');
+const { normalizePem, authHeaders, applyServerDate, clockOffset } = require('./kalshi-auth');
 const { matchParlay, describeLockOverlap } = require('./rfq');
 const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
 const { findStartedEvent } = require('./started');
@@ -709,13 +713,20 @@ async function warmConnection() {
     const headers = {
       ...authHeaders({ keyId: KEY_ID, pem: PEM, method: 'GET', signPath: WARM_PATH }),
     };
-    const { statusCode, body } = await kalshiHttp.request({
+    const { statusCode, headers: resHeaders, body } = await kalshiHttp.request({
       path: WARM_PATH,
       method: 'GET',
       headers,
     });
     await body.text();
-    console.log(`[${MODE}] connection warm ok status=${statusCode}`);
+    const dateHdr = resHeaders && (resHeaders.date || resHeaders.Date);
+    if (dateHdr) {
+      const offset = applyServerDate(dateHdr);
+      if (Math.abs(offset) > 2000) {
+        console.warn(`[${MODE}] kalshi clock offset ${offset}ms (from Date header)`);
+      }
+    }
+    console.log(`[${MODE}] connection warm ok status=${statusCode} clockOffset=${clockOffset()}ms`);
   } catch (e) {
     console.error(`[${MODE}] connection warm failed`, e.message);
   }
@@ -1417,17 +1428,35 @@ async function main() {
   });
   polyLoop = poly;
 
+  let lastWsAlertAt = 0;
+  function noteWsStatus(s, info) {
+    console.log(`[${MODE}] ws:${s}`, info || '');
+    const handshake = s === 'error' && info && /handshake|timestamp_expired|header_timestamp/i.test(String(info.message || ''));
+    if (s !== 'stalled' && !handshake) return;
+    if (Date.now() - lastWsAlertAt < 5 * 60_000) return;
+    lastWsAlertAt = Date.now();
+    const detail = info && typeof info === 'object' ? JSON.stringify(info) : String(info || s);
+    sendAlert(
+      `⚠️ Kalshi WS ${s}\n${detail}\n` +
+      `Firehose reconnecting — Combo Locks quoting is paused until communications resume.`
+    ).catch(() => {});
+  }
+
   const client = createKalshiWs({
     keyId: KEY_ID,
     pem: PEM,
-    onStatus: (s, i) => console.log(`[${MODE}] ws:${s}`, i || ''),
+    onStatus: noteWsStatus,
     onRfqCreated: (rfq, env) => onRfq(rfq, env).catch((e) => console.error('onRfq', e)),
     onRfqDeleted: (evt, env) => { try { onRfqDeleted(evt, env); } catch (e) { console.error('onRfqDeleted', e); } },
     onQuoteAccepted: (evt) => onQuoteAccepted(evt).catch((e) => console.error('onQuoteAccepted', e)),
     onQuoteExecuted: (evt) => onQuoteExecuted(evt).catch((e) => console.error('onQuoteExecuted', e)),
   });
 
-  setInterval(() => console.log(`[${MODE}] tallies`, counts), 60000);
+  setInterval(() => {
+    const h = client.health ? client.health() : null;
+    const age = h && h.lastCommAt ? Date.now() - h.lastCommAt : null;
+    console.log(`[${MODE}] tallies`, { ...counts, kalshiWsAgeMs: age, kalshiWsStallMs: h && h.stallMs });
+  }, 60000);
   process.on('SIGINT', () => {
     client.stop();
     try { poly && poly.stop && poly.stop(); } catch (_) {}

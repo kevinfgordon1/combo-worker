@@ -173,6 +173,14 @@ assert.ok(
     'RFQ_DEBUG_NEEDLE capture must be wired inside kalshi-ws (every communications consumer)'
   );
   assert.ok(
+    /unexpected-response/.test(wsSrc) && /auth_timestamp/.test(wsSrc),
+    'Kalshi WS must reconnect on handshake 401 (ws does not emit close)'
+  );
+  assert.ok(
+    /stalled/.test(wsSrc) && /forceReconnect\('stall'\)/.test(wsSrc),
+    'Kalshi WS must force-reconnect when communications goes silent'
+  );
+  assert.ok(
     !/require\('\.\/rfq-debug'\)/.test(liveSrc),
     'live-runner must not double-fire captureRfq; kalshi-ws owns the hook'
   );
