@@ -1,6 +1,7 @@
 'use strict';
 const assert = require('assert');
 const { generateKeyPairSync } = require('crypto');
+const crypto = require('crypto');
 const {
   applyServerDate,
   applyResponseDate,
@@ -11,9 +12,11 @@ const {
   isTimestampExpired,
   signedRequest,
   DATE_NOISE_MS,
+  privateKeyObject,
+  sign,
 } = require('./kalshi-auth');
 
-const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const PEM = privateKey.export({ type: 'pkcs1', format: 'pem' });
 
 function dateUtc(ms) {
@@ -74,6 +77,26 @@ function dateUtc(ms) {
   assert.strictEqual(isTimestampExpired(401, '{"error":{"code":"invalid_signature"}}'), false);
   assert.strictEqual(isTimestampExpired(400, 'header_timestamp_expired'), false);
   assert.ok(DATE_NOISE_MS >= 1000);
+}
+
+{
+  const first = privateKeyObject(PEM);
+  const second = privateKeyObject(PEM);
+  assert.strictEqual(first, second, 'PEM must parse once and reuse the KeyObject');
+  const ts = 1_700_000_000_000;
+  const sig = sign(PEM, ts, 'POST', '/trade-api/v2/communications/quotes');
+  const msg = String(ts) + 'POST' + '/trade-api/v2/communications/quotes';
+  const ok = crypto.verify(
+    'sha256',
+    Buffer.from(msg, 'utf8'),
+    {
+      key: publicKey,
+      padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+      saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
+    },
+    Buffer.from(sig, 'base64')
+  );
+  assert.ok(ok, 'cached KeyObject must produce a valid RSA-PSS signature');
 }
 
 async function runAsync() {

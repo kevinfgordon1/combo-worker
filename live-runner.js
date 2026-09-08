@@ -12,8 +12,13 @@
 // LATENCY: Steps 0–4 — instrument, POST first, undici keep-alive, pre-stage.
 //   Quote POST/confirm/cancel use a dedicated undici Client so background
 //   GETs (unhedged /markets, skip-tape, fill tracker, warm) cannot HOL-block
-//   the auction send. [LAT] match/pre/post/total ms on every attempt; 409
-//   rfq_closed is logged as QUOTE LATE with that latency (null quote_id).
+//   the auction send. While a POST/confirm is in flight, unmatched
+//   rfq_created frames are setImmediate'd (lock-needle raw filter) so the
+//   HTTP callback is not stuck behind firehose JSON.parse / RFQ-DEBUG
+//   console. Quote pool is re-warmed every QUOTE_WARM_MS (not 45s) so an
+//   idle LB cannot leave a dead socket for the next auction. [LAT]
+//   match/pre/post/total ms on every attempt; 409 rfq_closed is logged as
+//   QUOTE LATE with that latency (null quote_id).
 // START GATE: never quote (and cancel open quotes) once any leg's start <= now.
 //   Started still wins; the cap is a second gate.
 //   Polymarket confirm + resting-quote cancel uses the same startedFor /
@@ -124,7 +129,8 @@ const {
   formatRepeatSkipAlert,
   REPEAT_SKIP_REASON,
 } = require('./rfq-repeat');
-const { createKalshiRestPair } = require('./kalshi-http');
+const { createKalshiRestPair, QUOTE_WARM_MS } = require('./kalshi-http');
+const { createQuoteHot, lockNeedlesFromParlays } = require('./quote-hot');
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -135,6 +141,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 // behind unhedged /markets pagination or skip-tape GETs (undici Client
 // defaults to one connection).
 const { rest: kalshiHttp, quote: kalshiQuoteHttp } = createKalshiRestPair();
+const quoteHot = createQuoteHot();
 const QUOTE_PATH = '/trade-api/v2/communications/quotes';
 const WARM_PATH = '/trade-api/v2/exchange/status';
 
@@ -264,6 +271,7 @@ async function refresh() {
       }
       staged = next;
     }
+    quoteHot.setNeedles(lockNeedlesFromParlays(parlays));
 
     if (parlaysFailed) {
       const kept = parlays.map((row) => row.label || row.id).join(', ') || 'none';
@@ -448,17 +456,28 @@ function persistQuoteSkip(quoteId, skipReason, fallback) {
     });
 }
 
-async function postQuote(rfqId, noBid, yesBid = YES_DECLINE, restRemainder) {
-  const body = JSON.stringify(buildQuoteBody(rfqId, noBid, yesBid, restRemainder));
-  const { statusCode, text } = await kalshiSigned('POST', QUOTE_PATH, {
-    headers: { 'Content-Type': 'application/json' },
-    body,
-    http: kalshiQuoteHttp,
-  });
-  if (statusCode < 200 || statusCode >= 300) {
-    throw new Error(`Kalshi quote failed ${statusCode}: ${text}`);
+async function withQuoteHot(fn) {
+  quoteHot.begin();
+  try {
+    return await fn();
+  } finally {
+    quoteHot.end();
   }
-  return JSON.parse(text); // { id: quote_id }
+}
+
+async function postQuote(rfqId, noBid, yesBid = YES_DECLINE, restRemainder) {
+  return withQuoteHot(async () => {
+    const body = JSON.stringify(buildQuoteBody(rfqId, noBid, yesBid, restRemainder));
+    const { statusCode, text } = await kalshiSigned('POST', QUOTE_PATH, {
+      headers: { 'Content-Type': 'application/json' },
+      body,
+      http: kalshiQuoteHttp,
+    });
+    if (statusCode < 200 || statusCode >= 300) {
+      throw new Error(`Kalshi quote failed ${statusCode}: ${text}`);
+    }
+    return JSON.parse(text); // { id: quote_id }
+  });
 }
 
 // Kalshi RFQ: after quote_accepted the maker must confirm within the window
@@ -741,18 +760,20 @@ async function cancelStartedQuotes() {
 }
 
 async function confirmQuote(rfqId, quoteId) {
-  const path = confirmPath(rfqId, quoteId);
-  // Kalshi rejects PUTs without an explicit JSON content-type (400 invalid_content_type),
-  // even when the body is empty — send {} + application/json.
-  const { statusCode, text } = await kalshiSigned('PUT', path, {
-    headers: { 'Content-Type': 'application/json' },
-    body: '{}',
-    http: kalshiQuoteHttp,
+  return withQuoteHot(async () => {
+    const path = confirmPath(rfqId, quoteId);
+    // Kalshi rejects PUTs without an explicit JSON content-type (400 invalid_content_type),
+    // even when the body is empty — send {} + application/json.
+    const { statusCode, text } = await kalshiSigned('PUT', path, {
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+      http: kalshiQuoteHttp,
+    });
+    if (statusCode < 200 || statusCode >= 300) {
+      throw new Error(`Kalshi confirm failed ${statusCode}: ${text}`);
+    }
+    return { statusCode };
   });
-  if (statusCode < 200 || statusCode >= 300) {
-    throw new Error(`Kalshi confirm failed ${statusCode}: ${text}`);
-  }
-  return { statusCode };
 }
 
 async function warmOne(http, label) {
@@ -770,10 +791,10 @@ async function warmOne(http, label) {
 
 async function warmConnection() {
   // Warm quote + rest in parallel — different Clients, same origin.
-  await Promise.all([
-    warmOne(kalshiHttp, 'rest'),
-    warmOne(kalshiQuoteHttp, 'quote'),
-  ]);
+  // Skip the quote-pool GET while a POST/confirm owns those sockets.
+  const tasks = [warmOne(kalshiHttp, 'rest')];
+  if (!quoteHot.inFlight) tasks.push(warmOne(kalshiQuoteHttp, 'quote'));
+  await Promise.all(tasks);
 }
 
 async function kalshiGet(path, query) {
@@ -1464,7 +1485,8 @@ async function main() {
     process.exit(1);
   }
   console.log(
-    `[${MODE}] starting — latency-optimized. POST first, dedicated quote HTTP, pre-staged prices. ` +
+    `[${MODE}] starting — latency-optimized. POST first, dedicated quote HTTP, ` +
+    `firehose yield while quote-hot, quote warm ${QUOTE_WARM_MS}ms, pre-staged prices. ` +
     `Auto-confirms quote_accepted (HVM ~3s window). ` +
     `Remaining = max - filled - outstanding quotes (Kalshi + Polymarket). ` +
     `Unaccepted quotes are DELETE'd after ${RESERVE_TTL_MS / 1000}s. ` +
@@ -1513,9 +1535,9 @@ async function main() {
     unhedgedFills.tick().catch((e) => console.error('[UNHEDGED] fill tick', e && e.message));
   }, FILL_TICK_MS);
 
-  // Step 2 — pre-warm + keep warm
+  // Step 2 — pre-warm + keep warm (15s so LB idle-kill cannot cold-start POST)
   await warmConnection();
-  setInterval(warmConnection, 45000);
+  setInterval(warmConnection, QUOTE_WARM_MS);
 
   startHeartbeat(supabase, MODE, counts, () => parlays.length);
 
@@ -1560,6 +1582,7 @@ async function main() {
     keyId: KEY_ID,
     pem: PEM,
     onStatus: noteWsStatus,
+    shouldDeferCreated: (raw) => quoteHot.shouldDeferCreated(raw),
     onRfqCreated: (rfq, env) => onRfq(rfq, env).catch((e) => console.error('onRfq', e)),
     onRfqDeleted: (evt, env) => { try { onRfqDeleted(evt, env); } catch (e) { console.error('onRfqDeleted', e); } },
     onQuoteAccepted: (evt) => onQuoteAccepted(evt).catch((e) => console.error('onQuoteAccepted', e)),

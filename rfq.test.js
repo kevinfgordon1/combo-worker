@@ -8,7 +8,13 @@ const {
   matchParlay,
   describeLockOverlap,
   parlayKeys,
+  peekEnvelopeType,
 } = require('./rfq');
+
+assert.strictEqual(peekEnvelopeType('{"id":1,"type":"rfq_created","msg":{}}'), 'rfq_created');
+assert.strictEqual(peekEnvelopeType('{"type":"quote_accepted"}'), 'quote_accepted');
+assert.strictEqual(peekEnvelopeType({ type: 'rfq_deleted' }), 'rfq_deleted');
+assert.strictEqual(peekEnvelopeType('not-json'), null);
 
 function kalshiEnv(id, legs, extra = {}) {
   return {

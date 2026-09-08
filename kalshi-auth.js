@@ -65,10 +65,26 @@ function signedNow(ts) {
   return Date.now() + clockOffsetMs;
 }
 
+// Re-parsing the PEM on every RSA-PSS sign shows up on the quote POST
+// hot path (WS handshake + every REST call). Cache the KeyObject.
+const keyObjectCache = new Map();
+
+function privateKeyObject(pem) {
+  const raw = String(pem || '');
+  let key = keyObjectCache.get(raw);
+  if (!key) {
+    key = crypto.createPrivateKey(raw);
+    keyObjectCache.set(raw, key);
+  }
+  return key;
+}
+
 function sign(pem, tsMs, method, signPath) {
   const msg = String(tsMs) + method.toUpperCase() + signPath; // signPath incl /trade-api/..., no query
   return crypto.sign('sha256', Buffer.from(msg, 'utf8'), {
-    key: pem, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
+    key: privateKeyObject(pem),
+    padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+    saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
   }).toString('base64');
 }
 
@@ -117,7 +133,7 @@ async function signedRequest(requestFn, {
 }
 
 module.exports = {
-  normalizePem, sign, authHeaders,
+  normalizePem, sign, authHeaders, privateKeyObject,
   applyServerDate, applyResponseDate, resetClockOffset, clockOffset, signedNow,
   headerDate, isTimestampExpired, signedRequest, DATE_NOISE_MS,
 };
