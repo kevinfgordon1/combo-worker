@@ -14,7 +14,7 @@
 //      timers or leave two sockets on one API key.
 'use strict';
 const WebSocket = require('ws');
-const { authHeaders, applyServerDate } = require('./kalshi-auth');
+const { authHeaders, applyServerDate, isTimestampExpired } = require('./kalshi-auth');
 const { parseEnvelope, isRfqCreated, isRfqClosed, normalizeRfq, normalizeRfqClosed } = require('./rfq');
 const { captureRfq } = require('./rfq-debug');
 
@@ -125,7 +125,7 @@ function createKalshiWs({
         statusCode,
       });
       try { req && req.destroy && req.destroy(); } catch (_) {}
-      const expired = /timestamp_expired|header_timestamp/i.test(snippet);
+      const expired = isTimestampExpired(statusCode, snippet);
       forceReconnect(expired ? 'auth_timestamp' : `http_${statusCode || 'handshake'}`, {
         immediate: expired,
       });

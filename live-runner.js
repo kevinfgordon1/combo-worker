@@ -22,6 +22,11 @@
 //   handshake 401 (header_timestamp_expired) is ignored — ws does not
 //   emit close — or the socket stays OPEN with no messages. Watchdog
 //   + unexpected-response reconnect; do not confuse with a quiet book.
+// REST CLOCK: quote POST/confirm/cancel/GET share signedRequest so the
+//   timestamp is minted at send, Date-header offset ignores 1s Date
+//   truncation (PR #61 expired otherwise-good quotes), and a 401
+//   header_timestamp_expired retries once after resync. Matching is
+//   unchanged. Quote-watcher is not wired here.
 // SKIP TAPE: oversized / limit_reached skips persist a distinct reason on
 //   combo_submissions, then one RFQ+ticker tape lookup after close (or pad).
 //   Poly Combo Locks reconcile SKIP/QUOTE also insert here (venue=polymarket)
@@ -52,7 +57,7 @@
 const { createClient } = require('@supabase/supabase-js');
 const { Client } = require('undici');
 const { createKalshiWs } = require('./kalshi-ws');
-const { normalizePem, authHeaders, applyServerDate, clockOffset } = require('./kalshi-auth');
+const { normalizePem, clockOffset, signedRequest } = require('./kalshi-auth');
 const { matchParlay, describeLockOverlap } = require('./rfq');
 const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
 const { findStartedEvent } = require('./started');
@@ -102,6 +107,28 @@ const kalshiHttp = new Client('https://external-api.kalshi.com', {
 });
 const QUOTE_PATH = '/trade-api/v2/communications/quotes';
 const WARM_PATH = '/trade-api/v2/exchange/status';
+
+// Sign immediately before send; retry once on header_timestamp_expired
+// after applying Kalshi's Date header. Quote POST / confirm / cancel / GET
+// share this so Combo Locks REST cannot keep the #61 WS-only clock offset.
+async function kalshiSigned(method, signPath, opts = {}) {
+  return signedRequest(async ({ method: m, path, headers, body }) => {
+    const req = { method: m, path, headers };
+    if (body != null) req.body = body;
+    const { statusCode, headers: resHeaders, body: resBody } = await kalshiHttp.request(req);
+    const text = await resBody.text();
+    return { statusCode, headers: resHeaders, text };
+  }, {
+    keyId: KEY_ID,
+    pem: PEM,
+    method,
+    signPath,
+    path: opts.path,
+    headers: opts.headers,
+    body: opts.body,
+  });
+}
+
 const cancelingQuotes = new Set();
 const cancelledQuotes = new Set();
 const confirmingQuotes = new Set(); // de-dupe accept + skip 20s TTL during confirm
@@ -382,17 +409,10 @@ function persistQuoteSkip(quoteId, skipReason, fallback) {
 
 async function postQuote(rfqId, noBid, yesBid = YES_DECLINE, restRemainder) {
   const body = JSON.stringify(buildQuoteBody(rfqId, noBid, yesBid, restRemainder));
-  const headers = {
-    'Content-Type': 'application/json',
-    ...authHeaders({ keyId: KEY_ID, pem: PEM, method: 'POST', signPath: QUOTE_PATH }),
-  };
-  const { statusCode, body: resBody } = await kalshiHttp.request({
-    path: QUOTE_PATH,
-    method: 'POST',
-    headers,
+  const { statusCode, text } = await kalshiSigned('POST', QUOTE_PATH, {
+    headers: { 'Content-Type': 'application/json' },
     body,
   });
-  const text = await resBody.text();
   if (statusCode < 200 || statusCode >= 300) {
     throw new Error(`Kalshi quote failed ${statusCode}: ${text}`);
   }
@@ -411,15 +431,7 @@ function cancelPath(quoteId) {
 
 async function cancelQuote(quoteId) {
   const path = cancelPath(quoteId);
-  const headers = {
-    ...authHeaders({ keyId: KEY_ID, pem: PEM, method: 'DELETE', signPath: path }),
-  };
-  const { statusCode, body: resBody } = await kalshiHttp.request({
-    path,
-    method: 'DELETE',
-    headers,
-  });
-  const text = await resBody.text();
+  const { statusCode, text } = await kalshiSigned('DELETE', path);
   // 204 = deleted. 404 = already gone (RFQ closed / already cancelled).
   if (statusCode === 204 || statusCode === 404) return { statusCode };
   if (statusCode < 200 || statusCode >= 300) {
@@ -690,18 +702,10 @@ async function confirmQuote(rfqId, quoteId) {
   const path = confirmPath(rfqId, quoteId);
   // Kalshi rejects PUTs without an explicit JSON content-type (400 invalid_content_type),
   // even when the body is empty — send {} + application/json.
-  const body = '{}';
-  const headers = {
-    'Content-Type': 'application/json',
-    ...authHeaders({ keyId: KEY_ID, pem: PEM, method: 'PUT', signPath: path }),
-  };
-  const { statusCode, body: resBody } = await kalshiHttp.request({
-    path,
-    method: 'PUT',
-    headers,
-    body,
+  const { statusCode, text } = await kalshiSigned('PUT', path, {
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
   });
-  const text = await resBody.text();
   if (statusCode < 200 || statusCode >= 300) {
     throw new Error(`Kalshi confirm failed ${statusCode}: ${text}`);
   }
@@ -710,39 +714,20 @@ async function confirmQuote(rfqId, quoteId) {
 
 async function warmConnection() {
   try {
-    const headers = {
-      ...authHeaders({ keyId: KEY_ID, pem: PEM, method: 'GET', signPath: WARM_PATH }),
-    };
-    const { statusCode, headers: resHeaders, body } = await kalshiHttp.request({
-      path: WARM_PATH,
-      method: 'GET',
-      headers,
-    });
-    await body.text();
-    const dateHdr = resHeaders && (resHeaders.date || resHeaders.Date);
-    if (dateHdr) {
-      const offset = applyServerDate(dateHdr);
-      if (Math.abs(offset) > 2000) {
-        console.warn(`[${MODE}] kalshi clock offset ${offset}ms (from Date header)`);
-      }
+    const { statusCode } = await kalshiSigned('GET', WARM_PATH);
+    const offset = clockOffset();
+    if (Math.abs(offset) > 2000) {
+      console.warn(`[${MODE}] kalshi clock offset ${offset}ms (from Date header)`);
     }
-    console.log(`[${MODE}] connection warm ok status=${statusCode} clockOffset=${clockOffset()}ms`);
+    console.log(`[${MODE}] connection warm ok status=${statusCode} clockOffset=${offset}ms`);
   } catch (e) {
     console.error(`[${MODE}] connection warm failed`, e.message);
   }
 }
 
 async function kalshiGet(path, query) {
-  const headers = {
-    ...authHeaders({ keyId: KEY_ID, pem: PEM, method: 'GET', signPath: path }),
-  };
   const fullPath = query ? `${path}?${query}` : path;
-  const { statusCode, body } = await kalshiHttp.request({
-    path: fullPath,
-    method: 'GET',
-    headers,
-  });
-  const text = await body.text();
+  const { statusCode, text } = await kalshiSigned('GET', path, { path: fullPath });
   if (statusCode === 404) return { statusCode, json: null };
   if (statusCode < 200 || statusCode >= 300) {
     throw new Error(`Kalshi GET ${path} ${statusCode}: ${text}`);

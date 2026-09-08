@@ -195,6 +195,27 @@ assert.ok(
 );
 
 assert.ok(
+  /signedRequest/.test(liveSrc) && /function kalshiSigned\(/.test(liveSrc),
+  'Combo Locks Kalshi REST must go through signedRequest (fresh ts + timestamp retry)'
+);
+assert.ok(
+  /kalshiSigned\('POST', QUOTE_PATH/.test(liveSrc),
+  'postQuote must sign immediately via kalshiSigned, not a pre-built timestamp'
+);
+assert.ok(
+  /kalshiSigned\('PUT', path/.test(liveSrc) && /kalshiSigned\('DELETE', path/.test(liveSrc),
+  'confirm and cancel must share the same signed REST helper as quote POST'
+);
+assert.ok(
+  /kalshiSigned\('GET', WARM_PATH/.test(liveSrc) && /kalshiSigned\('GET', path/.test(liveSrc),
+  'warm + GET must apply the same clock offset / retry as quote POST'
+);
+assert.ok(
+  !/authHeaders\(\{ keyId: KEY_ID, pem: PEM, method: 'POST'/.test(liveSrc),
+  'do not sign quote POST outside signedRequest (timestamp would age before send)'
+);
+
+assert.ok(
   /unhedgedFills\.tick\(\)[\s\S]{0,120}FILL_TICK_MS/.test(liveSrc),
   'unhedged fill tick must not share the 15s skip-tape interval'
 );
