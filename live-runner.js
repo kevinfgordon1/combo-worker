@@ -55,28 +55,18 @@
 //   auction can still quote. History fingerprint is still written for
 //   grouping. Exact-lock matching unchanged. Poly is not wired.
 //   Quote-watcher stays parked.
-// UNHEDGED SHADOW: unmatched in-scope MLB/NFL ML combos persist to
-//   unhedged_rfqs (UNHEDGED_RFQ_SHADOW, default on). Never POSTs. Combo Locks
-//   match / reserve / quote path is unchanged. Fair is inverse-bet ourTrue:
-//   opponent YES → fee-included American (series taker: MLB 0.035, NFL 0.07,
-//   Poly 0.06), best Kalshi/Poly, then sign-flip (not same-side last,
-//   not Odds API). Combo WRAP is separate (NFL maker 0; else 0.035).
-//   Lookups stay sync off the 4s in-memory cache. UNHEDGED_RFQ_LIVE stays off.
-//   Started/live RFQs (findStartedEvent) are a silent skip — no insert, no
-//   fill patch. One shared fill tracker owns Kalshi + Polymarket rows: Kalshi
-//   uses skip-RFQ + public tape; Poly uses fetchPolymarketUnhedgedRfq /
-//   last-trade on a Poly HTTP client created before the quoting loop
-//   (never wait on polyLoop, never Kalshi tape).
-//   When a persisted pregame row later fills, UPDATE status=filled.
-//   NCAAF is out of scope.
-//   Process-split (unhedged as its own Railway job) is the NEXT PR — not
-//   this one. Combo Locks stay one worker with Kalshi + Polymarket. This
-//   PR only pauses unhedged/skip-tape/cancel ticks while quote-hot and
-//   defers miss logs so they cannot steal the POST callback.
+// UNHEDGED: default WORKER_MODE=combo does NOT schedule unhedged /markets
+//   refresh, fill ticks, or shadow-miss persist. That work is
+//   unhedged-runner.js (npm run start:unhedged) — its own Railway job,
+//   own Kalshi WS / REST, own cache. UNHEDGED_RFQ_LIVE stays off.
+//   WORKER_MODE=all is the local/rollback escape hatch (old one-process
+//   wiring). Quote-hot still pauses leftover background ticks (skip-tape,
+//   cancel, parlays refresh) while a Combo Lock POST/confirm is in flight.
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
 //      RFQ_REPEAT_COOLDOWN_MS (optional; default 90000; 0 disables)
+//      WORKER_MODE=combo|unhedged|all (default combo)
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
@@ -95,12 +85,7 @@ const {
   listStaleUnaccepted,
 } = require('./reserve');
 const { startHeartbeat } = require('./heartbeat');
-const {
-  startPolymarketRfqLoop,
-  fetchPolymarketUnhedgedRfq,
-  fetchPolymarketUnhedgedTrades,
-} = require('./polymarket-rfq');
-const { createPolymarketHttp } = require('./polymarket-client');
+const { startPolymarketRfqLoop } = require('./polymarket-rfq');
 const { shortId } = require('./short-id');
 const {
   classifySkip,
@@ -114,10 +99,7 @@ const {
   isUnhedgedRfqLive,
   persistUnhedgedRfq,
   shadowUnhedgedMiss,
-  createUnhedgedFillTracker,
-  DEFAULT_FILL_TICK_MS,
 } = require('./unhedged-rfq');
-const { createUnhedgedPriceCache } = require('./unhedged-price-cache');
 const {
   querySoftFailed,
   applyRefreshParlays,
@@ -135,6 +117,8 @@ const {
 } = require('./rfq-repeat');
 const { createKalshiRestPair, QUOTE_WARM_MS } = require('./kalshi-http');
 const { createQuoteHot, lockNeedlesFromParlays } = require('./quote-hot');
+const { resolveWorkerMode, shouldRunUnhedged } = require('./worker-mode');
+const { startUnhedgedSide } = require('./unhedged-boot');
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -233,13 +217,15 @@ const repeatGuard = createRepeatGuard({ cooldownMs: readCooldownMs(process.env) 
 let lastLockFingerprint = '';
 
 const pendingSkipTapes = new Map(); // submission id → skip row awaiting tape
-let unhedgedFills = null; // already-persisted unhedged RFQs awaiting fill
+let unhedgedFills = null; // WORKER_MODE=all only — default combo leaves this null
+let unhedgedSide = null;
+const workerMode = resolveWorkerMode(process.env);
+const runUnhedged = shouldRunUnhedged(process.env);
 const unknownCols = new Set();
 const COL_ERR = /Could not find the '([^']+)' column/i;
 const SKIP_TAPE_LOOKBACK_MS = 24 * 3600 * 1000;
 const SKIP_TAPE_TICK_MS = 15000;
 const SKIP_TAPE_MAX_PER_TICK = 5;
-const FILL_TICK_MS = DEFAULT_FILL_TICK_MS;
 
 async function refresh() {
   try {
@@ -469,9 +455,9 @@ async function withQuoteHot(fn) {
   }
 }
 
-// Background timers (unhedged fill, /markets refresh, skip-tape, 20s
-// cancel) must not run on the same tick as a Combo Lock POST/confirm.
-// Full unhedged process-split is the next PR; this only yields.
+// Background timers (skip-tape, 20s cancel, parlays refresh — and
+// unhedged ticks only when WORKER_MODE=all) must not run on the same
+// tick as a Combo Lock POST/confirm.
 function unlessQuoteHot(fn) {
   return () => {
     if (quoteHot.inFlight) return;
@@ -662,13 +648,12 @@ function noteReleased(quoteId, pending, reason) {
 }
 
 function persistUnhedgedRow(row) {
+  if (!runUnhedged) return Promise.resolve(null);
+  if (unhedgedSide && typeof unhedgedSide.persist === 'function') {
+    return unhedgedSide.persist(row);
+  }
   if (unhedgedFills) unhedgedFills.remember(row);
-  return persistUnhedgedRfq(supabase, row).then((out) => {
-    if (out && out.alreadyFilled && unhedgedFills) {
-      unhedgedFills.remember({ venue: row.venue, rfq_id: row.rfq_id, status: 'filled' });
-    }
-    return out;
-  });
+  return persistUnhedgedRfq(supabase, row);
 }
 
 function onRfqDeleted(evt, env) {
@@ -840,31 +825,6 @@ async function fetchSkipTrades(ticker, minTs, maxTs) {
   });
   const { json } = await kalshiGet('/trade-api/v2/markets/trades', qs.toString());
   return (json && json.trades) || [];
-}
-
-function createPolyUnhedgedHttp() {
-  const keyId = process.env.POLYMARKET_KEY_ID;
-  const secretKey = process.env.POLYMARKET_SECRET_KEY;
-  if (!keyId || !secretKey) return null;
-  return createPolymarketHttp({ keyId, secretKey });
-}
-
-// Venue-aware. Poly ids must never hit Kalshi skip-RFQ / public tape (404).
-// Bound to polyUnhedgedHttp — do not require the quoting loop to be up.
-async function fetchUnhedgedVenueRfq(rfqId, row) {
-  if (row && row.venue === 'polymarket') {
-    if (!polyUnhedgedHttp) return null;
-    return fetchPolymarketUnhedgedRfq(polyUnhedgedHttp, rfqId);
-  }
-  return fetchSkipRfq(rfqId);
-}
-
-async function fetchUnhedgedVenueTrades(ticker, minTs, maxTs, row) {
-  if (row && row.venue === 'polymarket') {
-    if (!polyUnhedgedHttp) return [];
-    return fetchPolymarketUnhedgedTrades(polyUnhedgedHttp, ticker, minTs, maxTs, row);
-  }
-  return fetchSkipTrades(ticker, minTs, maxTs);
 }
 
 async function persistSkipTape(id, patch) {
@@ -1251,29 +1211,30 @@ async function onRfq(rfq, env) {
         );
       });
     }
-    // Combo Locks miss — shadow in-scope unhedged RFQs only. Never quotes.
-    // Defer classify/price/persist so a later matched lock in this tick can
-    // start POST before we walk miss legs or trip a price-cache refresh.
-    const missRfq = rfq;
-    const missExtra = env && env.msg ? { msg: env.msg } : null;
-    setImmediate(() => {
-      shadowUnhedgedMiss(missRfq, {
-        venue: 'kalshi',
-        extra: missExtra,
-        persist: persistUnhedgedRow,
-        supabase,
-        env: process.env,
-        priceCache: unhedgedPrices,
-        onPersisted: (row) => {
-          if (unhedgedFills) {
-            unhedgedFills.remember({
-              ...row,
-              market_ticker: missRfq.marketTicker || missRfq.market_ticker || null,
-            });
-          }
-        },
+    // Combo Locks miss — unhedged paper tape is the other Railway job.
+    // WORKER_MODE=all keeps the old in-process shadow (yielded).
+    if (runUnhedged) {
+      const missRfq = rfq;
+      const missExtra = env && env.msg ? { msg: env.msg } : null;
+      setImmediate(() => {
+        shadowUnhedgedMiss(missRfq, {
+          venue: 'kalshi',
+          extra: missExtra,
+          persist: persistUnhedgedRow,
+          supabase,
+          env: process.env,
+          priceCache: unhedgedPrices,
+          onPersisted: (row) => {
+            if (unhedgedFills) {
+              unhedgedFills.remember({
+                ...row,
+                market_ticker: missRfq.marketTicker || missRfq.market_ticker || null,
+              });
+            }
+          },
+        });
       });
-    });
+    }
     return;
   }
   counts.matched++;
@@ -1507,6 +1468,12 @@ async function onRfq(rfq, env) {
 }
 
 async function main() {
+  if (workerMode === 'unhedged') {
+    console.error(
+      `[${MODE}] WORKER_MODE=unhedged — use start-unhedged.js / npm run start:unhedged`
+    );
+    process.exit(1);
+  }
   if (!KEY_ID || !PEM || !process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
     console.error(
       `[${MODE}] missing env: need KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY`
@@ -1523,25 +1490,24 @@ async function main() {
     `Skipped oversized/cap RFQs get a targeted tape lookup after close. ` +
     `RFQ repeat cooldown ${repeatGuard.cooldownMs}ms creator-gated ` +
     `(RFQ_REPEAT_COOLDOWN_MS; 0 disables; empty creator_id always quotes). ` +
-    `Unhedged RFQ shadow (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(process.env) ? 'on' : 'off'}, ` +
-    `UNHEDGED_RFQ_LIVE=${isUnhedgedRfqLive(process.env) ? 'on' : 'off'}) ` +
-    `persists in-scope unmatched MLB/NFL ML combos — never posts.`
+    `WORKER_MODE=${workerMode}. ` +
+    (runUnhedged
+      ? `Unhedged RFQ shadow in-process (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(process.env) ? 'on' : 'off'}, ` +
+        `UNHEDGED_RFQ_LIVE=${isUnhedgedRfqLive(process.env) ? 'on' : 'off'}) — never posts.`
+      : 'Unhedged /markets, fill ticks, and shadow miss are off — run npm run start:unhedged.')
   );
 
-  unhedgedPrices = createUnhedgedPriceCache({
-    env: process.env,
-    shouldPause: () => quoteHot.inFlight,
-    fetchKalshiMarkets: async (series, cursor) => {
-      const qs = new URLSearchParams({
-        series_ticker: series,
-        status: 'open',
-        limit: String(200),
-      });
-      if (cursor) qs.set('cursor', String(cursor));
-      return kalshiGet('/trade-api/v2/markets', qs.toString());
-    },
-  });
-  unhedgedPrices.start();
+  if (runUnhedged) {
+    unhedgedSide = startUnhedgedSide({
+      supabase,
+      env: process.env,
+      kalshiGet,
+      shouldPause: () => quoteHot.inFlight,
+    });
+    unhedgedPrices = unhedgedSide.prices;
+    unhedgedFills = unhedgedSide.fills;
+    polyUnhedgedHttp = unhedgedSide.polyHttp;
+  }
 
   await refresh();
   setInterval(unlessQuoteHot(() => { refresh(); }), 30000);
@@ -1552,18 +1518,6 @@ async function main() {
   setInterval(unlessQuoteHot(() => {
     reconcileSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape tick`, e.message));
   }), SKIP_TAPE_TICK_MS);
-
-  polyUnhedgedHttp = createPolyUnhedgedHttp();
-  unhedgedFills = createUnhedgedFillTracker({
-    supabase,
-    env: process.env,
-    fetchRfq: fetchUnhedgedVenueRfq,
-    fetchTrades: fetchUnhedgedVenueTrades,
-  });
-  unhedgedFills.hydrate().catch((e) => console.error('[UNHEDGED] fill hydrate', e && e.message));
-  setInterval(unlessQuoteHot(() => {
-    unhedgedFills.tick().catch((e) => console.error('[UNHEDGED] fill tick', e && e.message));
-  }), FILL_TICK_MS);
 
   // Step 2 — pre-warm + keep warm (15s so LB idle-kill cannot cold-start POST)
   await warmConnection();
@@ -1588,9 +1542,11 @@ async function main() {
     sessionFilledByParlay,
     supabase,
     env: process.env,
-    unhedgedPrices,
-    unhedgedFills,
-    http: polyUnhedgedHttp || undefined,
+    enableLocks: true,
+    enableUnhedged: runUnhedged,
+    unhedgedPrices: runUnhedged ? unhedgedPrices : null,
+    unhedgedFills: runUnhedged ? unhedgedFills : null,
+    http: (runUnhedged && polyUnhedgedHttp) || undefined,
   });
   polyLoop = poly;
 
@@ -1627,6 +1583,7 @@ async function main() {
   process.on('SIGINT', () => {
     client.stop();
     try { poly && poly.stop && poly.stop(); } catch (_) {}
+    try { unhedgedSide && unhedgedSide.stop && unhedgedSide.stop(); } catch (_) {}
     try { unhedgedPrices && unhedgedPrices.stop && unhedgedPrices.stop(); } catch (_) {}
     try { polyUnhedgedHttp && polyUnhedgedHttp.close && polyUnhedgedHttp.close(); } catch (_) {}
     try { kalshiHttp.close(); } catch (_) {}

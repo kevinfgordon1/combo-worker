@@ -63,6 +63,15 @@ assert.ok(
   /couldMatchActiveLocks\(rfq, locks\)/.test(polySrc),
   'quote matching gate must stay couldMatchActiveLocks'
 );
+assert.ok(
+  /const enableLocks = ctx\.enableLocks !== false/.test(polySrc) &&
+    /const enableUnhedged = ctx\.enableUnhedged !== false/.test(polySrc),
+  'Poly loop must honor enableLocks / enableUnhedged so the process split can isolate quoting vs paper tape'
+);
+assert.ok(
+  /if \(!enableLocks\) \{[\s\S]*?reason: 'locks_off'/.test(polySrc),
+  'Unhedged-only Poly loop must not POST/confirm Combo Lock quotes'
+);
 
 // Fixed seed / timestamp / path — do not rotate these; they are the signing fixture.
 const SEED_B64 = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
@@ -1553,6 +1562,100 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     unhedgedRows.push(row);
   };
   unhedgedLoop.stop();
+
+  // Process split: Unhedged job (enableLocks=false) never POSTs even if live is on.
+  const splitPosts = [];
+  const locksOffRows = [];
+  const locksOffLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    enableLocks: false,
+    enableUnhedged: true,
+    http: {
+      async getUserId() { return { rfqUserId: 'rfquser_test' }; },
+      async listRfqs() { return { rfqs: [] }; },
+      async listQuotes() { return { quotes: [] }; },
+      async getCombo() { throw new Error('unhedged-only must not hydrate for locks'); },
+      async createQuote() { splitPosts.push('create'); throw new Error('locks_off must not POST'); },
+      async confirmQuote() { throw new Error('locks_off must not confirm'); },
+      close() {},
+    },
+    startWs: false,
+    getParlays: () => [kalshiParlay],
+    persistUnhedged: async (row) => { locksOffRows.push(row); },
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+  });
+  assert.strictEqual(locksOffLoop.enableLocks, false);
+  assert.strictEqual(locksOffLoop.live, false);
+  const locksOffLock = await locksOffLoop.handleRfq({ ...pmRfq, id: 'rfq_split_lock' });
+  assert.strictEqual(locksOffLock.post, false);
+  assert.strictEqual(locksOffLock.reason, 'locks_off');
+  assert.strictEqual(splitPosts.length, 0);
+  const locksOffMiss = await locksOffLoop.handleRfq({
+    id: 'rfq_split_unhedged',
+    status: 'RFQ_STATUS_OPEN',
+    qtyDecimal: '8',
+    comboLegs: [
+      { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-bos-pit-2026-08-14-pit', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-nyy-bal-2026-08-14-nyy', side: 'SIDE_BUY' },
+    ],
+  });
+  assert.strictEqual(locksOffMiss.reason, 'no_lock_overlap');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(locksOffRows.some((r) => r.rfq_id === 'rfq_split_unhedged'));
+  locksOffLoop.stop();
+
+  const comboOnlyRows = [];
+  const comboOnlyLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'false',
+    },
+    enableLocks: true,
+    enableUnhedged: false,
+    http: {
+      async getUserId() { return { rfqUserId: 'rfquser_test' }; },
+      async listRfqs() { return { rfqs: [] }; },
+      async listQuotes() { return { quotes: [] }; },
+      async getCombo() { return { combos: [] }; },
+      async createQuote() { throw new Error('combo-only test must not POST'); },
+      async confirmQuote() { throw new Error('combo-only test must not confirm'); },
+      close() {},
+    },
+    startWs: false,
+    getParlays: () => [kalshiParlay],
+    persistUnhedged: async (row) => { comboOnlyRows.push(row); },
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+  });
+  assert.strictEqual(comboOnlyLoop.enableUnhedged, false);
+  assert.strictEqual(comboOnlyLoop.unhedgedFills, null);
+  await comboOnlyLoop.handleRfq({
+    id: 'rfq_combo_only_miss',
+    status: 'RFQ_STATUS_OPEN',
+    qtyDecimal: '8',
+    comboLegs: [
+      { symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-bos-pit-2026-08-14-pit', side: 'SIDE_BUY' },
+      { symbol: 'aec-mlb-nyy-bal-2026-08-14-nyy', side: 'SIDE_BUY' },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(comboOnlyRows.length, 0);
+  comboOnlyLoop.stop();
+
   const fillLoop = startPolymarketRfqLoop({
     env: {
       POLYMARKET_KEY_ID: 'key-id-fixture',

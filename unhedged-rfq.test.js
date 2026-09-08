@@ -82,26 +82,40 @@ assert.ok(!SCOPE_LEAGUES.has('ncaaf'));
   const engineSrc = fs.readFileSync(path.join(__dirname, 'engine.js'), 'utf8');
   assert.ok(!engineSrc.includes('unhedged_rfqs'));
   const liveSrc = fs.readFileSync(path.join(__dirname, 'live-runner.js'), 'utf8');
+  const bootSrc = fs.readFileSync(path.join(__dirname, 'unhedged-boot.js'), 'utf8');
+  const unhedgedRunnerSrc = fs.readFileSync(path.join(__dirname, 'unhedged-runner.js'), 'utf8');
   assert.ok(
-    /startPolymarketRfqLoop\(\{[\s\S]*unhedgedFills/.test(liveSrc),
-    'Poly loop must receive the shared unhedged fill tracker'
+    /enableUnhedged:\s*runUnhedged/.test(liveSrc),
+    'Combo Locks Poly loop must not enable unhedged persist unless WORKER_MODE=all'
   );
-  assert.ok(liveSrc.includes('fetchUnhedgedVenueRfq'));
-  assert.ok(liveSrc.includes('fetchUnhedgedVenueTrades'));
-  assert.ok(liveSrc.includes('fetchPolymarketUnhedgedRfq'));
-  assert.ok(liveSrc.includes('fetchPolymarketUnhedgedTrades'));
-  assert.ok(liveSrc.includes('createPolymarketHttp'));
   assert.ok(
-    /polyUnhedgedHttp = createPolyUnhedgedHttp\(\);\s*unhedgedFills = createUnhedgedFillTracker\(/.test(liveSrc),
+    /if \(runUnhedged\) \{[\s\S]*?startUnhedgedSide\(/.test(liveSrc),
+    'live-runner must not boot the unhedged side-car on combo default'
+  );
+  assert.ok(bootSrc.includes('fetchUnhedgedVenueRfq'));
+  assert.ok(bootSrc.includes('fetchUnhedgedVenueTrades'));
+  assert.ok(bootSrc.includes('fetchPolymarketUnhedgedRfq'));
+  assert.ok(bootSrc.includes('fetchPolymarketUnhedgedTrades'));
+  assert.ok(bootSrc.includes('createPolymarketHttp'));
+  assert.ok(
+    /createUnhedgedFillTracker\(/.test(bootSrc) &&
+      /createPolyUnhedgedHttp/.test(bootSrc),
     'Poly HTTP for fill lookup must exist before the shared tracker ticks'
   );
   assert.ok(
-    /fetchUnhedgedVenueRfq[\s\S]*fetchPolymarketUnhedgedRfq\(polyUnhedgedHttp/.test(liveSrc),
+    /fetchUnhedgedVenueRfq[\s\S]*fetchPolymarketUnhedgedRfq\(polyHttp/.test(bootSrc),
     'Poly fill GET must call fetchPolymarketUnhedgedRfq directly — not polyLoop.fetchUnhedgedRfq'
   );
   assert.ok(!/polyLoop\.fetchUnhedgedRfq/.test(liveSrc));
-  assert.ok(!/if \(row && row\.venue === 'polymarket'\) return \[\]/.test(liveSrc));
-  assert.ok(!/createUnhedgedFillTracker\(\{[\s\S]*fetchRfq:\s*fetchSkipRfq/.test(liveSrc));
+  assert.ok(!/polyLoop\.fetchUnhedgedRfq/.test(bootSrc));
+  assert.ok(!/if \(row && row\.venue === 'polymarket'\) return \[\]/.test(bootSrc));
+  assert.ok(!/createUnhedgedFillTracker\(\{[\s\S]*fetchRfq:\s*fetchSkipRfq/.test(bootSrc));
+  assert.ok(
+    /enableLocks:\s*false/.test(unhedgedRunnerSrc) &&
+      !/postQuote\(/.test(unhedgedRunnerSrc) &&
+      !/confirmQuote\(/.test(unhedgedRunnerSrc),
+    'Unhedged job must not Combo Lock quote POST/confirm'
+  );
   assert.ok(
     !/\.select\([^)]*market_ticker/.test(src),
     'unhedged_rfqs selects must use real columns only — market_ticker is not in the schema'
@@ -119,11 +133,11 @@ assert.ok(!SCOPE_LEAGUES.has('ncaaf'));
   assert.ok(DEFAULT_FILL_TICK_MS <= 1000, '1s fill tick so newest closes are looked at');
   assert.ok(HYDRATE_SEEN_LIMIT >= 15000);
   assert.ok(
-    /FILL_TICK_MS/.test(liveSrc) && /unhedgedFills\.tick\(\)[\s\S]{0,80}FILL_TICK_MS/.test(liveSrc),
-    'fill tracker must tick faster than skip-tape (15s)'
+    /DEFAULT_FILL_TICK_MS/.test(bootSrc) && /fills\.tick\(\)/.test(bootSrc),
+    'fill tracker lives on the Unhedged job, not Combo Locks skip-tape interval'
   );
   assert.ok(
-    /market_ticker:\s*(?:rfq|missRfq)\.marketTicker/.test(liveSrc),
+    /market_ticker:\s*(?:rfq|missRfq)\.marketTicker/.test(bootSrc),
     'remember MVE ticker from rfq_created so GET 404 can still tape'
   );
   assert.ok(
