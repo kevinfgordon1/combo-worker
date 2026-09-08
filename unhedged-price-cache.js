@@ -457,6 +457,7 @@ function createUnhedgedPriceCache({
   maxPmWatchGames = null,
   pmRefreshConcurrency = null,
   staleMs = null,
+  shouldPause = null,
 } = {}) {
   const kalshi = new Map();
   const polymarket = new Map();
@@ -852,10 +853,16 @@ function createUnhedgedPriceCache({
   }
 
   let soonTimer = null;
+  function paused() {
+    return typeof shouldPause === 'function' && !!shouldPause();
+  }
+
   function scheduleSoon() {
+    if (paused()) return;
     if (soonTimer) return;
     soonTimer = setTimeout(() => {
       soonTimer = null;
+      if (paused()) return;
       refresh().catch((e) => console.error('[UNHEDGED] price refresh', e && e.message));
     }, 250);
     if (soonTimer.unref) soonTimer.unref();
@@ -865,6 +872,7 @@ function createUnhedgedPriceCache({
     if (timer) return;
     refresh().catch((e) => console.error('[UNHEDGED] price refresh', e && e.message));
     timer = setInterval(() => {
+      if (paused()) return;
       refresh().catch((e) => console.error('[UNHEDGED] price refresh', e && e.message));
     }, refreshEvery);
     if (timer.unref) timer.unref();

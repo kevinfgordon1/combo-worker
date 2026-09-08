@@ -11,6 +11,15 @@ function parseEnvelope(raw) {
   let e; try { e = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (_) { return null; }
   return (e && typeof e === 'object' && typeof e.type === 'string') ? e : null;
 }
+
+// Cheap type peek so a quote-hot firehose can skip JSON.parse of unmatched
+// rfq_created frames. Kalshi puts type at the top level; first match wins.
+function peekEnvelopeType(raw) {
+  if (raw && typeof raw === 'object' && typeof raw.type === 'string') return raw.type;
+  if (typeof raw !== 'string') return null;
+  const m = /"type"\s*:\s*"([a-z0-9_]+)"/i.exec(raw);
+  return m ? m[1] : null;
+}
 const isRfqCreated = (e) => e && e.type === 'rfq_created';
 // Docs broadcast rfq_deleted to all communications subscribers (expire / delete /
 // replace_existing / execute). Treat nearby close types the same if they appear.
@@ -296,7 +305,7 @@ function describeLockOverlap(rfq, parlays) {
 }
 
 module.exports = {
-  parseEnvelope, isRfqCreated, isRfqClosed, normalizeRfq, normalizeRfqClosed, matchParlay,
+  parseEnvelope, peekEnvelopeType, isRfqCreated, isRfqClosed, normalizeRfq, normalizeRfqClosed, matchParlay,
   normalizeLeg, normalizeLegKey, canonicalizeLegKey, parlayKeys, sameSet,
   describeLockOverlap,
 };

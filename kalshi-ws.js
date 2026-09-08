@@ -15,7 +15,7 @@
 'use strict';
 const WebSocket = require('ws');
 const { authHeaders, applyServerDate, isTimestampExpired } = require('./kalshi-auth');
-const { parseEnvelope, isRfqCreated, isRfqClosed, normalizeRfq, normalizeRfqClosed } = require('./rfq');
+const { parseEnvelope, peekEnvelopeType, isRfqCreated, isRfqClosed, normalizeRfq, normalizeRfqClosed } = require('./rfq');
 const { captureRfq } = require('./rfq-debug');
 
 const WS_URL = process.env.KALSHI_WS_URL || 'wss://external-api-ws.kalshi.com/trade-api/ws/v2';
@@ -48,9 +48,12 @@ function createKalshiWs({
   onStatus,
   onEvent,
   stallMs,
+  shouldDeferCreated,
+  captureRfq: captureFn,
   WebSocket: WsImpl,
 } = {}) {
   const Ws = WsImpl || WebSocket;
+  const capture = captureFn || captureRfq;
   const stallAfter = readStallMs(stallMs);
   let ws = null, subId = 1, pingTimer = null, stallTimer = null;
   let backoff = 1000, closedByUs = false, reconnectTimer = null;
@@ -177,22 +180,19 @@ function createKalshiWs({
       onHandshakeFail(req, res);
     });
 
-    ws.on('message', (d) => {
-      const env = parseEnvelope(d.toString());
+    function handleRaw(raw) {
+      const env = parseEnvelope(raw);
       if (!env) return;
-      touchComm();
 
       try { onEvent && onEvent(env); } catch (_) {}
-      // Always-on hook: no-op unless RFQ_DEBUG_NEEDLE is set. Console only
-      // (no rfq_debug insert) so Railway 522s cannot hide samples.
-      try { captureRfq(env); } catch (_) {}
 
       if (env.type === 'error' || env.type === 'unsubscribed') {
         const msg = (env.msg && (env.msg.message || env.msg.error || env.msg.code)) || env.type;
         status('error', { message: String(msg), type: env.type });
       }
 
-      // RFQ created → existing path
+      // RFQ created → existing path. Runs before RFQ-DEBUG so a matched
+      // lock can start POST before any debug stringify.
       if (isRfqCreated(env) && onRfqCreated) {
         try { onRfqCreated(normalizeRfq(env), env); } catch (e) { console.error('onRfqCreated', e); }
       }
@@ -236,6 +236,28 @@ function createKalshiWs({
           }, env);
         } catch (e) { console.error('onQuoteExecuted', e); }
       }
+
+      // Always-on hook: no-op unless RFQ_DEBUG_NEEDLE is set. Off the WS
+      // tick so JSON/console cannot delay a quote POST already in flight.
+      setImmediate(() => { try { capture(env); } catch (_) {} });
+    }
+
+    ws.on('message', (d) => {
+      const raw = d.toString();
+      touchComm();
+      // While a quote POST/confirm is in flight, unmatched rfq_created
+      // frames are deferred (setImmediate) so the HTTP callback is not
+      // stuck behind JSON.parse of the communications book. Lock-needle
+      // hits and quote_accepted/executed stay on this tick.
+      if (
+        shouldDeferCreated
+        && peekEnvelopeType(raw) === 'rfq_created'
+        && shouldDeferCreated(raw)
+      ) {
+        setImmediate(() => handleRaw(raw));
+        return;
+      }
+      handleRaw(raw);
     });
 
     ws.on('close', (c) => {

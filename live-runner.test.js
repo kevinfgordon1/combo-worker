@@ -169,8 +169,9 @@ assert.ok(
 {
   const wsSrc = fs.readFileSync(path.join(__dirname, 'kalshi-ws.js'), 'utf8');
   assert.ok(
-    /require\('\.\/rfq-debug'\)/.test(wsSrc) && /captureRfq\(env\)/.test(wsSrc),
-    'RFQ_DEBUG_NEEDLE capture must be wired inside kalshi-ws (every communications consumer)'
+    /require\('\.\/rfq-debug'\)/.test(wsSrc) &&
+      /setImmediate\(\(\) => \{ try \{ capture\(env\)/.test(wsSrc),
+    'RFQ_DEBUG_NEEDLE capture must be wired inside kalshi-ws off the WS tick'
   );
   assert.ok(
     /unexpected-response/.test(wsSrc) && /auth_timestamp/.test(wsSrc),
@@ -307,6 +308,28 @@ assert.ok(
   'unhedged miss persist must yield so a matched lock can POST first'
 );
 assert.ok(
+  /setImmediate\(\(\) => \{[\s\S]*?RFQ-SAMPLE/.test(liveSrc) &&
+    /setImmediate\(\(\) => \{[\s\S]*?EMPTY-LEGS/.test(liveSrc) &&
+    /setImmediate\(\(\) => \{[\s\S]*?describeLockOverlap/.test(liveSrc),
+  'RFQ-SAMPLE / EMPTY-LEGS / LOCK-MISS logs must not run on the quote tick'
+);
+assert.ok(
+  /function unlessQuoteHot\(/.test(liveSrc) &&
+    /setInterval\(unlessQuoteHot\(\(\) => \{ refresh\(\); \}\)/.test(liveSrc) &&
+    /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?cancelUnacceptedQuotes/.test(liveSrc) &&
+    /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?reconcileSkipTapes/.test(liveSrc) &&
+    /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?unhedgedFills\.tick/.test(liveSrc),
+  'refresh / cancel / skip-tape / unhedged fill must pause while quote-hot'
+);
+assert.ok(
+  /shouldPause:\s*\(\) => quoteHot\.inFlight/.test(liveSrc),
+  'unhedged /markets refresh must pause while a Combo Lock POST is in flight'
+);
+assert.ok(
+  /Process-split \(unhedged as its own Railway job\) is the NEXT PR/.test(liveSrc),
+  'document that the unhedged service split is the next PR, not this one'
+);
+assert.ok(
   /skip_reason: 'rfq_closed'/.test(liveSrc) &&
     /QUOTE LATE/.test(liveSrc) &&
     /formatQuoteLatency/.test(liveSrc) &&
@@ -325,6 +348,43 @@ assert.ok(
 assert.ok(
   !/require\('\.\/quote-watcher'\)/.test(liveSrc),
   'quote-watcher stays parked'
+);
+assert.ok(
+  /require\('\.\/quote-hot'\)/.test(liveSrc) &&
+    /createQuoteHot/.test(liveSrc) &&
+    /lockNeedlesFromParlays/.test(liveSrc),
+  'quote-hot needles + in-flight tracker must be wired'
+);
+assert.ok(
+  /shouldDeferCreated:\s*\(raw\) => quoteHot\.shouldDeferCreated\(raw\)/.test(liveSrc),
+  'Kalshi WS must defer unmatched firehose frames while a quote POST is in flight'
+);
+assert.ok(
+  /function withQuoteHot\(/.test(liveSrc) &&
+    /return withQuoteHot\(async \(\) => \{/.test(liveSrc),
+  'quote POST and confirm must mark quote-hot so the firehose yields'
+);
+assert.ok(
+  liveSrc.indexOf('async function postQuote') < liveSrc.indexOf('async function confirmQuote') &&
+    /async function postQuote[\s\S]*?withQuoteHot[\s\S]*?async function confirmQuote[\s\S]*?withQuoteHot/.test(liveSrc),
+  'both POST and confirm wrap withQuoteHot'
+);
+assert.ok(
+  /if \(!quoteHot\.inFlight\) tasks\.push\(warmOne\(kalshiQuoteHttp, 'quote'\)\)/.test(liveSrc),
+  'do not steal the quote pool for a warm GET during POST/confirm'
+);
+assert.ok(
+  /setInterval\(warmConnection, QUOTE_WARM_MS\)/.test(liveSrc) &&
+    /QUOTE_WARM_MS/.test(liveSrc),
+  'quote pool warm must use QUOTE_WARM_MS (15s), not a 45s idle gap'
+);
+assert.ok(
+  /quoteHot\.setNeedles\(lockNeedlesFromParlays\(parlays\)\)/.test(liveSrc),
+  'refresh must restage lock needles after parlays apply'
+);
+assert.ok(
+  !/setInterval\(warmConnection, 45000\)/.test(liveSrc),
+  '45s warm left a dead quote socket for the next auction'
 );
 assert.ok(
   !/require\('\.\/rfq-repeat'\)/.test(fs.readFileSync(path.join(__dirname, 'polymarket-rfq.js'), 'utf8')),

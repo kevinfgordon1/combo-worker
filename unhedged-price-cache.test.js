@@ -938,6 +938,30 @@ return live.refresh().then(async () => {
     stale.stop();
   }
 
+  {
+    let fetches = 0;
+    let pause = false;
+    const gated = createUnhedgedPriceCache({
+      intervalMs: 15,
+      shouldPause: () => pause,
+      fetchKalshiMarkets: async () => {
+        fetches += 1;
+        return { markets: [] };
+      },
+    });
+    gated.start();
+    await new Promise((r) => setTimeout(r, 25));
+    const afterStart = fetches;
+    assert.ok(afterStart >= 1, 'start() still refreshes once');
+    pause = true;
+    await new Promise((r) => setTimeout(r, 50));
+    assert.strictEqual(fetches, afterStart, 'shouldPause must skip interval /markets refresh');
+    gated.watch('polymarket', [{ symbol: 'aec-mlb-cws-det-2026-08-14-cws' }]);
+    await new Promise((r) => setTimeout(r, 40));
+    assert.strictEqual(fetches, afterStart, 'shouldPause must skip scheduleSoon refresh');
+    gated.stop();
+  }
+
   console.log('unhedged-price-cache.test.js ok');
 }).catch((e) => {
   live.stop();

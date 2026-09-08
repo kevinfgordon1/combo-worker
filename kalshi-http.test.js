@@ -4,6 +4,10 @@ const {
   KALSHI_ORIGIN,
   REST_CONNECTIONS,
   QUOTE_CONNECTIONS,
+  QUOTE_WARM_MS,
+  CONNECT_TIMEOUT_MS,
+  HEADERS_TIMEOUT_MS,
+  BODY_TIMEOUT_MS,
   kalshiClientOptions,
   createKalshiRestPair,
   isQuoteMutationPath,
@@ -11,7 +15,9 @@ const {
 
 assert.strictEqual(KALSHI_ORIGIN, 'https://external-api.kalshi.com');
 assert.ok(REST_CONNECTIONS >= 2, 'background GETs must not share a single socket');
-assert.ok(QUOTE_CONNECTIONS >= 1);
+assert.ok(QUOTE_CONNECTIONS >= 3, 'quote pool needs POST + confirm + spare');
+assert.ok(QUOTE_WARM_MS <= 20_000, 'warm must beat typical 30s LB idle-kill');
+assert.ok(QUOTE_WARM_MS >= 5_000);
 
 {
   const def = kalshiClientOptions();
@@ -19,6 +25,10 @@ assert.ok(QUOTE_CONNECTIONS >= 1);
   assert.strictEqual(def.pipelining, 1);
   assert.strictEqual(def.keepAliveTimeout, 60_000);
   assert.strictEqual(def.keepAliveMaxTimeout, 600_000);
+  assert.strictEqual(def.connectTimeout, CONNECT_TIMEOUT_MS);
+  assert.strictEqual(def.headersTimeout, HEADERS_TIMEOUT_MS);
+  assert.strictEqual(def.bodyTimeout, BODY_TIMEOUT_MS);
+  assert.ok(def.connectTimeout <= 3_000, 'dead quote sockets must fail fast');
 
   const quote = kalshiClientOptions({ connections: QUOTE_CONNECTIONS });
   assert.strictEqual(quote.connections, QUOTE_CONNECTIONS);

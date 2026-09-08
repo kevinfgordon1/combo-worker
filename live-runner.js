@@ -12,8 +12,13 @@
 // LATENCY: Steps 0–4 — instrument, POST first, undici keep-alive, pre-stage.
 //   Quote POST/confirm/cancel use a dedicated undici Client so background
 //   GETs (unhedged /markets, skip-tape, fill tracker, warm) cannot HOL-block
-//   the auction send. [LAT] match/pre/post/total ms on every attempt; 409
-//   rfq_closed is logged as QUOTE LATE with that latency (null quote_id).
+//   the auction send. While a POST/confirm is in flight, unmatched
+//   rfq_created frames are setImmediate'd (lock-needle raw filter) so the
+//   HTTP callback is not stuck behind firehose JSON.parse / RFQ-DEBUG
+//   console. Quote pool is re-warmed every QUOTE_WARM_MS (not 45s) so an
+//   idle LB cannot leave a dead socket for the next auction. [LAT]
+//   match/pre/post/total ms on every attempt; 409 rfq_closed is logged as
+//   QUOTE LATE with that latency (null quote_id).
 // START GATE: never quote (and cancel open quotes) once any leg's start <= now.
 //   Started still wins; the cap is a second gate.
 //   Polymarket confirm + resting-quote cancel uses the same startedFor /
@@ -64,6 +69,10 @@
 //   (never wait on polyLoop, never Kalshi tape).
 //   When a persisted pregame row later fills, UPDATE status=filled.
 //   NCAAF is out of scope.
+//   Process-split (unhedged as its own Railway job) is the NEXT PR — not
+//   this one. Combo Locks stay one worker with Kalshi + Polymarket. This
+//   PR only pauses unhedged/skip-tape/cancel ticks while quote-hot and
+//   defers miss logs so they cannot steal the POST callback.
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
@@ -124,7 +133,8 @@ const {
   formatRepeatSkipAlert,
   REPEAT_SKIP_REASON,
 } = require('./rfq-repeat');
-const { createKalshiRestPair } = require('./kalshi-http');
+const { createKalshiRestPair, QUOTE_WARM_MS } = require('./kalshi-http');
+const { createQuoteHot, lockNeedlesFromParlays } = require('./quote-hot');
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -135,6 +145,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 // behind unhedged /markets pagination or skip-tape GETs (undici Client
 // defaults to one connection).
 const { rest: kalshiHttp, quote: kalshiQuoteHttp } = createKalshiRestPair();
+const quoteHot = createQuoteHot();
 const QUOTE_PATH = '/trade-api/v2/communications/quotes';
 const WARM_PATH = '/trade-api/v2/exchange/status';
 
@@ -264,6 +275,7 @@ async function refresh() {
       }
       staged = next;
     }
+    quoteHot.setNeedles(lockNeedlesFromParlays(parlays));
 
     if (parlaysFailed) {
       const kept = parlays.map((row) => row.label || row.id).join(', ') || 'none';
@@ -448,17 +460,38 @@ function persistQuoteSkip(quoteId, skipReason, fallback) {
     });
 }
 
-async function postQuote(rfqId, noBid, yesBid = YES_DECLINE, restRemainder) {
-  const body = JSON.stringify(buildQuoteBody(rfqId, noBid, yesBid, restRemainder));
-  const { statusCode, text } = await kalshiSigned('POST', QUOTE_PATH, {
-    headers: { 'Content-Type': 'application/json' },
-    body,
-    http: kalshiQuoteHttp,
-  });
-  if (statusCode < 200 || statusCode >= 300) {
-    throw new Error(`Kalshi quote failed ${statusCode}: ${text}`);
+async function withQuoteHot(fn) {
+  quoteHot.begin();
+  try {
+    return await fn();
+  } finally {
+    quoteHot.end();
   }
-  return JSON.parse(text); // { id: quote_id }
+}
+
+// Background timers (unhedged fill, /markets refresh, skip-tape, 20s
+// cancel) must not run on the same tick as a Combo Lock POST/confirm.
+// Full unhedged process-split is the next PR; this only yields.
+function unlessQuoteHot(fn) {
+  return () => {
+    if (quoteHot.inFlight) return;
+    return fn();
+  };
+}
+
+async function postQuote(rfqId, noBid, yesBid = YES_DECLINE, restRemainder) {
+  return withQuoteHot(async () => {
+    const body = JSON.stringify(buildQuoteBody(rfqId, noBid, yesBid, restRemainder));
+    const { statusCode, text } = await kalshiSigned('POST', QUOTE_PATH, {
+      headers: { 'Content-Type': 'application/json' },
+      body,
+      http: kalshiQuoteHttp,
+    });
+    if (statusCode < 200 || statusCode >= 300) {
+      throw new Error(`Kalshi quote failed ${statusCode}: ${text}`);
+    }
+    return JSON.parse(text); // { id: quote_id }
+  });
 }
 
 // Kalshi RFQ: after quote_accepted the maker must confirm within the window
@@ -646,12 +679,16 @@ function onRfqDeleted(evt, env) {
     noteReleased(id, quote, 'closed');
   }
   if (unhedgedFills && rfqId) {
-    unhedgedFills.onClosed({
-      venue: 'kalshi',
-      rfqId,
-      extra: env,
-      rfq: evt,
-    }).catch((e) => console.error('[UNHEDGED] fill close', e && e.message));
+    const closedEvt = evt;
+    const closedEnv = env;
+    setImmediate(() => {
+      unhedgedFills.onClosed({
+        venue: 'kalshi',
+        rfqId,
+        extra: closedEnv,
+        rfq: closedEvt,
+      }).catch((e) => console.error('[UNHEDGED] fill close', e && e.message));
+    });
   }
 }
 
@@ -741,18 +778,20 @@ async function cancelStartedQuotes() {
 }
 
 async function confirmQuote(rfqId, quoteId) {
-  const path = confirmPath(rfqId, quoteId);
-  // Kalshi rejects PUTs without an explicit JSON content-type (400 invalid_content_type),
-  // even when the body is empty — send {} + application/json.
-  const { statusCode, text } = await kalshiSigned('PUT', path, {
-    headers: { 'Content-Type': 'application/json' },
-    body: '{}',
-    http: kalshiQuoteHttp,
+  return withQuoteHot(async () => {
+    const path = confirmPath(rfqId, quoteId);
+    // Kalshi rejects PUTs without an explicit JSON content-type (400 invalid_content_type),
+    // even when the body is empty — send {} + application/json.
+    const { statusCode, text } = await kalshiSigned('PUT', path, {
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+      http: kalshiQuoteHttp,
+    });
+    if (statusCode < 200 || statusCode >= 300) {
+      throw new Error(`Kalshi confirm failed ${statusCode}: ${text}`);
+    }
+    return { statusCode };
   });
-  if (statusCode < 200 || statusCode >= 300) {
-    throw new Error(`Kalshi confirm failed ${statusCode}: ${text}`);
-  }
-  return { statusCode };
 }
 
 async function warmOne(http, label) {
@@ -770,10 +809,10 @@ async function warmOne(http, label) {
 
 async function warmConnection() {
   // Warm quote + rest in parallel — different Clients, same origin.
-  await Promise.all([
-    warmOne(kalshiHttp, 'rest'),
-    warmOne(kalshiQuoteHttp, 'quote'),
-  ]);
+  // Skip the quote-pool GET while a POST/confirm owns those sockets.
+  const tasks = [warmOne(kalshiHttp, 'rest')];
+  if (!quoteHot.inFlight) tasks.push(warmOne(kalshiQuoteHttp, 'quote'));
+  await Promise.all(tasks);
 }
 
 async function kalshiGet(path, query) {
@@ -1162,12 +1201,16 @@ async function onRfq(rfq, env) {
   if (rfq.targetCostDollars > 0) counts.dollarRfqs++;
   if (counts.combos <= 12) {
     const keys = rfq.legKeys || [];
-    console.log(
-      `[${MODE}] RFQ-SAMPLE n=${counts.combos} rfq=${rfq.rfqId} ` +
-      `contracts=${rfq.contracts != null ? rfq.contracts : '(none)'} ` +
-      `dollar=${rfq.targetCostDollars != null ? `$${rfq.targetCostDollars}` : '(none)'} ` +
-      `legs=${keys.length} keys=${keys.join('|') || '(none)'}`
-    );
+    const sampleN = counts.combos;
+    const sampleRfq = rfq;
+    setImmediate(() => {
+      console.log(
+        `[${MODE}] RFQ-SAMPLE n=${sampleN} rfq=${sampleRfq.rfqId} ` +
+        `contracts=${sampleRfq.contracts != null ? sampleRfq.contracts : '(none)'} ` +
+        `dollar=${sampleRfq.targetCostDollars != null ? `$${sampleRfq.targetCostDollars}` : '(none)'} ` +
+        `legs=${keys.length} keys=${keys.join('|') || '(none)'}`
+      );
+    });
   }
 
   const p = matchParlay(rfq, parlays);
@@ -1179,27 +1222,34 @@ async function onRfq(rfq, env) {
     if (!keys.length) {
       counts.emptyLegs++;
       if (counts.emptyLegs <= 8) {
+        const missRfq = rfq;
         const raw = env && env.msg && typeof env.msg === 'object' ? env.msg : {};
-        const nested = raw.rfq && typeof raw.rfq === 'object' ? raw.rfq : {};
-        console.log(
-          `[${MODE}] EMPTY-LEGS rfq=${rfq.rfqId} ` +
-          `msgKeys=${Object.keys(raw).join(',') || '(none)'} ` +
-          `nestedKeys=${Object.keys(nested).join(',') || '(none)'} ` +
-          `collection=${rfq.mveCollection || '(none)'} ` +
-          `contracts=${rfq.contracts != null ? rfq.contracts : '(none)'} ` +
-          `dollar=${rfq.targetCostDollars != null ? `$${rfq.targetCostDollars}` : '(none)'}`
-        );
+        setImmediate(() => {
+          const nested = raw.rfq && typeof raw.rfq === 'object' ? raw.rfq : {};
+          console.log(
+            `[${MODE}] EMPTY-LEGS rfq=${missRfq.rfqId} ` +
+            `msgKeys=${Object.keys(raw).join(',') || '(none)'} ` +
+            `nestedKeys=${Object.keys(nested).join(',') || '(none)'} ` +
+            `collection=${missRfq.mveCollection || '(none)'} ` +
+            `contracts=${missRfq.contracts != null ? missRfq.contracts : '(none)'} ` +
+            `dollar=${missRfq.targetCostDollars != null ? `$${missRfq.targetCostDollars}` : '(none)'}`
+          );
+        });
       }
     }
     counts.lockMiss++;
     if (counts.lockMiss <= 8 || counts.lockMiss % 2000 === 0) {
-      const overlap = describeLockOverlap(rfq, parlays);
-      console.log(
-        `[${MODE}] LOCK-MISS rfq=${rfq.rfqId} legs=${keys.length} ` +
-        `keys=${keys.join('|') || '(none)'} ` +
-        `active=${parlays.map((x) => x.label || x.id).join(',') || '(none)'}` +
-        (overlap ? ` overlap=${overlap}` : '')
-      );
+      const missRfq = rfq;
+      const missKeys = keys;
+      setImmediate(() => {
+        const overlap = describeLockOverlap(missRfq, parlays);
+        console.log(
+          `[${MODE}] LOCK-MISS rfq=${missRfq.rfqId} legs=${missKeys.length} ` +
+          `keys=${missKeys.join('|') || '(none)'} ` +
+          `active=${parlays.map((x) => x.label || x.id).join(',') || '(none)'}` +
+          (overlap ? ` overlap=${overlap}` : '')
+        );
+      });
     }
     // Combo Locks miss — shadow in-scope unhedged RFQs only. Never quotes.
     // Defer classify/price/persist so a later matched lock in this tick can
@@ -1464,7 +1514,8 @@ async function main() {
     process.exit(1);
   }
   console.log(
-    `[${MODE}] starting — latency-optimized. POST first, dedicated quote HTTP, pre-staged prices. ` +
+    `[${MODE}] starting — latency-optimized. POST first, dedicated quote HTTP, ` +
+    `firehose yield while quote-hot, quote warm ${QUOTE_WARM_MS}ms, pre-staged prices. ` +
     `Auto-confirms quote_accepted (HVM ~3s window). ` +
     `Remaining = max - filled - outstanding quotes (Kalshi + Polymarket). ` +
     `Unaccepted quotes are DELETE'd after ${RESERVE_TTL_MS / 1000}s. ` +
@@ -1479,6 +1530,7 @@ async function main() {
 
   unhedgedPrices = createUnhedgedPriceCache({
     env: process.env,
+    shouldPause: () => quoteHot.inFlight,
     fetchKalshiMarkets: async (series, cursor) => {
       const qs = new URLSearchParams({
         series_ticker: series,
@@ -1492,14 +1544,14 @@ async function main() {
   unhedgedPrices.start();
 
   await refresh();
-  setInterval(refresh, 30000);
-  setInterval(() => {
+  setInterval(unlessQuoteHot(() => { refresh(); }), 30000);
+  setInterval(unlessQuoteHot(() => {
     cancelUnacceptedQuotes().catch((e) => console.error(`[${MODE}] cancel-unaccepted tick`, e.message));
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start tick`, e.message));
-  }, 2000);
-  setInterval(() => {
+  }), 2000);
+  setInterval(unlessQuoteHot(() => {
     reconcileSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape tick`, e.message));
-  }, SKIP_TAPE_TICK_MS);
+  }), SKIP_TAPE_TICK_MS);
 
   polyUnhedgedHttp = createPolyUnhedgedHttp();
   unhedgedFills = createUnhedgedFillTracker({
@@ -1509,13 +1561,13 @@ async function main() {
     fetchTrades: fetchUnhedgedVenueTrades,
   });
   unhedgedFills.hydrate().catch((e) => console.error('[UNHEDGED] fill hydrate', e && e.message));
-  setInterval(() => {
+  setInterval(unlessQuoteHot(() => {
     unhedgedFills.tick().catch((e) => console.error('[UNHEDGED] fill tick', e && e.message));
-  }, FILL_TICK_MS);
+  }), FILL_TICK_MS);
 
-  // Step 2 — pre-warm + keep warm
+  // Step 2 — pre-warm + keep warm (15s so LB idle-kill cannot cold-start POST)
   await warmConnection();
-  setInterval(warmConnection, 45000);
+  setInterval(warmConnection, QUOTE_WARM_MS);
 
   startHeartbeat(supabase, MODE, counts, () => parlays.length);
 
@@ -1560,6 +1612,7 @@ async function main() {
     keyId: KEY_ID,
     pem: PEM,
     onStatus: noteWsStatus,
+    shouldDeferCreated: (raw) => quoteHot.shouldDeferCreated(raw),
     onRfqCreated: (rfq, env) => onRfq(rfq, env).catch((e) => console.error('onRfq', e)),
     onRfqDeleted: (evt, env) => { try { onRfqDeleted(evt, env); } catch (e) { console.error('onRfqDeleted', e); } },
     onQuoteAccepted: (evt) => onQuoteAccepted(evt).catch((e) => console.error('onQuoteAccepted', e)),

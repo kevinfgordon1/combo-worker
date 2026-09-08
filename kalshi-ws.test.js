@@ -172,6 +172,41 @@ async function runAsync() {
     client.stop();
   }
 
+  {
+    FakeWs.instances = [];
+    const created = [];
+    const captured = [];
+    const client = createKalshiWs({
+      keyId: 'test-key',
+      pem: PEM,
+      WebSocket: FakeWs,
+      stallMs: 60_000,
+      shouldDeferCreated: (raw) => raw.includes('DEFER-ME'),
+      captureRfq: (env) => captured.push(env && env.msg && env.msg.id),
+      onRfqCreated: (rfq) => created.push(rfq.rfqId),
+    });
+    client.start();
+    await wait(15);
+    const sock = FakeWs.instances[FakeWs.instances.length - 1];
+    sock.emit('message', JSON.stringify({
+      type: 'rfq_created',
+      msg: { id: 'rfq-defer', contracts_fp: '5.00', mve_collection_ticker: 'KXMVE-X', note: 'DEFER-ME' },
+    }));
+    assert.strictEqual(created.length, 0, 'deferred rfq_created must not run on the WS tick');
+    assert.strictEqual(captured.length, 0, 'RFQ-DEBUG must not run on the WS tick');
+    await wait(15);
+    assert.ok(created.includes('rfq-defer'), 'deferred rfq_created still delivers');
+    assert.ok(captured.includes('rfq-defer'), 'RFQ-DEBUG still runs after setImmediate');
+
+    sock.emit('message', JSON.stringify({
+      type: 'rfq_created',
+      msg: { id: 'rfq-hot', contracts_fp: '5.00', mve_collection_ticker: 'KXMVE-X' },
+    }));
+    assert.strictEqual(created[created.length - 1], 'rfq-hot', 'non-deferred rfq_created stays sync');
+    assert.strictEqual(created.filter((id) => id === 'rfq-hot').length, 1);
+    client.stop();
+  }
+
   console.log('kalshi-ws.test.js ok');
 }
 
