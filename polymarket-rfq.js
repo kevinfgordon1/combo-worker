@@ -13,7 +13,9 @@
 // Combo Locks Miss tape (combo_submissions) gets quotes + matched-lock
 // declines (oversized / limit_reached / game_started / insufficient_balance).
 // no_lock_overlap* SKIPs stay in the engine — they are not taped.
-// Live POSTs (create quote, confirm) require POLYMARKET_RFQ_LIVE to be truthy.
+// Live POSTs (create quote, confirm) require POLYMARKET_RFQ_LIVE to be truthy
+// AND ctx.quoteLocks !== false (unhedged-runner never quotes, even if LIVE is on).
+// ctx.unhedgedEnabled === false skips unhedged shadow / fill-tracker (locks-only).
 // quoteExecuted means paired orders were submitted — not a fill.
 // START GATE: never quote or confirm once any lock leg has started (first pitch
 // / kickoff <= now). Resting quotes for that lock are DELETE'd the same way
@@ -988,7 +990,9 @@ function startPolymarketRfqLoop(ctx = {}) {
     };
   }
 
-  const live = isPolymarketRfqLive(env);
+  const quoteLocks = ctx.quoteLocks !== false;
+  const unhedgedEnabled = ctx.unhedgedEnabled !== false;
+  const live = quoteLocks && isPolymarketRfqLive(env);
   const creds = inspectPolymarketCreds({ keyId, secretKey }, env);
   const pendingQuotes = ctx.pendingQuotes || new Map();
   const confirmingQuotes = ctx.confirmingQuotes || new Set();
@@ -1003,12 +1007,14 @@ function startPolymarketRfqLoop(ctx = {}) {
   });
 
   console.log(
-    `[${MODE}] starting — live=${live}. ` +
-    `POST create-quote / confirm only when POLYMARKET_RFQ_LIVE is truthy. ` +
-    `Kalshi quoting keeps running. Remaining is shared via reserve.js. ` +
+    `[${MODE}] starting — live=${live} quoteLocks=${quoteLocks} unhedged=${unhedgedEnabled}. ` +
+    `POST create-quote / confirm only when POLYMARKET_RFQ_LIVE is truthy and quoteLocks. ` +
+    `Kalshi quoting keeps running on the Combo Locks worker. Remaining is shared via reserve.js. ` +
     `Unhedged RFQ shadow (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(env) ? 'on' : 'off'}, ` +
     `UNHEDGED_RFQ_LIVE=${isUnhedgedRfqLive(env) ? 'on' : 'off'}) ` +
-    `persists in-scope unmatched MLB/NFL ML combos — never posts.`
+    (unhedgedEnabled
+      ? 'persists in-scope unmatched MLB/NFL ML combos — never posts.'
+      : 'is off in this process (dedicated unhedged-runner owns the tape).')
   );
   console.log(
     `[${MODE}] creds keyId=${creds.keyIdLooksUuid ? 'uuid' : (creds.keyIdPresent ? 'not_uuid' : 'missing')} ` +
@@ -1019,24 +1025,32 @@ function startPolymarketRfqLoop(ctx = {}) {
     console.error(`[${MODE}] Retail creds look invalid — ${ROTATE_HINT}`);
   }
 
-  const unhedgedPrices = ctx.unhedgedPrices || null;
+  const unhedgedPrices = unhedgedEnabled ? (ctx.unhedgedPrices || null) : null;
   if (unhedgedPrices && typeof unhedgedPrices.setPmFetch === 'function') {
     unhedgedPrices.setPmFetch(ctx.fetchMarket || ((slug) => http.getMarketBySlug(slug)));
   }
 
-  const ownFills = !ctx.unhedgedFills;
-  const unhedgedFills = ctx.unhedgedFills || createUnhedgedFillTracker({
-    supabase: ctx.supabase,
-    persist: ctx.persistUnhedged,
-    env,
-    fetchRfq: fetchUnhedgedPmRfq,
-    fetchTrades: fetchUnhedgedPmTrades,
-  });
+  const noopFills = {
+    remember() {},
+    onClosed: async () => {},
+    tick: async () => {},
+    hydrate: async () => {},
+  };
+  const ownFills = unhedgedEnabled && !ctx.unhedgedFills;
+  const unhedgedFills = !unhedgedEnabled
+    ? noopFills
+    : (ctx.unhedgedFills || createUnhedgedFillTracker({
+      supabase: ctx.supabase,
+      persist: ctx.persistUnhedged,
+      env,
+      fetchRfq: fetchUnhedgedPmRfq,
+      fetchTrades: fetchUnhedgedPmTrades,
+    }));
   if (ownFills && typeof unhedgedFills.hydrate === 'function') {
     unhedgedFills.hydrate().catch((e) => console.error('[UNHEDGED] fill hydrate', e && e.message));
   }
 
-  const missTape = typeof ctx.logAsync === 'function'
+  const missTape = quoteLocks && typeof ctx.logAsync === 'function'
     ? createPolyMissTape({ logAsync: ctx.logAsync })
     : null;
 
@@ -1046,6 +1060,7 @@ function startPolymarketRfqLoop(ctx = {}) {
   }
 
   function persistUnhedgedShadow(rfq, extra = {}) {
+    if (!unhedgedEnabled) return;
     shadowUnhedgedMiss(rfq, {
       venue: 'polymarket',
       lockSkipReason: extra.skipReason || null,
@@ -1179,6 +1194,10 @@ function startPolymarketRfqLoop(ctx = {}) {
       }
       persistLockTape(evaluation, 'declined');
       return evaluation;
+    }
+
+    if (!quoteLocks) {
+      return { ...evaluation, post: false, reason: 'unhedged_only' };
     }
 
     const gate = shouldPostNow(evaluation, { live });
@@ -1374,20 +1393,22 @@ function startPolymarketRfqLoop(ctx = {}) {
         `[${MODE}] RESERVE RELEASED closed ${quote.label || ''} quote_id=${id} rfq=${rfqId}`
       );
     }
-    unhedgedFills.onClosed({
-      venue: 'polymarket',
-      rfqId,
-      extra: evt,
-      rfq,
-      symbol: rfq.symbol || rfq.ticker,
-    }).catch((e) => console.error('[UNHEDGED] fill close', e && e.message));
+    if (unhedgedEnabled) {
+      unhedgedFills.onClosed({
+        venue: 'polymarket',
+        rfqId,
+        extra: evt,
+        rfq,
+        symbol: rfq.symbol || rfq.ticker,
+      }).catch((e) => console.error('[UNHEDGED] fill close', e && e.message));
+    }
   }
 
   function noteUnhedgedFillEvent(evt) {
     const rfq = (evt && evt.rfq) || {};
     const quote = (evt && evt.quote) || {};
     const rfqId = rfq.id || rfq.rfqId || quote.rfqId || quote.rfq_id || (evt && evt.rfqId);
-    if (!rfqId) return;
+    if (!rfqId || !unhedgedEnabled) return;
     unhedgedFills.onClosed({
       venue: 'polymarket',
       rfqId,

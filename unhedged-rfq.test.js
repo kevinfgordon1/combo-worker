@@ -82,26 +82,37 @@ assert.ok(!SCOPE_LEAGUES.has('ncaaf'));
   const engineSrc = fs.readFileSync(path.join(__dirname, 'engine.js'), 'utf8');
   assert.ok(!engineSrc.includes('unhedged_rfqs'));
   const liveSrc = fs.readFileSync(path.join(__dirname, 'live-runner.js'), 'utf8');
+  const runtimeSrc = fs.readFileSync(path.join(__dirname, 'unhedged-runtime.js'), 'utf8');
+  const runnerSrc = fs.readFileSync(path.join(__dirname, 'unhedged-runner.js'), 'utf8');
   assert.ok(
     /startPolymarketRfqLoop\(\{[\s\S]*unhedgedFills/.test(liveSrc),
-    'Poly loop must receive the shared unhedged fill tracker'
+    'Poly loop must receive the shared unhedged fill tracker when in-process'
   );
-  assert.ok(liveSrc.includes('fetchUnhedgedVenueRfq'));
-  assert.ok(liveSrc.includes('fetchUnhedgedVenueTrades'));
-  assert.ok(liveSrc.includes('fetchPolymarketUnhedgedRfq'));
-  assert.ok(liveSrc.includes('fetchPolymarketUnhedgedTrades'));
-  assert.ok(liveSrc.includes('createPolymarketHttp'));
+  assert.ok(runtimeSrc.includes('fetchVenueRfq'));
+  assert.ok(runtimeSrc.includes('fetchVenueTrades'));
+  assert.ok(runtimeSrc.includes('fetchPolymarketUnhedgedRfq'));
+  assert.ok(runtimeSrc.includes('fetchPolymarketUnhedgedTrades'));
+  assert.ok(runtimeSrc.includes('createPolymarketHttp'));
   assert.ok(
-    /polyUnhedgedHttp = createPolyUnhedgedHttp\(\);\s*unhedgedFills = createUnhedgedFillTracker\(/.test(liveSrc),
+    /createUnhedgedFillTracker\(/.test(runtimeSrc) && /createPolyUnhedgedHttp/.test(runtimeSrc),
     'Poly HTTP for fill lookup must exist before the shared tracker ticks'
   );
   assert.ok(
-    /fetchUnhedgedVenueRfq[\s\S]*fetchPolymarketUnhedgedRfq\(polyUnhedgedHttp/.test(liveSrc),
+    /fetchVenueRfq[\s\S]*fetchPolymarketUnhedgedRfq\(polyHttp/.test(runtimeSrc),
     'Poly fill GET must call fetchPolymarketUnhedgedRfq directly — not polyLoop.fetchUnhedgedRfq'
   );
   assert.ok(!/polyLoop\.fetchUnhedgedRfq/.test(liveSrc));
+  assert.ok(!/polyLoop\.fetchUnhedgedRfq/.test(runtimeSrc));
   assert.ok(!/if \(row && row\.venue === 'polymarket'\) return \[\]/.test(liveSrc));
   assert.ok(!/createUnhedgedFillTracker\(\{[\s\S]*fetchRfq:\s*fetchSkipRfq/.test(liveSrc));
+  assert.ok(
+    /if \(unhedgedInProcess\) \{[\s\S]*createUnhedgedRuntime/.test(liveSrc),
+    'live-runner must gate the shared runtime so locks-only skips markets + fill tracker'
+  );
+  assert.ok(
+    /quoteLocks:\s*false/.test(runnerSrc) && /createUnhedgedRuntime/.test(runnerSrc),
+    'unhedged-runner must run the tape independently without Combo Lock POSTs'
+  );
   assert.ok(
     !/\.select\([^)]*market_ticker/.test(src),
     'unhedged_rfqs selects must use real columns only — market_ticker is not in the schema'
@@ -119,11 +130,11 @@ assert.ok(!SCOPE_LEAGUES.has('ncaaf'));
   assert.ok(DEFAULT_FILL_TICK_MS <= 1000, '1s fill tick so newest closes are looked at');
   assert.ok(HYDRATE_SEEN_LIMIT >= 15000);
   assert.ok(
-    /FILL_TICK_MS/.test(liveSrc) && /unhedgedFills\.tick\(\)[\s\S]{0,80}FILL_TICK_MS/.test(liveSrc),
-    'fill tracker must tick faster than skip-tape (15s)'
+    /FILL_TICK_MS/.test(liveSrc) && /unhedged\.tick\(\)[\s\S]{0,80}FILL_TICK_MS/.test(liveSrc),
+    'in-process fill tracker must tick faster than skip-tape (15s)'
   );
   assert.ok(
-    /market_ticker:\s*(?:rfq|missRfq)\.marketTicker/.test(liveSrc),
+    /market_ticker:\s*\(rfq && \(rfq\.marketTicker/.test(runtimeSrc),
     'remember MVE ticker from rfq_created so GET 404 can still tape'
   );
   assert.ok(

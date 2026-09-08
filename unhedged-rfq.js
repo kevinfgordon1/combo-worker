@@ -48,6 +48,8 @@
 //
 // Env: UNHEDGED_RFQ_SHADOW default ON (collect tape). Set 0/false/off to idle.
 //      UNHEDGED_RFQ_LIVE default OFF — posting is not wired on this path.
+//      Production: unhedged-runner.js (second Railway service). live-runner
+//      only runs this in-process while UNHEDGED_IN_PROCESS is on (default).
 'use strict';
 const { parseKalshiTicker } = require('./leg-identity');
 const { findStartedEvent, parseTs } = require('./started');
