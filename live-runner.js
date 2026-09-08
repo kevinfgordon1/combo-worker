@@ -238,7 +238,15 @@ async function refresh() {
       staged = next;
     }
 
-    console.log(`[${MODE}] refreshed — ${parlays.length} active parlay(s), staged=${Object.keys(staged).length}`);
+    if (parlaysFailed) {
+      const kept = parlays.map((row) => row.label || row.id).join(', ') || 'none';
+      console.log(
+        `[${MODE}] refreshed — ${parlays.length} active parlay(s) RETAINED after soft-fail, ` +
+        `staged=${Object.keys(staged).length} — ${kept}`
+      );
+    } else {
+      console.log(`[${MODE}] refreshed — ${parlays.length} active parlay(s), staged=${Object.keys(staged).length}`);
+    }
     const lockBits = parlays.map((row) => {
       const keys = row.leg_keys || row.legKeys || [];
       return `${row.label || row.id}[${Array.isArray(keys) ? keys.join('|') : ''}]`;

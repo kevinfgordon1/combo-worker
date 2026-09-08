@@ -16,10 +16,25 @@ function querySoftFailed(result) {
   return error != null || !Array.isArray(data);
 }
 
+function lockLabels(parlays) {
+  if (!Array.isArray(parlays) || !parlays.length) return 'none';
+  return parlays.map((p) => p.label || p.id).join(', ');
+}
+
+function killSwitchSummary(killByUser) {
+  if (!killByUser || typeof killByUser !== 'object') return 'none';
+  const keys = Object.keys(killByUser);
+  if (!keys.length) return 'none';
+  return keys.map((id) => `${id}=${killByUser[id]}`).join(', ');
+}
+
 function applyRefreshParlays(prev, result, log = console) {
   if (querySoftFailed(result)) {
     const n = Array.isArray(prev) ? prev.length : 0;
-    log.error(`refresh soft-fail parlays: ${queryErrorMessage(result && result.error)} — keeping ${n} locks`);
+    log.error(
+      `refresh soft-fail parlays: ${queryErrorMessage(result && result.error)} — ` +
+      `keeping ${n} lock(s): ${lockLabels(prev)}`
+    );
     return prev;
   }
   return result.data;
@@ -27,8 +42,10 @@ function applyRefreshParlays(prev, result, log = console) {
 
 function applyRefreshKillByUser(prev, result, log = console) {
   if (querySoftFailed(result)) {
-    const n = prev && typeof prev === 'object' ? Object.keys(prev).length : 0;
-    log.error(`refresh soft-fail settings: ${queryErrorMessage(result && result.error)} — keeping ${n} user kill_switch(es)`);
+    log.error(
+      `refresh soft-fail settings: ${queryErrorMessage(result && result.error)} — ` +
+      `keeping kill_switch ${killSwitchSummary(prev)}`
+    );
     return prev;
   }
   const next = {};
@@ -51,6 +68,7 @@ function applyRefreshFilledByParlay(prev, result, countField, log = console) {
 
 module.exports = {
   querySoftFailed,
+  lockLabels,
   applyRefreshParlays,
   applyRefreshKillByUser,
   applyRefreshFilledByParlay,

@@ -42,7 +42,7 @@ const ARI_JAC = {
   assert.strictEqual(next.length, 1);
   assert.strictEqual(next[0].id, ARI_JAC.id);
   assert.ok(
-    /refresh soft-fail parlays: Timeout — keeping 1 locks/.test(log.errors[0]),
+    /refresh soft-fail parlays: Timeout — keeping 1 lock\(s\): Arizona \+ Jacksonville/.test(log.errors[0]),
     log.errors[0]
   );
 }
@@ -52,7 +52,7 @@ const ARI_JAC = {
   const log = silentLog();
   const next = applyRefreshParlays(prev, { data: null, error: null }, log);
   assert.strictEqual(next, prev, 'null data without a thrown error still keeps locks');
-  assert.ok(/keeping 1 locks/.test(log.errors[0]));
+  assert.ok(/keeping 1 lock\(s\): Arizona \+ Jacksonville/.test(log.errors[0]));
 }
 
 {
@@ -78,7 +78,7 @@ const ARI_JAC = {
   assert.strictEqual(next, prev);
   assert.strictEqual(next['user-1'], false, 'settings soft-fail must preserve kill_switch false');
   assert.strictEqual(next['user-1'] !== false, false);
-  assert.ok(/refresh soft-fail settings: 502/.test(log.errors[0]));
+  assert.ok(/refresh soft-fail settings: 502 — keeping kill_switch user-1=false/.test(log.errors[0]));
 }
 
 {

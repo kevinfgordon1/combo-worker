@@ -22,6 +22,7 @@ const { matchParlay } = require('./rfq');
 const { decideAtFill } = require('./engine');
 const { shortId } = require('./short-id');
 const {
+  querySoftFailed,
   applyRefreshParlays,
   applyRefreshKillByUser,
   applyRefreshFilledByParlay,
@@ -87,10 +88,18 @@ async function refresh() {
     ]);
     const refreshLog = { error: (msg) => console.error(`[${MODE}] ${msg}`) };
     // supabase-js soft-fails as { data: null, error } — do not treat null as [].
+    const parlaysFailed = querySoftFailed(parlaysQ);
     parlays = applyRefreshParlays(parlays, parlaysQ, refreshLog);
     killByUser = applyRefreshKillByUser(killByUser, settingsQ, refreshLog);
     filledByParlay = applyRefreshFilledByParlay(filledByParlay, fillsQ, 'contracts', refreshLog);
-    console.log(`[${MODE}] refreshed — ${parlays.length} active parlay(s)`);
+    if (parlaysFailed) {
+      const kept = parlays.map((row) => row.label || row.id).join(', ') || 'none';
+      console.log(
+        `[${MODE}] refreshed — ${parlays.length} active parlay(s) RETAINED after soft-fail — ${kept}`
+      );
+    } else {
+      console.log(`[${MODE}] refreshed — ${parlays.length} active parlay(s)`);
+    }
   } catch (e) { console.error(`[${MODE}] refresh failed`, e.message); }
 }
 // Contracts counted against a parlay's ceiling: real booked fills (DB) + would-be fills this session.

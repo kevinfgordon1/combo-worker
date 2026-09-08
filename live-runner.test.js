@@ -216,6 +216,10 @@ assert.ok(
 );
 
 assert.ok(
+  /RETAINED after soft-fail/.test(liveSrc),
+  'live refresh must log RETAINED + lock labels when parlays query soft-fails'
+);
+assert.ok(
   /require\('\.\/refresh-state'\)/.test(liveSrc) && /applyRefreshParlays/.test(liveSrc),
   'live refresh must apply parlays/settings/fills via refresh-state (keep prior on soft-fail)'
 );
@@ -230,6 +234,10 @@ assert.ok(
 assert.ok(
   /require\('\.\/refresh-state'\)/.test(shadowSrc) && /applyRefreshParlays/.test(shadowSrc),
   'shadow refresh must use the same soft-fail keep-previous helpers'
+);
+assert.ok(
+  /RETAINED after soft-fail/.test(shadowSrc),
+  'shadow refresh must log RETAINED when parlays query soft-fails'
 );
 assert.ok(
   !/parlays = p \|\| \[\]/.test(shadowSrc),
