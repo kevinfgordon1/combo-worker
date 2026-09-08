@@ -243,6 +243,30 @@ assert.ok(
   !/parlays = p \|\| \[\]/.test(shadowSrc),
   'shadow refresh must not coerce null parlays data to []'
 );
+assert.ok(
+  /require\('\.\/rfq-repeat'\)/.test(liveSrc) && /repeatGuard\.claim\(fingerprint\)/.test(liveSrc),
+  'Kalshi quote path must claim an RFQ fingerprint before POST'
+);
+assert.ok(
+  /skipReason:\s*REPEAT_SKIP_REASON/.test(liveSrc) && liveSrc.includes('rfq_fingerprint'),
+  'repeat skips must persist skip_reason=rfq_repeat + rfq_fingerprint'
+);
+assert.ok(
+  /if \(claimed\.alert\) \{[\s\S]*?sendAlert\(formatRepeatSkipAlert/.test(liveSrc),
+  'Telegram only once per cooldown window — not every repeat tick'
+);
+assert.ok(
+  /RFQ_REPEAT_COOLDOWN_MS/.test(liveSrc) && /rfqRepeat:\s*0/.test(liveSrc),
+  'cooldown must be env-tunable and tallied'
+);
+assert.ok(
+  !/require\('\.\/quote-watcher'\)/.test(liveSrc),
+  'quote-watcher stays parked'
+);
+assert.ok(
+  !/require\('\.\/rfq-repeat'\)/.test(fs.readFileSync(path.join(__dirname, 'polymarket-rfq.js'), 'utf8')),
+  'Poly path is not wired unless the same spam pattern appears'
+);
 
 assert.ok(
   /unhedgedFills\.tick\(\)[\s\S]{0,120}FILL_TICK_MS/.test(liveSrc),

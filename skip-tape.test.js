@@ -80,6 +80,10 @@ const args = {
   assert.strictEqual(funds.skip_reason, 'insufficient_balance');
   assert.strictEqual(funds.contracts, 43);
   assert.strictEqual(funds.remaining, 73);
+
+  const repeat = skipPersistExtra({ skipReason: 'rfq_repeat', contracts: 6 });
+  assert.strictEqual(repeat.skip_reason, 'rfq_repeat');
+  assert.strictEqual(repeat.contracts, 6);
 }
 
 // Miss tape insert extras: default kalshi; Poly fallback; caller venue wins.
@@ -113,6 +117,7 @@ const args = {
   assert.strictEqual(isSkipTapeEligible(base), true);
   assert.strictEqual(isSkipTapeEligible({ ...base, skipReason: 'limit_reached' }), true);
   assert.strictEqual(isSkipTapeEligible({ ...base, skipReason: 'insufficient_balance' }), false);
+  assert.strictEqual(isSkipTapeEligible({ ...base, skipReason: 'rfq_repeat' }), false);
   assert.strictEqual(isSkipTapeEligible({ ...base, skipReason: 'declined' }), false);
   assert.strictEqual(isSkipTapeEligible({ ...base, tapeMatch: 'none' }), false);
   assert.strictEqual(isSkipTapeEligible({ ...base, tapeMatch: 'matched' }), false);

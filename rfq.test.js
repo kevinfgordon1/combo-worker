@@ -340,6 +340,45 @@ assert.strictEqual(
   assert.strictEqual(centi.targetCostDollars, 25);
 }
 
+// creator_id is documented on rfq_created but often empty — parse when present.
+{
+  const empty = normalizeRfq(kalshiEnv('rfq-no-creator', legsFromKeys(ariJacDateOnly.leg_keys)));
+  assert.strictEqual(empty.creatorId, null);
+  const blank = normalizeRfq({
+    type: 'rfq_created',
+    msg: {
+      id: 'rfq-blank-creator',
+      contracts_fp: '6.00',
+      creator_id: '  ',
+      mve_selected_legs: legsFromKeys(ariJacDateOnly.leg_keys),
+    },
+  });
+  assert.strictEqual(blank.creatorId, null);
+  const present = normalizeRfq({
+    type: 'rfq_created',
+    msg: {
+      id: 'rfq-creator',
+      contracts_fp: '6.00',
+      creator_id: 'kalshi-user-1',
+      mve_selected_legs: legsFromKeys(ariJacDateOnly.leg_keys),
+    },
+  });
+  assert.strictEqual(present.creatorId, 'kalshi-user-1');
+  const nested = normalizeRfq({
+    type: 'rfq_created',
+    msg: {
+      id: 'rfq-nested-creator',
+      contracts_fp: '6.00',
+      mve_selected_legs: [],
+      rfq: {
+        creatorId: 'nested-user',
+        mve_selected_legs: legsFromKeys(ariJacDateOnly.leg_keys),
+      },
+    },
+  });
+  assert.strictEqual(nested.creatorId, 'nested-user');
+}
+
 // Overlap helper for LOCK-MISS logs.
 {
   const rfq = normalizeRfq(kalshiEnv('rfq-overlap', [

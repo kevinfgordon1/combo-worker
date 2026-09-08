@@ -135,6 +135,14 @@ function collectLegsRaw(m) {
   return Array.isArray(top) ? top : null;
 }
 
+function parseCreatorId(m) {
+  const raw = firstPresent(m, ['creator_id', 'creatorId'])
+    ?? firstPresent(m && m.rfq, ['creator_id', 'creatorId']);
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  return s || null;
+}
+
 function parseTargetCost(m) {
   const rawCost = firstPresent(m, COST_FIELDS) ?? firstPresent(m && m.rfq, COST_FIELDS);
   if (rawCost != null) {
@@ -171,6 +179,7 @@ function normalizeRfq(e) {
     ),
     contracts: parseContracts(contractsRaw),
     targetCostDollars: Number.isFinite(targetCost) && targetCost > 0 ? targetCost : null,
+    creatorId: parseCreatorId(m),
     createdTs: m.created_ts || (m.rfq && m.rfq.created_ts) || null,
   };
 }

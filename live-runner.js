@@ -35,6 +35,14 @@
 //   declined combo_submissions row for the lock card. Telegram stays silent.
 //   No public-tape lookup. Precision rejects stay console + unfilled.
 //   Quote-watcher stays parked. We do not write combo_matches or watcher_debug.
+// RFQ REPEAT: lock-matched RFQs about to quote are fingerprinted
+//   (sorted legs + contracts + target_cost + creator_id when non-empty).
+//   First claim in RFQ_REPEAT_COOLDOWN_MS (default 90s; 0 disables)
+//   quotes/shadows as today and Telegrams. Later identical claims persist
+//   skip_reason=rfq_repeat on Miss tape (meaningful skip) and Telegram
+//   once per window — not every tick. History can collapse consecutive
+//   identical skip rows (aibetbuilder #108). Exact-lock matching unchanged.
+//   Poly is not wired. Quote-watcher stays parked.
 // UNHEDGED SHADOW: unmatched in-scope MLB/NFL ML combos persist to
 //   unhedged_rfqs (UNHEDGED_RFQ_SHADOW, default on). Never POSTs. Combo Locks
 //   match / reserve / quote path is unchanged. Fair is inverse-bet ourTrue:
@@ -52,6 +60,7 @@
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
+//      RFQ_REPEAT_COOLDOWN_MS (optional; default 90000; 0 disables)
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
@@ -100,6 +109,13 @@ const {
   applyRefreshKillByUser,
   applyRefreshFilledByParlay,
 } = require('./refresh-state');
+const {
+  fingerprintRfq,
+  createRepeatGuard,
+  readCooldownMs,
+  formatRepeatSkipAlert,
+  REPEAT_SKIP_REASON,
+} = require('./rfq-repeat');
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -191,7 +207,9 @@ const counts = {
   limitReached: 0,
   posted: 0, postFailed: 0, dollarRfqs: 0, filled: 0,
   tapeMatched: 0, tapeNone: 0,
+  rfqRepeat: 0,
 };
+const repeatGuard = createRepeatGuard({ cooldownMs: readCooldownMs(process.env) });
 let lastLockFingerprint = '';
 
 const pendingSkipTapes = new Map(); // submission id → skip row awaiting tape
@@ -1265,6 +1283,35 @@ async function onRfq(rfq, env) {
     console.log(`[${MODE}] NO-LOCK (posting) ${p.label} rfq=${rfq.rfqId} worst=$${d.worst}`);
   }
 
+  const fingerprint = fingerprintRfq(rfq);
+  const claimed = repeatGuard.claim(fingerprint);
+  if (claimed.skip) {
+    counts.rfqRepeat++;
+    const extra = {
+      ...skipPersistExtra({
+        skipReason: REPEAT_SKIP_REASON,
+        contracts: size.contracts != null ? size.contracts : rfq.contracts,
+        remaining: d && d.remaining != null ? d.remaining : null,
+        marketTicker: rfq.marketTicker,
+      }),
+      rfq_fingerprint: fingerprint,
+    };
+    logAsync(p, rfq, d, 'declined', extra);
+    console.log(
+      `[${MODE}] SKIP ${REPEAT_SKIP_REASON} ${p.label} rfq=${rfq.rfqId} ` +
+      `fp=${fingerprint} remaining=${claimed.remainingMs}ms skips=${claimed.skipCount}`
+    );
+    if (claimed.alert) {
+      sendAlert(formatRepeatSkipAlert({
+        label: p.label,
+        contracts: size.contracts != null ? size.contracts : rfq.contracts,
+        cooldownMs: claimed.cooldownMs,
+        skipCount: claimed.skipCount,
+      })).catch(() => {});
+    }
+    return;
+  }
+
   counts.wouldQuote++;
   const t1 = performance.now(); // after match + price
 
@@ -1307,6 +1354,7 @@ async function onRfq(rfq, env) {
       // Fire-and-forget after POST (Step 1)
       logAsync(p, rfq, d, 'quoted', {
         quote_id: result.id, is_live: true, contracts: reservedContracts,
+        rfq_fingerprint: fingerprint,
       });
       sendAlert(
         `✅ QUOTED — ${p.label}\n` +
@@ -1337,7 +1385,7 @@ async function onRfq(rfq, env) {
   }
 
   // Kill-switch engaged → shadow only (not latency-critical)
-  logAsync(p, rfq, d, 'shadow');
+  logAsync(p, rfq, d, 'shadow', { rfq_fingerprint: fingerprint });
   console.log(
     `[${MODE}] SHADOW ${p.label} rfq=${rfq.rfqId} wouldSell=${d.contracts} noBid=${noBid}`
   );
@@ -1357,6 +1405,7 @@ async function main() {
     `Unaccepted quotes are DELETE'd after ${RESERVE_TTL_MS / 1000}s. ` +
     `rfq_deleted releases immediately. ` +
     `Skipped oversized/cap RFQs get a targeted tape lookup after close. ` +
+    `RFQ repeat cooldown ${repeatGuard.cooldownMs}ms (RFQ_REPEAT_COOLDOWN_MS; 0 disables). ` +
     `Unhedged RFQ shadow (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(process.env) ? 'on' : 'off'}, ` +
     `UNHEDGED_RFQ_LIVE=${isUnhedgedRfqLive(process.env) ? 'on' : 'off'}) ` +
     `persists in-scope unmatched MLB/NFL ML combos — never posts.`
