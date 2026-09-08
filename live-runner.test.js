@@ -365,6 +365,11 @@ assert.ok(
   '409 rfq_closed must persist skip_reason, log QUOTE LATE with [LAT] ms'
 );
 assert.ok(
+  /✅ QUOTED[\s\S]*?match→POST \$\{totalMs\}ms/.test(liveSrc) &&
+    /❌ QUOTE LATE[\s\S]*?match→POST \$\{totalMs\}ms/.test(liveSrc),
+  'QUOTED and QUOTE LATE Telegram both include match→POST total ms'
+);
+assert.ok(
   /require\('\.\/kalshi-http'\)/.test(liveSrc) &&
     !/new Client\('https:\/\/external-api\.kalshi\.com'/.test(liveSrc),
   'do not construct a single shared undici Client for all Kalshi REST'
