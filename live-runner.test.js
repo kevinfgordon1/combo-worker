@@ -244,8 +244,10 @@ assert.ok(
   'shadow refresh must not coerce null parlays data to []'
 );
 assert.ok(
-  /require\('\.\/rfq-repeat'\)/.test(liveSrc) && /repeatGuard\.claim\(fingerprint\)/.test(liveSrc),
-  'Kalshi quote path must claim an RFQ fingerprint before POST'
+  /require\('\.\/rfq-repeat'\)/.test(liveSrc) &&
+    /cooldownFingerprint\(rfq\)/.test(liveSrc) &&
+    /cooldownFp \? repeatGuard\.claim\(cooldownFp\)/.test(liveSrc),
+  'Kalshi quote path must claim cooldown only when creator_id is known'
 );
 assert.ok(
   /skipReason:\s*REPEAT_SKIP_REASON/.test(liveSrc) && liveSrc.includes('rfq_fingerprint'),
@@ -253,11 +255,24 @@ assert.ok(
 );
 assert.ok(
   /if \(claimed\.alert\) \{[\s\S]*?sendAlert\(formatRepeatSkipAlert/.test(liveSrc),
-  'Telegram only once per cooldown window — not every repeat tick'
+  'Telegram only when creator-gated cooldown applies — not every repeat tick'
 );
 assert.ok(
   /RFQ_REPEAT_COOLDOWN_MS/.test(liveSrc) && /rfqRepeat:\s*0/.test(liveSrc),
   'cooldown must be env-tunable and tallied'
+);
+assert.ok(
+  /creator-gated/.test(liveSrc) && /empty creator_id always quotes/.test(liveSrc),
+  'startup log must say anonymous RFQs still quote'
+);
+assert.ok(
+  /creatorIdFromQuoteResponse\(result\)/.test(liveSrc) &&
+    /await postQuote\(rfq\.rfqId/.test(liveSrc),
+  'REST rfq_creator_id is stored after a successful POST, not before'
+);
+assert.ok(
+  !/await fetchSkipRfq\(rfq\.rfqId\)/.test(liveSrc.split('async function onRfq')[1] || ''),
+  'first quote must not wait on REST GET for creator_id'
 );
 assert.ok(
   !/require\('\.\/quote-watcher'\)/.test(liveSrc),

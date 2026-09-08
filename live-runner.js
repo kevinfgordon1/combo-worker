@@ -37,12 +37,13 @@
 //   Quote-watcher stays parked. We do not write combo_matches or watcher_debug.
 // RFQ REPEAT: lock-matched RFQs about to quote are fingerprinted
 //   (sorted legs + contracts + target_cost + creator_id when non-empty).
-//   First claim in RFQ_REPEAT_COOLDOWN_MS (default 90s; 0 disables)
-//   quotes/shadows as today and Telegrams. Later identical claims persist
-//   skip_reason=rfq_repeat on Miss tape (meaningful skip) and Telegram
-//   once per window — not every tick. History can collapse consecutive
-//   identical skip rows (aibetbuilder #108). Exact-lock matching unchanged.
-//   Poly is not wired. Quote-watcher stays parked.
+//   Cooldown / skip rfq_repeat ONLY when creator_id is known. Anonymous
+//   WS RFQs (empty creator — common) always POST, even if Ari+Jax 6-contract
+//   is identical. Known-creator loops use RFQ_REPEAT_COOLDOWN_MS (default
+//   90s; 0 disables): first quotes, later persist skip_reason=rfq_repeat
+//   on Miss tape and Telegram once per window. History fingerprint is still
+//   written for grouping. Exact-lock matching unchanged. Poly is not wired.
+//   Quote-watcher stays parked.
 // UNHEDGED SHADOW: unmatched in-scope MLB/NFL ML combos persist to
 //   unhedged_rfqs (UNHEDGED_RFQ_SHADOW, default on). Never POSTs. Combo Locks
 //   match / reserve / quote path is unchanged. Fair is inverse-bet ourTrue:
@@ -111,6 +112,8 @@ const {
 } = require('./refresh-state');
 const {
   fingerprintRfq,
+  cooldownFingerprint,
+  creatorIdFromQuoteResponse,
   createRepeatGuard,
   readCooldownMs,
   formatRepeatSkipAlert,
@@ -1284,7 +1287,8 @@ async function onRfq(rfq, env) {
   }
 
   const fingerprint = fingerprintRfq(rfq);
-  const claimed = repeatGuard.claim(fingerprint);
+  const cooldownFp = cooldownFingerprint(rfq);
+  const claimed = cooldownFp ? repeatGuard.claim(cooldownFp) : { skip: false, gated: false };
   if (claimed.skip) {
     counts.rfqRepeat++;
     const extra = {
@@ -1351,10 +1355,21 @@ async function onRfq(rfq, env) {
         `reserved=${outstanding + reservedContracts}/${d.totalLimit} locks=${d.locks}`
       );
 
+      // REST may return rfq_creator_id after we already posted. Persist it
+      // for History; start the creator-gated window without blocking POST.
+      const restCreator = creatorIdFromQuoteResponse(result);
+      const quotedFingerprint = restCreator && !rfq.creatorId
+        ? fingerprintRfq({ ...rfq, creatorId: restCreator })
+        : fingerprint;
+      if (restCreator && !cooldownFp) {
+        const learned = cooldownFingerprint({ ...rfq, creatorId: restCreator });
+        if (learned) repeatGuard.claim(learned);
+      }
+
       // Fire-and-forget after POST (Step 1)
       logAsync(p, rfq, d, 'quoted', {
         quote_id: result.id, is_live: true, contracts: reservedContracts,
-        rfq_fingerprint: fingerprint,
+        rfq_fingerprint: quotedFingerprint,
       });
       sendAlert(
         `✅ QUOTED — ${p.label}\n` +
@@ -1405,7 +1420,8 @@ async function main() {
     `Unaccepted quotes are DELETE'd after ${RESERVE_TTL_MS / 1000}s. ` +
     `rfq_deleted releases immediately. ` +
     `Skipped oversized/cap RFQs get a targeted tape lookup after close. ` +
-    `RFQ repeat cooldown ${repeatGuard.cooldownMs}ms (RFQ_REPEAT_COOLDOWN_MS; 0 disables). ` +
+    `RFQ repeat cooldown ${repeatGuard.cooldownMs}ms creator-gated ` +
+    `(RFQ_REPEAT_COOLDOWN_MS; 0 disables; empty creator_id always quotes). ` +
     `Unhedged RFQ shadow (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(process.env) ? 'on' : 'off'}, ` +
     `UNHEDGED_RFQ_LIVE=${isUnhedgedRfqLive(process.env) ? 'on' : 'off'}) ` +
     `persists in-scope unmatched MLB/NFL ML combos — never posts.`
