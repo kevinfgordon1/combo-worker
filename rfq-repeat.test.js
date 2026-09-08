@@ -153,18 +153,30 @@ assert.strictEqual(cooldownFingerprint(null), null);
   const bob = cooldownFingerprint(normalizeRfq(kalshiEnv('b1', ariJaxLegs, {
     contracts: 6, creatorId: 'bob',
   })));
+  assert.strictEqual(g.peek(alice).skip, false, 'peek before first claim must not start the window');
+  assert.strictEqual(g.size, 0);
   const first = g.claim(alice);
   assert.strictEqual(first.skip, false);
   assert.strictEqual(first.gated, true);
+  const peeked = g.peek(alice);
+  assert.strictEqual(peeked.skip, true);
+  assert.strictEqual(peeked.skipCount, 0, 'peek must not increment skipCount');
+  const noted = g.noteSkip(alice);
+  assert.strictEqual(noted.skip, true);
+  assert.strictEqual(noted.alert, true);
+  assert.strictEqual(noted.skipCount, 1);
+  const notedAgain = g.noteSkip(alice);
+  assert.strictEqual(notedAgain.alert, false);
+  assert.strictEqual(notedAgain.skipCount, 2);
   const second = g.claim(alice);
   assert.strictEqual(second.skip, true);
-  assert.strictEqual(second.alert, true, 'Telegram once when creator-gated cooldown applies');
-  assert.strictEqual(second.skipCount, 1);
+  assert.strictEqual(second.alert, false, 'Telegram already fired via noteSkip');
+  assert.strictEqual(second.skipCount, 3);
   assert.strictEqual(second.remainingMs, 90_000);
   const third = g.claim(alice);
   assert.strictEqual(third.skip, true);
   assert.strictEqual(third.alert, false, 'Telegram only once per cooldown window');
-  assert.strictEqual(third.skipCount, 2);
+  assert.strictEqual(third.skipCount, 4);
 
   const otherSize = g.claim(cooldownFingerprint(normalizeRfq(kalshiEnv('a10', ariJaxLegs, {
     contracts: 10, creatorId: 'alice',
@@ -177,6 +189,21 @@ assert.strictEqual(cooldownFingerprint(null), null);
   t += 90_000;
   const after = g.claim(alice);
   assert.strictEqual(after.skip, false, 'same creator+fingerprint quotes again after cooldown');
+}
+
+{
+  let t = 2_000_000;
+  const g = createRepeatGuard({ cooldownMs: 90_000, now: () => t });
+  const alice = cooldownFingerprint(normalizeRfq(kalshiEnv('late', ariJaxLegs, {
+    contracts: 3, creatorId: 'friend',
+  })));
+  assert.strictEqual(g.peek(alice).skip, false);
+  assert.strictEqual(g.size, 0, 'peek before POST must not occupy the map');
+  // 409 rfq_closed — do not claim. Next identical RFQ must still quote.
+  assert.strictEqual(g.peek(alice).skip, false, 'failed POST must not start cooldown');
+  const landed = g.claim(alice);
+  assert.strictEqual(landed.skip, false);
+  assert.strictEqual(g.peek(alice).skip, true);
 }
 
 {

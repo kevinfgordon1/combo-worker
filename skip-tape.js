@@ -1,6 +1,7 @@
 // Skip-reason + targeted public-tape lookup for RFQs we declined (oversized / cap).
 // insufficient_balance is a lock-card / Miss-tape skip_reason but is NOT
 // tape-eligible — we never posted, so there is no public print to match.
+// rfq_closed (late quote POST) is persist-only on combo_submissions — same.
 // Pure helpers plus one reconcile function. No firehose, no quote-watcher.
 'use strict';
 const { parseTs } = require('./started');

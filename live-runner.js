@@ -10,6 +10,10 @@
 //   Released on fill, cancel, POST fail, rfq_deleted, or 20s unaccepted DELETE.
 // PARTIAL-FILL: d.locks is informational; post while ceiling remains.
 // LATENCY: Steps 0–4 — instrument, POST first, undici keep-alive, pre-stage.
+//   Quote POST/confirm/cancel use a dedicated undici Client so background
+//   GETs (unhedged /markets, skip-tape, fill tracker, warm) cannot HOL-block
+//   the auction send. [LAT] match/pre/post/total ms on every attempt; 409
+//   rfq_closed is logged as QUOTE LATE with that latency (null quote_id).
 // START GATE: never quote (and cancel open quotes) once any leg's start <= now.
 //   Started still wins; the cap is a second gate.
 //   Polymarket confirm + resting-quote cancel uses the same startedFor /
@@ -40,9 +44,11 @@
 //   Cooldown / skip rfq_repeat ONLY when creator_id is known. Anonymous
 //   WS RFQs (empty creator — common) always POST, even if Ari+Jax 6-contract
 //   is identical. Known-creator loops use RFQ_REPEAT_COOLDOWN_MS (default
-//   90s; 0 disables): first quotes, later persist skip_reason=rfq_repeat
-//   on Miss tape and Telegram once per window. History fingerprint is still
-//   written for grouping. Exact-lock matching unchanged. Poly is not wired.
+//   90s; 0 disables): first successful POST starts the window; later persist
+//   skip_reason=rfq_repeat on Miss tape and Telegram once per window.
+//   Failed POST (incl. 409 rfq_closed) does not claim — the next live
+//   auction can still quote. History fingerprint is still written for
+//   grouping. Exact-lock matching unchanged. Poly is not wired.
 //   Quote-watcher stays parked.
 // UNHEDGED SHADOW: unmatched in-scope MLB/NFL ML combos persist to
 //   unhedged_rfqs (UNHEDGED_RFQ_SHADOW, default on). Never POSTs. Combo Locks
@@ -65,11 +71,10 @@
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
-const { Client } = require('undici');
 const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, clockOffset, signedRequest } = require('./kalshi-auth');
 const { matchParlay, describeLockOverlap } = require('./rfq');
-const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
+const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, isRfqClosedFailure, quotePostFailReason, formatQuoteLatency, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
 const { findStartedEvent } = require('./started');
 const {
   RESERVE_TTL_MS,
@@ -119,17 +124,17 @@ const {
   formatRepeatSkipAlert,
   REPEAT_SKIP_REASON,
 } = require('./rfq-repeat');
+const { createKalshiRestPair } = require('./kalshi-http');
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// Step 2 — one persistent HTTP client (warm socket)
-const kalshiHttp = new Client('https://external-api.kalshi.com', {
-  keepAliveTimeout: 60_000,
-  keepAliveMaxTimeout: 600_000,
-});
+// Step 2 — two persistent HTTP clients. Quote mutations must not queue
+// behind unhedged /markets pagination or skip-tape GETs (undici Client
+// defaults to one connection).
+const { rest: kalshiHttp, quote: kalshiQuoteHttp } = createKalshiRestPair();
 const QUOTE_PATH = '/trade-api/v2/communications/quotes';
 const WARM_PATH = '/trade-api/v2/exchange/status';
 
@@ -137,10 +142,11 @@ const WARM_PATH = '/trade-api/v2/exchange/status';
 // after applying Kalshi's Date header. Quote POST / confirm / cancel / GET
 // share this so Combo Locks REST cannot keep the #61 WS-only clock offset.
 async function kalshiSigned(method, signPath, opts = {}) {
+  const http = opts.http || kalshiHttp;
   return signedRequest(async ({ method: m, path, headers, body }) => {
     const req = { method: m, path, headers };
     if (body != null) req.body = body;
-    const { statusCode, headers: resHeaders, body: resBody } = await kalshiHttp.request(req);
+    const { statusCode, headers: resHeaders, body: resBody } = await http.request(req);
     const text = await resBody.text();
     return { statusCode, headers: resHeaders, text };
   }, {
@@ -447,6 +453,7 @@ async function postQuote(rfqId, noBid, yesBid = YES_DECLINE, restRemainder) {
   const { statusCode, text } = await kalshiSigned('POST', QUOTE_PATH, {
     headers: { 'Content-Type': 'application/json' },
     body,
+    http: kalshiQuoteHttp,
   });
   if (statusCode < 200 || statusCode >= 300) {
     throw new Error(`Kalshi quote failed ${statusCode}: ${text}`);
@@ -466,7 +473,7 @@ function cancelPath(quoteId) {
 
 async function cancelQuote(quoteId) {
   const path = cancelPath(quoteId);
-  const { statusCode, text } = await kalshiSigned('DELETE', path);
+  const { statusCode, text } = await kalshiSigned('DELETE', path, { http: kalshiQuoteHttp });
   // 204 = deleted. 404 = already gone (RFQ closed / already cancelled).
   if (statusCode === 204 || statusCode === 404) return { statusCode };
   if (statusCode < 200 || statusCode >= 300) {
@@ -740,6 +747,7 @@ async function confirmQuote(rfqId, quoteId) {
   const { statusCode, text } = await kalshiSigned('PUT', path, {
     headers: { 'Content-Type': 'application/json' },
     body: '{}',
+    http: kalshiQuoteHttp,
   });
   if (statusCode < 200 || statusCode >= 300) {
     throw new Error(`Kalshi confirm failed ${statusCode}: ${text}`);
@@ -747,17 +755,25 @@ async function confirmQuote(rfqId, quoteId) {
   return { statusCode };
 }
 
-async function warmConnection() {
+async function warmOne(http, label) {
   try {
-    const { statusCode } = await kalshiSigned('GET', WARM_PATH);
+    const { statusCode } = await kalshiSigned('GET', WARM_PATH, { http });
     const offset = clockOffset();
     if (Math.abs(offset) > 2000) {
       console.warn(`[${MODE}] kalshi clock offset ${offset}ms (from Date header)`);
     }
-    console.log(`[${MODE}] connection warm ok status=${statusCode} clockOffset=${offset}ms`);
+    console.log(`[${MODE}] connection warm ${label} ok status=${statusCode} clockOffset=${offset}ms`);
   } catch (e) {
-    console.error(`[${MODE}] connection warm failed`, e.message);
+    console.error(`[${MODE}] connection warm ${label} failed`, e.message);
   }
+}
+
+async function warmConnection() {
+  // Warm quote + rest in parallel — different Clients, same origin.
+  await Promise.all([
+    warmOne(kalshiHttp, 'rest'),
+    warmOne(kalshiQuoteHttp, 'quote'),
+  ]);
 }
 
 async function kalshiGet(path, query) {
@@ -1186,21 +1202,27 @@ async function onRfq(rfq, env) {
       );
     }
     // Combo Locks miss — shadow in-scope unhedged RFQs only. Never quotes.
-    shadowUnhedgedMiss(rfq, {
-      venue: 'kalshi',
-      extra: env && env.msg ? { msg: env.msg } : null,
-      persist: persistUnhedgedRow,
-      supabase,
-      env: process.env,
-      priceCache: unhedgedPrices,
-      onPersisted: (row) => {
-        if (unhedgedFills) {
-          unhedgedFills.remember({
-            ...row,
-            market_ticker: rfq.marketTicker || rfq.market_ticker || null,
-          });
-        }
-      },
+    // Defer classify/price/persist so a later matched lock in this tick can
+    // start POST before we walk miss legs or trip a price-cache refresh.
+    const missRfq = rfq;
+    const missExtra = env && env.msg ? { msg: env.msg } : null;
+    setImmediate(() => {
+      shadowUnhedgedMiss(missRfq, {
+        venue: 'kalshi',
+        extra: missExtra,
+        persist: persistUnhedgedRow,
+        supabase,
+        env: process.env,
+        priceCache: unhedgedPrices,
+        onPersisted: (row) => {
+          if (unhedgedFills) {
+            unhedgedFills.remember({
+              ...row,
+              market_ticker: missRfq.marketTicker || missRfq.market_ticker || null,
+            });
+          }
+        },
+      });
     });
     return;
   }
@@ -1288,7 +1310,8 @@ async function onRfq(rfq, env) {
 
   const fingerprint = fingerprintRfq(rfq);
   const cooldownFp = cooldownFingerprint(rfq);
-  const claimed = cooldownFp ? repeatGuard.claim(cooldownFp) : { skip: false, gated: false };
+  const peeked = cooldownFp ? repeatGuard.peek(cooldownFp) : { skip: false, gated: false };
+  const claimed = peeked.skip ? repeatGuard.noteSkip(cooldownFp) : peeked;
   if (claimed.skip) {
     counts.rfqRepeat++;
     const extra = {
@@ -1339,11 +1362,14 @@ async function onRfq(rfq, env) {
         : d.contracts;
 
       // Step 0 — latency log
-      console.log(
-        `[LAT] match=${(t1 - t0).toFixed(1)} pre=${(t2 - t1).toFixed(1)} ` +
-        `post=${(t3 - t2).toFixed(1)} total=${(t3 - t0).toFixed(1)}ms ` +
-        `rfq=${rfq.rfqId} quote=${result.id}`
-      );
+      console.log(formatQuoteLatency({
+        matchMs: (t1 - t0).toFixed(1),
+        preMs: (t2 - t1).toFixed(1),
+        postMs: (t3 - t2).toFixed(1),
+        totalMs: (t3 - t0).toFixed(1),
+        rfqId: rfq.rfqId,
+        quoteId: result.id,
+      }));
 
       counts.posted++;
       pendingQuotes.delete(reserveKey);
@@ -1356,7 +1382,8 @@ async function onRfq(rfq, env) {
       );
 
       // REST may return rfq_creator_id after we already posted. Persist it
-      // for History; start the creator-gated window without blocking POST.
+      // for History; start the creator-gated window only after POST landed.
+      if (cooldownFp) repeatGuard.claim(cooldownFp);
       const restCreator = creatorIdFromQuoteResponse(result);
       const quotedFingerprint = restCreator && !rfq.creatorId
         ? fingerprintRfq({ ...rfq, creatorId: restCreator })
@@ -1381,19 +1408,42 @@ async function onRfq(rfq, env) {
     } catch (e) {
       pendingQuotes.delete(reserveKey);
       const t3 = performance.now();
-      console.log(
-        `[LAT] match=${(t1 - t0).toFixed(1)} pre=${(t2 - t1).toFixed(1)} ` +
-        `post=${(t3 - t2).toFixed(1)} total=${(t3 - t0).toFixed(1)}ms FAIL rfq=${rfq.rfqId}`
-      );
+      const failReason = quotePostFailReason(e.message) || 'error';
+      const totalMs = (t3 - t0).toFixed(1);
+      console.log(formatQuoteLatency({
+        matchMs: (t1 - t0).toFixed(1),
+        preMs: (t2 - t1).toFixed(1),
+        postMs: (t3 - t2).toFixed(1),
+        totalMs,
+        rfqId: rfq.rfqId,
+        failReason,
+      }));
       counts.postFailed++;
-      console.error(`[${MODE}] POST FAILED ${p.label} rfq=${rfq.rfqId}`, e.message);
+      const closed = isRfqClosedFailure(e.message);
+      console.error(
+        `[${MODE}] POST FAILED${closed ? ' rfq_closed' : ''} ${p.label} ` +
+        `rfq=${rfq.rfqId} in ${totalMs}ms`,
+        e.message
+      );
       if (quoteFailureSkipReason(e.message)) {
         logFundingSkip(p, rfq, d);
+      } else if (closed) {
+        logAsync(p, rfq, d, 'unfilled', {
+          skip_reason: 'rfq_closed',
+          rfq_fingerprint: fingerprint,
+        });
       } else {
         logAsync(p, rfq, d, 'unfilled');
       }
       if (!isSilentQuoteFailure(e.message)) {
-        sendAlert(`❌ QUOTE FAILED — ${p.label}\nrfq ${shortId(rfq.rfqId)}\n${e.message}`).catch(() => {});
+        sendAlert(
+          closed
+            ? `❌ QUOTE LATE — ${p.label}\n` +
+              `rfq ${shortId(rfq.rfqId)} already closed\n` +
+              `match→POST ${totalMs}ms\n` +
+              `${e.message}`
+            : `❌ QUOTE FAILED — ${p.label}\nrfq ${shortId(rfq.rfqId)}\n${e.message}`
+        ).catch(() => {});
       }
     }
     return;
@@ -1414,7 +1464,7 @@ async function main() {
     process.exit(1);
   }
   console.log(
-    `[${MODE}] starting — latency-optimized. POST first, undici keep-alive, pre-staged prices. ` +
+    `[${MODE}] starting — latency-optimized. POST first, dedicated quote HTTP, pre-staged prices. ` +
     `Auto-confirms quote_accepted (HVM ~3s window). ` +
     `Remaining = max - filled - outstanding quotes (Kalshi + Polymarket). ` +
     `Unaccepted quotes are DELETE'd after ${RESERVE_TTL_MS / 1000}s. ` +
@@ -1527,6 +1577,7 @@ async function main() {
     try { unhedgedPrices && unhedgedPrices.stop && unhedgedPrices.stop(); } catch (_) {}
     try { polyUnhedgedHttp && polyUnhedgedHttp.close && polyUnhedgedHttp.close(); } catch (_) {}
     try { kalshiHttp.close(); } catch (_) {}
+    try { kalshiQuoteHttp.close(); } catch (_) {}
     console.log(`[${MODE}] final`, counts);
     process.exit(0);
   });

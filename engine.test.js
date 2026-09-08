@@ -3,6 +3,7 @@ const assert = require('assert');
 const {
   decideAtFill, fillView, buildQuoteBody, yesBidForQuote, shouldPostQuote, isSilentQuoteFailure,
   isInsufficientFundsFailure, quoteFailureSkipReason,
+  isRfqClosedFailure, quotePostFailReason, formatQuoteLatency,
   YES_DECLINE, impliedYesBid, quoteYesBid, isRealYesBid, shouldConfirmAccept, contractsFromQuoteResponse,
 } = require('./engine');
 const { normalizeRfq } = require('./rfq');
@@ -195,6 +196,36 @@ assert.strictEqual(
 );
 assert.strictEqual(quoteFailureSkipReason('Kalshi quote failed 400: invalid_yes_bid'), null);
 assert.strictEqual(quoteFailureSkipReason('Kalshi quote failed 400: RFQ_CLOSED'), null);
+assert.ok(isRfqClosedFailure('Kalshi quote failed 409: {"error":{"code":"rfq_closed"}}'));
+assert.ok(isRfqClosedFailure('Kalshi quote failed 409: RFQ_CLOSED'));
+assert.ok(isRfqClosedFailure('409 already closed'));
+assert.ok(!isRfqClosedFailure('Kalshi quote failed 400: insufficient_balance'));
+assert.ok(!isRfqClosedFailure('fetch failed'));
+assert.strictEqual(
+  quotePostFailReason('Kalshi quote failed 409: {"error":{"code":"rfq_closed"}}'),
+  'rfq_closed'
+);
+assert.strictEqual(
+  quotePostFailReason('Kalshi quote failed 400: {"error":{"code":"insufficient_balance"}}'),
+  'insufficient_balance'
+);
+assert.strictEqual(quotePostFailReason('fetch failed'), null);
+assert.ok(!isSilentQuoteFailure('Kalshi quote failed 409: {"error":{"code":"rfq_closed"}}'));
+{
+  const ok = formatQuoteLatency({
+    matchMs: '1.2', preMs: '0.3', postMs: '42.0', totalMs: '43.5',
+    rfqId: 'rfq-1', quoteId: 'q-1',
+  });
+  assert.strictEqual(ok, '[LAT] match=1.2 pre=0.3 post=42.0 total=43.5ms rfq=rfq-1 quote=q-1');
+  const late = formatQuoteLatency({
+    matchMs: '2.0', preMs: '0.1', postMs: '180.4', totalMs: '182.5',
+    rfqId: 'rfq-late', failReason: 'rfq_closed',
+  });
+  assert.strictEqual(
+    late,
+    '[LAT] match=2.0 pre=0.1 post=180.4 total=182.5ms FAIL reason=rfq_closed rfq=rfq-late'
+  );
+}
 
 // Two-sided dollar quote: confirm only the NO side.
 assert.strictEqual(shouldConfirmAccept(YES_DECLINE, 'yes'), true);

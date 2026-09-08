@@ -246,8 +246,21 @@ assert.ok(
 assert.ok(
   /require\('\.\/rfq-repeat'\)/.test(liveSrc) &&
     /cooldownFingerprint\(rfq\)/.test(liveSrc) &&
-    /cooldownFp \? repeatGuard\.claim\(cooldownFp\)/.test(liveSrc),
-  'Kalshi quote path must claim cooldown only when creator_id is known'
+    /cooldownFp \? repeatGuard\.peek\(cooldownFp\)/.test(liveSrc),
+  'Kalshi quote path must peek cooldown only when creator_id is known'
+);
+assert.ok(
+  /peeked\.skip \? repeatGuard\.noteSkip\(cooldownFp\)/.test(liveSrc),
+  'repeat skip must noteSkip without claiming a new window'
+);
+assert.ok(
+  /if \(cooldownFp\) repeatGuard\.claim\(cooldownFp\)/.test(liveSrc) &&
+    /await postQuote\(rfq\.rfqId/.test(liveSrc),
+  'creator-gated cooldown starts only after a successful quote POST'
+);
+assert.ok(
+  liveSrc.indexOf('await postQuote(rfq.rfqId') < liveSrc.indexOf('if (cooldownFp) repeatGuard.claim(cooldownFp)'),
+  'claim must sit after postQuote so 409 rfq_closed cannot start the 90s skip'
 );
 assert.ok(
   /skipReason:\s*REPEAT_SKIP_REASON/.test(liveSrc) && liveSrc.includes('rfq_fingerprint'),
@@ -269,6 +282,41 @@ assert.ok(
   /creatorIdFromQuoteResponse\(result\)/.test(liveSrc) &&
     /await postQuote\(rfq\.rfqId/.test(liveSrc),
   'REST rfq_creator_id is stored after a successful POST, not before'
+);
+assert.ok(
+  /http: kalshiQuoteHttp/.test(liveSrc) &&
+    /createKalshiRestPair/.test(liveSrc),
+  'quote POST/confirm/cancel must use the dedicated quote HTTP client'
+);
+assert.ok(
+  /kalshiSigned\('POST', QUOTE_PATH[\s\S]*?http: kalshiQuoteHttp/.test(liveSrc),
+  'postQuote must send on kalshiQuoteHttp, not the GET pool'
+);
+assert.ok(
+  /kalshiSigned\('PUT', path[\s\S]*?http: kalshiQuoteHttp/.test(liveSrc) &&
+    /kalshiSigned\('DELETE', path, \{ http: kalshiQuoteHttp \}/.test(liveSrc),
+  'confirm and cancel share the quote client'
+);
+assert.ok(
+  /warmOne\(kalshiHttp, 'rest'\)/.test(liveSrc) &&
+    /warmOne\(kalshiQuoteHttp, 'quote'\)/.test(liveSrc),
+  'both REST pools must be warmed so the first quote POST is not a cold TLS'
+);
+assert.ok(
+  /setImmediate\(\(\) => \{[\s\S]*?shadowUnhedgedMiss\(missRfq/.test(liveSrc),
+  'unhedged miss persist must yield so a matched lock can POST first'
+);
+assert.ok(
+  /skip_reason: 'rfq_closed'/.test(liveSrc) &&
+    /QUOTE LATE/.test(liveSrc) &&
+    /formatQuoteLatency/.test(liveSrc) &&
+    /isRfqClosedFailure/.test(liveSrc),
+  '409 rfq_closed must persist skip_reason, log QUOTE LATE with [LAT] ms'
+);
+assert.ok(
+  /require\('\.\/kalshi-http'\)/.test(liveSrc) &&
+    !/new Client\('https:\/\/external-api\.kalshi\.com'/.test(liveSrc),
+  'do not construct a single shared undici Client for all Kalshi REST'
 );
 assert.ok(
   !/await fetchSkipRfq\(rfq\.rfqId\)/.test(liveSrc.split('async function onRfq')[1] || ''),

@@ -123,7 +123,7 @@ assert.ok(!SCOPE_LEAGUES.has('ncaaf'));
     'fill tracker must tick faster than skip-tape (15s)'
   );
   assert.ok(
-    /market_ticker:\s*rfq\.marketTicker/.test(liveSrc),
+    /market_ticker:\s*(?:rfq|missRfq)\.marketTicker/.test(liveSrc),
     'remember MVE ticker from rfq_created so GET 404 can still tape'
   );
   assert.ok(
