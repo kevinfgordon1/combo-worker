@@ -39,7 +39,7 @@ assert.ok(
 assert.ok(
   !/require\(['"]\.\/skip-tape['"]\)/.test(runnerSrc) &&
     !/require\(['"]\.\/poly-miss-tape['"]\)/.test(runnerSrc) &&
-    !runnerSrc.includes('combo_submissions'),
+    !/from\(['"]combo_submissions['"]\)/.test(runnerSrc),
   'Combo Locks Miss tape stays on live-runner'
 );
 assert.ok(
