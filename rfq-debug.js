@@ -8,8 +8,9 @@
 //   NESEA,CHICAR,WASPHI,SFLAR,ARILAC,CLEJAC
 // MLB-era BOSTOR,BALMIN,HOUSF will not hit current locks.
 //
-// Wired from live-runner Kalshi WS onEvent. It only READS the incoming
-// message and INSERTS a debug row. It never places/cancels/quotes.
+// Wired inside kalshi-ws.js on every communications message. Console-only
+// by default (Railway logs). Set RFQ_DEBUG_PERSIST=1 to also INSERT
+// rfq_debug — skip that while Supabase is 522ing. Never quotes/cancels.
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
 
@@ -58,13 +59,22 @@ async function captureRfq(env) {
     + '|' + JSON.stringify(m.market_ticker || nested.market_ticker || '');
   if (!needles.some((n) => hay.includes(n))) return;
 
+  const rfqId = m.id || m.rfq_id || nested.id || null;
+  const contracts = m.contracts_fp != null ? String(m.contracts_fp)
+    : (nested.contracts_fp != null ? String(nested.contracts_fp) : null);
+  // Railway logs, not Supabase — xuolkiadmumtbksbyjzc 522s must not be the sample path.
+  console.log(
+    `[RFQ-DEBUG] rfq=${rfqId} collection=${collection || '(none)'} ` +
+    `contracts=${contracts || '(none)'} legs=${JSON.stringify(legs)}`
+  );
+  if (!/^(1|true|yes)$/i.test(String(process.env.RFQ_DEBUG_PERSIST || ''))) return;
+
   try {
     await client().from('rfq_debug').insert({
-      rfq_id: m.id || m.rfq_id || nested.id || null,
+      rfq_id: rfqId,
       mve_collection_ticker: collection,
       mve_selected_legs: legs,
-      contracts_fp: m.contracts_fp != null ? String(m.contracts_fp)
-        : (nested.contracts_fp != null ? String(nested.contracts_fp) : null),
+      contracts_fp: contracts,
       raw: env,
     });
   } catch (_) { /* debug only — never disrupt the worker */ }

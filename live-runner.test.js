@@ -166,11 +166,17 @@ assert.ok(
   liveSrc.includes('EMPTY-LEGS') && /msgKeys=/.test(liveSrc),
   'first empty-legKey combo RFQs must log raw msg keys (renamed legs field)'
 );
-assert.ok(
-  /require\('\.\/rfq-debug'\)/.test(liveSrc)
-  && /onEvent:\s*\(env\) => \{ captureRfq\(env\)/.test(liveSrc),
-  'RFQ_DEBUG_NEEDLE capture must be wired on the Kalshi WS onEvent path'
-);
+{
+  const wsSrc = fs.readFileSync(path.join(__dirname, 'kalshi-ws.js'), 'utf8');
+  assert.ok(
+    /require\('\.\/rfq-debug'\)/.test(wsSrc) && /captureRfq\(env\)/.test(wsSrc),
+    'RFQ_DEBUG_NEEDLE capture must be wired inside kalshi-ws (every communications consumer)'
+  );
+  assert.ok(
+    !/require\('\.\/rfq-debug'\)/.test(liveSrc),
+    'live-runner must not double-fire captureRfq; kalshi-ws owns the hook'
+  );
+}
 assert.ok(
   !/if \(size\.source === 'dollar'\) counts\.dollarRfqs\+\+/.test(liveSrc),
   'do not count dollarRfqs only after a lock match'
