@@ -143,6 +143,31 @@ assert.ok(
   assert.strictEqual(polyFunded.status, 'declined');
 }
 assert.ok(
+  /lockMiss:\s*0/.test(liveSrc) && /emptyLegs:\s*0/.test(liveSrc),
+  'Kalshi tallies must include lockMiss (no parlay) distinct from noLock'
+);
+assert.ok(
+  /if \(!p\) \{[\s\S]*?counts\.lockMiss\+\+/.test(liveSrc),
+  'unmatched Kalshi combo RFQs must increment lockMiss, not only shadow unhedged'
+);
+assert.ok(
+  liveSrc.includes('LOCK-MISS'),
+  'Kalshi lock misses must log keys so date-only vs HHMM is visible'
+);
+assert.ok(
+  /if \(rfq\.targetCostDollars > 0 && !\(rfq\.contracts > 0\)\) counts\.dollarRfqs\+\+/.test(liveSrc),
+  'dollarRfqs must count at combo classification, before matchParlay'
+);
+assert.ok(
+  !/if \(size\.source === 'dollar'\) counts\.dollarRfqs\+\+/.test(liveSrc),
+  'do not count dollarRfqs only after a lock match'
+);
+assert.ok(
+  /describeLockOverlap/.test(liveSrc),
+  'LOCK-MISS logs should include overlap against staged locks'
+);
+
+assert.ok(
   /unhedgedFills\.tick\(\)[\s\S]{0,120}FILL_TICK_MS/.test(liveSrc),
   'unhedged fill tick must not share the 15s skip-tape interval'
 );
