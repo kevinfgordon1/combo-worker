@@ -53,7 +53,9 @@ function normalizeLegKey(key) {
 function normalizeLeg(leg) {
   if (leg == null) return null;
   if (typeof leg === 'string') return normalizeLegKey(leg);
-  const t = leg.market_ticker || leg.ticker || leg.event_ticker || leg.selected_market || '';
+  const t = leg.market_ticker || leg.marketTicker || leg.ticker
+    || leg.selected_ticker || leg.selected_market
+    || leg.event_ticker || leg.eventTicker || '';
   const side = (leg.side || leg.selected_side || 'yes').toString().toLowerCase();
   return t ? `${String(t).trim().toUpperCase()}:${side === 'no' ? 'no' : 'yes'}` : null;
 }
@@ -67,34 +69,68 @@ function parseContracts(fp) {
 function firstPresent(obj, keys) {
   if (!obj) return null;
   for (const k of keys) {
-    if (obj[k] != null && obj[k] !== '') return obj[k];
+    const v = obj[k];
+    if (v == null || v === '') continue;
+    if (Array.isArray(v) && !v.length) continue;
+    return v;
   }
   return null;
 }
 
+const LEG_FIELDS = [
+  'mve_selected_legs', 'selected_legs', 'legs', 'mve_legs',
+  'mveSelectedLegs', 'selectedLegs',
+];
+const COST_FIELDS = [
+  'target_cost_dollars', 'rfq_target_cost_dollars', 'target_cost', 'cash_order_qty',
+];
+
+// WS rfq_created usually has fields on msg. If Kalshi nests the RFQ
+// (msg.rfq / msg.data), merge so empty top-level mve_selected_legs: []
+// cannot hide a populated nested legs array.
+function rfqMsg(e) {
+  const m = (e && e.msg && typeof e.msg === 'object') ? e.msg : (e && typeof e === 'object' ? e : {});
+  const nested = [m.rfq, m.data, m.payload].find((x) => x && typeof x === 'object' && !Array.isArray(x));
+  return nested ? { ...nested, ...m } : m;
+}
+
+function collectLegsRaw(m) {
+  const top = firstPresent(m, LEG_FIELDS);
+  if (Array.isArray(top) && top.length) return top;
+  for (const nest of [m.rfq, m.data, m.payload]) {
+    if (!nest || typeof nest !== 'object') continue;
+    const inner = firstPresent(nest, LEG_FIELDS);
+    if (Array.isArray(inner) && inner.length) return inner;
+  }
+  return Array.isArray(top) ? top : null;
+}
+
 function normalizeRfq(e) {
-  const m = (e && e.msg) || {};
-  const legsRaw = firstPresent(m, [
-    'mve_selected_legs', 'selected_legs', 'legs', 'mve_legs',
-    'mveSelectedLegs', 'selectedLegs',
-  ]);
+  const m = rfqMsg(e);
+  const legsRaw = collectLegsRaw(m);
   const legKeys = Array.isArray(legsRaw) ? legsRaw.map(normalizeLeg).filter(Boolean).sort() : null;
-  const rawCost = firstPresent(m, [
-    'target_cost_dollars', 'rfq_target_cost_dollars', 'target_cost',
-  ]);
+  const rawCost = firstPresent(m, COST_FIELDS) ?? firstPresent(m.rfq, COST_FIELDS);
   const targetCost = rawCost != null
     ? (typeof rawCost === 'string' ? parseFloat(rawCost) : Number(rawCost))
     : null;
+  const contractsRaw = m.contracts_fp != null ? m.contracts_fp
+    : (m.contracts != null ? m.contracts
+      : (m.rfq && (m.rfq.contracts_fp != null ? m.rfq.contracts_fp : m.rfq.contracts)));
   return {
-    rfqId: rfqIdFromMsg(m),
-    marketTicker: m.market_ticker || m.ticker || null,
-    mveCollection: m.mve_collection_ticker || m.mveCollectionTicker || null,
+    rfqId: rfqIdFromMsg(m) || rfqIdFromMsg(m.rfq),
+    marketTicker: m.market_ticker || m.ticker || (m.rfq && (m.rfq.market_ticker || m.rfq.ticker)) || null,
+    mveCollection: m.mve_collection_ticker || m.mveCollectionTicker
+      || (m.rfq && (m.rfq.mve_collection_ticker || m.rfq.mveCollectionTicker)) || null,
     legKeys,
     legs: Array.isArray(legsRaw) ? legsRaw : null,
-    isCombo: !!(m.mve_collection_ticker || m.mveCollectionTicker || (legKeys && legKeys.length > 1)),
-    contracts: parseContracts(m.contracts_fp != null ? m.contracts_fp : m.contracts),
+    isCombo: !!(
+      m.mve_collection_ticker || m.mveCollectionTicker
+      || (m.rfq && (m.rfq.mve_collection_ticker || m.rfq.mveCollectionTicker))
+      || (legKeys && legKeys.length > 1)
+    ),
+    contracts: parseContracts(contractsRaw),
     targetCostDollars: Number.isFinite(targetCost) && targetCost > 0 ? targetCost : null,
-    createdTs: m.created_ts || null,
+    createdTs: m.created_ts || (m.rfq && m.rfq.created_ts) || null,
   };
 }
 

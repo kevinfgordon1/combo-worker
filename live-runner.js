@@ -50,6 +50,7 @@ const { Client } = require('undici');
 const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay, describeLockOverlap } = require('./rfq');
+const { captureRfq } = require('./rfq-debug');
 const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
 const { findStartedEvent } = require('./started');
 const {
@@ -1109,9 +1110,19 @@ async function onRfq(rfq, env) {
     return;
   }
   counts.combos++;
-  // Count dollar book before match — dollarRfqs=0 with matched=0 used to be
-  // unreadable (the increment lived after matchParlay).
-  if (rfq.targetCostDollars > 0 && !(rfq.contracts > 0)) counts.dollarRfqs++;
+  // Count dollar sizing on the book BEFORE match. Production dollarRfqs=0
+  // with matched=0 was an accounting hole (increment lived after matchParlay),
+  // not proof the firehose had no dollar RFQs.
+  if (rfq.targetCostDollars > 0) counts.dollarRfqs++;
+  if (counts.combos <= 12) {
+    const keys = rfq.legKeys || [];
+    console.log(
+      `[${MODE}] RFQ-SAMPLE n=${counts.combos} rfq=${rfq.rfqId} ` +
+      `contracts=${rfq.contracts != null ? rfq.contracts : '(none)'} ` +
+      `dollar=${rfq.targetCostDollars != null ? `$${rfq.targetCostDollars}` : '(none)'} ` +
+      `legs=${keys.length} keys=${keys.join('|') || '(none)'}`
+    );
+  }
 
   const p = matchParlay(rfq, parlays);
   if (!p) {
@@ -1397,6 +1408,7 @@ async function main() {
     keyId: KEY_ID,
     pem: PEM,
     onStatus: (s, i) => console.log(`[${MODE}] ws:${s}`, i || ''),
+    onEvent: (env) => { captureRfq(env).catch(() => {}); },
     onRfqCreated: (rfq, env) => onRfq(rfq, env).catch((e) => console.error('onRfq', e)),
     onRfqDeleted: (evt, env) => { try { onRfqDeleted(evt, env); } catch (e) { console.error('onRfqDeleted', e); } },
     onQuoteAccepted: (evt) => onQuoteAccepted(evt).catch((e) => console.error('onQuoteAccepted', e)),

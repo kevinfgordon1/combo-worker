@@ -155,8 +155,17 @@ assert.ok(
   'Kalshi lock misses must log keys so date-only vs HHMM is visible'
 );
 assert.ok(
-  /if \(rfq\.targetCostDollars > 0 && !\(rfq\.contracts > 0\)\) counts\.dollarRfqs\+\+/.test(liveSrc),
+  /if \(rfq\.targetCostDollars > 0\) counts\.dollarRfqs\+\+/.test(liveSrc),
   'dollarRfqs must count at combo classification, before matchParlay'
+);
+assert.ok(
+  liveSrc.includes('RFQ-SAMPLE'),
+  'first combo RFQs must log contracts/dollar/keys so classification is visible'
+);
+assert.ok(
+  /require\('\.\/rfq-debug'\)/.test(liveSrc)
+  && /onEvent:\s*\(env\) => \{ captureRfq\(env\)/.test(liveSrc),
+  'RFQ_DEBUG_NEEDLE capture must be wired on the Kalshi WS onEvent path'
 );
 assert.ok(
   !/if \(size\.source === 'dollar'\) counts\.dollarRfqs\+\+/.test(liveSrc),

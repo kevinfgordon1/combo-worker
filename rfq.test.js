@@ -41,13 +41,25 @@ const ariJacDateOnly = {
   ],
 };
 
+// Production combo_parlays keys (Kevin 2026-09-08). Date-only; team blob
+// order may not match the Kalshi RFQ market ticker.
 const seaPhiLarDateOnly = {
   id: 'sea-phi-lar',
   label: 'SEA + PHI + LAR',
   leg_keys: [
-    'KXNFLGAME-26SEP13SEASF-SEA:yes',
-    'KXNFLGAME-26SEP13DALPHI-PHI:yes',
-    'KXNFLGAME-26SEP13LARHOU-LAR:yes',
+    'KXNFLGAME-26SEP13NESEA-SEA:yes',
+    'KXNFLGAME-26SEP13SFLAR-LAR:yes',
+    'KXNFLGAME-26SEP13WASPHI-PHI:yes',
+  ],
+};
+
+const chiPhiLar = {
+  id: 'chi-phi-lar',
+  label: 'CHI + PHI + LAR',
+  leg_keys: [
+    'KXNFLGAME-26SEP13CHICAR-CHI:yes',
+    'KXNFLGAME-26SEP13WASPHI-PHI:yes',
+    'KXNFLGAME-26SEP13SFLAR-LAR:yes',
   ],
 };
 
@@ -116,15 +128,25 @@ assert.strictEqual(
   assert.strictEqual(hit.id, ariJacDateOnly.id);
 }
 
-// SEA+PHI+LAR: three-leg date-only lock vs Sunday 1pm HHMM RFQ.
+// SEA+PHI+LAR production keys vs timed + reversed team-blob RFQ.
 {
   const rfq = normalizeRfq(kalshiEnv('rfq-sea-phi-lar', [
-    { side: 'yes', market_ticker: 'KXNFLGAME-26SEP131320SEASF-SEA' },
-    { side: 'yes', market_ticker: 'KXNFLGAME-26SEP131320DALPHI-PHI' },
-    { side: 'yes', market_ticker: 'KXNFLGAME-26SEP131320LARHOU-LAR' },
+    { side: 'yes', market_ticker: 'KXNFLGAME-26SEP132017SEANE-SEA' },
+    { side: 'yes', market_ticker: 'KXNFLGAME-26SEP131320LARSF-LAR' },
+    { side: 'yes', market_ticker: 'KXNFLGAME-26SEP131320PHIWAS-PHI' },
   ]));
-  const hit = matchParlay(rfq, [ariJacDateOnly, seaPhiLarDateOnly]);
+  const hit = matchParlay(rfq, [ariJacDateOnly, seaPhiLarDateOnly, chiPhiLar]);
   assert.strictEqual(hit && hit.id, seaPhiLarDateOnly.id);
+}
+
+// CHI lock vs reversed CHICAR blob.
+{
+  const rfq = normalizeRfq(kalshiEnv('rfq-chi', [
+    { side: 'yes', market_ticker: 'KXNFLGAME-26SEP131320CARCHI-CHI' },
+    { side: 'yes', market_ticker: 'KXNFLGAME-26SEP131320WASPHI-PHI' },
+    { side: 'yes', market_ticker: 'KXNFLGAME-26SEP131320SFLAR-LAR' },
+  ]));
+  assert.strictEqual(matchParlay(rfq, [chiPhiLar, seaPhiLarDateOnly]).id, chiPhiLar.id);
 }
 
 // Case / missing :side on the lock still matches.
@@ -246,6 +268,44 @@ assert.strictEqual(
   });
   assert.strictEqual(viaAlias.contracts, null);
   assert.strictEqual(viaAlias.targetCostDollars, 25);
+}
+
+// Empty mve_selected_legs: [] must not hide nested / alternate legs.
+// That shape would increment combos (collection + contracts) then match=0.
+{
+  const nested = normalizeRfq({
+    type: 'rfq_created',
+    msg: {
+      id: 'rfq-nested-legs',
+      contracts_fp: '10.00',
+      mve_collection_ticker: 'KXMVE-X',
+      mve_selected_legs: [],
+      rfq: {
+        target_cost_dollars: '15.00',
+        mve_selected_legs: [
+          { side: 'yes', market_ticker: 'KXNFLGAME-26SEP131320ARILAC-ARI' },
+          { side: 'yes', market_ticker: 'KXNFLGAME-26SEP131320CLEJAC-JAC' },
+        ],
+      },
+    },
+  });
+  assert.strictEqual(nested.targetCostDollars, 15);
+  assert.ok(nested.legKeys && nested.legKeys.length === 2);
+  assert.strictEqual(matchParlay(nested, [ariJacDateOnly]).id, ariJacDateOnly.id);
+
+  const altField = normalizeRfq({
+    type: 'rfq_created',
+    msg: {
+      id: 'rfq-alt-legs',
+      contracts_fp: '10.00',
+      target_cost_dollars: '20.00',
+      mve_collection_ticker: 'KXMVE-X',
+      mve_selected_legs: [],
+      selected_legs: legsFromKeys(ariJacDateOnly.leg_keys),
+    },
+  });
+  assert.strictEqual(altField.targetCostDollars, 20);
+  assert.strictEqual(matchParlay(altField, [ariJacDateOnly]).id, ariJacDateOnly.id);
 }
 
 // Overlap helper for LOCK-MISS logs.
