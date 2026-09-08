@@ -14,6 +14,10 @@
 //   Started still wins; the cap is a second gate.
 //   Polymarket confirm + resting-quote cancel uses the same startedFor /
 //   findStartedEvent (polymarket-rfq.js) — date-only PM slugs are not starts.
+// LOCK-MISS: combo RFQ that matchParlay missed. Distinct from noLock
+//   (matched, hedge does not lock). Tallies lockMiss + emptyLegs; sample
+//   logs include RFQ keys vs staged lock overlap. NFL date-only Combo
+//   Locks vs timed Kalshi tickers match via identity / HHMM strip.
 // SKIP TAPE: oversized / limit_reached skips persist a distinct reason on
 //   combo_submissions, then one RFQ+ticker tape lookup after close (or pad).
 //   Poly Combo Locks reconcile SKIP/QUOTE also insert here (venue=polymarket)
@@ -45,7 +49,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { Client } = require('undici');
 const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
-const { matchParlay } = require('./rfq');
+const { matchParlay, describeLockOverlap } = require('./rfq');
 const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
 const { findStartedEvent } = require('./started');
 const {
@@ -146,10 +150,12 @@ let staged = {};
 
 const counts = {
   rfqs: 0, combos: 0, matched: 0, wouldQuote: 0,
-  declined: 0, noLock: 0, limitReached: 0,
+  declined: 0, noLock: 0, lockMiss: 0, emptyLegs: 0,
+  limitReached: 0,
   posted: 0, postFailed: 0, dollarRfqs: 0, filled: 0,
   tapeMatched: 0, tapeNone: 0,
 };
+let lastLockFingerprint = '';
 
 const pendingSkipTapes = new Map(); // submission id → skip row awaiting tape
 let unhedgedFills = null; // already-persisted unhedged RFQs awaiting fill
@@ -196,6 +202,17 @@ async function refresh() {
     staged = next;
 
     console.log(`[${MODE}] refreshed — ${parlays.length} active parlay(s), staged=${Object.keys(staged).length}`);
+    const lockBits = parlays.map((row) => {
+      const keys = row.leg_keys || row.legKeys || [];
+      return `${row.label || row.id}[${Array.isArray(keys) ? keys.join('|') : ''}]`;
+    });
+    const fingerprint = lockBits.join(' || ');
+    if (fingerprint !== lastLockFingerprint) {
+      lastLockFingerprint = fingerprint;
+      if (lockBits.length) {
+        for (const bit of lockBits) console.log(`[${MODE}] lock ${bit}`);
+      }
+    }
     // Do not seed outstanding from combo_submissions — a 2h is_live re-import
     // revived 1309 dead contracts on Cards/Pirates every 30s. WS close + 20s
     // unaccepted DELETE is the reserve clock; unmark stale is_live so a restart
@@ -1092,9 +1109,51 @@ async function onRfq(rfq, env) {
     return;
   }
   counts.combos++;
+  // Count dollar sizing on the book BEFORE match. Production dollarRfqs=0
+  // with matched=0 was an accounting hole (increment lived after matchParlay),
+  // not proof the firehose had no dollar RFQs.
+  if (rfq.targetCostDollars > 0) counts.dollarRfqs++;
+  if (counts.combos <= 12) {
+    const keys = rfq.legKeys || [];
+    console.log(
+      `[${MODE}] RFQ-SAMPLE n=${counts.combos} rfq=${rfq.rfqId} ` +
+      `contracts=${rfq.contracts != null ? rfq.contracts : '(none)'} ` +
+      `dollar=${rfq.targetCostDollars != null ? `$${rfq.targetCostDollars}` : '(none)'} ` +
+      `legs=${keys.length} keys=${keys.join('|') || '(none)'}`
+    );
+  }
 
   const p = matchParlay(rfq, parlays);
   if (!p) {
+    // lockMiss ≠ noLock. noLock is "matched a parlay but hedge does not lock".
+    // lockMiss is "combo RFQ did not hit any staged parlay" — the quiet-Kalshi
+    // failure mode (exact ticker miss / empty legs).
+    const keys = rfq.legKeys || [];
+    if (!keys.length) {
+      counts.emptyLegs++;
+      if (counts.emptyLegs <= 8) {
+        const raw = env && env.msg && typeof env.msg === 'object' ? env.msg : {};
+        const nested = raw.rfq && typeof raw.rfq === 'object' ? raw.rfq : {};
+        console.log(
+          `[${MODE}] EMPTY-LEGS rfq=${rfq.rfqId} ` +
+          `msgKeys=${Object.keys(raw).join(',') || '(none)'} ` +
+          `nestedKeys=${Object.keys(nested).join(',') || '(none)'} ` +
+          `collection=${rfq.mveCollection || '(none)'} ` +
+          `contracts=${rfq.contracts != null ? rfq.contracts : '(none)'} ` +
+          `dollar=${rfq.targetCostDollars != null ? `$${rfq.targetCostDollars}` : '(none)'}`
+        );
+      }
+    }
+    counts.lockMiss++;
+    if (counts.lockMiss <= 8 || counts.lockMiss % 2000 === 0) {
+      const overlap = describeLockOverlap(rfq, parlays);
+      console.log(
+        `[${MODE}] LOCK-MISS rfq=${rfq.rfqId} legs=${keys.length} ` +
+        `keys=${keys.join('|') || '(none)'} ` +
+        `active=${parlays.map((x) => x.label || x.id).join(',') || '(none)'}` +
+        (overlap ? ` overlap=${overlap}` : '')
+      );
+    }
     // Combo Locks miss — shadow in-scope unhedged RFQs only. Never quotes.
     shadowUnhedgedMiss(rfq, {
       venue: 'kalshi',
@@ -1136,7 +1195,6 @@ async function onRfq(rfq, env) {
   const st = staged[p.id];
 
   const size = resolveRfqContracts(rfq, p.fill_american, st && st.noBid);
-  if (size.source === 'dollar') counts.dollarRfqs++;
   if (!shouldPostQuote(size)) {
     counts.declined++;
     if (size.source === 'dollar' || (size.source === 'none' && rfq.targetCostDollars > 0)) {
