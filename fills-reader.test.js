@@ -4,10 +4,18 @@ const { fillView } = require('./engine');
 const {
   tickerMatchesCollection,
   attributeParlay,
+  attributeComboFill,
+  attributeFromSubmissions,
   sumFillCounts,
+  sumAttributedFillCounts,
   remainingContracts,
   formatRealFillAlert,
   noBidMatchesFill,
+  liveRunnerFillRow,
+  existingFillNeedsParlay,
+  submissionFilledPatch,
+  canStampSubmission,
+  pickFillForSum,
 } = require('./fills-attr');
 
 const soxLabel = 'Chicago White Sox ML + Pittsburgh Pirates ML + Baltimore Orioles ML';
@@ -162,6 +170,152 @@ const fillRow = {
   );
   assert.ok(!/session /.test(text));
   assert.ok(!/left/.test(text));
+}
+
+// CROSSCATEGORY shard ticker does not match KXMVESPORTSMULTIGAMEEXTENDED-R
+{
+  const shard = 'KXMVECROSSCATEGORY0-SHARD1-S20260E99CE0B6F9-BD36A940BEC';
+  assert.ok(!tickerMatchesCollection(shard, sox.mve_collection));
+  const sea = {
+    id: 'p-sea',
+    label: 'Seattle Seahawks ML + Philadelphia Eagles ML + Los Angeles Rams ML',
+    mve_collection: 'KXMVESPORTSMULTIGAMEEXTENDED-R',
+    active: true,
+    max_contracts: 408,
+    fill_american: 290,
+  };
+  const bears = {
+    id: 'p-bears',
+    label: 'Chicago Bears ML + Los Angeles Rams ML + Detroit Lions ML',
+    mve_collection: 'KXMVESPORTSMULTIGAMEEXTENDED-R',
+    active: true,
+    max_contracts: 201,
+    fill_american: 280,
+  };
+  const fill = {
+    fill_id: '07228709-6229-8235-5047-44b3103ff56b',
+    order_id: '01a081a8-4a08-7823-a57f-2273007cd403',
+    ticker: shard,
+    count: 98,
+    no_price: 0.74,
+    kalshi_created_time: '2026-09-08T15:34:45.573097Z',
+  };
+  // +280 no_bid is 0.73 — within a cent of the 0.74 fill, so price is ambiguous.
+  assert.ok(noBidMatchesFill(0.74, 290));
+  assert.ok(noBidMatchesFill(0.74, 280));
+  assert.strictEqual(attributeParlay(shard, fill, [sea, bears]), null);
+
+  // Two locks at +290 → do not guess from price; quote window recovers.
+  const twinSea = { ...sea, id: 'p-sea-2', label: 'Seattle twin' };
+  assert.strictEqual(attributeParlay(shard, fill, [sea, twinSea]), null);
+
+  const subs = [
+    {
+      id: 'sub-105',
+      parlay_id: 'p-sea',
+      quote_id: '23e32a31-748d-4cc5-9bbb-6769ad52a8e1',
+      order_id: null,
+      contracts: 105,
+      status: 'unfilled',
+      created_at: '2026-09-08T15:34:43.104357Z',
+    },
+    {
+      id: 'sub-103',
+      parlay_id: 'p-sea',
+      quote_id: 'cf66e4f4-77c9-43a0-9ec7-c452f8deda44',
+      order_id: null,
+      contracts: 103,
+      status: 'unfilled',
+      created_at: '2026-09-08T15:34:40.755887Z',
+    },
+    {
+      id: 'sub-bears',
+      parlay_id: 'p-bears',
+      quote_id: '227c4eb0-247d-45c1-b6ce-0f1bd555355d',
+      order_id: null,
+      contracts: 37,
+      status: 'unfilled',
+      created_at: '2026-09-08T15:34:18.835924Z',
+    },
+    {
+      id: 'sub-declined',
+      parlay_id: 'p-bears',
+      quote_id: null,
+      contracts: 1000,
+      status: 'declined',
+      created_at: '2026-09-08T15:34:42.000Z',
+    },
+  ];
+  const viaQuotes = attributeFromSubmissions(fill, subs, [sea, bears, twinSea]);
+  assert.strictEqual(viaQuotes && viaQuotes.parlay && viaQuotes.parlay.id, 'p-sea');
+  assert.strictEqual(viaQuotes.reason, 'quote_window');
+  assert.strictEqual(viaQuotes.submission && viaQuotes.submission.id, 'sub-105');
+
+  const viaCombo = attributeComboFill(shard, fill, [sea, twinSea], { submissions: subs });
+  assert.strictEqual(viaCombo && viaCombo.parlay && viaCombo.parlay.id, 'p-sea');
+  assert.ok(viaCombo.reason === 'quote_window' || viaCombo.reason === 'collection_or_price');
+
+  const stamped = { ...subs[0], order_id: fill.order_id };
+  const viaOrder = attributeComboFill(shard, fill, [sea, twinSea], { submissions: [stamped] });
+  assert.strictEqual(viaOrder && viaOrder.reason, 'order_id');
+  assert.strictEqual(viaOrder.parlay.id, 'p-sea');
+
+  const twin = liveRunnerFillRow({
+    quoteId: '23e32a31-748d-4cc5-9bbb-6769ad52a8e1',
+    orderId: fill.order_id,
+    parlayId: 'p-sea',
+    count: 105,
+  });
+  assert.strictEqual(twin.fill_id, fill.order_id);
+  assert.strictEqual(twin.raw.source, 'live-runner');
+  const viaTwin = attributeComboFill(shard, fill, [sea, twinSea], { existingFills: [twin] });
+  assert.strictEqual(viaTwin && viaTwin.reason, 'order_id_fill');
+  assert.strictEqual(viaTwin.parlay.id, 'p-sea');
+
+  assert.strictEqual(existingFillNeedsParlay(null, 'p-sea'), true);
+  assert.strictEqual(existingFillNeedsParlay({ parlay_id: null }, 'p-sea'), true);
+  assert.strictEqual(existingFillNeedsParlay({ parlay_id: 'p-sea' }, 'p-sea'), false);
+
+  const patch = submissionFilledPatch(fill);
+  assert.strictEqual(patch.status, 'filled');
+  assert.strictEqual(patch.order_id, fill.order_id);
+  assert.ok(canStampSubmission(subs[0], fill));
+  assert.ok(!canStampSubmission({ id: 'x', status: 'shadow' }, fill));
+  assert.ok(!canStampSubmission({ id: 'x', order_id: 'other' }, fill));
+
+  const summed = sumAttributedFillCounts([twin, { ...fill, parlay_id: 'p-sea' }]);
+  assert.strictEqual(summed, 98);
+  const picked = pickFillForSum([twin, { ...fill, parlay_id: 'p-sea' }]);
+  assert.strictEqual(picked.length, 1);
+  assert.strictEqual(picked[0].fill_id, fill.fill_id);
+
+  // Two parlays both quoted covering size in-window → do not guess
+  const ambiguous = attributeFromSubmissions(fill, [
+    ...subs,
+    {
+      id: 'sub-other',
+      parlay_id: 'p-sea-2',
+      quote_id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      contracts: 100,
+      status: 'unfilled',
+      created_at: '2026-09-08T15:34:44.000Z',
+    },
+  ], [sea, twinSea]);
+  assert.strictEqual(ambiguous, null);
+}
+
+{
+  const fs = require('fs');
+  const path = require('path');
+  const src = fs.readFileSync(path.join(__dirname, 'fills-reader.js'), 'utf8');
+  assert.ok(!/ignoreDuplicates:\s*true/.test(src), 'must update parlay_id on existing unattributed fill_id');
+  assert.ok(/attributeComboFill/.test(src) && /stampSubmissionFilled/.test(src));
+  assert.ok(/REATTRIBUTED/.test(src));
+  const repair = fs.readFileSync(path.join(__dirname, 'sql/repair_20260908_sea_phi_lar_fill.sql'), 'utf8');
+  assert.ok(repair.includes('07228709-6229-8235-5047-44b3103ff56b'));
+  assert.ok(repair.includes('01a081a8-4a08-7823-a57f-2273007cd403'));
+  assert.ok(repair.includes('2a01055d-4fcb-446e-be1b-19e98984ca3c'));
+  assert.ok(repair.includes('bfde99f4-1b12-4244-a84e-a706b439a108'));
 }
 
 console.log('fills-reader.test.js ok');

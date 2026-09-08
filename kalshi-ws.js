@@ -225,6 +225,7 @@ function createKalshiWs({
         try {
           const m = env.msg || {};
           const q = (m.quote && typeof m.quote === 'object') ? m.quote : m;
+          const contractsRaw = m.contracts_fp ?? m.count_fp ?? m.contracts ?? q.contracts_fp ?? q.count_fp ?? q.contracts;
           onQuoteExecuted({
             quoteId: m.quote_id || m.id || q.quote_id || q.id || null,
             rfqId: m.rfq_id || q.rfq_id || null,
@@ -232,6 +233,7 @@ function createKalshiWs({
             clientOrderId: m.client_order_id || q.client_order_id || null,
             marketTicker: m.market_ticker || q.market_ticker || null,
             executedTs: m.executed_ts || q.executed_ts || null,
+            contracts: contractsRaw != null && contractsRaw !== '' ? Number(contractsRaw) : null,
             raw: m,
           }, env);
         } catch (e) { console.error('onQuoteExecuted', e); }

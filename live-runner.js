@@ -2,6 +2,9 @@
 // live-runner.js — LIVE worker (latency-optimized)
 //
 // ACCOUNTING: POST → 'quoted'. Filled advances on quote_executed.
+//   Persist combo_fills (parlay_id) FIRST, then stamp combo_submissions
+//   status=filled + order_id. UI Filled tab is combo_fills; History needs
+//   both fields. Restart recovery reads combo_submissions by quote_id.
 // RESERVE: outstanding live quotes (pendingQuotes + in-flight POST) count against
 //   remaining so parallel RFQs cannot all clear the same ceiling.
 //   remaining = max - filled - outstanding.
@@ -106,6 +109,7 @@ const {
   applyRefreshKillByUser,
   applyRefreshFilledByParlay,
 } = require('./refresh-state');
+const { liveRunnerFillRow } = require('./fills-attr');
 const {
   fingerprintRfq,
   cooldownFingerprint,
@@ -1042,22 +1046,36 @@ async function onQuoteAccepted(evt) {
   }
 }
 
-async function onQuoteExecuted(evt) {
-  const { quoteId, orderId } = evt;
-  if (!quoteId) return;
-
-  const pending = pendingQuotes.get(quoteId);
-  if (!pending) {
-    console.log(`[${MODE}] quote_executed unknown quote_id=${quoteId} order_id=${orderId}`);
-    return;
+async function persistExecutedFill(pending, evt) {
+  const quoteId = evt.quoteId;
+  const orderId = evt.orderId || null;
+  const contracts = evt.contracts != null ? evt.contracts : pending.contracts;
+  const ticker = evt.marketTicker || null;
+  // Combo Locks "Filled — awaiting settlement" keys off combo_fills.parlay_id.
+  // Write fills first so a submissions error cannot hide the position.
+  try {
+    const { error: fillErr } = await supabase.from('combo_fills').upsert(
+      liveRunnerFillRow({
+        quoteId,
+        orderId,
+        parlayId: pending.parlayId,
+        count: contracts,
+        ticker,
+        rfqId: pending.rfqId,
+        label: pending.label,
+      }),
+      { onConflict: 'fill_id' },
+    );
+    if (fillErr) console.error(`[${MODE}] combo_fills upsert failed`, fillErr.message);
+  } catch (e) {
+    console.error(`[${MODE}] combo_fills persist`, e.message);
   }
 
-  const contracts = pending.contracts;
   try {
-    // Prefer update; if the post-time insert never landed, insert a filled row.
+    const patch = { status: 'filled', order_id: orderId, is_live: true };
     const { data: updated, error } = await supabase
       .from('combo_submissions')
-      .update({ status: 'filled', order_id: orderId || null, is_live: true })
+      .update(patch)
       .eq('quote_id', quoteId)
       .select('id');
     if (error) console.error(`[${MODE}] update filled failed`, error.message);
@@ -1070,30 +1088,62 @@ async function onQuoteExecuted(evt) {
         contracts,
         status: 'filled',
         quote_id: quoteId,
-        order_id: orderId || null,
+        order_id: orderId,
         is_live: true,
         venue: 'kalshi',
       });
       if (insErr) console.error(`[${MODE}] insert filled failed`, insErr.message);
     }
-
-    // Combo Locks "Filled — awaiting settlement" keys off combo_fills.
-    const fillId = orderId || quoteId;
-    const { error: fillErr } = await supabase.from('combo_fills').upsert({
-      fill_id: fillId,
-      order_id: orderId || null,
-      parlay_id: pending.parlayId,
-      count: contracts,
-      is_combo: true,
-      is_taker: false,
-      outcome_side: 'no',
-      action: 'sell',
-      kalshi_created_time: new Date().toISOString(),
-      raw: { source: 'live-runner', quote_id: quoteId, rfq_id: pending.rfqId, label: pending.label },
-    }, { onConflict: 'fill_id' });
-    if (fillErr) console.error(`[${MODE}] combo_fills upsert failed`, fillErr.message);
   } catch (e) {
-    console.error(`[${MODE}] onQuoteExecuted DB error`, e.message);
+    console.error(`[${MODE}] onQuoteExecuted submission`, e.message);
+  }
+}
+
+async function pendingFromSubmission(quoteId) {
+  if (!quoteId) return null;
+  try {
+    const { data, error } = await supabase
+      .from('combo_submissions')
+      .select('quote_id,parlay_id,label,rfq_id,contracts,user_id,order_id,status')
+      .eq('quote_id', quoteId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error || !data) return null;
+    return {
+      parlayId: data.parlay_id,
+      userId: data.user_id,
+      contracts: data.contracts,
+      label: data.label,
+      rfqId: data.rfq_id,
+      maxContracts: null,
+      alreadyFilled: !!(data.order_id || data.status === 'filled'),
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+async function onQuoteExecuted(evt) {
+  const { quoteId, orderId } = evt;
+  if (!quoteId) return;
+
+  let pending = pendingQuotes.get(quoteId);
+  const fromMemory = !!pending;
+  if (!pending) {
+    pending = await pendingFromSubmission(quoteId);
+    if (!pending) {
+      console.log(`[${MODE}] quote_executed unknown quote_id=${quoteId} order_id=${orderId}`);
+      return;
+    }
+    console.log(`[${MODE}] quote_executed recovered quote_id=${quoteId} from combo_submissions`);
+  }
+
+  const contracts = evt.contracts != null ? evt.contracts : pending.contracts;
+  await persistExecutedFill(pending, evt);
+  if (!fromMemory && pending.alreadyFilled) {
+    pendingQuotes.delete(quoteId);
+    return;
   }
 
   sessionFilledByParlay[pending.parlayId] =

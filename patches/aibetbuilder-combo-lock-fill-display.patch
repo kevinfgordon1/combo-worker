@@ -1,0 +1,286 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 8 Sep 2026 18:00:00 +0000
+Subject: [PATCH] Show Combo Lock fills when Kalshi confirmed them
+
+Deduplicate live-runner order_id twins, count stamped submissions, and
+display filled whenever order_id is set. Apply on aibetbuilder:
+
+  git apply patches/aibetbuilder-combo-lock-fill-display.patch
+
+This environment could not push to kevinfgordon1/aibetbuilder (403).
+---
+ src/ComboLocks.jsx     |  24 ++++----
+ src/comboTape.js       |  89 +++++++++++++++++++++++++++-
+ src/comboTape.test.js  |  66 +++++++++++++++++++--
+ 3 files changed, 166 insertions(+), 17 deletions(-)
+
+diff --git a/src/ComboLocks.jsx b/src/ComboLocks.jsx
+index fbe9451..47bf980 100644
+--- a/src/ComboLocks.jsx
++++ b/src/ComboLocks.jsx
+@@ -20,6 +20,7 @@ import { applyComboDeskPoll, buildParlayDesk, comboDeskChrome, comboListQueryOk,
+ import { resolveComboTicker, marketSettlement, historyOutcome } from "./comboSettlement";
+ import { lockProfile, formatTargetLine, formatFillProgress, signedMoney, moneyAbs } from "./comboLockProfile";
+ import { attemptRepeatLabel, attemptSummaryFilled, attemptSummaryParts, buildLockAttempts, visibleAttempts } from "./comboLockHistory";
++import { deskFillCounts, historyDisplayStatus } from "./comboTape";
+ import { settleLegs, uniqueEspnQueries, needsUnderlyingStamp, outcomeChrome } from "./comboLegResult";
+ import { OWNER_EMAIL, canSeeComboLocks, comboLockHash } from "./comboAccess";
+ import { absoluteShareUrl, copyTextToClipboard } from "./shareCard";
+@@ -628,10 +629,10 @@ export default function ComboLocks({ user, prefill = null, focusLockId = null })
+       if (ocRows) setOutcomes(ocRows);
+       const fillRows = takeList(fillsRes);
+       if (fillRows) {
+-        const rf = {}; let un = 0;
+-        fillRows.forEach((f) => { const c = Number(f.count || 0); if (f.parlay_id) rf[f.parlay_id] = (rf[f.parlay_id] || 0) + c; else un += c; });
++        const summed = deskFillCounts(fillRows, []);
+         setComboFills(fillRows);
+-        setRealFills(rf); setRealUnattr(un);
++        setRealFills(summed.byParlay);
++        setRealUnattr(summed.unattributed);
+       }
+       const bookedRows = takeList(bookedRes);
+       if (bookedRows) {
+@@ -667,6 +668,11 @@ export default function ComboLocks({ user, prefill = null, focusLockId = null })
+       if (livingSubsOk) {
+         const subRows = [...livingSubRows, ...archivedSubRows];
+         setSubmissions(subRows);
++        const deskFills = fillRows ? deskFillCounts(fillRows, subRows) : null;
++        if (deskFills) {
++          setRealFills(deskFills.byParlay);
++          setRealUnattr(deskFills.unattributed);
++        }
+         refreshSettlements({
+           living: livingRows,
+           archived: archivedForSubs,
+@@ -674,11 +680,7 @@ export default function ComboLocks({ user, prefill = null, focusLockId = null })
+           outcomes: ocRows || [],
+           matchesByParlay: matchRows ? mbp : {},
+           submissions: subRows,
+-          filledById: fillRows ? fillRows.reduce((rf, f) => {
+-            const c = Number(f.count || 0);
+-            if (f.parlay_id) rf[f.parlay_id] = (rf[f.parlay_id] || 0) + c;
+-            return rf;
+-          }, {}) : {},
++          filledById: deskFills ? deskFills.byParlay : {},
+         });
+       }
+     } catch (_) {
+@@ -1206,14 +1208,12 @@ export default function ComboLocks({ user, prefill = null, focusLockId = null })
+         {history.length === 0 ? <div className="empty">No submissions yet. Shadow quotes you run land here; once the worker is live, real fills and no-fills show as REAL with a Filled / Unfilled status.</div> : (
+           <table><thead><tr><th>Type</th><th>When</th><th>Parlay</th><th>Fill</th><th>Contracts</th><th>Worst lock</th><th>Status</th></tr></thead>
+             <tbody>{history.map((h) => {
+-              const isReal = h.is_live || h.status === "filled" || h.status === "unfilled";
+-              // A row logged 'filled' but with NO order_id is a posted quote that wasn't accepted —
+-              // show it honestly as "quoted", not "filled". Only a real execution id counts as filled.
++              const isReal = h.is_live || h.status === "filled" || h.status === "unfilled" || !!h.order_id;
++              // order_id is a real Kalshi execution even if status lingered on unfilled.
++              // status=filled with no order_id is only a posted quote (quoted awaiting).
+               const executed = !!h.order_id;
+-              const dispStatus = h.status === "filled" && !executed ? "quoted (awaiting)"
+-                : h.status === "shadow" ? "would post"
+-                : h.status;
+-              const stClass = h.status === "filled" && !executed ? "unfilled" : h.status;
++              const dispStatus = historyDisplayStatus(h);
++              const stClass = executed ? "filled" : (h.status === "filled" ? "unfilled" : h.status);
+               return (
+               <tr key={h.id}><td><span className={"st " + (isReal ? "real" : "test")}>{isReal ? "REAL" : "SHADOW"}</span></td><td>{new Date(h.created_at).toLocaleString()}</td><td>{h.label}</td><td>{fmtAm(h.fill_american)}</td><td>{h.contracts}</td><td>{money(h.worst_lock)}</td>
+                 <td><span className={"st " + stClass} title={h.status === "filled" && !executed ? "Quote posted to Kalshi but not accepted — no position held." : ""}>{dispStatus}</span></td></tr>
+diff --git a/src/comboTape.js b/src/comboTape.js
+index b341230..91ce4c7 100644
+--- a/src/comboTape.js
++++ b/src/comboTape.js
+@@ -351,9 +351,96 @@ export function pickFillRow(fills = []) {
+   return real || pool[0];
+ }
+ 
++export function isLiveRunnerTwin(fill) {
++  if (!fill) return false;
++  if (fill.raw && fill.raw.source === "live-runner") return true;
++  return !!(fill.fill_id && fill.order_id && fill.fill_id === fill.order_id);
++}
++
++// One row per Kalshi order: prefer the account fill (fill_id ≠ order_id)
++// over the live-runner twin that books fill_id = order_id.
++export function dedupeFillsByOrder(fills = []) {
++  const byKey = new Map();
++  const unkeyed = [];
++  (fills || []).forEach((f) => {
++    if (!f) return;
++    const key = f.order_id || f.fill_id;
++    if (!key) {
++      unkeyed.push(f);
++      return;
++    }
++    const prev = byKey.get(key);
++    if (!prev) {
++      byKey.set(key, f);
++      return;
++    }
++    if (isLiveRunnerTwin(prev) && !isLiveRunnerTwin(f)) byKey.set(key, f);
++  });
++  return [...byKey.values(), ...unkeyed];
++}
++
++export function sumAttributedFills(fills = []) {
++  const byParlay = {};
++  let unattributed = 0;
++  dedupeFillsByOrder(fills).forEach((f) => {
++    const c = Math.max(0, toNum(f.count) || 0);
++    if (f.parlay_id) byParlay[f.parlay_id] = (byParlay[f.parlay_id] || 0) + c;
++    else unattributed += c;
++  });
++  return { byParlay, unattributed };
++}
++
++// History / lock remaining: a stamped order_id on combo_submissions is a
++// real fill even if combo_fills.parlay_id is still null (shard ticker miss).
++// Prefer the Kalshi fill count when the same order_id is unattributed.
++export function mergeSubmissionFillCounts(byParlay, submissions = [], fills = []) {
++  const attributedOrders = new Set();
++  const unattrByOrder = new Map();
++  (fills || []).forEach((f) => {
++    if (!f || !f.order_id) return;
++    if (f.parlay_id) attributedOrders.add(f.order_id);
++    else unattrByOrder.set(f.order_id, f);
++  });
++  const next = { ...(byParlay || {}) };
++  (submissions || []).forEach((s) => {
++    if (!s || !s.order_id || !s.parlay_id || attributedOrders.has(s.order_id)) return;
++    attributedOrders.add(s.order_id);
++    const twin = unattrByOrder.get(s.order_id);
++    const c = Math.max(0, toNum(twin ? twin.count : s.contracts) || 0);
++    next[s.parlay_id] = (next[s.parlay_id] || 0) + c;
++  });
++  return next;
++}
++
++export function deskFillCounts(fills = [], submissions = []) {
++  const summed = sumAttributedFills(fills);
++  const byParlay = mergeSubmissionFillCounts(summed.byParlay, submissions, fills);
++  const assigned = new Set();
++  (submissions || []).forEach((s) => {
++    if (s && s.order_id && s.parlay_id) assigned.add(s.order_id);
++  });
++  let unattributed = 0;
++  dedupeFillsByOrder(fills).forEach((f) => {
++    if (f.parlay_id) return;
++    if (f.order_id && assigned.has(f.order_id)) return;
++    unattributed += Math.max(0, toNum(f.count) || 0);
++  });
++  return { byParlay, unattributed };
++}
++
++// Submitted-bets History: order_id is the execution. status=filled without
++// order_id is only "quoted (awaiting)".
++export function historyDisplayStatus(row) {
++  if (!row) return "";
++  if (row.order_id) return "filled";
++  if (row.status === "filled") return "quoted (awaiting)";
++  if (row.status === "shadow") return "would post";
++  return row.status || "";
++}
++
+ export function liveFilledContracts(fills = [], startsAt) {
+   let n = 0;
+-  (fills || []).forEach((f) => {
++  dedupeFillsByOrder(fills).forEach((f) => {
+     if (!isLiveQuotingTs(fillEventAt(f), startsAt)) return;
+     n += Math.max(0, toNum(f.count) || 0);
+   });
+diff --git a/src/comboTape.test.js b/src/comboTape.test.js
+index 4b76381..2dc58d4 100644
+--- a/src/comboTape.test.js
++++ b/src/comboTape.test.js
+@@ -35,6 +35,12 @@ import {
+   isFilledSubmission,
+   isQuotedLost,
+   pickFillRow,
++  isLiveRunnerTwin,
++  dedupeFillsByOrder,
++  sumAttributedFills,
++  mergeSubmissionFillCounts,
++  deskFillCounts,
++  historyDisplayStatus,
+   skipTapeSource,
+   skipFillState,
+   formatSkipReason,
+@@ -644,7 +650,7 @@ assert.equal(skipFillState({ tape_no_price: 0.8 }), "unknown");
+       },
+     ],
+   });
+-  assert.equal(tape.fill.filled, 215.38);
++  assert.equal(tape.fill.filled, 104.38);
+   assert.equal(tape.fill.ceiling, 1347);
+   const openRow = tape.rows.find((r) => r.rfqId === "open-1");
+   assert.equal(openRow.bucket, "awaiting");
+@@ -710,6 +716,60 @@ assert.equal(pickFillRow([
+   { fill_id: "f1", order_id: "o1", count: 104.38, no_price: 0.91 },
+ ]).count, 104.38);
+ 
++assert.equal(isLiveRunnerTwin({ fill_id: "o1", order_id: "o1" }), true);
++assert.equal(isLiveRunnerTwin({ fill_id: "f1", order_id: "o1" }), false);
++assert.equal(isLiveRunnerTwin({ raw: { source: "live-runner" }, fill_id: "o1", order_id: "o1" }), true);
++
++{
++  const twin = {
++    fill_id: "01a081a8-4a08-7823-a57f-2273007cd403",
++    order_id: "01a081a8-4a08-7823-a57f-2273007cd403",
++    parlay_id: "p-sea",
++    count: 105,
++    raw: { source: "live-runner" },
++  };
++  const real = {
++    fill_id: "07228709-6229-8235-5047-44b3103ff56b",
++    order_id: "01a081a8-4a08-7823-a57f-2273007cd403",
++    parlay_id: "p-sea",
++    count: 98,
++  };
++  const unattr = {
++    fill_id: "07228709-6229-8235-5047-44b3103ff56b",
++    order_id: "01a081a8-4a08-7823-a57f-2273007cd403",
++    parlay_id: null,
++    count: 98,
++  };
++  assert.equal(dedupeFillsByOrder([twin, real]).length, 1);
++  assert.equal(dedupeFillsByOrder([twin, real])[0].count, 98);
++  assert.equal(sumAttributedFills([twin, real]).byParlay["p-sea"], 98);
++  assert.equal(sumAttributedFills([unattr]).unattributed, 98);
++  assert.equal(sumAttributedFills([unattr]).byParlay["p-sea"], undefined);
++  const merged = mergeSubmissionFillCounts({}, [{
++    parlay_id: "p-sea",
++    order_id: "01a081a8-4a08-7823-a57f-2273007cd403",
++    contracts: 105,
++  }], [unattr]);
++  assert.equal(merged["p-sea"], 98, "unattributed Kalshi fill + stamped quote → lock uses fill count");
++  const desk = deskFillCounts([unattr], [{
++    parlay_id: "p-sea",
++    order_id: "01a081a8-4a08-7823-a57f-2273007cd403",
++    contracts: 105,
++  }]);
++  assert.equal(desk.byParlay["p-sea"], 98);
++  assert.equal(desk.unattributed, 0);
++  const fromSubOnly = deskFillCounts([], [{
++    parlay_id: "p-sea",
++    order_id: "01a081a8-4a08-7823-a57f-2273007cd403",
++    contracts: 105,
++  }]);
++  assert.equal(fromSubOnly.byParlay["p-sea"], 105);
++  assert.equal(historyDisplayStatus({ status: "unfilled", order_id: "o1" }), "filled");
++  assert.equal(historyDisplayStatus({ status: "filled" }), "quoted (awaiting)");
++  assert.equal(historyDisplayStatus({ status: "unfilled" }), "unfilled");
++  assert.equal(historyDisplayStatus({ status: "shadow" }), "would post");
++}
++
+ {
+   const scoped = buildLockTape({
+     parlay: { id: "p-a", active: true, max_contracts: 50 },
+@@ -728,6 +788,8 @@ assert.equal(pickFillRow([
+   assert.match(locks, /DeskChips/);
+   assert.match(locks, /FillProgress/);
+   assert.match(locks, /buildParlayDesk/);
++  assert.match(locks, /deskFillCounts/);
++  assert.match(locks, /historyDisplayStatus/);
+   const app = fs.readFileSync(path.join(dir, "App.jsx"), "utf8");
+   assert.match(app, /Miss tape/);
+   assert.match(app, /<ComboTape /);
