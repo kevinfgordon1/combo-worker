@@ -216,6 +216,35 @@ assert.ok(
 );
 
 assert.ok(
+  /RETAINED after soft-fail/.test(liveSrc),
+  'live refresh must log RETAINED + lock labels when parlays query soft-fails'
+);
+assert.ok(
+  /require\('\.\/refresh-state'\)/.test(liveSrc) && /applyRefreshParlays/.test(liveSrc),
+  'live refresh must apply parlays/settings/fills via refresh-state (keep prior on soft-fail)'
+);
+assert.ok(
+  !/parlays = p \|\| \[\]/.test(liveSrc),
+  'live refresh must not coerce null parlays data to []'
+);
+assert.ok(
+  /applyRefreshKillByUser/.test(liveSrc) && /applyRefreshFilledByParlay/.test(liveSrc),
+  'live refresh must keep killByUser / filledByParlay when those queries soft-fail'
+);
+assert.ok(
+  /require\('\.\/refresh-state'\)/.test(shadowSrc) && /applyRefreshParlays/.test(shadowSrc),
+  'shadow refresh must use the same soft-fail keep-previous helpers'
+);
+assert.ok(
+  /RETAINED after soft-fail/.test(shadowSrc),
+  'shadow refresh must log RETAINED when parlays query soft-fails'
+);
+assert.ok(
+  !/parlays = p \|\| \[\]/.test(shadowSrc),
+  'shadow refresh must not coerce null parlays data to []'
+);
+
+assert.ok(
   /unhedgedFills\.tick\(\)[\s\S]{0,120}FILL_TICK_MS/.test(liveSrc),
   'unhedged fill tick must not share the 15s skip-tape interval'
 );
