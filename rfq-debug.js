@@ -40,6 +40,30 @@ function pickLegs(m) {
   return null;
 }
 
+const DOLLAR_FIELDS = [
+  'target_cost_dollars', 'rfq_target_cost_dollars', 'target_cost', 'cash_order_qty',
+];
+
+function pickDollar(m, nested) {
+  for (const obj of [m, nested]) {
+    if (!obj || typeof obj !== 'object') continue;
+    for (const k of DOLLAR_FIELDS) {
+      const v = obj[k];
+      if (v == null || v === '') continue;
+      return v;
+    }
+  }
+  return null;
+}
+
+function formatRfqDebugLine({ rfqId, collection, contracts, dollar, legs }) {
+  return (
+    `[RFQ-DEBUG] rfq=${rfqId} collection=${collection || '(none)'} ` +
+    `contracts=${contracts || '(none)'} dollar=${dollar != null && dollar !== '' ? dollar : '(none)'} ` +
+    `legs=${JSON.stringify(legs)}`
+  );
+}
+
 async function captureRfq(env) {
   const raw = process.env.RFQ_DEBUG_NEEDLE;
   if (!raw) return;                                   // disabled unless explicitly turned on
@@ -62,11 +86,9 @@ async function captureRfq(env) {
   const rfqId = m.id || m.rfq_id || nested.id || null;
   const contracts = m.contracts_fp != null ? String(m.contracts_fp)
     : (nested.contracts_fp != null ? String(nested.contracts_fp) : null);
+  const dollar = pickDollar(m, nested);
   // Railway logs, not Supabase — xuolkiadmumtbksbyjzc 522s must not be the sample path.
-  console.log(
-    `[RFQ-DEBUG] rfq=${rfqId} collection=${collection || '(none)'} ` +
-    `contracts=${contracts || '(none)'} legs=${JSON.stringify(legs)}`
-  );
+  console.log(formatRfqDebugLine({ rfqId, collection, contracts, dollar, legs }));
   if (!/^(1|true|yes)$/i.test(String(process.env.RFQ_DEBUG_PERSIST || ''))) return;
 
   try {
@@ -80,4 +102,4 @@ async function captureRfq(env) {
   } catch (_) { /* debug only — never disrupt the worker */ }
 }
 
-module.exports = { captureRfq, pickLegs };
+module.exports = { captureRfq, pickLegs, pickDollar, formatRfqDebugLine };

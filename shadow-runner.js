@@ -21,6 +21,11 @@ const { normalizePem } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
 const { decideAtFill } = require('./engine');
 const { shortId } = require('./short-id');
+const {
+  applyRefreshParlays,
+  applyRefreshKillByUser,
+  applyRefreshFilledByParlay,
+} = require('./refresh-state');
 
 const MODE = 'SHADOW';
 // Demo read-check: if DEMO_KALSHI_* are present, use them (point KALSHI_WS_URL at the demo WS).
@@ -74,17 +79,17 @@ async function writeStats() {
 
 async function refresh() {
   try {
-    const [{ data: p }, { data: s }, { data: fills }] = await Promise.all([
+    const [parlaysQ, settingsQ, fillsQ] = await Promise.all([
       supabase.from('combo_parlays').select('*').eq('active', true),
       supabase.from('combo_settings').select('user_id,kill_switch'),
       // Real fills already booked, per parlay — the source of truth for the cumulative ceiling.
       supabase.from('combo_submissions').select('parlay_id,contracts,status,is_live').or('status.eq.filled,is_live.eq.true'),
     ]);
-    parlays = p || [];
-    killByUser = {};
-    (s || []).forEach((r) => (killByUser[r.user_id] = r.kill_switch));
-    filledByParlay = {};
-    (fills || []).forEach((r) => { filledByParlay[r.parlay_id] = (filledByParlay[r.parlay_id] || 0) + Number(r.contracts || 0); });
+    const refreshLog = { error: (msg) => console.error(`[${MODE}] ${msg}`) };
+    // supabase-js soft-fails as { data: null, error } — do not treat null as [].
+    parlays = applyRefreshParlays(parlays, parlaysQ, refreshLog);
+    killByUser = applyRefreshKillByUser(killByUser, settingsQ, refreshLog);
+    filledByParlay = applyRefreshFilledByParlay(filledByParlay, fillsQ, 'contracts', refreshLog);
     console.log(`[${MODE}] refreshed — ${parlays.length} active parlay(s)`);
   } catch (e) { console.error(`[${MODE}] refresh failed`, e.message); }
 }

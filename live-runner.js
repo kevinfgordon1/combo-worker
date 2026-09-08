@@ -94,6 +94,12 @@ const {
   DEFAULT_FILL_TICK_MS,
 } = require('./unhedged-rfq');
 const { createUnhedgedPriceCache } = require('./unhedged-price-cache');
+const {
+  querySoftFailed,
+  applyRefreshParlays,
+  applyRefreshKillByUser,
+  applyRefreshFilledByParlay,
+} = require('./refresh-state');
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -172,7 +178,7 @@ function outstandingFor(parlayId, excludeQuoteId) {
     + sumOutstanding(polyPendingQuotes, parlayId, excludeQuoteId);
 }
 
-// Step 3 — pre-staged quote pieces per parlay (rebuilt every refresh)
+// Step 3 — pre-staged quote pieces per parlay (rebuilt on successful parlays refresh)
 // staged[id] = { noBid, yesBid, rest_remainder, fillAmerican, effTaker }
 // yesBid stays YES_DECLINE (contract-count decline). Dollar RFQs pick
 // implied YES at POST time from the no_bid actually sent — do not use this
@@ -199,7 +205,7 @@ const FILL_TICK_MS = DEFAULT_FILL_TICK_MS;
 
 async function refresh() {
   try {
-    const [{ data: p }, { data: s }, { data: fills }] = await Promise.all([
+    const [parlaysQ, settingsQ, fillsQ] = await Promise.all([
       supabase.from('combo_parlays').select('*').eq('active', true),
       supabase.from('combo_settings').select('user_id,kill_switch'),
       // Ground truth contracts from Kalshi account fills (not our optimistic submission math).
@@ -209,28 +215,28 @@ async function refresh() {
         .eq('is_taker', false)
         .not('parlay_id', 'is', null),
     ]);
-    parlays = p || [];
-    killByUser = {};
-    (s || []).forEach((r) => (killByUser[r.user_id] = r.kill_switch));
+    const refreshLog = { error: (msg) => console.error(`[${MODE}] ${msg}`) };
+    // supabase-js soft-fails as { data: null, error } — do not treat null as [].
+    const parlaysFailed = querySoftFailed(parlaysQ);
+    parlays = applyRefreshParlays(parlays, parlaysQ, refreshLog);
+    killByUser = applyRefreshKillByUser(killByUser, settingsQ, refreshLog);
+    filledByParlay = applyRefreshFilledByParlay(filledByParlay, fillsQ, 'count', refreshLog);
 
-    filledByParlay = {};
-    (fills || []).forEach((r) => {
-      filledByParlay[r.parlay_id] = (filledByParlay[r.parlay_id] || 0) + Number(r.count || 0);
-    });
-
-    // Pre-stage prices (Step 3)
-    const next = {};
-    for (const row of parlays) {
-      const v = fillView(row.fill_american);
-      next[row.id] = {
-        noBid: v.noBid,
-        yesBid: YES_DECLINE,
-        rest_remainder: false,
-        fillAmerican: row.fill_american,
-        effTaker: v.effTaker,
-      };
+    // Pre-stage prices (Step 3). Soft-fail keeps previous staged with the locks.
+    if (!parlaysFailed) {
+      const next = {};
+      for (const row of parlays) {
+        const v = fillView(row.fill_american);
+        next[row.id] = {
+          noBid: v.noBid,
+          yesBid: YES_DECLINE,
+          rest_remainder: false,
+          fillAmerican: row.fill_american,
+          effTaker: v.effTaker,
+        };
+      }
+      staged = next;
     }
-    staged = next;
 
     console.log(`[${MODE}] refreshed — ${parlays.length} active parlay(s), staged=${Object.keys(staged).length}`);
     const lockBits = parlays.map((row) => {
