@@ -5,7 +5,11 @@ const {
   DEFAULT_COOLDOWN_MS,
   REPEAT_SKIP_REASON,
   compactNum,
+  normalizedCreatorId,
   fingerprintRfq,
+  cooldownFingerprint,
+  isAnonymousFingerprint,
+  creatorIdFromQuoteResponse,
   readCooldownMs,
   formatRepeatSkipAlert,
   createRepeatGuard,
@@ -58,19 +62,32 @@ assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: 'nope' }), 90_000);
   assert.ok(a.includes('KXNFLGAME-26SEP131320CLEJAC-JAC:yes'));
   assert.ok(a.includes('|c=6|'));
   assert.ok(a.endsWith('|u='), 'empty creator_id must not invent a user');
+  assert.ok(isAnonymousFingerprint(a));
+  assert.strictEqual(
+    cooldownFingerprint(normalizeRfq(kalshiEnv('rfq-1', ariJaxLegs, { contracts: 6 }))),
+    null,
+    'anonymous History fingerprint must not be a cooldown key'
+  );
 }
 
 {
-  const withCreator = fingerprintRfq(normalizeRfq(kalshiEnv('rfq-c', ariJaxLegs, {
+  const withCreator = normalizeRfq(kalshiEnv('rfq-c', ariJaxLegs, {
     contracts: 6, creatorId: 'user-abc',
-  })));
-  const empty = fingerprintRfq(normalizeRfq(kalshiEnv('rfq-e', ariJaxLegs, {
+  }));
+  const empty = normalizeRfq(kalshiEnv('rfq-e', ariJaxLegs, {
     contracts: 6, creatorId: '   ',
-  })));
-  const missing = fingerprintRfq(normalizeRfq(kalshiEnv('rfq-m', ariJaxLegs, { contracts: 6 })));
-  assert.ok(withCreator.includes('|u=user-abc'));
-  assert.strictEqual(empty, missing);
-  assert.notStrictEqual(withCreator, missing);
+  }));
+  const missing = normalizeRfq(kalshiEnv('rfq-m', ariJaxLegs, { contracts: 6 }));
+  assert.strictEqual(normalizedCreatorId(withCreator), 'user-abc');
+  assert.strictEqual(normalizedCreatorId(empty), '');
+  assert.strictEqual(normalizedCreatorId(missing), '');
+  assert.ok(fingerprintRfq(withCreator).includes('|u=user-abc'));
+  assert.strictEqual(fingerprintRfq(empty), fingerprintRfq(missing));
+  assert.notStrictEqual(fingerprintRfq(withCreator), fingerprintRfq(missing));
+  assert.strictEqual(cooldownFingerprint(empty), null);
+  assert.strictEqual(cooldownFingerprint(missing), null);
+  assert.strictEqual(cooldownFingerprint(withCreator), fingerprintRfq(withCreator));
+  assert.ok(!isAnonymousFingerprint(cooldownFingerprint(withCreator)));
 }
 
 {
@@ -94,52 +111,82 @@ assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: 'nope' }), 90_000);
 }
 
 {
-  const twoCreators = [
-    fingerprintRfq(normalizeRfq(kalshiEnv('a', ariJaxLegs, { contracts: 6, creatorId: 'alice' }))),
-    fingerprintRfq(normalizeRfq(kalshiEnv('b', ariJaxLegs, { contracts: 6, creatorId: 'bob' }))),
-  ];
-  assert.notStrictEqual(twoCreators[0], twoCreators[1]);
+  const alice = normalizeRfq(kalshiEnv('a', ariJaxLegs, { contracts: 6, creatorId: 'alice' }));
+  const bob = normalizeRfq(kalshiEnv('b', ariJaxLegs, { contracts: 6, creatorId: 'bob' }));
+  assert.notStrictEqual(cooldownFingerprint(alice), cooldownFingerprint(bob));
+  assert.ok(cooldownFingerprint(alice).includes('|u=alice'));
+  assert.ok(cooldownFingerprint(bob).includes('|u=bob'));
 }
 
 assert.strictEqual(fingerprintRfq({ contracts: 6 }), null);
 assert.strictEqual(fingerprintRfq({ legKeys: [] }), null);
 assert.strictEqual(fingerprintRfq(null), null);
+assert.strictEqual(cooldownFingerprint({ contracts: 6, creatorId: 'x' }), null);
+assert.strictEqual(cooldownFingerprint(null), null);
+
+{
+  assert.strictEqual(creatorIdFromQuoteResponse(null), null);
+  assert.strictEqual(creatorIdFromQuoteResponse({ id: 'q1' }), null);
+  assert.strictEqual(creatorIdFromQuoteResponse({ id: 'q1', rfq_creator_id: 'rest-user' }), 'rest-user');
+  assert.strictEqual(creatorIdFromQuoteResponse({ id: 'q1', creator_id: '  ' }), null);
+  assert.strictEqual(creatorIdFromQuoteResponse({ quote: { rfq_creator_id: 'nested-q' } }), 'nested-q');
+}
 
 {
   let t = 1_000_000;
   const g = createRepeatGuard({ cooldownMs: 90_000, now: () => t });
-  const fp = 'v1|ARI:yes,JAC:yes|c=6|t=|u=';
-  const first = g.claim(fp);
+  const anon = fingerprintRfq(normalizeRfq(kalshiEnv('anon-1', ariJaxLegs, { contracts: 6 })));
+  assert.ok(isAnonymousFingerprint(anon));
+  assert.strictEqual(g.claim(anon).skip, false);
+  assert.strictEqual(g.claim(anon).skip, false, 'anonymous identical RFQs must all quote');
+  assert.strictEqual(g.claim(null).skip, false);
+  assert.strictEqual(g.claim('').skip, false);
+  assert.strictEqual(g.size, 0, 'anonymous claims must not occupy the cooldown map');
+}
+
+{
+  let t = 1_000_000;
+  const g = createRepeatGuard({ cooldownMs: 90_000, now: () => t });
+  const alice = cooldownFingerprint(normalizeRfq(kalshiEnv('a1', ariJaxLegs, {
+    contracts: 6, creatorId: 'alice',
+  })));
+  const bob = cooldownFingerprint(normalizeRfq(kalshiEnv('b1', ariJaxLegs, {
+    contracts: 6, creatorId: 'bob',
+  })));
+  const first = g.claim(alice);
   assert.strictEqual(first.skip, false);
-  const second = g.claim(fp);
+  assert.strictEqual(first.gated, true);
+  const second = g.claim(alice);
   assert.strictEqual(second.skip, true);
-  assert.strictEqual(second.alert, true);
+  assert.strictEqual(second.alert, true, 'Telegram once when creator-gated cooldown applies');
   assert.strictEqual(second.skipCount, 1);
   assert.strictEqual(second.remainingMs, 90_000);
-  const third = g.claim(fp);
+  const third = g.claim(alice);
   assert.strictEqual(third.skip, true);
   assert.strictEqual(third.alert, false, 'Telegram only once per cooldown window');
   assert.strictEqual(third.skipCount, 2);
 
-  const other = g.claim('v1|ARI:yes,JAC:yes|c=10|t=|u=');
-  assert.strictEqual(other.skip, false, 'distinct contracts must still quote');
+  const otherSize = g.claim(cooldownFingerprint(normalizeRfq(kalshiEnv('a10', ariJaxLegs, {
+    contracts: 10, creatorId: 'alice',
+  }))));
+  assert.strictEqual(otherSize.skip, false, 'distinct contracts must still quote');
+
+  const otherUser = g.claim(bob);
+  assert.strictEqual(otherUser.skip, false, 'different known creators must not share cooldown');
 
   t += 90_000;
-  const after = g.claim(fp);
-  assert.strictEqual(after.skip, false, 'same fingerprint quotes again after cooldown');
+  const after = g.claim(alice);
+  assert.strictEqual(after.skip, false, 'same creator+fingerprint quotes again after cooldown');
 }
 
 {
   const g = createRepeatGuard({ cooldownMs: 0, now: () => 5 });
-  const fp = 'v1|x|c=6|t=|u=';
+  const fp = cooldownFingerprint(normalizeRfq(kalshiEnv('x', ariJaxLegs, {
+    contracts: 6, creatorId: 'alice',
+  })));
+  assert.ok(fp);
   assert.strictEqual(g.claim(fp).skip, false);
-  assert.strictEqual(g.claim(fp).skip, false, '0 disables cooldown');
-}
-
-{
-  const g = createRepeatGuard({ cooldownMs: 90_000, now: () => 1 });
-  assert.strictEqual(g.claim(null).skip, false);
-  assert.strictEqual(g.claim('').skip, false);
+  assert.strictEqual(g.claim(fp).skip, false, '0 disables cooldown even when creator is known');
 }
 
 {

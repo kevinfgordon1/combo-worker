@@ -1,8 +1,8 @@
 // Identical-RFQ fingerprint + in-memory cooldown for Combo Locks quotes.
-// Kalshi WS creator_id is documented but often empty — fingerprint works
-// from sorted legs + contracts (+ target_cost). Non-empty creator_id is
-// included so two real users requesting the same combo are not collapsed.
-// Does not change matchParlay / exact-lock matching.
+// History fingerprint = sorted legs + contracts + target_cost (+ creator when
+// present). Cooldown / skip rfq_repeat ONLY when creator_id is non-empty —
+// Kalshi WS often omits it, and two real people requesting the same Ari+Jax
+// 6-contract must both quote. Does not change matchParlay / exact-lock matching.
 'use strict';
 const { normalizeLegKey } = require('./rfq');
 
@@ -17,14 +17,49 @@ function compactNum(n) {
   return Math.abs(x - Math.round(x)) < 1e-9 ? String(Math.round(x)) : String(x);
 }
 
+function normalizedCreatorId(rfq) {
+  if (!rfq || typeof rfq !== 'object') return '';
+  const raw = rfq.creatorId != null && rfq.creatorId !== ''
+    ? rfq.creatorId
+    : rfq.creator_id;
+  if (raw == null || raw === '') return '';
+  const s = String(raw).trim();
+  return s;
+}
+
 function fingerprintRfq(rfq) {
   if (!rfq) return null;
   const legs = (rfq.legKeys || []).map(normalizeLegKey).filter(Boolean).sort();
   if (!legs.length) return null;
   const contracts = compactNum(rfq.contracts);
   const target = compactNum(rfq.targetCostDollars);
-  const creator = rfq.creatorId ? String(rfq.creatorId).trim() : '';
+  const creator = normalizedCreatorId(rfq);
   return `v1|${legs.join(',')}|c=${contracts}|t=${target}|u=${creator}`;
+}
+
+// Cooldown key is creator-primary. Empty/missing creator → null (always quote).
+function cooldownFingerprint(rfq) {
+  const creator = normalizedCreatorId(rfq);
+  if (!creator) return null;
+  return fingerprintRfq(rfq);
+}
+
+function isAnonymousFingerprint(fingerprint) {
+  return !fingerprint || /\|u=$/.test(String(fingerprint));
+}
+
+function creatorIdFromQuoteResponse(result) {
+  if (!result || typeof result !== 'object') return null;
+  const quote = result.quote && typeof result.quote === 'object' ? result.quote : null;
+  const nested = result.rfq && typeof result.rfq === 'object' ? result.rfq : null;
+  const raw = result.rfq_creator_id
+    ?? result.creator_id
+    ?? result.creatorId
+    ?? (quote && (quote.rfq_creator_id ?? quote.creator_id ?? quote.creatorId))
+    ?? (nested && (nested.rfq_creator_id ?? nested.creator_id ?? nested.creatorId));
+  if (raw == null || raw === '') return null;
+  const s = String(raw).trim();
+  return s || null;
 }
 
 function readCooldownMs(env = process.env) {
@@ -71,8 +106,8 @@ function createRepeatGuard({
 
   function claim(fingerprint, at) {
     const t = at != null ? at : nowMs();
-    if (!fingerprint || !(cooldownMs > 0)) {
-      return { skip: false, cooldownMs };
+    if (!fingerprint || isAnonymousFingerprint(fingerprint) || !(cooldownMs > 0)) {
+      return { skip: false, cooldownMs, gated: false };
     }
     const prev = map.get(fingerprint);
     if (prev && t - prev.at < cooldownMs) {
@@ -86,11 +121,12 @@ function createRepeatGuard({
         alert,
         cooldownMs,
         firstAt: prev.at,
+        gated: true,
       };
     }
     map.set(fingerprint, { at: t, skipCount: 0, skipAlerted: false });
     prune(t);
-    return { skip: false, first: true, cooldownMs };
+    return { skip: false, first: true, cooldownMs, gated: true };
   }
 
   return {
@@ -105,7 +141,11 @@ module.exports = {
   REPEAT_SKIP_REASON,
   MAX_ENTRIES,
   compactNum,
+  normalizedCreatorId,
   fingerprintRfq,
+  cooldownFingerprint,
+  isAnonymousFingerprint,
+  creatorIdFromQuoteResponse,
   readCooldownMs,
   formatRepeatSkipAlert,
   createRepeatGuard,
