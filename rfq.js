@@ -85,6 +85,30 @@ const COST_FIELDS = [
   'target_cost_dollars', 'rfq_target_cost_dollars', 'target_cost', 'cash_order_qty',
 ];
 
+function looksLikeLeg(x) {
+  if (x == null) return false;
+  if (typeof x === 'string') return /KX[A-Z]+-/i.test(x) || x.includes(':');
+  if (typeof x !== 'object') return false;
+  return !!(
+    x.market_ticker || x.marketTicker || x.ticker
+    || x.selected_ticker || x.selected_market
+    || x.event_ticker || x.eventTicker
+  );
+}
+
+// Official docs still say mve_selected_legs. If Kalshi renames the array,
+// walk the payload for any 2+ item list of ticker/side objects so collection
+// tickers cannot increment combos while matchParlay sees zero keys.
+function harvestLegArrays(obj, out, depth) {
+  if (!obj || typeof obj !== 'object' || depth > 5) return;
+  if (Array.isArray(obj)) {
+    if (obj.length >= 2 && obj.every(looksLikeLeg)) out.push(obj);
+    else for (const x of obj) harvestLegArrays(x, out, depth + 1);
+    return;
+  }
+  for (const v of Object.values(obj)) harvestLegArrays(v, out, depth + 1);
+}
+
 // WS rfq_created usually has fields on msg. If Kalshi nests the RFQ
 // (msg.rfq / msg.data), merge so empty top-level mve_selected_legs: []
 // cannot hide a populated nested legs array.
@@ -102,17 +126,34 @@ function collectLegsRaw(m) {
     const inner = firstPresent(nest, LEG_FIELDS);
     if (Array.isArray(inner) && inner.length) return inner;
   }
+  const harvested = [];
+  harvestLegArrays(m, harvested, 0);
+  if (harvested.length) {
+    harvested.sort((a, b) => b.length - a.length);
+    return harvested[0];
+  }
   return Array.isArray(top) ? top : null;
+}
+
+function parseTargetCost(m) {
+  const rawCost = firstPresent(m, COST_FIELDS) ?? firstPresent(m && m.rfq, COST_FIELDS);
+  if (rawCost != null) {
+    const n = typeof rawCost === 'string' ? parseFloat(rawCost) : Number(rawCost);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  // Create RFQ still documents deprecated target_cost_centi_cents (1e-4 USD).
+  const centi = firstPresent(m, ['target_cost_centi_cents', 'targetCostCentiCents'])
+    ?? firstPresent(m && m.rfq, ['target_cost_centi_cents', 'targetCostCentiCents']);
+  if (centi == null) return null;
+  const c = typeof centi === 'string' ? parseFloat(centi) : Number(centi);
+  return Number.isFinite(c) && c > 0 ? c / 10000 : null;
 }
 
 function normalizeRfq(e) {
   const m = rfqMsg(e);
   const legsRaw = collectLegsRaw(m);
   const legKeys = Array.isArray(legsRaw) ? legsRaw.map(normalizeLeg).filter(Boolean).sort() : null;
-  const rawCost = firstPresent(m, COST_FIELDS) ?? firstPresent(m.rfq, COST_FIELDS);
-  const targetCost = rawCost != null
-    ? (typeof rawCost === 'string' ? parseFloat(rawCost) : Number(rawCost))
-    : null;
+  const targetCost = parseTargetCost(m);
   const contractsRaw = m.contracts_fp != null ? m.contracts_fp
     : (m.contracts != null ? m.contracts
       : (m.rfq && (m.rfq.contracts_fp != null ? m.rfq.contracts_fp : m.rfq.contracts)));

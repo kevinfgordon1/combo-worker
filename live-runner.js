@@ -1130,7 +1130,21 @@ async function onRfq(rfq, env) {
     // lockMiss is "combo RFQ did not hit any staged parlay" — the quiet-Kalshi
     // failure mode (exact ticker miss / empty legs).
     const keys = rfq.legKeys || [];
-    if (!keys.length) counts.emptyLegs++;
+    if (!keys.length) {
+      counts.emptyLegs++;
+      if (counts.emptyLegs <= 8) {
+        const raw = env && env.msg && typeof env.msg === 'object' ? env.msg : {};
+        const nested = raw.rfq && typeof raw.rfq === 'object' ? raw.rfq : {};
+        console.log(
+          `[${MODE}] EMPTY-LEGS rfq=${rfq.rfqId} ` +
+          `msgKeys=${Object.keys(raw).join(',') || '(none)'} ` +
+          `nestedKeys=${Object.keys(nested).join(',') || '(none)'} ` +
+          `collection=${rfq.mveCollection || '(none)'} ` +
+          `contracts=${rfq.contracts != null ? rfq.contracts : '(none)'} ` +
+          `dollar=${rfq.targetCostDollars != null ? `$${rfq.targetCostDollars}` : '(none)'}`
+        );
+      }
+    }
     counts.lockMiss++;
     if (counts.lockMiss <= 8 || counts.lockMiss % 2000 === 0) {
       const overlap = describeLockOverlap(rfq, parlays);

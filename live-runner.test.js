@@ -163,6 +163,10 @@ assert.ok(
   'first combo RFQs must log contracts/dollar/keys so classification is visible'
 );
 assert.ok(
+  liveSrc.includes('EMPTY-LEGS') && /msgKeys=/.test(liveSrc),
+  'first empty-legKey combo RFQs must log raw msg keys (renamed legs field)'
+);
+assert.ok(
   /require\('\.\/rfq-debug'\)/.test(liveSrc)
   && /onEvent:\s*\(env\) => \{ captureRfq\(env\)/.test(liveSrc),
   'RFQ_DEBUG_NEEDLE capture must be wired on the Kalshi WS onEvent path'

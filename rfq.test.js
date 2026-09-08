@@ -308,6 +308,38 @@ assert.strictEqual(
   assert.strictEqual(matchParlay(altField, [ariJacDateOnly]).id, ariJacDateOnly.id);
 }
 
+// Renamed legs array (not in the known field list) — harvest by shape.
+{
+  const renamed = normalizeRfq({
+    type: 'rfq_created',
+    msg: {
+      id: 'rfq-renamed-legs',
+      contracts_fp: '10.00',
+      mve_collection_ticker: 'KXMVE-X',
+      multivariate_legs: [
+        { side: 'yes', market_ticker: 'KXNFLGAME-26SEP13ARILAC-ARI' },
+        { side: 'yes', market_ticker: 'KXNFLGAME-26SEP13CLEJAC-JAC' },
+      ],
+    },
+  });
+  assert.ok(renamed.legKeys && renamed.legKeys.length === 2);
+  assert.strictEqual(matchParlay(renamed, [ariJacDateOnly]).id, ariJacDateOnly.id);
+}
+
+// Deprecated Create RFQ dollar field (centi-cents).
+{
+  const centi = normalizeRfq({
+    type: 'rfq_created',
+    msg: {
+      id: 'rfq-centi',
+      target_cost_centi_cents: 250000,
+      mve_collection_ticker: 'KXMVE-X',
+      mve_selected_legs: legsFromKeys(ariJacDateOnly.leg_keys),
+    },
+  });
+  assert.strictEqual(centi.targetCostDollars, 25);
+}
+
 // Overlap helper for LOCK-MISS logs.
 {
   const rfq = normalizeRfq(kalshiEnv('rfq-overlap', [
