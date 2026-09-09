@@ -110,6 +110,8 @@ assert.ok(!SCOPE_LEAGUES.has('ncaaf'));
   assert.ok(!/polyLoop\.fetchUnhedgedRfq/.test(bootSrc));
   assert.ok(!/if \(row && row\.venue === 'polymarket'\) return \[\]/.test(bootSrc));
   assert.ok(!/createUnhedgedFillTracker\(\{[\s\S]*fetchRfq:\s*fetchSkipRfq/.test(bootSrc));
+  assert.ok(src.includes("require('./supabase-http')"), 'persist must retry via supabase-http');
+  assert.ok(/persist_shed|createPersistGate/.test(src));
   assert.ok(
     /enableLocks:\s*false/.test(unhedgedRunnerSrc) &&
       !/postQuote\(/.test(unhedgedRunnerSrc) &&
@@ -2246,6 +2248,113 @@ function pmRfq(id, symbols, extra = {}) {
       } finally {
         console.log = origLog;
       }
+    }
+
+    {
+      let updates = 0;
+      const flapThenInsert = {
+        from() {
+          const chain = {
+            update() { return chain; },
+            insert(row) { return Promise.resolve({ error: null, data: [row] }); },
+            eq() { return chain; },
+            neq() { return chain; },
+            select() {
+              updates += 1;
+              if (updates < 2) {
+                return Promise.resolve({ data: null, error: { message: 'TypeError: fetch failed' } });
+              }
+              return Promise.resolve({ data: [], error: null });
+            },
+          };
+          return chain;
+        },
+      };
+      const recovered = await persistUnhedgedRfq(flapThenInsert, {
+        rfq_id: 'rfq-flap',
+        venue: 'kalshi',
+        status: 'seen',
+        legs: [],
+      }, { gate: null, retry: { maxAttempts: 3, delaysMs: [0, 0, 0], sleep: async () => {} } });
+      assert.strictEqual(recovered.ok, true);
+      assert.strictEqual(updates, 2);
+
+      let uniqCalls = 0;
+      const uniqDb = {
+        from() {
+          const chain = {
+            update() { uniqCalls += 1; return chain; },
+            insert() { return Promise.resolve({ error: { code: '23505', message: 'duplicate key' } }); },
+            eq() { return chain; },
+            neq() { return chain; },
+            select() { return Promise.resolve({ data: [], error: null }); },
+          };
+          return chain;
+        },
+      };
+      const uniq = await persistUnhedgedRfq(uniqDb, {
+        rfq_id: 'rfq-dup',
+        venue: 'kalshi',
+        status: 'seen',
+        legs: [{ selection: 'cws' }],
+        our_fair_american: -110,
+        our_quote_american: -105,
+      }, { gate: null, retry: { maxAttempts: 4, delaysMs: [0, 0, 0] } });
+      assert.strictEqual(uniq.ok, true);
+      assert.ok(uniq.alreadyFilled);
+      assert.ok(uniqCalls <= 2, 'unique violation must not retry-storm');
+
+      const failDb = {
+        from() {
+          const chain = {
+            update() { return chain; },
+            eq() { return chain; },
+            neq() { return chain; },
+            select() {
+              return Promise.resolve({ data: null, error: { message: 'TypeError: fetch failed' } });
+            },
+          };
+          return chain;
+        },
+      };
+      const persistErrs = [];
+      const origErr = console.error;
+      console.error = (...a) => persistErrs.push(a.map(String).join(' '));
+      try {
+        for (let i = 0; i < 20; i++) {
+          await persistUnhedgedRfq(failDb, {
+            rfq_id: `rfq-spam-${i}`,
+            venue: 'kalshi',
+            status: 'seen',
+            legs: [],
+          }, { gate: null, retry: { maxAttempts: 1, delaysMs: [0] } });
+        }
+      } finally {
+        console.error = origErr;
+      }
+      assert.ok(
+        persistErrs.filter((l) => /persist failed/.test(l)).length <= 1,
+        'persist fetch failures must be rate-limited, not one log per RFQ'
+      );
+
+      const lookupFlap = {
+        from() {
+          return {
+            select() { return this; },
+            eq() { return this; },
+            limit() {
+              return Promise.resolve({ data: null, error: { message: 'TypeError: fetch failed' } });
+            },
+          };
+        },
+      };
+      const tracker = createUnhedgedFillTracker({
+        supabase: lookupFlap,
+        persist: async () => {},
+        retry: { maxAttempts: 2, delaysMs: [0, 0], sleep: async () => {} },
+      });
+      const closed = await tracker.onClosed({ venue: 'kalshi', rfqId: 'rfq-lookup-flap' });
+      assert.notStrictEqual(closed.reason, 'unknown_row');
     }
 
     console.log('unhedged-rfq.test.js ok');

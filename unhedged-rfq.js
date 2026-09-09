@@ -46,6 +46,11 @@
 // Pricing is sync from the in-memory cache — never a per-RFQ HTTP call.
 // Do not invent prices. Do not POST / confirm / fill.
 //
+// Persist: dedicated undici Agent + bounded retries live in supabase-http.js
+// (Unhedged job only). Seen/fill writes share a concurrency gate and
+// rate-limited error logs so Cloudflare 520/522 / TypeError: fetch failed
+// cannot melt Railway or drop fills as unknown_row.
+//
 // Env: UNHEDGED_RFQ_SHADOW default ON (collect tape). Set 0/false/off to idle.
 //      UNHEDGED_RFQ_LIVE default OFF — posting is not wired on this path.
 'use strict';
@@ -59,6 +64,27 @@ const {
   priceUnhedgedCombo,
   annotateLegOdds,
 } = require('./unhedged-quote');
+const {
+  formatSupabaseFailure,
+  createRateLimitedLogger,
+  withTransientRetry,
+  createPersistGate,
+} = require('./supabase-http');
+
+const persistLog = createRateLimitedLogger({
+  write: (...args) => console.error(...args),
+});
+const persistGate = createPersistGate();
+const PERSIST_RETRY = { maxAttempts: 3, delaysMs: [250, 1000, 3000] };
+
+function logPersistFailure(label, errOrOut) {
+  const err = errOrOut && errOrOut.error ? errOrOut.error : errOrOut;
+  const reason = errOrOut && errOrOut.reason ? ` reason=${errOrOut.reason}` : '';
+  persistLog.log(
+    label,
+    `[UNHEDGED] ${label} ${formatSupabaseFailure(err)}${reason}`
+  );
+}
 
 const SCOPE_LEAGUES = new Set(['mlb', 'nfl']);
 // Same pad as Combo Locks skip-tape / quote-watcher. Copied — do not import skip-tape.
@@ -595,9 +621,7 @@ function oddsOnlyUnhedgedPatch(row) {
 // Seen upsert must not clobber status=filled (WS replay / re-see).
 // Non-filled rows still get a full update. Filled rows keep status/fill and
 // only refresh per-leg odds when present.
-async function persistUnhedgedRfq(supabase, row) {
-  if (!supabase || !row) return { ok: false, reason: 'no_client' };
-
+async function persistUnhedgedRfqOnce(supabase, row) {
   const { data: updated, error: updateError } = await supabase
     .from('unhedged_rfqs')
     .update(row)
@@ -605,18 +629,12 @@ async function persistUnhedgedRfq(supabase, row) {
     .eq('rfq_id', row.rfq_id)
     .neq('status', 'filled')
     .select('rfq_id');
-  if (updateError) {
-    console.error('[UNHEDGED] persist failed', updateError.message);
-    return { ok: false, error: updateError };
-  }
+  if (updateError) return { ok: false, error: updateError };
   if (updated && updated.length) return { ok: true };
 
   const { error: insertError } = await supabase.from('unhedged_rfqs').insert(row);
   if (!insertError) return { ok: true };
-  if (!isUniqueViolation(insertError)) {
-    console.error('[UNHEDGED] persist failed', insertError.message);
-    return { ok: false, error: insertError };
-  }
+  if (!isUniqueViolation(insertError)) return { ok: false, error: insertError };
 
   const { error: oddsError } = await supabase
     .from('unhedged_rfqs')
@@ -624,11 +642,24 @@ async function persistUnhedgedRfq(supabase, row) {
     .eq('venue', row.venue)
     .eq('rfq_id', row.rfq_id)
     .eq('status', 'filled');
-  if (oddsError) {
-    console.error('[UNHEDGED] persist failed', oddsError.message);
-    return { ok: false, error: oddsError };
-  }
+  if (oddsError) return { ok: false, error: oddsError };
   return { ok: true, alreadyFilled: true };
+}
+
+async function persistUnhedgedRfq(supabase, row, opts = {}) {
+  if (!supabase || !row) return { ok: false, reason: 'no_client' };
+  const retry = { ...PERSIST_RETRY, ...(opts.retry || {}) };
+  const gate = opts.gate === null ? null : (opts.gate || persistGate);
+  const run = () => withTransientRetry(async () => {
+    try {
+      return await persistUnhedgedRfqOnce(supabase, row);
+    } catch (e) {
+      return { ok: false, error: e };
+    }
+  }, retry);
+  const out = gate ? await gate.enqueue('seen', run) : await run();
+  if (out && out.ok === false) logPersistFailure('persist failed', out);
+  return out;
 }
 
 function considerUnhedgedRfq(rfq, opts = {}) {
@@ -650,7 +681,11 @@ async function maybePersistUnhedged(rfq, opts = {}) {
     return considered;
   }
   if (opts.supabase) {
-    await persistUnhedgedRfq(opts.supabase, considered.row);
+    try {
+      await persistUnhedgedRfq(opts.supabase, considered.row);
+    } catch (e) {
+      logPersistFailure('persist failed', e);
+    }
   }
   return considered;
 }
@@ -944,17 +979,30 @@ async function lookupKnownUnhedgedRow(opts, venue, rfqId) {
     return opts.knownIds.has(knownKey(venue, rfqId)) ? { status: null } : null;
   }
   if (opts.supabase) {
-    const { data, error } = await opts.supabase
-      .from('unhedged_rfqs')
-      .select('rfq_id,status')
-      .eq('venue', venue)
-      .eq('rfq_id', rfqId)
-      .limit(1);
-    if (error) {
-      console.error('[UNHEDGED] fill lookup failed', error.message);
-      return null;
+    const retry = { ...PERSIST_RETRY, ...(opts.retry || {}), delaysMs: opts.retry && opts.retry.delaysMs || [250, 1000, 3000] };
+    try {
+      const looked = await withTransientRetry(async () => {
+        try {
+          const { data, error } = await opts.supabase
+            .from('unhedged_rfqs')
+            .select('rfq_id,status')
+            .eq('venue', venue)
+            .eq('rfq_id', rfqId)
+            .limit(1);
+          if (error) return { ok: false, error };
+          return { ok: true, row: (data && data[0]) || null };
+        } catch (e) {
+          return { ok: false, error: e };
+        }
+      }, retry);
+      if (looked && looked.ok) return looked.row;
+      logPersistFailure('fill lookup failed', looked);
+      // Transient miss must not look like "unknown row" (that drops the fill).
+      return { status: 'seen', lookupError: true };
+    } catch (e) {
+      logPersistFailure('fill lookup failed', e);
+      return { status: 'seen', lookupError: true };
     }
-    return (data && data[0]) || null;
   }
   return null;
 }
@@ -1003,20 +1051,14 @@ function mergeUnhedgedFillPatch(existing, patch) {
   };
 }
 
-async function persistUnhedgedFill(supabase, patch, { omitUpdatedAt = false, now } = {}) {
-  if (!supabase || !patch || !patch.rfq_id || !patch.venue) {
-    return { ok: false, reason: 'no_client' };
-  }
+async function persistUnhedgedFillOnce(supabase, patch, { omitUpdatedAt = false, now } = {}) {
   const { data: existingRows, error: lookupError } = await supabase
     .from('unhedged_rfqs')
     .select('filled_at,fill_yes_price,fill_no_price,fill_american,created_at,status')
     .eq('venue', patch.venue)
     .eq('rfq_id', patch.rfq_id)
     .limit(1);
-  if (lookupError) {
-    console.error('[UNHEDGED] fill update failed', lookupError.message);
-    return { ok: false, error: lookupError };
-  }
+  if (lookupError) return { ok: false, error: lookupError };
   if (existingRows && existingRows[0] && existingRows[0].status === 'started') {
     return { ok: false, reason: 'game_started', updated: false };
   }
@@ -1032,12 +1074,31 @@ async function persistUnhedgedFill(supabase, patch, { omitUpdatedAt = false, now
   if (error) {
     if (!omitUpdatedAt && isMissingUnhedgedCol(error, 'updated_at')) {
       console.warn('[UNHEDGED] unhedged_rfqs missing column updated_at — degrading');
-      return persistUnhedgedFill(supabase, patch, { omitUpdatedAt: true, now });
+      return persistUnhedgedFillOnce(supabase, patch, { omitUpdatedAt: true, now });
     }
-    console.error('[UNHEDGED] fill update failed', error.message);
     return { ok: false, error };
   }
   return { ok: true, updated: !!(data && data.length) };
+}
+
+async function persistUnhedgedFill(supabase, patch, { omitUpdatedAt = false, now, retry, gate } = {}) {
+  if (!supabase || !patch || !patch.rfq_id || !patch.venue) {
+    return { ok: false, reason: 'no_client' };
+  }
+  const retryOpts = { ...PERSIST_RETRY, ...(retry || {}) };
+  const persistGateOrNull = gate === null ? null : (gate || persistGate);
+  const run = () => withTransientRetry(async () => {
+    try {
+      return await persistUnhedgedFillOnce(supabase, patch, { omitUpdatedAt, now });
+    } catch (e) {
+      return { ok: false, error: e };
+    }
+  }, retryOpts);
+  const out = persistGateOrNull ? await persistGateOrNull.enqueue('fill', run) : await run();
+  if (out && out.ok === false && out.reason !== 'game_started') {
+    logPersistFailure('fill update failed', out);
+  }
+  return out;
 }
 
 async function maybePersistUnhedgedFill(opts = {}) {
@@ -1054,7 +1115,11 @@ async function maybePersistUnhedgedFill(opts = {}) {
     return considered;
   }
   if (opts.supabase) {
-    await persistUnhedgedFill(opts.supabase, considered.row);
+    try {
+      await persistUnhedgedFill(opts.supabase, considered.row);
+    } catch (e) {
+      logPersistFailure('fill persist failed', e);
+    }
   }
   return considered;
 }
@@ -1342,33 +1407,47 @@ function createUnhedgedFillTracker(opts = {}) {
     if (ticker) tickers.set(key, ticker);
   }
 
+  async function hydrateQuery(run) {
+    try {
+      const out = await withTransientRetry(async () => {
+        try {
+          const q = await run();
+          if (q && q.error) return { ok: false, error: q.error, data: q.data };
+          return { ok: true, data: q && q.data };
+        } catch (e) {
+          return { ok: false, error: e };
+        }
+      }, PERSIST_RETRY);
+      if (out && out.ok) return out.data || [];
+      logPersistFailure('fill hydrate failed', out);
+      return null;
+    } catch (e) {
+      logPersistFailure('fill hydrate failed', e);
+      return null;
+    }
+  }
+
   async function hydrateOpen() {
-    const { data, error } = await opts.supabase
+    const data = await hydrateQuery(() => opts.supabase
       .from('unhedged_rfqs')
       .select('venue,rfq_id,status,contracts,created_at')
       .eq('status', 'seen')
       .order('created_at', { ascending: false })
-      .limit(HYDRATE_SEEN_LIMIT);
-    if (error) {
-      console.error('[UNHEDGED] fill hydrate failed', error.message);
-      return;
-    }
-    for (const r of data || []) remember(r);
+      .limit(HYDRATE_SEEN_LIMIT));
+    if (!data) return;
+    for (const r of data) remember(r);
   }
 
   // IDs only — same 500 cap as open rows. Do not load fill payloads.
   async function hydrateFilled() {
-    const { data, error } = await opts.supabase
+    const data = await hydrateQuery(() => opts.supabase
       .from('unhedged_rfqs')
       .select('venue,rfq_id,status')
       .eq('status', 'filled')
       .order('filled_at', { ascending: false })
-      .limit(500);
-    if (error) {
-      console.error('[UNHEDGED] fill hydrate failed', error.message);
-      return;
-    }
-    for (const r of data || []) remember(r);
+      .limit(500));
+    if (!data) return;
+    for (const r of data) remember(r);
   }
 
   async function hydrate() {
@@ -1401,7 +1480,10 @@ function createUnhedgedFillTracker(opts = {}) {
     }
     const key = knownKey(venue, rfqId);
     if (!known.has(key)) {
-      const existing = await lookupKnownUnhedgedRow({ supabase: opts.supabase }, venue, rfqId);
+      const existing = await lookupKnownUnhedgedRow({
+        supabase: opts.supabase,
+        retry: opts.retry,
+      }, venue, rfqId);
       if (!existing) {
         noteFillTick('unknown');
         return fail('unknown_row');
