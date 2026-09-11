@@ -77,8 +77,25 @@ assert.ok(
   'Kalshi runner comment must document Poly Miss tape writes'
 );
 assert.ok(
-  /status:\s*'filled',[\s\S]*?venue:\s*'kalshi'/.test(liveSrc),
-  'Kalshi filled insert-fallback must include venue kalshi'
+  /function fillVenueOf/.test(liveSrc) && /venue === 'polymarket'/.test(liveSrc),
+  'filled persist must stamp venue kalshi | polymarket'
+);
+assert.ok(
+  /onQuoteExecuted:\s*\(evt\) =>\s*onQuoteExecuted\(\{/.test(liveSrc) &&
+    /venue:\s*\(evt && evt\.venue\) \|\| 'polymarket'/.test(liveSrc),
+  'Poly loop must persist ORDER FILL via onQuoteExecuted (same path as Kalshi quote_executed)'
+);
+assert.ok(
+  /seenFillIds/.test(liveSrc) && /duplicate fill_id/.test(liveSrc),
+  'in-process duplicate fill events must not re-count or re-Telegram'
+);
+assert.ok(
+  /polyLoop\.cancelOpenQuotesForParlay/.test(liveSrc),
+  'full-fill cap must cancel leftover Poly quotes as well as Kalshi'
+);
+assert.ok(
+  /FILL CONFIRMED\$\{venueTag\}/.test(liveSrc) && /polymarket' \? ' · polymarket'/.test(liveSrc),
+  'Poly fills send FILL CONFIRMED Telegram with a venue tag'
 );
 assert.ok(
   /require\('\.\/fills-attr'\)/.test(liveSrc) && /liveRunnerFillRow/.test(liveSrc),

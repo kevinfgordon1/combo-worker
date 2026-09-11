@@ -15,6 +15,8 @@
 // no_lock_overlap* SKIPs stay in the engine — they are not taped.
 // Live POSTs (create quote, confirm) require POLYMARKET_RFQ_LIVE to be truthy.
 // quoteExecuted means paired orders were submitted — not a fill.
+// Combo Locks fills persist on orderExecution FILL / PARTIAL_FILL via
+// ctx.onQuoteExecuted (same combo_fills + combo_submissions path as Kalshi).
 // START GATE: never quote or confirm once any lock leg has started (first pitch
 // / kickoff <= now). Resting quotes for that lock are DELETE'd the same way
 // Kalshi cancelStartedQuotes works. Date-only Polymarket slugs are not starts —
@@ -649,6 +651,138 @@ function acceptedFromEvent(evt) {
     acceptedSide: q.acceptedSide || q.accepted_side || r.acceptedSide || null,
     creatorOrderId: q.creatorOrderId || q.creator_order_id || null,
     confirmationDeadline: q.confirmationDeadline || q.confirmation_deadline || null,
+  };
+}
+
+function parsePositiveShares(n) {
+  const x = parseFloat(n);
+  if (!Number.isFinite(x) || x <= 0) return 0;
+  return Math.round(x * 1e8) / 1e8;
+}
+
+function orderIdFromExecution(ex) {
+  const order = (ex && ex.order) || {};
+  return order.id || (ex && (ex.orderId || ex.order_id)) || null;
+}
+
+function quoteIdFromExecution(ex) {
+  const order = (ex && ex.order) || {};
+  return (
+    order.quoteId || order.quote_id
+    || (ex && (ex.quoteId || ex.quote_id))
+    || null
+  );
+}
+
+function rfqIdFromExecution(ex) {
+  const order = (ex && ex.order) || {};
+  return order.rfqId || order.rfq_id || (ex && (ex.rfqId || ex.rfq_id)) || null;
+}
+
+function executionFillId(ex, orderId, quoteId) {
+  const last = parsePositiveShares(ex && (ex.lastShares ?? ex.last_shares));
+  const raw = ex && (ex.executionId || ex.execution_id || ex.tradeId || ex.trade_id);
+  if (raw && raw !== orderId && raw !== quoteId) return raw;
+  const maybeId = ex && ex.id;
+  if (maybeId && maybeId !== orderId && maybeId !== quoteId) return maybeId;
+  if (orderId && last) return `${orderId}:${last}`;
+  return orderId || quoteId || null;
+}
+
+function isOrderFillExecution(typ) {
+  const t = String(typ || '').toUpperCase();
+  return t === 'EXECUTION_TYPE_FILL' || t === 'EXECUTION_TYPE_PARTIAL_FILL';
+}
+
+function isOrderCancelExecution(typ) {
+  const t = String(typ || '').toUpperCase();
+  return (
+    t === 'EXECUTION_TYPE_CANCELED'
+    || t === 'EXECUTION_TYPE_REJECTED'
+    || t === 'EXECUTION_TYPE_EXPIRED'
+  );
+}
+
+// lastShares is the increment. If FILL lastShares looks like a running total
+// after partials already counted, use the remainder so we do not double-count.
+function contractsFromExecution(ex, pending) {
+  const last = parsePositiveShares(ex && (ex.lastShares ?? ex.last_shares ?? ex.lastQty ?? ex.last_qty));
+  const cum = parsePositiveShares(ex && (
+    ex.cumQty ?? ex.cumulativeQty ?? ex.filledQty ?? ex.filled_qty ?? ex.totalFilled
+  ));
+  const already = parsePositiveShares(pending && pending.filledContracts);
+  const quoted = parsePositiveShares(pending && pending.contracts);
+  const typ = String((ex && ex.type) || '').toUpperCase();
+
+  if (cum > 0 && already > 0 && cum + 1e-9 >= already) {
+    const inc = Math.round((cum - already) * 1e8) / 1e8;
+    if (inc > 1e-9) return inc;
+    return 0;
+  }
+  if (
+    typ === 'EXECUTION_TYPE_FILL'
+    && last > 0
+    && already > 0
+    && last + 1e-9 >= already
+    && (quoted <= 0 || last + 1e-9 >= quoted)
+  ) {
+    const inc = Math.round((last - already) * 1e8) / 1e8;
+    return inc > 1e-9 ? inc : 0;
+  }
+  if (last > 0) return last;
+  if (quoted > 0 && already > 0) return Math.max(0, Math.round((quoted - already) * 1e8) / 1e8);
+  return quoted || 0;
+}
+
+function findPendingForOrderExecution(pendingQuotes, ex) {
+  if (!pendingQuotes || typeof pendingQuotes.forEach !== 'function') return null;
+  const orderId = orderIdFromExecution(ex);
+  const quoteId = quoteIdFromExecution(ex);
+  if (quoteId && pendingQuotes.has && pendingQuotes.has(quoteId) && !isReserveKey(quoteId)) {
+    const pending = pendingQuotes.get(quoteId);
+    if (pending) return { pending, pendingId: quoteId };
+  }
+  let byOrder = null;
+  const byRfq = [];
+  pendingQuotes.forEach((q, id) => {
+    if (!q || isReserveKey(id)) return;
+    if (q.creatorOrderId && orderId && q.creatorOrderId === orderId) {
+      byOrder = { pending: q, pendingId: id };
+    }
+    const rfqId = rfqIdFromExecution(ex);
+    if (rfqId && q.rfqId === rfqId) byRfq.push({ pending: q, pendingId: id });
+  });
+  if (byOrder) return byOrder;
+  if (byRfq.length === 1) return byRfq[0];
+  return null;
+}
+
+function orderFillEvent(ex, pending, pendingId) {
+  const typ = String((ex && ex.type) || '').toUpperCase();
+  const orderId = orderIdFromExecution(ex);
+  const quoteId = quoteIdFromExecution(ex) || pendingId || null;
+  const contracts = contractsFromExecution(ex, pending);
+  return {
+    quoteId,
+    orderId: orderId || null,
+    fillId: executionFillId(ex, orderId, quoteId),
+    contracts,
+    venue: 'polymarket',
+    isPartial: typ === 'EXECUTION_TYPE_PARTIAL_FILL',
+    rfqId: (pending && pending.rfqId) || rfqIdFromExecution(ex) || null,
+    marketTicker: null,
+    label: pending && pending.label,
+    parlayId: pending && pending.parlayId,
+    pending: pending
+      ? {
+        parlayId: pending.parlayId,
+        userId: pending.userId,
+        contracts: pending.contracts,
+        label: pending.label,
+        rfqId: pending.rfqId,
+        maxContracts: pending.maxContracts,
+      }
+      : null,
   };
 }
 
@@ -1298,7 +1432,10 @@ function startPolymarketRfqLoop(ctx = {}) {
     const acc = acceptedFromEvent(evt);
     const { quoteId, rfqId, acceptedSide } = acc;
     const pending = quoteId ? pendingQuotes.get(quoteId) : null;
-    if (pending) pending.accepted = true;
+    if (pending) {
+      pending.accepted = true;
+      if (acc.creatorOrderId) pending.creatorOrderId = acc.creatorOrderId;
+    }
     const parlay = parlayOfPending(pending);
     const started = parlay ? startedFor(parlay) : { started: false };
     const gate = shouldConfirmNow(acceptedSide, { live, started });
@@ -1420,7 +1557,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     const pending = quoteId ? pendingQuotes.get(quoteId) : null;
     if (pending) {
       pending.executed = true;
-      pending.creatorOrderId = q.creatorOrderId || q.creator_order_id || null;
+      pending.creatorOrderId = q.creatorOrderId || q.creator_order_id || pending.creatorOrderId || null;
     }
     console.log(
       `[${MODE}] quoteExecuted orders submitted (not a fill) ` +
@@ -1429,43 +1566,61 @@ function startPolymarketRfqLoop(ctx = {}) {
     );
   }
 
-  function handleOrderExecution(ex) {
-    if (!ex || typeof ex !== 'object') return;
-    const typ = String(ex.type || '').toUpperCase();
-    const order = ex.order || {};
-    const orderId = order.id || ex.orderId || ex.order_id || null;
-    let pending = null;
-    let pendingId = null;
-    pendingQuotes.forEach((q, id) => {
-      if (q.creatorOrderId && q.creatorOrderId === orderId) {
-        pending = q;
-        pendingId = id;
-      }
-    });
-    if (!pending) return;
-
-    if (typ === 'EXECUTION_TYPE_FILL' || typ === 'EXECUTION_TYPE_PARTIAL_FILL') {
-      const n = parseFloat(ex.lastShares || ex.last_shares || 0);
-      const contracts = Number.isFinite(n) && n > 0 ? n : pending.contracts;
-      if (typeof ctx.onFill === 'function') ctx.onFill(pending.parlayId, contracts);
-      else if (ctx.sessionFilledByParlay) {
-        ctx.sessionFilledByParlay[pending.parlayId] =
-          (ctx.sessionFilledByParlay[pending.parlayId] || 0) + contracts;
-      }
-      if (typ === 'EXECUTION_TYPE_FILL') pendingQuotes.delete(pendingId);
-      console.log(
-        `[${MODE}] ORDER FILL ${pending.label} order_id=${orderId} contracts=${contracts}`
-      );
-      return;
+  function emitOrderFill(evt) {
+    if (typeof ctx.onQuoteExecuted === 'function') {
+      Promise.resolve()
+        .then(() => ctx.onQuoteExecuted(evt))
+        .catch((e) => console.error(`[${MODE}] onQuoteExecuted`, e && e.message));
+      return 'persist';
     }
-    if (
-      typ === 'EXECUTION_TYPE_CANCELED' ||
-      typ === 'EXECUTION_TYPE_REJECTED' ||
-      typ === 'EXECUTION_TYPE_EXPIRED'
-    ) {
+    if (typeof ctx.onFill === 'function') {
+      ctx.onFill(evt.parlayId, evt.contracts);
+      return 'onFill';
+    }
+    if (ctx.sessionFilledByParlay && evt.parlayId) {
+      ctx.sessionFilledByParlay[evt.parlayId] =
+        (ctx.sessionFilledByParlay[evt.parlayId] || 0) + evt.contracts;
+      return 'session';
+    }
+    return null;
+  }
+
+  function handleOrderExecution(ex) {
+    if (!ex || typeof ex !== 'object') return null;
+    const typ = String(ex.type || '').toUpperCase();
+    const matched = findPendingForOrderExecution(pendingQuotes, ex);
+    const pending = matched && matched.pending;
+    const pendingId = (matched && matched.pendingId) || quoteIdFromExecution(ex);
+
+    if (isOrderFillExecution(typ)) {
+      const evt = orderFillEvent(ex, pending, pendingId);
+      if (!evt.quoteId && !evt.orderId) return null;
+      // In-memory replay of a cumulative FILL after partials already counted.
+      if (pending && !(evt.contracts > 0)) {
+        if (typ === 'EXECUTION_TYPE_FILL' && pendingId) pendingQuotes.delete(pendingId);
+        return evt;
+      }
+      if (pending && evt.contracts > 0) {
+        pending.filledContracts = (pending.filledContracts || 0) + evt.contracts;
+      }
+      if (!pending && !(evt.contracts > 0)) evt.contracts = null;
+      emitOrderFill(evt);
+      if (typ === 'EXECUTION_TYPE_FILL' && pendingId) pendingQuotes.delete(pendingId);
+      console.log(
+        `[${MODE}] ORDER FILL ${(pending && pending.label) || '(recovered)'} ` +
+        `order_id=${evt.orderId || '?'} quote_id=${evt.quoteId || pendingId || '?'} ` +
+        `contracts=${evt.contracts}` +
+        (evt.isPartial ? ' PARTIAL' : '')
+      );
+      return evt;
+    }
+    if (!matched) return null;
+    if (isOrderCancelExecution(typ)) {
       pendingQuotes.delete(pendingId);
       console.log(`[${MODE}] RESERVE RELEASED order ${typ} quote_id=${pendingId}`);
+      return { canceled: true, pendingId, type: typ };
     }
+    return null;
   }
 
   async function reconcileOpenRfqs() {
@@ -1632,6 +1787,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     onWsEvent,
     cancelStartedQuotes,
     cancelPendingIfStarted,
+    cancelOpenQuotesForParlay,
     pendingQuotes,
     seenRfqs,
     missTape,
@@ -1671,6 +1827,16 @@ module.exports = {
   parlayFromPending,
   quoteBodyFromEval,
   acceptedFromEvent,
+  parsePositiveShares,
+  orderIdFromExecution,
+  quoteIdFromExecution,
+  rfqIdFromExecution,
+  executionFillId,
+  isOrderFillExecution,
+  isOrderCancelExecution,
+  contractsFromExecution,
+  findPendingForOrderExecution,
+  orderFillEvent,
   startPolymarketRfqLoop,
   NEAR_MISS_CODES,
   fetchPolymarketUnhedgedRfq,

@@ -268,6 +268,24 @@ const fillRow = {
   });
   assert.strictEqual(twin.fill_id, fill.order_id);
   assert.strictEqual(twin.raw.source, 'live-runner');
+  assert.strictEqual(twin.raw.venue, 'kalshi');
+
+  const polyTwin = liveRunnerFillRow({
+    quoteId: 'OtcRsZDF0D6mfW7LaRSoLOESiNL1BLpPsICTa6Rh2G0',
+    orderId: 'poly-order-1',
+    fillId: 'poly-exec-1',
+    parlayId: 'p-jets',
+    count: 107.68,
+    venue: 'polymarket',
+    rfqId: 'f27cfa32-644a-4b2e-90e8-416d7d99fd74',
+    label: 'Jets + Rams + Ravens',
+  });
+  assert.strictEqual(polyTwin.fill_id, 'poly-exec-1');
+  assert.strictEqual(polyTwin.order_id, 'poly-order-1');
+  assert.strictEqual(polyTwin.parlay_id, 'p-jets');
+  assert.strictEqual(polyTwin.count, 107.68);
+  assert.strictEqual(polyTwin.raw.venue, 'polymarket');
+  assert.strictEqual(polyTwin.raw.quote_id, 'OtcRsZDF0D6mfW7LaRSoLOESiNL1BLpPsICTa6Rh2G0');
   const viaTwin = attributeComboFill(shard, fill, [sea, twinSea], { existingFills: [twin] });
   assert.strictEqual(viaTwin && viaTwin.reason, 'order_id_fill');
   assert.strictEqual(viaTwin.parlay.id, 'p-sea');
