@@ -1,10 +1,12 @@
 // ─────────────────────────────────────────────────────────────────────────
 // live-runner.js — LIVE worker (latency-optimized)
 //
-// ACCOUNTING: POST → 'quoted'. Filled advances on quote_executed.
+// ACCOUNTING: POST → 'quoted'. Filled advances on quote_executed (Kalshi)
+//   or Polymarket orderExecution FILL / PARTIAL_FILL (same persist).
 //   Persist combo_fills (parlay_id) FIRST, then stamp combo_submissions
 //   status=filled + order_id. UI Filled tab is combo_fills; History needs
 //   both fields. Restart recovery reads combo_submissions by quote_id.
+//   Poly quoteExecuted is orders-submitted, not a fill — do not persist there.
 // RESERVE: outstanding live quotes (pendingQuotes + in-flight POST) count against
 //   remaining so parallel RFQs cannot all clear the same ceiling.
 //   remaining = max - filled - outstanding.
@@ -194,6 +196,7 @@ let filledByParlay = {};
 let sessionFilledByParlay = {};
 const pendingQuotes = new Map();
 const polyPendingQuotes = new Map();
+const seenFillIds = new Set();
 let polyLoop = null;
 // Poly fill GET/tape uses this client, created before the shared tracker.
 // Do not wait for startPolymarketRfqLoop — tracker + warmConnection run first.
@@ -743,6 +746,13 @@ async function cancelOpenQuotesForParlay(parlayId, started, extras) {
 async function cancelCapLeftovers(parlayId, info) {
   const extras = (await loadOpenSubmissionQuotes()).filter((r) => r.parlay_id === parlayId);
   await cancelOpenQuotesForParlay(parlayId, { kind: 'cap_full', ...info }, extras);
+  if (polyLoop && typeof polyLoop.cancelOpenQuotesForParlay === 'function') {
+    try {
+      await polyLoop.cancelOpenQuotesForParlay(parlayId, { kind: 'cap_full', ...info });
+    } catch (e) {
+      console.error(`[${MODE}] poly cancel leftover`, e.message);
+    }
+  }
 }
 
 async function cancelPendingIfStarted() {
@@ -1049,11 +1059,21 @@ async function onQuoteAccepted(evt) {
   }
 }
 
+function fillVenueOf(evt) {
+  return evt && evt.venue === 'polymarket' ? 'polymarket' : 'kalshi';
+}
+
+function fillKeyOf(evt) {
+  if (!evt) return null;
+  return evt.fillId || evt.orderId || evt.quoteId || null;
+}
+
 async function persistExecutedFill(pending, evt) {
   const quoteId = evt.quoteId;
-  const orderId = evt.orderId || null;
+  const orderId = evt.orderId || evt.fillId || quoteId || null;
   const contracts = evt.contracts != null ? evt.contracts : pending.contracts;
   const ticker = evt.marketTicker || null;
+  const venue = fillVenueOf(evt);
   // Combo Locks "Filled — awaiting settlement" keys off combo_fills.parlay_id.
   // Write fills first so a submissions error cannot hide the position.
   try {
@@ -1061,11 +1081,13 @@ async function persistExecutedFill(pending, evt) {
       liveRunnerFillRow({
         quoteId,
         orderId,
+        fillId: evt.fillId,
         parlayId: pending.parlayId,
         count: contracts,
         ticker,
-        rfqId: pending.rfqId,
+        rfqId: pending.rfqId || evt.rfqId,
         label: pending.label,
+        venue,
       }),
       { onConflict: 'fill_id' },
     );
@@ -1086,14 +1108,14 @@ async function persistExecutedFill(pending, evt) {
       const { error: insErr } = await supabase.from('combo_submissions').insert({
         user_id: pending.userId,
         parlay_id: pending.parlayId,
-        rfq_id: pending.rfqId,
+        rfq_id: pending.rfqId || evt.rfqId,
         label: pending.label,
         contracts,
         status: 'filled',
         quote_id: quoteId,
         order_id: orderId,
         is_live: true,
-        venue: 'kalshi',
+        venue,
       });
       if (insErr) console.error(`[${MODE}] insert filled failed`, insErr.message);
     }
@@ -1128,11 +1150,26 @@ async function pendingFromSubmission(quoteId) {
 }
 
 async function onQuoteExecuted(evt) {
-  const { quoteId, orderId } = evt;
-  if (!quoteId) return;
+  if (!evt || !evt.quoteId) return;
+  const { quoteId } = evt;
+  const orderId = evt.orderId || evt.fillId || quoteId || null;
+  const fillKey = fillKeyOf(evt);
+  if (fillKey && seenFillIds.has(fillKey)) {
+    console.log(`[${MODE}] quote_executed duplicate fill_id=${fillKey}`);
+    return;
+  }
+  if (fillKey) seenFillIds.add(fillKey);
 
-  let pending = pendingQuotes.get(quoteId);
-  const fromMemory = !!pending;
+  let pending = evt.pending || null;
+  let fromMemory = !!pending;
+  if (!pending) {
+    pending = pendingQuotes.get(quoteId);
+    fromMemory = !!pending;
+  }
+  if (!pending) {
+    pending = polyPendingQuotes.get(quoteId);
+    fromMemory = !!pending;
+  }
   if (!pending) {
     pending = await pendingFromSubmission(quoteId);
     if (!pending) {
@@ -1143,15 +1180,22 @@ async function onQuoteExecuted(evt) {
   }
 
   const contracts = evt.contracts != null ? evt.contracts : pending.contracts;
-  await persistExecutedFill(pending, evt);
-  if (!fromMemory && pending.alreadyFilled) {
+  const venue = fillVenueOf(evt);
+  await persistExecutedFill(pending, { ...evt, orderId, venue });
+  // Restart replay of the same full fill: persist is idempotent; do not
+  // re-count or re-Telegram. Partials keep a distinct fill_id so they add.
+  if (!fromMemory && pending.alreadyFilled && !evt.isPartial) {
     pendingQuotes.delete(quoteId);
+    polyPendingQuotes.delete(quoteId);
     return;
   }
 
   sessionFilledByParlay[pending.parlayId] =
     (sessionFilledByParlay[pending.parlayId] || 0) + contracts;
-  pendingQuotes.delete(quoteId);
+  if (!evt.isPartial) {
+    pendingQuotes.delete(quoteId);
+    polyPendingQuotes.delete(quoteId);
+  }
   counts.filled++;
 
   const sessionTotal = sessionFilledByParlay[pending.parlayId];
@@ -1183,13 +1227,15 @@ async function onQuoteExecuted(evt) {
     });
   }
 
+  const venueTag = venue === 'polymarket' ? ' POLY' : '';
   console.log(
-    `[${MODE}] FILL CONFIRMED ${pending.label} quote_id=${quoteId} order_id=${orderId} ` +
+    `[${MODE}] FILL CONFIRMED${venueTag} ${pending.label} quote_id=${quoteId} order_id=${orderId} ` +
     `contracts=${contracts} sessionTotal=${sessionTotal}` +
-    (fullyFilled ? ' FULL' : '')
+    (fullyFilled ? ' FULL' : '') +
+    (evt.isPartial ? ' PARTIAL' : '')
   );
   sendAlert(
-    `✅ FILL CONFIRMED — ${pending.label}\n` +
+    `✅ FILL CONFIRMED — ${pending.label}${venue === 'polymarket' ? ' · polymarket' : ''}\n` +
     `order ${orderId ? shortId(orderId) : '(none)'} · quote ${shortId(quoteId)}\n` +
     `+${contracts} contracts` +
     (fullyFilled
@@ -1602,6 +1648,10 @@ async function main() {
     unhedgedPrices: runUnhedged ? unhedgedPrices : null,
     unhedgedFills: runUnhedged ? unhedgedFills : null,
     http: (runUnhedged && polyUnhedgedHttp) || undefined,
+    onQuoteExecuted: (evt) => onQuoteExecuted({
+      ...evt,
+      venue: (evt && evt.venue) || 'polymarket',
+    }).catch((e) => console.error('onQuoteExecuted', e)),
   });
   polyLoop = poly;
 

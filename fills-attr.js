@@ -182,10 +182,10 @@ function canStampSubmission(sub, fill) {
   return true;
 }
 
-function liveRunnerFillRow({ quoteId, orderId, parlayId, count, ticker, rfqId, label, createdAt }) {
-  const fillId = orderId || quoteId;
+function liveRunnerFillRow({ quoteId, orderId, fillId, parlayId, count, ticker, rfqId, label, createdAt, venue }) {
+  const id = fillId || orderId || quoteId;
   return {
-    fill_id: fillId,
+    fill_id: id,
     order_id: orderId || null,
     parlay_id: parlayId || null,
     ticker: ticker || null,
@@ -195,7 +195,13 @@ function liveRunnerFillRow({ quoteId, orderId, parlayId, count, ticker, rfqId, l
     outcome_side: 'no',
     action: 'sell',
     kalshi_created_time: createdAt || new Date().toISOString(),
-    raw: { source: 'live-runner', quote_id: quoteId || null, rfq_id: rfqId || null, label: label || null },
+    raw: {
+      source: 'live-runner',
+      quote_id: quoteId || null,
+      rfq_id: rfqId || null,
+      label: label || null,
+      venue: venue || 'kalshi',
+    },
   };
 }
 
