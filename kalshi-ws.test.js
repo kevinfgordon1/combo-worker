@@ -2,7 +2,7 @@
 const assert = require('assert');
 const { EventEmitter } = require('events');
 const { generateKeyPairSync } = require('crypto');
-const { createKalshiWs, DEFAULT_STALL_MS, readStallMs } = require('./kalshi-ws');
+const { createKalshiWs, DEFAULT_STALL_MS, PING_MS, INITIAL_BACKOFF_MS, readStallMs } = require('./kalshi-ws');
 const { applyServerDate, resetClockOffset, signedNow, authHeaders } = require('./kalshi-auth');
 
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -46,7 +46,10 @@ class FakeWs extends EventEmitter {
   }
 
   send(payload) { this.sent.push(payload); }
-  ping() { this.pinged = true; }
+  ping() {
+    this.pinged = true;
+    this.pingCount = (this.pingCount || 0) + 1;
+  }
   close() {
     this.readyState = FakeWs.CLOSED;
     this.emit('close', 1000);
@@ -78,6 +81,8 @@ function startClient(extra = {}) {
 
 {
   assert.strictEqual(DEFAULT_STALL_MS, 20_000);
+  assert.strictEqual(PING_MS, 10_000);
+  assert.strictEqual(INITIAL_BACKOFF_MS, 1000);
   assert.strictEqual(readStallMs(undefined, {}), 20_000);
   assert.strictEqual(readStallMs(15_000, {}), 15_000);
   assert.strictEqual(readStallMs(undefined, { KALSHI_WS_STALL_MS: '8000' }), 8000);
@@ -137,8 +142,10 @@ async function runAsync() {
     const { client, statuses } = startClient({ stallMs: 40 });
     await wait(20);
     const n0 = FakeWs.instances.length;
+    const first = FakeWs.instances[0];
+    assert.ok(first.pinged, 'open must send an immediate keepalive ping');
     await wait(80);
-    assert.ok(statuses.some((x) => x.s === 'stalled'), 'silence must trip stall watchdog');
+    assert.ok(statuses.some((x) => x.s === 'stalled'), 'silence with no pong must trip stall watchdog');
     assert.ok(statuses.some((x) => x.s === 'reconnecting' && x.i && x.i.reason === 'stall'));
     await wait(1100);
     assert.ok(FakeWs.instances.length > n0, 'stall must open a new socket');
@@ -158,6 +165,58 @@ async function runAsync() {
       await wait(20);
     }
     assert.ok(!statuses.some((x) => x.s === 'stalled'), 'live communications must not stall');
+    client.stop();
+  }
+
+  {
+    FakeWs.instances = [];
+    const { client, statuses } = startClient({ stallMs: 50 });
+    await wait(15);
+    const sock = FakeWs.instances[0];
+    for (let i = 0; i < 8; i++) {
+      sock.emit('pong');
+      await wait(20);
+    }
+    assert.ok(!statuses.some((x) => x.s === 'stalled'), 'quiet book with pongs must not stall');
+    assert.ok(!statuses.some((x) => x.s === 'reconnecting' && x.i && x.i.reason === 'stall'));
+    assert.strictEqual(client.health().backoff, 1000, 'pong liveness must reset backoff');
+    client.stop();
+  }
+
+  {
+    FakeWs.instances = [];
+    const { client, statuses } = startClient({ stallMs: 50 });
+    await wait(15);
+    const sock = FakeWs.instances[0];
+    sock.emit('message', JSON.stringify({
+      type: 'subscribed',
+      id: 1,
+      msg: { channel: 'communications' },
+    }));
+    for (let i = 0; i < 6; i++) {
+      sock.emit('ping');
+      await wait(20);
+    }
+    assert.ok(!statuses.some((x) => x.s === 'stalled'), 'subscribe ack + inbound ping are liveness');
+    client.stop();
+  }
+
+  {
+    FakeWs.instances = [];
+    const { client, statuses } = startClient({ stallMs: 40 });
+    await wait(100);
+    const r1 = statuses.filter((x) => x.s === 'reconnecting' && x.i && x.i.reason === 'stall');
+    assert.ok(r1.length >= 1, 'first stall must schedule a reconnect');
+    assert.strictEqual(r1[0].i.wait, 1000, 'first stall reconnect waits initial backoff');
+    await wait(1100);
+    await wait(80);
+    const r2 = statuses.filter((x) => x.s === 'reconnecting' && x.i && x.i.reason === 'stall');
+    assert.ok(r2.length >= 2, 'second stall after silent open must reconnect again');
+    assert.ok(r2[1].i.wait >= 2000, `stall backoff must grow across reconnects, got wait=${r2[1].i.wait}`);
+    assert.ok(
+      !r2.slice(1).every((x) => x.i.wait === 1000),
+      'open must not reset backoff to 1s during a stall storm'
+    );
     client.stop();
   }
 

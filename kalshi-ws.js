@@ -7,11 +7,16 @@
 //   1. `unexpected-response` — ws does NOT emit close/error on a 401
 //      handshake (header_timestamp_expired). Without this hook the socket
 //      is dead forever and Poly keeps quoting the same lock.
-//   2. Stall watchdog — communications volume is huge; if no channel
-//      message arrives for STALL_MS, tear down and reconnect (zombie TCP
-//      / dropped subscription still looks "open").
+//   2. Stall watchdog — zombie TCP / dropped subscription still looks
+//      OPEN. Liveness is any WS frame: communications messages, subscribe
+//      acks, or keepalive ping/pong. A quiet Saturday book (no rfq_created
+//      for >20s) must NOT reconnect while pongs succeed. Reconnect only
+//      when STALL_MS elapses with no message and no pong.
 //   3. Single-flight reconnect — close + handshake-fail must not stack
 //      timers or leave two sockets on one API key.
+//   4. Backoff — do not reset to 1s on `open`. A stall→open→quiet loop
+//      used to hammer Kalshi every ~21s. Reset backoff only after a
+//      proven-live frame (message or pong).
 'use strict';
 const WebSocket = require('ws');
 const { authHeaders, applyServerDate, isTimestampExpired } = require('./kalshi-auth');
@@ -20,10 +25,13 @@ const { captureRfq } = require('./rfq-debug');
 
 const WS_URL = process.env.KALSHI_WS_URL || 'wss://external-api-ws.kalshi.com/trade-api/ws/v2';
 const WS_SIGN_PATH = '/trade-api/ws/v2';
-// Kalshi combo RFQs run hundreds/sec when the book is live. 20s of zero
-// communications is a dead subscription, not a quiet book.
+// 20s of zero frames (no communications message AND no keepalive pong)
+// is a dead socket. Quiet books still pong; do not treat them as dead.
 const DEFAULT_STALL_MS = 20_000;
 const STALL_TICK_MS = 5_000;
+const PING_MS = 10_000;
+const INITIAL_BACKOFF_MS = 1000;
+const MAX_BACKOFF_MS = 30_000;
 
 function readStallMs(explicit, env = process.env) {
   if (explicit != null && Number.isFinite(Number(explicit))) return Number(explicit);
@@ -56,12 +64,20 @@ function createKalshiWs({
   const capture = captureFn || captureRfq;
   const stallAfter = readStallMs(stallMs);
   let ws = null, subId = 1, pingTimer = null, stallTimer = null;
-  let backoff = 1000, closedByUs = false, reconnectTimer = null;
+  let backoff = INITIAL_BACKOFF_MS, closedByUs = false, reconnectTimer = null;
   let lastCommAt = 0;
   const status = (s, i) => { try { onStatus && onStatus(s, i); } catch (_) {} };
 
-  function touchComm() {
+  function touchAlive() {
     lastCommAt = Date.now();
+  }
+
+  // Message, subscribe ack, or keepalive pong/ping — socket is not a zombie.
+  // Reset reconnect backoff here, not on `open` (open used to restart a
+  // 1s stall storm every quiet 20s).
+  function touchComm() {
+    touchAlive();
+    backoff = INITIAL_BACKOFF_MS;
   }
 
   function clearTimers() {
@@ -84,11 +100,11 @@ function createKalshiWs({
       return;
     }
     const immediate = !!(opts.immediate);
-    const wait = immediate ? 250 : Math.min(backoff, 30000);
+    const wait = immediate ? 250 : Math.min(backoff, MAX_BACKOFF_MS);
     status('reconnecting', { wait, reason });
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
-      if (!immediate) backoff = Math.min(backoff * 2, 30000);
+      if (!immediate) backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
       connect();
     }, wait);
   }
@@ -159,8 +175,9 @@ function createKalshiWs({
     ws = new Ws(WS_URL, { headers });
 
     ws.on('open', () => {
-      backoff = 1000;
-      touchComm();
+      // Grace period only — do not reset backoff or treat open as proven live.
+      // A stall→open→quiet loop used to snap backoff to 1s forever.
+      touchAlive();
       try {
         ws.send(JSON.stringify({ id: subId++, cmd: 'subscribe', params: { channels: ['communications'] } }));
       } catch (e) {
@@ -170,10 +187,17 @@ function createKalshiWs({
       }
       status('subscribed');
       clearTimers();
-      pingTimer = setInterval(() => { try { ws && ws.ping && ws.ping(); } catch (_) {} }, 10000);
+      const sendPing = () => { try { ws && ws.ping && ws.ping(); } catch (_) {} };
+      sendPing();
+      pingTimer = setInterval(sendPing, PING_MS);
       const stallTick = Math.max(10, Math.min(STALL_TICK_MS, Math.floor(stallAfter / 2) || STALL_TICK_MS));
       stallTimer = setInterval(checkStall, stallTick);
     });
+
+    // ws keepalive: pong (and an inbound ping) prove TCP is alive even
+    // when the communications book is quiet. Do not touch on outbound ping.
+    ws.on('pong', () => { touchComm(); });
+    ws.on('ping', () => { touchComm(); });
 
     ws.on('unexpected-response', (req, res) => {
       // ws: failed handshake does not emit open/error/close. Must destroy + reconnect.
@@ -289,9 +313,10 @@ function createKalshiWs({
         stallMs: stallAfter,
         readyState: ws ? ws.readyState : null,
         reconnectPending: !!reconnectTimer,
+        backoff,
       };
     },
   };
 }
 
-module.exports = { createKalshiWs, DEFAULT_STALL_MS, readStallMs };
+module.exports = { createKalshiWs, DEFAULT_STALL_MS, PING_MS, INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, readStallMs };

@@ -31,6 +31,7 @@ const {
   formatSupabaseFailure,
   createRateLimitedLogger,
 } = require('./supabase-http');
+const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
 
 const MODE = 'UNHEDGED';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -198,14 +199,11 @@ async function main() {
     http: side.polyHttp || undefined,
   });
 
-  let lastWsAlertAt = 0;
+  const wsAlerter = createWsStatusAlerter();
   function noteWsStatus(s, info) {
     console.log(`[${MODE}] ws:${s}`, info || '');
-    if (s !== 'stalled' && s !== 'error') return;
-    if (Date.now() - lastWsAlertAt < 5 * 60_000) return;
-    lastWsAlertAt = Date.now();
-    const detail = info && typeof info === 'object' ? JSON.stringify(info) : String(info || s);
-    console.error(`[${MODE}] Kalshi WS ${s} ${detail} — paper tape paused until communications resume.`);
+    if (!wsAlerter.shouldAlert(s, info)) return;
+    console.error(`[${MODE}] ${formatWsAlert(s, info).replace(/\n/g, ' — ')}`);
   }
 
   const client = createKalshiWs({
