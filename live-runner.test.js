@@ -198,8 +198,23 @@ assert.ok(
     'Kalshi WS must reconnect on handshake 401 (ws does not emit close)'
   );
   assert.ok(
-    /stalled/.test(wsSrc) && /forceReconnect\('stall'\)/.test(wsSrc),
-    'Kalshi WS must force-reconnect when communications goes silent'
+    /stalled/.test(wsSrc) && /forceReconnect\('stall'\)/.test(wsSrc) &&
+      /'pong'/.test(wsSrc) && /touchComm\(\)/.test(wsSrc),
+    'Kalshi WS must force-reconnect only when keepalive (pong) and communications are both silent'
+  );
+  assert.ok(
+    /touchAlive\(\)/.test(wsSrc) && !/backoff = 1000/.test(wsSrc),
+    'successful open must not reset reconnect backoff (stall storm)'
+  );
+  assert.ok(
+    /require\('\.\/ws-status-alert'\)/.test(liveSrc) &&
+      /createWsStatusAlerter/.test(liveSrc) &&
+      /formatWsAlert/.test(liveSrc),
+    'Telegram WS alerts must go through createWsStatusAlerter (no per-stall spam)'
+  );
+  assert.ok(
+    !/if \(s !== 'stalled' && !handshake\) return/.test(liveSrc),
+    'do not Telegram every watchdog stall'
   );
   assert.ok(
     !/require\('\.\/rfq-debug'\)/.test(liveSrc),

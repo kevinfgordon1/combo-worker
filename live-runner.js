@@ -31,10 +31,11 @@
 //   (matched, hedge does not lock). Tallies lockMiss + emptyLegs; sample
 //   logs include RFQ keys vs staged lock overlap. NFL date-only Combo
 //   Locks vs timed Kalshi tickers match via identity / HHMM strip.
-// WS STALL: Kalshi communications dies ~minutes after deploy if the
-//   handshake 401 (header_timestamp_expired) is ignored — ws does not
-//   emit close — or the socket stays OPEN with no messages. Watchdog
-//   + unexpected-response reconnect; do not confuse with a quiet book.
+// WS STALL: handshake 401 (header_timestamp_expired) is ignored — ws
+//   does not emit close — or a zombie OPEN socket that neither messages
+//   nor pongs. Keepalive pong is liveness; a quiet Saturday book must
+//   not reconnect. Telegram only on handshake/auth or a stall/reconnect
+//   burst — not every quiet-book watchdog tick.
 // REST CLOCK: quote POST/confirm/cancel/GET share signedRequest so the
 //   timestamp is minted at send, Date-header offset ignores 1s Date
 //   truncation (PR #61 expired otherwise-good quotes), and a 401
@@ -124,6 +125,7 @@ const { createKalshiRestPair, QUOTE_WARM_MS } = require('./kalshi-http');
 const { createQuoteHot, lockNeedlesFromParlays } = require('./quote-hot');
 const { resolveWorkerMode, shouldRunUnhedged } = require('./worker-mode');
 const { startUnhedgedSide } = require('./unhedged-boot');
+const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -1603,18 +1605,11 @@ async function main() {
   });
   polyLoop = poly;
 
-  let lastWsAlertAt = 0;
+  const wsAlerter = createWsStatusAlerter();
   function noteWsStatus(s, info) {
     console.log(`[${MODE}] ws:${s}`, info || '');
-    const handshake = s === 'error' && info && /handshake|timestamp_expired|header_timestamp/i.test(String(info.message || ''));
-    if (s !== 'stalled' && !handshake) return;
-    if (Date.now() - lastWsAlertAt < 5 * 60_000) return;
-    lastWsAlertAt = Date.now();
-    const detail = info && typeof info === 'object' ? JSON.stringify(info) : String(info || s);
-    sendAlert(
-      `⚠️ Kalshi WS ${s}\n${detail}\n` +
-      `Firehose reconnecting — Combo Locks quoting is paused until communications resume.`
-    ).catch(() => {});
+    if (!wsAlerter.shouldAlert(s, info)) return;
+    sendAlert(formatWsAlert(s, info)).catch(() => {});
   }
 
   const client = createKalshiWs({
