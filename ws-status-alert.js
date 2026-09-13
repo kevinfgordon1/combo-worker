@@ -23,6 +23,25 @@ function isHandshakeOrAuth(s, info) {
   return false;
 }
 
+// Communications dropped while TCP/pongs stayed up. Page immediately —
+// a quiet `error` with type=unsubscribed used to be filtered, and the
+// stall watchdog never fired.
+function isSubscriptionLost(s, info) {
+  if (s === 'unsubscribed') return true;
+  if (s === 'reconnecting') {
+    const reason = String(info && info.reason || '');
+    return reason === 'unsubscribed' || reason === 'channel_error';
+  }
+  if (s === 'error') {
+    const type = String(info && info.type || '');
+    if (type === 'unsubscribed') return true;
+    const code = Number(info && info.code);
+    if (code === 9 || code === 10 || code === 25) return true;
+    return /unsubscribed|channel error|buffer overflow/i.test(infoText(info));
+  }
+  return false;
+}
+
 function isFailedReconnect(s, info) {
   if (s !== 'reconnecting') return false;
   const reason = String(info && info.reason || '');
@@ -32,9 +51,12 @@ function isFailedReconnect(s, info) {
 
 function formatWsAlert(s, info) {
   const detail = info && typeof info === 'object' ? JSON.stringify(info) : String(info || s);
+  const reason = info && info.reason;
   const suffix = s === 'stalled'
     ? 'Repeated firehose stalls — Combo Locks Kalshi quoting may be unreliable until the socket stays up.'
-    : 'Firehose reconnecting — Combo Locks quoting is paused until communications resume.';
+    : (s === 'unsubscribed' || reason === 'unsubscribed' || reason === 'channel_error' || (info && info.type === 'unsubscribed'))
+      ? 'Communications channel dropped — Combo Locks Kalshi quoting is paused until we resubscribe.'
+      : 'Firehose reconnecting — Combo Locks quoting is paused until communications resume.';
   return `⚠️ Kalshi WS ${s}\n${detail}\n${suffix}`;
 }
 
@@ -59,7 +81,7 @@ function createWsStatusAlerter(opts = {}) {
 
   function shouldAlert(s, info) {
     const t = now();
-    if (isHandshakeOrAuth(s, info)) return takeAlert(t);
+    if (isHandshakeOrAuth(s, info) || isSubscriptionLost(s, info)) return takeAlert(t);
     if (s === 'stalled') {
       stallAt.push(t);
       prune(stallAt, t);
@@ -82,6 +104,7 @@ module.exports = {
   createWsStatusAlerter,
   formatWsAlert,
   isHandshakeOrAuth,
+  isSubscriptionLost,
   DEFAULT_COOLDOWN_MS,
   DEFAULT_BURST_COUNT,
   DEFAULT_BURST_WINDOW_MS,

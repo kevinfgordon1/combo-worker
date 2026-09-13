@@ -217,7 +217,12 @@ assert.ok(
   assert.ok(
     /stalled/.test(wsSrc) && /forceReconnect\('stall'\)/.test(wsSrc) &&
       /'pong'/.test(wsSrc) && /touchComm\(\)/.test(wsSrc),
-    'Kalshi WS must force-reconnect only when keepalive (pong) and communications are both silent'
+    'Kalshi WS stall watchdog must treat pong as liveness (quiet book must not reconnect)'
+  );
+  assert.ok(
+    /deadChannelReason/.test(wsSrc) && /forceReconnect\(deadReason\)/.test(wsSrc) &&
+      /unsubscribed/.test(wsSrc),
+    'Kalshi WS must force-reconnect when communications unsubscribes'
   );
   assert.ok(
     /touchAlive\(\)/.test(wsSrc) && !/backoff = 1000/.test(wsSrc),

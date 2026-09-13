@@ -36,8 +36,10 @@
 // WS STALL: handshake 401 (header_timestamp_expired) is ignored — ws
 //   does not emit close — or a zombie OPEN socket that neither messages
 //   nor pongs. Keepalive pong is liveness; a quiet Saturday book must
-//   not reconnect. Telegram only on handshake/auth or a stall/reconnect
-//   burst — not every quiet-book watchdog tick.
+//   not reconnect. Communications `unsubscribed` / channel-dead error
+//   frames force close + resubscribe (pongs must not hide a dropped
+//   sub). Telegram on handshake/auth, subscription loss, or a
+//   stall/reconnect burst — not every quiet-book watchdog tick.
 // REST CLOCK: quote POST/confirm/cancel/GET share signedRequest so the
 //   timestamp is minted at send, Date-header offset ignores 1s Date
 //   truncation (PR #61 expired otherwise-good quotes), and a 401
@@ -50,7 +52,8 @@
 //   Underfunded quote create/confirm (insufficient_balance) also persist a
 //   declined combo_submissions row for the lock card. Telegram stays silent.
 //   No public-tape lookup. Precision rejects stay console + unfilled.
-//   Quote-watcher stays parked. We do not write combo_matches or watcher_debug.
+//   Quote-watcher stays parked (same KALSHI_KEY_ID unsubscribes this WS).
+//   We do not write combo_matches or watcher_debug.
 // RFQ REPEAT: lock-matched RFQs about to quote are fingerprinted
 //   (sorted legs + contracts + target_cost + creator_id when non-empty).
 //   Cooldown / skip rfq_repeat ONLY when creator_id is known. Anonymous

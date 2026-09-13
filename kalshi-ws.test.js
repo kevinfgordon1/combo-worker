@@ -2,7 +2,7 @@
 const assert = require('assert');
 const { EventEmitter } = require('events');
 const { generateKeyPairSync } = require('crypto');
-const { createKalshiWs, DEFAULT_STALL_MS, PING_MS, INITIAL_BACKOFF_MS, readStallMs } = require('./kalshi-ws');
+const { createKalshiWs, DEFAULT_STALL_MS, PING_MS, INITIAL_BACKOFF_MS, readStallMs, deadChannelReason, shouldOpenQuoteWatcherWs } = require('./kalshi-ws');
 const { applyServerDate, resetClockOffset, signedNow, authHeaders } = require('./kalshi-auth');
 
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -86,6 +86,25 @@ function startClient(extra = {}) {
   assert.strictEqual(readStallMs(undefined, {}), 20_000);
   assert.strictEqual(readStallMs(15_000, {}), 15_000);
   assert.strictEqual(readStallMs(undefined, { KALSHI_WS_STALL_MS: '8000' }), 8000);
+  assert.strictEqual(deadChannelReason({ type: 'unsubscribed' }), 'unsubscribed');
+  assert.strictEqual(deadChannelReason({ type: 'unsubscribed', msg: { channel: 'communications' } }), 'unsubscribed');
+  assert.strictEqual(deadChannelReason({ type: 'error', msg: { code: 10, msg: 'Channel error' } }), 'channel_error');
+  assert.strictEqual(deadChannelReason({ type: 'error', msg: { code: 25, msg: 'Subscription buffer overflow' } }), 'channel_error');
+  assert.strictEqual(deadChannelReason({ type: 'error', msg: { code: 9, msg: 'Authentication required' } }), 'channel_error');
+  assert.strictEqual(deadChannelReason({ type: 'error', msg: { message: 'unsubscribed' } }), 'channel_error');
+  assert.strictEqual(deadChannelReason({ type: 'error', msg: { code: 1, msg: 'Unable to process message' } }), null);
+  assert.strictEqual(deadChannelReason({ type: 'error', msg: { code: 6, msg: 'Already subscribed' } }), null);
+  assert.strictEqual(deadChannelReason({ type: 'subscribed', msg: { channel: 'communications' } }), null);
+  assert.strictEqual(deadChannelReason({ type: 'rfq_created' }), null);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({}), true);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ QUOTE_WATCHER_WS: '0' }), false);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ QUOTE_WATCHER_WS: 'false' }), false);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ QUOTE_WATCHER_WS: 'off' }), false);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ KALSHI_WS_OWNER: 'combo' }), false);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ KALSHI_WS_OWNER: 'combo-worker' }), false);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ KALSHI_WS_OWNER: 'quote-watcher' }), true);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ KALSHI_WS_OWNER: 'watcher' }), true);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ KALSHI_WS_OWNER: 'quote-watcher', QUOTE_WATCHER_WS: '0' }), false);
 }
 
 {
@@ -179,7 +198,65 @@ async function runAsync() {
     }
     assert.ok(!statuses.some((x) => x.s === 'stalled'), 'quiet book with pongs must not stall');
     assert.ok(!statuses.some((x) => x.s === 'reconnecting' && x.i && x.i.reason === 'stall'));
+    assert.ok(!statuses.some((x) => x.s === 'reconnecting'), 'pong-only quiet book must not reconnect');
     assert.strictEqual(client.health().backoff, 1000, 'pong liveness must reset backoff');
+    client.stop();
+  }
+
+  {
+    FakeWs.instances = [];
+    const { client, statuses } = startClient();
+    await wait(15);
+    const n0 = FakeWs.instances.length;
+    const sock = FakeWs.instances[0];
+    sock.emit('message', JSON.stringify({
+      type: 'unsubscribed',
+      msg: { channel: 'communications' },
+    }));
+    assert.ok(statuses.some((x) => x.s === 'unsubscribed'), 'unsubscribed must be a first-class status');
+    assert.ok(
+      statuses.some((x) => x.s === 'reconnecting' && x.i && x.i.reason === 'unsubscribed'),
+      'unsubscribed must schedule a reconnect'
+    );
+    assert.ok(sock.terminated, 'unsubscribed must drop the pong-alive socket');
+    await wait(1100);
+    assert.ok(FakeWs.instances.length > n0, 'unsubscribed must open a new socket');
+    assert.ok(statuses.some((x) => x.s === 'subscribed'), 'reconnect after unsubscribed must resubscribe');
+    client.stop();
+  }
+
+  {
+    FakeWs.instances = [];
+    const { client, statuses } = startClient();
+    await wait(15);
+    const n0 = FakeWs.instances.length;
+    FakeWs.instances[0].emit('message', JSON.stringify({
+      type: 'error',
+      msg: { code: 10, msg: 'Channel error' },
+    }));
+    assert.ok(statuses.some((x) => x.s === 'error' && x.i && x.i.code === 10));
+    assert.ok(
+      statuses.some((x) => x.s === 'reconnecting' && x.i && x.i.reason === 'channel_error'),
+      'channel-dead error must schedule a reconnect'
+    );
+    await wait(1100);
+    assert.ok(FakeWs.instances.length > n0, 'channel error must open a new socket');
+    client.stop();
+  }
+
+  {
+    FakeWs.instances = [];
+    const { client, statuses } = startClient();
+    await wait(15);
+    const n0 = FakeWs.instances.length;
+    FakeWs.instances[0].emit('message', JSON.stringify({
+      type: 'error',
+      msg: { code: 1, msg: 'Unable to process message' },
+    }));
+    assert.ok(statuses.some((x) => x.s === 'error'));
+    assert.ok(!statuses.some((x) => x.s === 'reconnecting'), 'benign command error must not reconnect');
+    await wait(40);
+    assert.strictEqual(FakeWs.instances.length, n0, 'benign error must keep the same socket');
     client.stop();
   }
 

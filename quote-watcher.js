@@ -17,11 +17,21 @@
 // Env: KALSHI_KEY_ID, Kalshi_combo_key (or KALSHI_PRIVATE_KEY),
 //      SUPABASE_URL, SUPABASE_SERVICE_KEY,
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional; lost-quote DMs).
+//      QUOTE_WATCHER_WS=0 or KALSHI_WS_OWNER=combo — do not open the
+//      communications WS (REST reconcile only). Required in production
+//      when combo-worker already holds that API key's sole subscription.
 //      Run as its own process:  node quote-watcher.js
+//
+// SINGLE-SUBSCRIBER: Kalshi keeps ONE communications subscription per
+// API key. Combo Locks (`live-runner` / combo-worker) owns the production
+// socket. A second createKalshiWs on the same KALSHI_KEY_ID receives
+// `unsubscribed` ~30–40s later; TCP/pongs stay up so health looks fine
+// while quoting goes silent. Do not multiplex. Park this service on
+// Railway (`sleep infinity`) or disable the WS via the env above.
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
-const { createKalshiWs } = require('./kalshi-ws');
+const { createKalshiWs, shouldOpenQuoteWatcherWs } = require('./kalshi-ws');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const { matchParlay, normalizeRfq } = require('./rfq');
 const { toNum: tapeNum, normalizeTrade, matchTapeTrades, formatLostAlert, shouldAlertLost } = require('./tape');
@@ -581,6 +591,13 @@ async function main() {
   probeAccount();          // one-shot: read the worker key's balance + positions (eligibility check)
   setInterval(() => console.log('[WATCH] tallies', counts), 60000);
 
+  if (!shouldOpenQuoteWatcherWs()) {
+    console.log('[WATCH] communications WS disabled (QUOTE_WATCHER_WS / KALSHI_WS_OWNER). Kalshi allows one subscription per API key — combo-worker keeps the sole socket. REST reconcile continues.');
+    process.on('SIGINT', () => { console.log('[WATCH] final', counts); process.exit(0); });
+    return;
+  }
+  console.warn('[WATCH] opening communications WS. Kalshi keeps ONE subscription per API key — if combo-worker uses this KALSHI_KEY_ID, one client will be unsubscribed and Combo Lock quoting goes silent.');
+
   const client = createKalshiWs({
     keyId: KEY_ID, pem: PEM,
     onStatus: (s, i) => console.log(`[WATCH] ws:${s}`, i || ''),
@@ -589,4 +606,7 @@ async function main() {
   process.on('SIGINT', () => { client.stop(); console.log('[WATCH] final', counts); process.exit(0); });
   client.start();
 }
-main();
+if (require.main === module) {
+  main();
+}
+module.exports = { main, shouldOpenQuoteWatcherWs };
