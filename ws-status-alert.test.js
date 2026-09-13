@@ -4,6 +4,7 @@ const {
   createWsStatusAlerter,
   formatWsAlert,
   isHandshakeOrAuth,
+  isSubscriptionLost,
   DEFAULT_COOLDOWN_MS,
   DEFAULT_BURST_COUNT,
 } = require('./ws-status-alert');
@@ -16,6 +17,14 @@ assert.strictEqual(isHandshakeOrAuth('reconnecting', { reason: 'auth_timestamp' 
 assert.strictEqual(isHandshakeOrAuth('stalled', { age: 20000, stallMs: 20000 }), false);
 assert.strictEqual(isHandshakeOrAuth('reconnecting', { reason: 'stall' }), false);
 assert.strictEqual(isHandshakeOrAuth('subscribed'), false);
+assert.strictEqual(isHandshakeOrAuth('unsubscribed', { message: 'unsubscribed' }), false);
+assert.strictEqual(isSubscriptionLost('unsubscribed', { message: 'unsubscribed', type: 'unsubscribed' }), true);
+assert.strictEqual(isSubscriptionLost('reconnecting', { wait: 1000, reason: 'unsubscribed' }), true);
+assert.strictEqual(isSubscriptionLost('reconnecting', { wait: 1000, reason: 'channel_error' }), true);
+assert.strictEqual(isSubscriptionLost('error', { message: 'unsubscribed', type: 'unsubscribed' }), true);
+assert.strictEqual(isSubscriptionLost('error', { message: 'Channel error', code: 10 }), true);
+assert.strictEqual(isSubscriptionLost('reconnecting', { reason: 'stall' }), false);
+assert.strictEqual(isSubscriptionLost('error', { message: 'Unable to process message', code: 1 }), false);
 
 {
   let t = 1_000_000;
@@ -83,6 +92,39 @@ assert.strictEqual(isHandshakeOrAuth('subscribed'), false);
 {
   const text = formatWsAlert('error', { message: 'handshake 401: expired' });
   assert.match(text, /quoting is paused until communications resume/);
+}
+
+{
+  let t = 5_000_000;
+  const alerter = createWsStatusAlerter({ now: () => t, cooldownMs: 60_000, burstCount: 3, burstWindowMs: 120_000 });
+  assert.strictEqual(
+    alerter.shouldAlert('unsubscribed', { message: 'unsubscribed', type: 'unsubscribed' }),
+    true,
+    'communications unsubscribed must page immediately'
+  );
+  t += 1_000;
+  assert.strictEqual(
+    alerter.shouldAlert('reconnecting', { wait: 1000, reason: 'unsubscribed' }),
+    false,
+    'unsubscribed reconnect honors cooldown'
+  );
+}
+
+{
+  let t = 6_000_000;
+  const alerter = createWsStatusAlerter({ now: () => t, cooldownMs: 60_000, burstCount: 3, burstWindowMs: 120_000 });
+  assert.strictEqual(
+    alerter.shouldAlert('error', { message: 'unsubscribed', type: 'unsubscribed' }),
+    true,
+    'legacy quiet error { type: unsubscribed } must page'
+  );
+}
+
+{
+  const text = formatWsAlert('unsubscribed', { message: 'unsubscribed', type: 'unsubscribed' });
+  assert.match(text, /Kalshi WS unsubscribed/);
+  assert.match(text, /Communications channel dropped/);
+  assert.ok(!/quoting is paused until communications resume/.test(text));
 }
 
 console.log('ws-status-alert.test.js ok');

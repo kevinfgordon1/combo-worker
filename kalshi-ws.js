@@ -17,6 +17,9 @@
 //   4. Backoff — do not reset to 1s on `open`. A stall→open→quiet loop
 //      used to hammer Kalshi every ~21s. Reset backoff only after a
 //      proven-live frame (message or pong).
+//   5. Communications `unsubscribed` / channel-dead `error` — the socket
+//      can keep ponging after Kalshi drops the only channel we quote on.
+//      Stall watchdog will not fire. Close + resubscribe immediately.
 'use strict';
 const WebSocket = require('ws');
 const { authHeaders, applyServerDate, isTimestampExpired } = require('./kalshi-auth');
@@ -44,6 +47,35 @@ function readStallMs(explicit, env = process.env) {
 function headerDate(res) {
   if (!res || !res.headers) return null;
   return res.headers.date || res.headers.Date || null;
+}
+
+function envelopeMsg(env) {
+  const m = env && env.msg;
+  if (!m || typeof m !== 'object') return env && env.type;
+  return m.message || m.msg || m.error || m.code || (env && env.type);
+}
+
+function envelopeCode(env) {
+  const m = env && env.msg;
+  if (!m || typeof m !== 'object') return undefined;
+  return m.code;
+}
+
+// Communications `unsubscribed` always means the RFQ channel is gone.
+// Error frames: 9 (channel auth), 10 (channel error while running the
+// sub), 25 (subscription buffer overflow). Other command errors (bad
+// JSON, already subscribed, shard params) are not a dropped sub.
+function deadChannelReason(env) {
+  if (!env || !env.type) return null;
+  if (env.type === 'unsubscribed') return 'unsubscribed';
+  if (env.type !== 'error') return null;
+  const code = Number(envelopeCode(env));
+  if (code === 9 || code === 10 || code === 25) return 'channel_error';
+  const text = String(envelopeMsg(env) || '');
+  if (/unsubscribed|not subscribed|channel error|buffer overflow|authentication required/i.test(text)) {
+    return 'channel_error';
+  }
+  return null;
 }
 
 function createKalshiWs({
@@ -210,9 +242,21 @@ function createKalshiWs({
 
       try { onEvent && onEvent(env); } catch (_) {}
 
-      if (env.type === 'error' || env.type === 'unsubscribed') {
-        const msg = (env.msg && (env.msg.message || env.msg.error || env.msg.code)) || env.type;
-        status('error', { message: String(msg), type: env.type });
+      const deadReason = deadChannelReason(env);
+      if (deadReason) {
+        const info = { message: String(envelopeMsg(env)), type: env.type };
+        const code = envelopeCode(env);
+        if (code != null) info.code = code;
+        status(deadReason === 'unsubscribed' ? 'unsubscribed' : 'error', info);
+        forceReconnect(deadReason);
+        return;
+      }
+
+      if (env.type === 'error') {
+        const info = { message: String(envelopeMsg(env)), type: env.type };
+        const code = envelopeCode(env);
+        if (code != null) info.code = code;
+        status('error', info);
       }
 
       // RFQ created → existing path. Runs before RFQ-DEBUG so a matched
@@ -319,4 +363,12 @@ function createKalshiWs({
   };
 }
 
-module.exports = { createKalshiWs, DEFAULT_STALL_MS, PING_MS, INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, readStallMs };
+module.exports = {
+  createKalshiWs,
+  DEFAULT_STALL_MS,
+  PING_MS,
+  INITIAL_BACKOFF_MS,
+  MAX_BACKOFF_MS,
+  readStallMs,
+  deadChannelReason,
+};
