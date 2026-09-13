@@ -56,6 +56,16 @@ assert.ok(
   'live quotes must write Miss tape'
 );
 assert.ok(
+  /formatAlertStatus\('✅ QUOTED', 'polymarket'/.test(polySrc) &&
+    /ctx\.sendAlert/.test(polySrc),
+  'Poly live QUOTED must Telegram with (Polymarket), matching Kalshi'
+);
+assert.ok(
+  !/formatAlertStatus\('❌ QUOTE/.test(polySrc) &&
+    !/formatAlertStatus\('❌ CONFIRM/.test(polySrc),
+  'Poly must not add FAIL / LATE / CONFIRM Telegram types'
+);
+assert.ok(
   !/UNHEDGED_RFQ_LIVE\s*=\s*['"]true['"]/.test(polySrc),
   'UNHEDGED_RFQ_LIVE must stay off'
 );
@@ -2192,6 +2202,7 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
 
   const gamePosts = [];
   const gameLogs = [];
+  const gameAlerts = [];
   const origGameLog = console.log;
   console.log = (...args) => { gameLogs.push(args.join(' ')); origGameLog(...args); };
   const gameHttp = {
@@ -2227,11 +2238,14 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     getOutstanding: () => 0,
     pendingQuotes: new Map(),
     reconcileMs: 60 * 60 * 1000,
+    sendAlert: async (text) => { gameAlerts.push(text); },
   });
   try {
     await new Promise((r) => setTimeout(r, 30));
     assert.strictEqual(gamePosts.length, 1);
     assert.ok(gameLogs.some((l) => l.includes('[POLY] QUOTED') && l.includes('Texas Rangers')));
+    assert.strictEqual(gameAlerts.length, 1, 'only the quoted lock RFQ Telegrams — lock-miss stays silent');
+    assert.ok(gameAlerts[0].startsWith('✅ QUOTED (Polymarket) — Texas Rangers'));
     assert.ok(gameLogs.some((l) => (
       l.includes('[POLY] SKIP no_lock_overlap') && l.includes('code=same_games_no_match')
     )));
@@ -2613,6 +2627,82 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     assert.strictEqual(confirmRow.skip_reason, 'insufficient_balance');
   } finally {
     fundLoop.stop();
+  }
+
+  const quotedAlerts = [];
+  const quotedLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    http: {
+      async getUserId() { return { rfqUserId: 'rfquser_alert' }; },
+      async listRfqs() { return { rfqs: [] }; },
+      async listQuotes() { return { quotes: [] }; },
+      async getCombo() { return { combos: [] }; },
+      async createQuote() { return { quoteId: 'quote_pm_alert' }; },
+      async confirmQuote() { return {}; },
+      async deleteQuote() { return { statusCode: 200 }; },
+      close() {},
+    },
+    startWs: false,
+    getParlays: () => [pmParlay],
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+    sendAlert: async (text) => { quotedAlerts.push(text); },
+  });
+  try {
+    const quoted = await quotedLoop.handleRfq({ ...pmRfq, id: 'rfq_quoted_alert' });
+    assert.strictEqual(quoted.post, true);
+    assert.strictEqual(quotedAlerts.length, 1);
+    assert.ok(quotedAlerts[0].startsWith('✅ QUOTED (Polymarket) — PM Sox/Pirates'));
+    assert.ok(quotedAlerts[0].includes('rfq alert'));
+    assert.ok(quotedAlerts[0].includes('quote alert'));
+    assert.ok(quotedAlerts[0].includes('10 contracts'));
+    assert.ok(!quotedAlerts[0].includes('✅ QUOTED —'));
+    assert.ok(!quotedAlerts[0].includes('match→POST'), 'Poly quote path does not invent Kalshi latency');
+  } finally {
+    quotedLoop.stop();
+  }
+
+  const silentAlerts = [];
+  const silentLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    http: {
+      async getUserId() { return { rfqUserId: 'rfquser_silent' }; },
+      async listRfqs() { return { rfqs: [] }; },
+      async listQuotes() { return { quotes: [] }; },
+      async getCombo() { return { combos: [] }; },
+      async createQuote() {
+        throw new Error('Polymarket POST /v1/rfqs/quotes 400 not enough balance / allowance');
+      },
+      async confirmQuote() { return {}; },
+      async deleteQuote() { return { statusCode: 200 }; },
+      close() {},
+    },
+    startWs: false,
+    getParlays: () => [pmParlay],
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: () => 0,
+    pendingQuotes: new Map(),
+    reconcileMs: 60 * 60 * 1000,
+    sendAlert: async (text) => { silentAlerts.push(text); },
+  });
+  try {
+    const under = await silentLoop.handleRfq({ ...pmRfq, id: 'rfq_silent_underfunded' });
+    assert.strictEqual(under.post, false);
+    assert.strictEqual(silentAlerts.length, 0, 'underfunded Poly POST stays off Telegram');
+  } finally {
+    silentLoop.stop();
   }
 
   const otherFailRows = [];

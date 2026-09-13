@@ -5,6 +5,7 @@
 // 6-contract must both quote. Does not change matchParlay / exact-lock matching.
 'use strict';
 const { normalizeLegKey } = require('./rfq');
+const { formatAlertStatus } = require('./venue-alert');
 
 const DEFAULT_COOLDOWN_MS = 90_000;
 const REPEAT_SKIP_REASON = 'rfq_repeat';
@@ -70,11 +71,11 @@ function readCooldownMs(env = process.env) {
   return n;
 }
 
-function formatRepeatSkipAlert({ label, contracts, cooldownMs, skipCount } = {}) {
+function formatRepeatSkipAlert({ label, contracts, cooldownMs, skipCount, venue = 'kalshi' } = {}) {
   const secs = Math.max(0, Math.round((cooldownMs || 0) / 1000));
   const n = contracts != null && contracts !== '' ? String(contracts) : '?';
   let text =
-    `⏭️ RFQ REPEAT — ${label || '(unknown)'}\n` +
+    `${formatAlertStatus('⏭️ RFQ REPEAT', venue)} — ${label || '(unknown)'}\n` +
     `same ${n}-contract fingerprint · cooling ${secs}s\n` +
     `further identical RFQs skipped (Miss tape: ${REPEAT_SKIP_REASON})`;
   if (skipCount > 1) text += `\n×${skipCount} this window`;

@@ -223,11 +223,19 @@ assert.strictEqual(cooldownFingerprint(null), null);
     cooldownMs: 90_000,
     skipCount: 1,
   });
-  assert.ok(text.includes('⏭️ RFQ REPEAT — Arizona + Jacksonville'));
+  assert.ok(text.includes('⏭️ RFQ REPEAT (Kalshi) — Arizona + Jacksonville'));
   assert.ok(text.includes('same 6-contract fingerprint'));
   assert.ok(text.includes('cooling 90s'));
   assert.ok(text.includes('Miss tape: rfq_repeat'));
   assert.ok(!text.includes('×1'));
+  const poly = formatRepeatSkipAlert({
+    label: 'Arizona + Jacksonville',
+    contracts: 6,
+    cooldownMs: 90_000,
+    skipCount: 1,
+    venue: 'polymarket',
+  });
+  assert.ok(poly.startsWith('⏭️ RFQ REPEAT (Polymarket) — Arizona + Jacksonville'));
 }
 
 console.log('rfq-repeat.test.js ok');

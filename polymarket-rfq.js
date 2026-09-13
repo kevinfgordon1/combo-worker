@@ -14,6 +14,9 @@
 // declines (oversized / limit_reached / game_started / insufficient_balance).
 // no_lock_overlap* SKIPs stay in the engine — they are not taped.
 // Live POSTs (create quote, confirm) require POLYMARKET_RFQ_LIVE to be truthy.
+// Successful Combo Lock QUOTED sends Telegram via ctx.sendAlert (same
+// Kaygosports chat as Kalshi), labeled (Polymarket). FAIL / LATE / CONFIRM
+// stay console-only — do not add those alert types here.
 // quoteExecuted means paired orders were submitted — not a fill.
 // Combo Locks fills persist on orderExecution FILL / PARTIAL_FILL via
 // ctx.onQuoteExecuted (same combo_fills + combo_submissions path as Kalshi).
@@ -69,6 +72,8 @@ const {
   isNearMissCode,
   createPolyMissTape,
 } = require('./poly-miss-tape');
+const { shortId } = require('./short-id');
+const { formatAlertStatus } = require('./venue-alert');
 
 const MODE = 'POLY';
 const RECONCILE_MS = 3000;
@@ -1362,6 +1367,15 @@ function startPolymarketRfqLoop(ctx = {}) {
       persistLockTape(evaluation, 'quoted', {
         quote_id: quoteId, is_live: true, contracts: d.contracts,
       });
+      if (typeof ctx.sendAlert === 'function') {
+        const fillAm = p.fill_american;
+        Promise.resolve(ctx.sendAlert(
+          `${formatAlertStatus('✅ QUOTED', 'polymarket')} — ${p.label}\n` +
+          `rfq ${shortId(rfq.rfqId)} · quote ${shortId(quoteId)}\n` +
+          `${d.contracts} contracts · buy @ ${q.buyPrice} · sell @ ${q.sellPrice}` +
+          (fillAm != null ? ` · ${fillAm > 0 ? '+' + fillAm : '' + fillAm}` : '')
+        )).catch(() => {});
+      }
       return { ...evaluation, post: true, quoteId };
     } catch (e) {
       pendingQuotes.delete(reserveKey);

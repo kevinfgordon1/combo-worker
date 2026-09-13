@@ -94,8 +94,20 @@ assert.ok(
   'full-fill cap must cancel leftover Poly quotes as well as Kalshi'
 );
 assert.ok(
-  /FILL CONFIRMED\$\{venueTag\}/.test(liveSrc) && /polymarket' \? ' · polymarket'/.test(liveSrc),
+  /FILL CONFIRMED\$\{venueTag\}/.test(liveSrc) &&
+    /formatAlertStatus\('✅ FILL CONFIRMED', venue\)/.test(liveSrc),
   'Poly fills send FILL CONFIRMED Telegram with a venue tag'
+);
+assert.ok(
+  /formatAlertStatus\('✅ QUOTED', 'kalshi'/.test(liveSrc) &&
+    /formatAlertStatus\('❌ QUOTE LATE', 'kalshi'/.test(liveSrc) &&
+    /formatAlertStatus\('❌ QUOTE FAILED', 'kalshi'/.test(liveSrc) &&
+    /formatAlertStatus\('❌ CONFIRM FAILED', 'kalshi'/.test(liveSrc),
+  'Kalshi quote-lifecycle Telegram headlines include (Kalshi)'
+);
+assert.ok(
+  /require\('\.\/venue-alert'\)/.test(liveSrc) && /formatAlertStatus/.test(liveSrc),
+  'live-runner must format Telegram venues via the shared helper'
 );
 assert.ok(
   /require\('\.\/fills-attr'\)/.test(liveSrc) && /liveRunnerFillRow/.test(liveSrc),
@@ -327,6 +339,10 @@ assert.ok(
 assert.ok(
   /if \(claimed\.alert\) \{[\s\S]*?sendAlert\(formatRepeatSkipAlert/.test(liveSrc),
   'Telegram only when creator-gated cooldown applies — not every repeat tick'
+);
+assert.ok(
+  /formatRepeatSkipAlert\(\{[\s\S]*?venue:\s*'kalshi'/.test(liveSrc),
+  'RFQ REPEAT Telegram is labeled Kalshi (Poly repeat is not wired)'
 );
 assert.ok(
   /RFQ_REPEAT_COOLDOWN_MS/.test(liveSrc) && /rfqRepeat:\s*0/.test(liveSrc),
