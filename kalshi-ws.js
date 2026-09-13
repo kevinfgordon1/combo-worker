@@ -20,6 +20,13 @@
 //   5. Communications `unsubscribed` / channel-dead `error` — the socket
 //      can keep ponging after Kalshi drops the only channel we quote on.
 //      Stall watchdog will not fire. Close + resubscribe immediately.
+//
+// SINGLE-SUBSCRIBER: Kalshi keeps ONE communications subscription per API
+// key. A second createKalshiWs on the same KALSHI_KEY_ID (quote-watcher,
+// a second replica, unhedged on a copied key) gets `unsubscribed` ~30–40s
+// later while TCP/pongs stay up. Combo Locks (live-runner) owns the
+// production socket. Do not multiplex. quote-watcher must stay parked or
+// set QUOTE_WATCHER_WS=0 / KALSHI_WS_OWNER=combo.
 'use strict';
 const WebSocket = require('ws');
 const { authHeaders, applyServerDate, isTimestampExpired } = require('./kalshi-auth');
@@ -76,6 +83,23 @@ function deadChannelReason(env) {
     return 'channel_error';
   }
   return null;
+}
+
+function envFlagOff(raw) {
+  if (raw == null || raw === '') return false;
+  const s = String(raw).trim().toLowerCase();
+  return s === '0' || s === 'false' || s === 'off' || s === 'no';
+}
+
+// quote-watcher must not steal Combo Locks' communications socket.
+// Off when QUOTE_WATCHER_WS is 0/false/off, or KALSHI_WS_OWNER is set
+// to anyone other than quote-watcher / watcher.
+function shouldOpenQuoteWatcherWs(env = process.env) {
+  if (!env) return true;
+  if (envFlagOff(env.QUOTE_WATCHER_WS)) return false;
+  const owner = String(env.KALSHI_WS_OWNER || '').trim().toLowerCase();
+  if (!owner) return true;
+  return owner === 'quote-watcher' || owner === 'watcher';
 }
 
 function createKalshiWs({
@@ -371,4 +395,5 @@ module.exports = {
   MAX_BACKOFF_MS,
   readStallMs,
   deadChannelReason,
+  shouldOpenQuoteWatcherWs,
 };

@@ -52,7 +52,8 @@
 //   Underfunded quote create/confirm (insufficient_balance) also persist a
 //   declined combo_submissions row for the lock card. Telegram stays silent.
 //   No public-tape lookup. Precision rejects stay console + unfilled.
-//   Quote-watcher stays parked. We do not write combo_matches or watcher_debug.
+//   Quote-watcher stays parked (same KALSHI_KEY_ID unsubscribes this WS).
+//   We do not write combo_matches or watcher_debug.
 // RFQ REPEAT: lock-matched RFQs about to quote are fingerprinted
 //   (sorted legs + contracts + target_cost + creator_id when non-empty).
 //   Cooldown / skip rfq_repeat ONLY when creator_id is known. Anonymous

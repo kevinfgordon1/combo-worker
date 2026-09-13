@@ -17,7 +17,21 @@ Do **not** Railway-deploy from this PR unless asked. Create / wire the second se
 - `unhedged` — Unhedged job only (Railway service 2; `start-unhedged.js` sets this)
 - `all` — old one-process wiring (`npm run start:all`). Local / rollback only. Do not use in production.
 
-Quote-watcher stays parked on both jobs.
+Quote-watcher stays parked on both jobs (`sleep infinity`, or `QUOTE_WATCHER_WS=0` / `KALSHI_WS_OWNER=combo`). **Never** run `node quote-watcher.js` against the Combo Locks `KALSHI_KEY_ID` — Kalshi keeps one communications subscription per key.
+
+## Kalshi communications WS — one subscriber per API key
+
+Kalshi keeps **one** `communications` subscription per `KALSHI_KEY_ID`. A second `createKalshiWs` on that key receives `unsubscribed` after ~30–40s. The TCP socket stays up and pongs, so `kalshiWsAgeMs` looks healthy while Combo Lock quoting is dead (`rfq_created` stops).
+
+**Production owner:** Combo Locks (`npm start` / `start-live.js`) — replica count **1**.
+
+Do **not** multiplex two WS clients on one key. Reconnect-on-unsubscribe recovers a lone client if Kalshi drops the sub; it cannot make two processes share one subscription.
+
+| Process | What to do |
+|---|---|
+| **quote-watcher** | Park on Railway (`sleep infinity`), or start with `QUOTE_WATCHER_WS=0` / `KALSHI_WS_OWNER=combo` (REST-only; no WS). |
+| **Combo Locks replicas** | Never scale above 1. |
+| **Unhedged** | Needs its **own** Kalshi API key if it opens `createKalshiWs`. Copying Combo Locks `KALSHI_KEY_ID` will unsubscribe the quoter. |
 
 ## Deploy two services (same repo)
 
@@ -34,9 +48,9 @@ Quote-watcher stays parked on both jobs.
    - **UNHEDGED_RFQ_SHADOW:** unset or `true` (paper tape on)
    - Replica count: **1**
 
-3. Copy the shared env vars onto the Unhedged service (same values):
+3. Copy the shared env vars onto the Unhedged service, except Kalshi keys:
 
-   - `KALSHI_KEY_ID`, `Kalshi_combo_key` (or `KALSHI_PRIVATE_KEY`)
+   - **Do not copy Combo Locks `KALSHI_KEY_ID` / `Kalshi_combo_key` if Unhedged opens its own communications WS.** Use a distinct Kalshi API key. Same key → Combo Locks gets `unsubscribed` and quoting goes silent.
    - `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`
    - `POLYMARKET_KEY_ID`, `POLYMARKET_SECRET_KEY` (needed for Poly paper tape / fill lookup)
    - Optional: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALERT_CHAT_ID` (Combo Locks alerts; Unhedged is console-only)

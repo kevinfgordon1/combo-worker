@@ -2,7 +2,7 @@
 const assert = require('assert');
 const { EventEmitter } = require('events');
 const { generateKeyPairSync } = require('crypto');
-const { createKalshiWs, DEFAULT_STALL_MS, PING_MS, INITIAL_BACKOFF_MS, readStallMs, deadChannelReason } = require('./kalshi-ws');
+const { createKalshiWs, DEFAULT_STALL_MS, PING_MS, INITIAL_BACKOFF_MS, readStallMs, deadChannelReason, shouldOpenQuoteWatcherWs } = require('./kalshi-ws');
 const { applyServerDate, resetClockOffset, signedNow, authHeaders } = require('./kalshi-auth');
 
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -96,6 +96,15 @@ function startClient(extra = {}) {
   assert.strictEqual(deadChannelReason({ type: 'error', msg: { code: 6, msg: 'Already subscribed' } }), null);
   assert.strictEqual(deadChannelReason({ type: 'subscribed', msg: { channel: 'communications' } }), null);
   assert.strictEqual(deadChannelReason({ type: 'rfq_created' }), null);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({}), true);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ QUOTE_WATCHER_WS: '0' }), false);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ QUOTE_WATCHER_WS: 'false' }), false);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ QUOTE_WATCHER_WS: 'off' }), false);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ KALSHI_WS_OWNER: 'combo' }), false);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ KALSHI_WS_OWNER: 'combo-worker' }), false);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ KALSHI_WS_OWNER: 'quote-watcher' }), true);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ KALSHI_WS_OWNER: 'watcher' }), true);
+  assert.strictEqual(shouldOpenQuoteWatcherWs({ KALSHI_WS_OWNER: 'quote-watcher', QUOTE_WATCHER_WS: '0' }), false);
 }
 
 {
