@@ -24,7 +24,9 @@
 //   idle LB cannot leave a dead socket for the next auction. [LAT]
 //   match/pre/post/total ms on every attempt; 409 rfq_closed is logged as
 //   QUOTE LATE with that latency (null quote_id). Successful QUOTED
-//   Telegram includes the same match→POST total ms as LATE.
+//   Telegram includes the same match→POST total ms as LATE. Quote-lifecycle
+//   Telegram (QUOTED / LATE / FAILED / CONFIRM / FILL / RFQ REPEAT) labels
+//   (Kalshi) or (Polymarket) so Kaygosports can tell the venues apart.
 // START GATE: never quote (and cancel open quotes) once any leg's start <= now.
 //   Started still wins; the cap is a second gate.
 //   Polymarket confirm + resting-quote cancel uses the same startedFor /
@@ -131,6 +133,7 @@ const { createQuoteHot, lockNeedlesFromParlays } = require('./quote-hot');
 const { resolveWorkerMode, shouldRunUnhedged } = require('./worker-mode');
 const { startUnhedgedSide } = require('./unhedged-boot');
 const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
+const { formatAlertStatus } = require('./venue-alert');
 
 const MODE = 'LIVE';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -1052,7 +1055,7 @@ async function onQuoteAccepted(evt) {
     }
     if (!isSilentQuoteFailure(e.message)) {
       sendAlert(
-        `❌ CONFIRM FAILED — ${pending ? pending.label : shortId(quoteId)}\n` +
+        `${formatAlertStatus('❌ CONFIRM FAILED', 'kalshi')} — ${pending ? pending.label : shortId(quoteId)}\n` +
         `quote ${shortId(quoteId)} · rfq ${shortId(rfqId)}\n` +
         `${e.message}`
       ).catch(() => {});
@@ -1238,7 +1241,7 @@ async function onQuoteExecuted(evt) {
     (evt.isPartial ? ' PARTIAL' : '')
   );
   sendAlert(
-    `✅ FILL CONFIRMED — ${pending.label}${venue === 'polymarket' ? ' · polymarket' : ''}\n` +
+    `${formatAlertStatus('✅ FILL CONFIRMED', venue)} — ${pending.label}\n` +
     `order ${orderId ? shortId(orderId) : '(none)'} · quote ${shortId(quoteId)}\n` +
     `+${contracts} contracts` +
     (fullyFilled
@@ -1447,6 +1450,7 @@ async function onRfq(rfq, env) {
         contracts: size.contracts != null ? size.contracts : rfq.contracts,
         cooldownMs: claimed.cooldownMs,
         skipCount: claimed.skipCount,
+        venue: 'kalshi',
       })).catch(() => {});
     }
     return;
@@ -1513,7 +1517,7 @@ async function onRfq(rfq, env) {
         rfq_fingerprint: quotedFingerprint,
       });
       sendAlert(
-        `✅ QUOTED — ${p.label}\n` +
+        `${formatAlertStatus('✅ QUOTED', 'kalshi')} — ${p.label}\n` +
         `rfq ${shortId(rfq.rfqId)} · quote ${shortId(result.id)}\n` +
         `match→POST ${totalMs}ms\n` +
         `${reservedContracts} contracts · NO @ $${noBid}` +
@@ -1553,11 +1557,11 @@ async function onRfq(rfq, env) {
       if (!isSilentQuoteFailure(e.message)) {
         sendAlert(
           closed
-            ? `❌ QUOTE LATE — ${p.label}\n` +
+            ? `${formatAlertStatus('❌ QUOTE LATE', 'kalshi')} — ${p.label}\n` +
               `rfq ${shortId(rfq.rfqId)} already closed\n` +
               `match→POST ${totalMs}ms\n` +
               `${e.message}`
-            : `❌ QUOTE FAILED — ${p.label}\nrfq ${shortId(rfq.rfqId)}\n${e.message}`
+            : `${formatAlertStatus('❌ QUOTE FAILED', 'kalshi')} — ${p.label}\nrfq ${shortId(rfq.rfqId)}\n${e.message}`
         ).catch(() => {});
       }
     }
