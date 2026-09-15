@@ -317,20 +317,31 @@ assert.ok(
   /require\('\.\/rfq-repeat'\)/.test(liveSrc) &&
     /cooldownFingerprint\(rfq\)/.test(liveSrc) &&
     /cooldownFp \? repeatGuard\.peek\(cooldownFp\)/.test(liveSrc),
-  'Kalshi quote path must peek cooldown only when creator_id is known'
+  'Kalshi quote path must peek the live-quote slot only when creator_id is known'
 );
 assert.ok(
-  /peeked\.skip \? repeatGuard\.noteSkip\(cooldownFp\)/.test(liveSrc),
-  'repeat skip must noteSkip without claiming a new window'
+  /peeked\.skip\s*\?[\s\S]*?repeatGuard\.noteSkip\(cooldownFp\)/.test(liveSrc),
+  'repeat skip must noteSkip without occupying a new live slot'
 );
 assert.ok(
-  /if \(cooldownFp\) repeatGuard\.claim\(cooldownFp\)/.test(liveSrc) &&
+  /!engaged && cooldownFp \? repeatGuard\.claim\(cooldownFp\)/.test(liveSrc) &&
     /await postQuote\(rfq\.rfqId/.test(liveSrc),
-  'creator-gated cooldown starts only after a successful quote POST'
+  'creator-gated live slot is occupied only when we are about to POST'
 );
 assert.ok(
-  liveSrc.indexOf('await postQuote(rfq.rfqId') < liveSrc.indexOf('if (cooldownFp) repeatGuard.claim(cooldownFp)'),
-  'claim must sit after postQuote so 409 rfq_closed cannot start the 90s skip'
+  liveSrc.indexOf('repeatGuard.claim(cooldownFp)') < liveSrc.indexOf('await postQuote(rfq.rfqId'),
+  'claim before POST so a parallel identical RFQ cannot stack a second reserve'
+);
+assert.ok(
+  /if \(cooldownFp\) repeatGuard\.release\(cooldownFp\)/.test(liveSrc) &&
+    /function releaseRepeatFor\(pending\)/.test(liveSrc) &&
+    /releaseRepeatFor\(pending\)/.test(liveSrc),
+  '409 / cancel / rfq_deleted / TTL / fill must release the live fingerprint immediately'
+);
+assert.ok(
+  /repeatFingerprint:\s*cooldownFp/.test(liveSrc) &&
+    /repeatFingerprint:\s*repeatFp/.test(liveSrc),
+  'pending quotes must carry the repeat fingerprint so release can find it'
 );
 assert.ok(
   /skipReason:\s*REPEAT_SKIP_REASON/.test(liveSrc) && liveSrc.includes('rfq_fingerprint'),
@@ -338,7 +349,7 @@ assert.ok(
 );
 assert.ok(
   /if \(claimed\.alert\) \{[\s\S]*?sendAlert\(formatRepeatSkipAlert/.test(liveSrc),
-  'Telegram only when creator-gated cooldown applies — not every repeat tick'
+  'Telegram only when a live quote already covers the fingerprint — not every repeat tick'
 );
 assert.ok(
   /formatRepeatSkipAlert\(\{[\s\S]*?venue:\s*'kalshi'/.test(liveSrc),
@@ -346,11 +357,11 @@ assert.ok(
 );
 assert.ok(
   /RFQ_REPEAT_COOLDOWN_MS/.test(liveSrc) && /rfqRepeat:\s*0/.test(liveSrc),
-  'cooldown must be env-tunable and tallied'
+  'optional post-release anti-spam must be env-tunable and tallied'
 );
 assert.ok(
-  /creator-gated/.test(liveSrc) && /empty creator_id always quotes/.test(liveSrc),
-  'startup log must say anonymous RFQs still quote'
+  /live unaccepted quote occupies/.test(liveSrc) && /empty creator_id always quotes/.test(liveSrc),
+  'startup log must say we skip only while a live quote is out, and anonymous RFQs still quote'
 );
 assert.ok(
   /creatorIdFromQuoteResponse\(result\)/.test(liveSrc) &&
