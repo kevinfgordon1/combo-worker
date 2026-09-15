@@ -35,6 +35,7 @@ const {
   matchPolymarketParlay,
   matchPolymarketParlayDetailed,
   evaluatePolymarketRfq,
+  formatQtyDecimal,
   shouldPostNow,
   shouldConfirmNow,
   quoteBodyFromEval,
@@ -46,6 +47,14 @@ const { createMarketCache } = require('./polymarket-market-cache');
 
 const polySrc = fs.readFileSync(path.join(__dirname, 'polymarket-rfq.js'), 'utf8');
 assert.ok(polySrc.includes('createPolyMissTape'), 'reconcile must persist Combo Locks Miss tape');
+assert.ok(
+  /allowPartial:\s*true/.test(polySrc),
+  'Poly evaluate must clip leftover remaining instead of rfq_too_large'
+);
+assert.ok(
+  /includeAccepted:\s*true/.test(polySrc),
+  'Poly TTL must release accepted-but-unfilled reserves'
+);
 assert.ok(polySrc.includes('persistLockTape'), 'SKIP/QUOTE path must go through persistLockTape');
 assert.ok(
   /persistLockTape\(evaluation, 'declined', \{ locks \}\)/.test(polySrc),
@@ -992,7 +1001,8 @@ assert.strictEqual(evaluatePolymarketRfq({
   now: AFTER_PITCH,
 }).reason, 'game_started');
 
-// Shared remaining: Kalshi 43 + another 43 leaves 30; a $10 cash PM RFQ is 45 and must skip.
+// Shared remaining: Kalshi 43 + another 43 leaves 30. A $10 cash PM RFQ is 45 —
+// Poly quotes the leftover 30 instead of declining oversized (Kalshi still would).
 const SIZE = 43;
 const kalshiPending = new Map();
 kalshiPending.set('q-kalshi-1', { parlayId: 'pm-parlay', contracts: SIZE });
@@ -1014,9 +1024,18 @@ const cashEval = evaluatePolymarketRfq({
   outstanding: sharedOut,
 });
 assert.strictEqual(cashEval.quote.estimatedContracts, 45);
-assert.strictEqual(cashEval.action, 'skip');
-assert.strictEqual(cashEval.reason, 'rfq_too_large');
-assert.strictEqual(cashEval.decision.remaining, 116 - SIZE * 2);
+assert.strictEqual(cashEval.action, 'quoteable');
+assert.strictEqual(cashEval.decision.contracts, 116 - SIZE * 2);
+assert.strictEqual(cashEval.decision.partial, true);
+assert.strictEqual(cashEval.decision.remaining, 0);
+assert.deepStrictEqual(quoteBodyFromEval(cashEval), {
+  rfqId: 'rfq_cash_45',
+  buyPrice: '0.222',
+  sellPrice: '0',
+  restRemainder: false,
+  qtyDecimal: '30',
+});
+assert.strictEqual(formatQtyDecimal(30), '30');
 
 const cashAlone = evaluatePolymarketRfq({
   rfq: cashRfq,
@@ -1027,6 +1046,7 @@ const cashAlone = evaluatePolymarketRfq({
 assert.strictEqual(cashAlone.action, 'quoteable');
 assert.strictEqual(cashAlone.decision.contracts, 45);
 assert.strictEqual(cashAlone.decision.outstanding, SIZE);
+assert.ok(!('qtyDecimal' in quoteBodyFromEval(cashAlone)));
 
 const qtyFit = evaluatePolymarketRfq({
   rfq: { ...pmRfq, id: 'rfq_qty_10', qtyDecimal: '10' },
@@ -1057,8 +1077,19 @@ const over = evaluatePolymarketRfq({
   filledSoFar: 0,
   outstanding: SIZE,
 });
-assert.strictEqual(over.action, 'skip');
-assert.strictEqual(over.reason, 'rfq_too_large');
+assert.strictEqual(over.action, 'quoteable');
+assert.strictEqual(over.decision.contracts, 116 - SIZE);
+assert.strictEqual(over.decision.partial, true);
+assert.strictEqual(quoteBodyFromEval(over).qtyDecimal, '73');
+
+const exhausted = evaluatePolymarketRfq({
+  rfq: { ...pmRfq, id: 'rfq_qty_exhausted', qtyDecimal: '10' },
+  parlays: [pmParlay],
+  filledSoFar: 0,
+  outstanding: 116,
+});
+assert.strictEqual(exhausted.action, 'skip');
+assert.strictEqual(exhausted.reason, 'limit_reached');
 
 // Live flag off: handleRfq must not POST even when quoteable.
 const posts = [];
@@ -2501,6 +2532,8 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     }
 
     const sizeRows = [];
+    const sizePosts = [];
+    const sizePending = new Map();
     const sizeLoop = startPolymarketRfqLoop({
       env: {
         POLYMARKET_KEY_ID: '550e8400-e29b-41d4-a716-446655440000',
@@ -2512,7 +2545,10 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
         async listRfqs() { return { rfqs: [] }; },
         async listQuotes() { return { quotes: [] }; },
         async getCombo() { return { combos: [] }; },
-        async createQuote() { throw new Error('oversized lock must not quote'); },
+        async createQuote(body) {
+          sizePosts.push(body);
+          return { quoteId: 'quote_partial' };
+        },
         async confirmQuote() { return {}; },
         async deleteQuote() { return { statusCode: 200 }; },
         close() {},
@@ -2522,8 +2558,8 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
       fetchMarket: async () => null,
       startedFor: () => ({ started: false }),
       filledSoFarFor: () => 0,
-      getOutstanding: () => 0,
-      pendingQuotes: new Map(),
+      getOutstanding: (id, ex) => sumOutstanding(sizePending, id, ex),
+      pendingQuotes: sizePending,
       reconcileMs: 60 * 60 * 1000,
       logAsync: (p, rfq, d, status, extra = {}) => {
         sizeRows.push({
@@ -2531,20 +2567,34 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
           rfq_id: rfq.rfqId,
           status,
           skip_reason: extra.skip_reason || null,
+          contracts: extra.contracts,
         });
       },
     });
     try {
-      const oversized = await sizeLoop.handleRfq({
+      const partial = await sizeLoop.handleRfq({
         ...ariJacQuoteRfq,
         id: 'rfq_ari_jac_oversized',
         qtyDecimal: '8000',
       });
-      assert.strictEqual(oversized.action, 'skip');
-      assert.strictEqual(oversized.reason, 'rfq_too_large');
+      assert.strictEqual(partial.action, 'quoteable');
+      assert.strictEqual(partial.post, true);
+      assert.strictEqual(partial.decision.contracts, ariJacSept13Lock.max_contracts);
+      assert.strictEqual(partial.decision.partial, true);
+      assert.strictEqual(sizePosts.length, 1);
+      assert.strictEqual(sizePosts[0].qtyDecimal, '150');
+      assert.strictEqual(sumOutstanding(sizePending, ariJacSept13Lock.id), 150);
       assert.strictEqual(sizeRows.length, 1);
-      assert.strictEqual(sizeRows[0].status, 'declined');
-      assert.strictEqual(sizeRows[0].skip_reason, 'oversized');
+      assert.strictEqual(sizeRows[0].status, 'quoted');
+      assert.strictEqual(sizeRows[0].contracts, 150);
+
+      const capped = await sizeLoop.handleRfq({
+        ...ariJacQuoteRfq,
+        id: 'rfq_ari_jac_cap',
+        qtyDecimal: '55',
+      });
+      assert.strictEqual(capped.action, 'skip');
+      assert.strictEqual(capped.reason, 'limit_reached');
     } finally {
       sizeLoop.stop();
     }
@@ -2620,6 +2670,7 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     });
     assert.strictEqual(confirmFund.confirmed, false);
     assert.strictEqual(confirmFund.reason, 'insufficient_balance');
+    assert.ok(!fundPending.has('quote_fund'), 'confirm fail must release the Poly reserve');
     assert.ok(fundSkips.some((s) => s.quoteId === 'quote_fund' && s.skipReason === 'insufficient_balance'));
     const confirmRow = fundRows.find((r) => r.rfq_id === 'rfq_underfunded_confirm');
     assert.ok(confirmRow);
@@ -2627,6 +2678,82 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     assert.strictEqual(confirmRow.skip_reason, 'insufficient_balance');
   } finally {
     fundLoop.stop();
+  }
+
+  const reserveDeletes = [];
+  const reservePending = new Map();
+  const reserveNow = Date.now();
+  reservePending.set('quote_open', {
+    parlayId: 'pm-parlay',
+    contracts: 276,
+    maxContracts: 623,
+    rfqId: 'rfq_open_reserve',
+    label: 'Yankees + White Sox + Dodgers',
+    postedAt: reserveNow,
+  });
+  reservePending.set('quote_accepted_stale', {
+    parlayId: 'pm-parlay',
+    contracts: 55,
+    maxContracts: 623,
+    rfqId: 'rfq_accepted_stale',
+    label: 'Yankees + White Sox + Dodgers',
+    postedAt: reserveNow - 20_000,
+    accepted: true,
+  });
+  reservePending.set('quote_other', {
+    parlayId: 'pm-parlay',
+    contracts: 55,
+    maxContracts: 623,
+    rfqId: 'rfq_still_open',
+    label: 'Yankees + White Sox + Dodgers',
+    postedAt: reserveNow,
+  });
+  const reserveLoop = startPolymarketRfqLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    http: {
+      async getUserId() { return { rfqUserId: 'rfquser_reserve' }; },
+      async listRfqs() { return { rfqs: [] }; },
+      async listQuotes() { return { quotes: [] }; },
+      async getCombo() { return { combos: [] }; },
+      async createQuote() { throw new Error('reserve test must not POST'); },
+      async confirmQuote() { return {}; },
+      async deleteQuote(rfqId, quoteId) {
+        reserveDeletes.push({ rfqId, quoteId });
+        return { statusCode: 200 };
+      },
+      close() {},
+    },
+    startWs: false,
+    getParlays: () => [pmParlay],
+    startedFor: () => ({ started: false }),
+    filledSoFarFor: () => 0,
+    getOutstanding: (id, ex) => sumOutstanding(reservePending, id, ex),
+    pendingQuotes: reservePending,
+    reconcileMs: 60 * 60 * 1000,
+  });
+  try {
+    assert.strictEqual(sumOutstanding(reservePending, 'pm-parlay'), 386);
+    reserveLoop.handleRfqClosed({ rfq: { id: 'rfq_open_reserve' } });
+    assert.ok(!reservePending.has('quote_open'));
+    assert.strictEqual(sumOutstanding(reservePending, 'pm-parlay'), 110);
+
+    reserveLoop.onWsEvent({
+      type: 'quoteDeleted',
+      quote: { id: 'quote_other', rfqId: 'rfq_still_open' },
+    });
+    assert.ok(!reservePending.has('quote_other'));
+    assert.strictEqual(sumOutstanding(reservePending, 'pm-parlay'), 55);
+
+    await reserveLoop.cancelUnaccepted();
+    assert.ok(!reservePending.has('quote_accepted_stale'));
+    assert.ok(reserveDeletes.some((d) => d.quoteId === 'quote_accepted_stale'));
+    assert.strictEqual(sumOutstanding(reservePending, 'pm-parlay'), 0);
+  } finally {
+    reserveLoop.stop();
   }
 
   const quotedAlerts = [];

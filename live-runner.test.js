@@ -86,6 +86,10 @@ assert.ok(
   'Poly loop must persist ORDER FILL via onQuoteExecuted (same path as Kalshi quote_executed)'
 );
 assert.ok(
+  !/allowPartial:\s*true/.test(liveSrc),
+  'Kalshi decideAtFill must keep full-RFQ decline (no allowPartial)'
+);
+assert.ok(
   /seenFillIds/.test(liveSrc) && /duplicate fill_id/.test(liveSrc),
   'in-process duplicate fill events must not re-count or re-Telegram'
 );

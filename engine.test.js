@@ -141,6 +141,21 @@ const dollarHuge = decideAtFill({
 assert.strictEqual(dollarHuge.ok, false);
 assert.strictEqual(dollarHuge.reason, 'rfq_too_large');
 
+const dollarHugePartial = decideAtFill({
+  parlayStake: 100,
+  parlayAmerican: 400,
+  fillAmerican: 350,
+  rfqContracts: 8000,
+  hedgeMode: '1x',
+  maxContracts: 116,
+  allowPartial: true,
+});
+assert.ok(dollarHugePartial.ok);
+assert.strictEqual(dollarHugePartial.contracts, 116);
+assert.strictEqual(dollarHugePartial.partial, true);
+assert.strictEqual(dollarHugePartial.trimmedByLimit, true);
+assert.strictEqual(dollarHugePartial.remaining, 0);
+
 // Parallel $10 RFQs: first two 43s fit 116; a third does not (the overfill bug).
 const soxArgs = {
   parlayStake: 100,
@@ -165,6 +180,18 @@ assert.strictEqual(q3.reason, 'rfq_too_large');
 assert.strictEqual(q3.remaining, 30);
 assert.strictEqual(q3.outstanding, 86);
 assert.ok(!shouldPostQuote({ source: 'dollar', contracts: 0, targetCost: 10 }));
+
+const q3Partial = decideAtFill({ ...soxArgs, filledSoFar: 0, outstanding: 86, allowPartial: true });
+assert.ok(q3Partial.ok);
+assert.strictEqual(q3Partial.contracts, 30);
+assert.strictEqual(q3Partial.partial, true);
+assert.strictEqual(q3Partial.remaining, 0);
+assert.strictEqual(q3Partial.outstanding, 86);
+
+const leftoverEmpty = decideAtFill({ ...soxArgs, filledSoFar: 0, outstanding: 116, allowPartial: true });
+assert.strictEqual(leftoverEmpty.ok, false);
+assert.strictEqual(leftoverEmpty.reason, 'limit_reached');
+assert.strictEqual(leftoverEmpty.remaining, 0);
 
 assert.ok(isSilentQuoteFailure('Kalshi quote failed 400: {"error":{"code":"insufficient_balance"}}'));
 assert.ok(isSilentQuoteFailure('Kalshi quote failed 400: invalid_yes_bid: invalid dollar precision: 0'));

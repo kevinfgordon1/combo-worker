@@ -12,6 +12,7 @@
 //   remaining = max - filled - outstanding.
 //   Polymarket Retail RFQ (polymarket-rfq.js) shares this ceiling via
 //   polyPendingQuotes + outstandingFor — Kalshi yes_bid / dollar RFQ math is unchanged.
+//   Kalshi still declines the full RFQ when rfqContracts > remaining (no allowPartial).
 //   Released on fill, cancel, POST fail, rfq_deleted, or 20s unaccepted DELETE.
 // PARTIAL-FILL: d.locks is informational; post while ceiling remains.
 // LATENCY: Steps 0–4 — instrument, POST first, undici keep-alive, pre-stage.

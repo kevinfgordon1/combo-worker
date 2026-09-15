@@ -2,9 +2,10 @@
 // Combo Locks sells the parlay: offer buyPrice only, decline sellPrice with "0".
 //
 // Live stream/auth/symbol-mapping come later. Do not POST from this module.
-// Live-runner will pass estimatedContracts into decideAtFill as rfqContracts so
-// Kalshi and Polymarket share the same remaining cap. This file does not call
-// decideAtFill or change Kalshi yes_bid / implied-YES dollar RFQ behavior.
+// evaluatePolymarketRfq passes estimatedContracts into decideAtFill as
+// rfqContracts with allowPartial so leftover remaining can size a smaller
+// qtyDecimal quote. This file does not call decideAtFill or change Kalshi
+// yes_bid / implied-YES dollar RFQ behavior.
 'use strict';
 const { impliedProb } = require('./engine');
 
