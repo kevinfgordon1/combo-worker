@@ -3,6 +3,7 @@ const assert = require('assert');
 const { normalizeRfq } = require('./rfq');
 const {
   DEFAULT_COOLDOWN_MS,
+  MAX_ANTISPAM_MS,
   REPEAT_SKIP_REASON,
   compactNum,
   normalizedCreatorId,
@@ -38,19 +39,27 @@ const seaPhiLegs = [
   { side: 'yes', market_ticker: 'KXNFLGAME-26SEP13WASPHI-PHI' },
 ];
 
-assert.strictEqual(DEFAULT_COOLDOWN_MS, 90_000);
+assert.strictEqual(DEFAULT_COOLDOWN_MS, 0);
+assert.strictEqual(MAX_ANTISPAM_MS, 10_000);
 assert.strictEqual(REPEAT_SKIP_REASON, 'rfq_repeat');
 assert.strictEqual(compactNum(6), '6');
 assert.strictEqual(compactNum('6.00'), '6');
 assert.strictEqual(compactNum(6.5), '6.5');
 assert.strictEqual(compactNum(null), '');
 
-assert.strictEqual(readCooldownMs({}), 90_000);
-assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '' }), 90_000);
-assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '120000' }), 120_000);
+assert.strictEqual(readCooldownMs({}), 0);
+assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '' }), 0);
+assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '5000' }), 5_000);
+assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '10000' }), 10_000);
 assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '0' }), 0);
-assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '-5' }), 90_000);
-assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: 'nope' }), 90_000);
+assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '-5' }), 0);
+assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: 'nope' }), 0);
+assert.strictEqual(
+  readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '90000' }),
+  0,
+  'legacy 90s env must not keep Combo Locks dark after a quote'
+);
+assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '120000' }), 0);
 
 {
   const a = fingerprintRfq(normalizeRfq(kalshiEnv('rfq-1', ariJaxLegs, { contracts: '6.00' })));
@@ -66,7 +75,7 @@ assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: 'nope' }), 90_000);
   assert.strictEqual(
     cooldownFingerprint(normalizeRfq(kalshiEnv('rfq-1', ariJaxLegs, { contracts: 6 }))),
     null,
-    'anonymous History fingerprint must not be a cooldown key'
+    'anonymous History fingerprint must not be a repeat key'
   );
 }
 
@@ -134,32 +143,35 @@ assert.strictEqual(cooldownFingerprint(null), null);
 
 {
   let t = 1_000_000;
-  const g = createRepeatGuard({ cooldownMs: 90_000, now: () => t });
+  const g = createRepeatGuard({ cooldownMs: 0, now: () => t });
   const anon = fingerprintRfq(normalizeRfq(kalshiEnv('anon-1', ariJaxLegs, { contracts: 6 })));
   assert.ok(isAnonymousFingerprint(anon));
   assert.strictEqual(g.claim(anon).skip, false);
   assert.strictEqual(g.claim(anon).skip, false, 'anonymous identical RFQs must all quote');
   assert.strictEqual(g.claim(null).skip, false);
   assert.strictEqual(g.claim('').skip, false);
-  assert.strictEqual(g.size, 0, 'anonymous claims must not occupy the cooldown map');
+  assert.strictEqual(g.size, 0, 'anonymous claims must not occupy the live-quote map');
+  assert.strictEqual(g.release(anon).released, false);
 }
 
 {
   let t = 1_000_000;
-  const g = createRepeatGuard({ cooldownMs: 90_000, now: () => t });
+  const g = createRepeatGuard({ cooldownMs: 0, now: () => t });
   const alice = cooldownFingerprint(normalizeRfq(kalshiEnv('a1', ariJaxLegs, {
     contracts: 6, creatorId: 'alice',
   })));
   const bob = cooldownFingerprint(normalizeRfq(kalshiEnv('b1', ariJaxLegs, {
     contracts: 6, creatorId: 'bob',
   })));
-  assert.strictEqual(g.peek(alice).skip, false, 'peek before first claim must not start the window');
+  assert.strictEqual(g.peek(alice).skip, false, 'peek before first claim must not occupy');
   assert.strictEqual(g.size, 0);
   const first = g.claim(alice);
   assert.strictEqual(first.skip, false);
   assert.strictEqual(first.gated, true);
+  assert.strictEqual(first.live, true);
   const peeked = g.peek(alice);
-  assert.strictEqual(peeked.skip, true);
+  assert.strictEqual(peeked.skip, true, 'second identical while live outstanding must skip');
+  assert.strictEqual(peeked.live, true);
   assert.strictEqual(peeked.skipCount, 0, 'peek must not increment skipCount');
   const noted = g.noteSkip(alice);
   assert.strictEqual(noted.skip, true);
@@ -172,10 +184,10 @@ assert.strictEqual(cooldownFingerprint(null), null);
   assert.strictEqual(second.skip, true);
   assert.strictEqual(second.alert, false, 'Telegram already fired via noteSkip');
   assert.strictEqual(second.skipCount, 3);
-  assert.strictEqual(second.remainingMs, 90_000);
+  assert.strictEqual(second.remainingMs, 0);
   const third = g.claim(alice);
   assert.strictEqual(third.skip, true);
-  assert.strictEqual(third.alert, false, 'Telegram only once per cooldown window');
+  assert.strictEqual(third.alert, false, 'Telegram only once while the live quote is out');
   assert.strictEqual(third.skipCount, 4);
 
   const otherSize = g.claim(cooldownFingerprint(normalizeRfq(kalshiEnv('a10', ariJaxLegs, {
@@ -184,23 +196,32 @@ assert.strictEqual(cooldownFingerprint(null), null);
   assert.strictEqual(otherSize.skip, false, 'distinct contracts must still quote');
 
   const otherUser = g.claim(bob);
-  assert.strictEqual(otherUser.skip, false, 'different known creators must not share cooldown');
+  assert.strictEqual(otherUser.skip, false, 'different known creators must not share the live slot');
 
   t += 90_000;
-  const after = g.claim(alice);
-  assert.strictEqual(after.skip, false, 'same creator+fingerprint quotes again after cooldown');
+  const stillLive = g.claim(alice);
+  assert.strictEqual(stillLive.skip, true, 'time passing must not clear a live outstanding quote');
+
+  assert.strictEqual(g.release(alice).released, true);
+  const afterRelease = g.claim(alice);
+  assert.strictEqual(afterRelease.skip, false, 'after outstanding released, quote immediately');
+  assert.strictEqual(g.peek(alice).skip, true);
+  g.release(alice);
 }
 
 {
   let t = 2_000_000;
-  const g = createRepeatGuard({ cooldownMs: 90_000, now: () => t });
+  const g = createRepeatGuard({ cooldownMs: 0, now: () => t });
   const alice = cooldownFingerprint(normalizeRfq(kalshiEnv('late', ariJaxLegs, {
     contracts: 3, creatorId: 'friend',
   })));
   assert.strictEqual(g.peek(alice).skip, false);
   assert.strictEqual(g.size, 0, 'peek before POST must not occupy the map');
-  // 409 rfq_closed — do not claim. Next identical RFQ must still quote.
-  assert.strictEqual(g.peek(alice).skip, false, 'failed POST must not start cooldown');
+  // In-flight claim + 409 rfq_closed — release so the next identical RFQ quotes.
+  assert.strictEqual(g.claim(alice).skip, false);
+  assert.strictEqual(g.peek(alice).skip, true);
+  assert.strictEqual(g.release(alice).released, true);
+  assert.strictEqual(g.peek(alice).skip, false, 'failed POST must not leave a live skip');
   const landed = g.claim(alice);
   assert.strictEqual(landed.skip, false);
   assert.strictEqual(g.peek(alice).skip, true);
@@ -213,25 +234,52 @@ assert.strictEqual(cooldownFingerprint(null), null);
   })));
   assert.ok(fp);
   assert.strictEqual(g.claim(fp).skip, false);
-  assert.strictEqual(g.claim(fp).skip, false, '0 disables cooldown even when creator is known');
+  assert.strictEqual(g.claim(fp).skip, true, 'live outstanding still skips when anti-spam is 0');
+  assert.strictEqual(g.release(fp).released, true);
+  assert.strictEqual(g.claim(fp).skip, false, 'release with 0 anti-spam quotes immediately');
+}
+
+{
+  let t = 3_000_000;
+  const g = createRepeatGuard({ cooldownMs: 5_000, now: () => t });
+  const fp = cooldownFingerprint(normalizeRfq(kalshiEnv('spam', ariJaxLegs, {
+    contracts: 6, creatorId: 'alice',
+  })));
+  assert.strictEqual(g.claim(fp).skip, false);
+  assert.strictEqual(g.release(fp).released, true);
+  assert.strictEqual(g.peek(fp).skip, true, 'optional ≤10s anti-spam holds after release');
+  assert.ok(g.peek(fp).remainingMs <= 5_000);
+  t += 4_999;
+  assert.strictEqual(g.claim(fp).skip, true);
+  t += 1;
+  assert.strictEqual(g.claim(fp).skip, false, 'anti-spam expires at cooldownMs');
 }
 
 {
   const text = formatRepeatSkipAlert({
     label: 'Arizona + Jacksonville',
     contracts: 6,
-    cooldownMs: 90_000,
+    cooldownMs: 0,
     skipCount: 1,
   });
   assert.ok(text.includes('⏭️ RFQ REPEAT (Kalshi) — Arizona + Jacksonville'));
   assert.ok(text.includes('same 6-contract fingerprint'));
-  assert.ok(text.includes('cooling 90s'));
+  assert.ok(text.includes('live quote already out'));
+  assert.ok(!text.includes('cooling'));
   assert.ok(text.includes('Miss tape: rfq_repeat'));
   assert.ok(!text.includes('×1'));
+  const withCool = formatRepeatSkipAlert({
+    label: 'Arizona + Jacksonville',
+    contracts: 6,
+    cooldownMs: 5_000,
+    skipCount: 2,
+  });
+  assert.ok(withCool.includes('cooling 5s after release'));
+  assert.ok(withCool.includes('×2 this window'));
   const poly = formatRepeatSkipAlert({
     label: 'Arizona + Jacksonville',
     contracts: 6,
-    cooldownMs: 90_000,
+    cooldownMs: 0,
     skipCount: 1,
     venue: 'polymarket',
   });

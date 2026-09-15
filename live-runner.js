@@ -58,15 +58,18 @@
 //   We do not write combo_matches or watcher_debug.
 // RFQ REPEAT: lock-matched RFQs about to quote are fingerprinted
 //   (sorted legs + contracts + target_cost + creator_id when non-empty).
-//   Cooldown / skip rfq_repeat ONLY when creator_id is known. Anonymous
-//   WS RFQs (empty creator — common) always POST, even if Ari+Jax 6-contract
-//   is identical. Known-creator loops use RFQ_REPEAT_COOLDOWN_MS (default
-//   90s; 0 disables): first successful POST starts the window; later persist
-//   skip_reason=rfq_repeat on Miss tape and Telegram once per window.
-//   Failed POST (incl. 409 rfq_closed) does not claim — the next live
-//   auction can still quote. History fingerprint is still written for
-//   grouping. Exact-lock matching unchanged. Poly is not wired.
-//   Quote-watcher stays parked.
+//   Skip rfq_repeat ONLY when creator_id is known AND a live unaccepted
+//   quote (or in-flight POST) already occupies that fingerprint — do not
+//   stack duplicates / double-reserve the hedge cap. Anonymous WS RFQs
+//   (empty creator — common) always POST, even if Ari+Jax 6-contract is
+//   identical. When the prior RFQ dies, is replaced, is cancelled, TTL
+//   DELETEs, fills, or POST fails, release immediately so the next
+//   identical RFQ can quote (Kalshi Buy Combo re-RFQs ~10s). Optional
+//   RFQ_REPEAT_COOLDOWN_MS is a tiny post-release anti-spam (≤10s;
+//   default 0). Legacy 90s values are ignored. Failed POST (incl. 409
+//   rfq_closed) releases — the next live auction can still quote.
+//   History fingerprint is still written for grouping. Exact-lock
+//   matching unchanged. Poly is not wired. Quote-watcher stays parked.
 // UNHEDGED: default WORKER_MODE=combo does NOT schedule unhedged /markets
 //   refresh, fill ticks, or shadow-miss persist. That work is
 //   unhedged-runner.js (npm run start:unhedged) — its own Railway job,
@@ -77,7 +80,7 @@
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
-//      RFQ_REPEAT_COOLDOWN_MS (optional; default 90000; 0 disables)
+//      RFQ_REPEAT_COOLDOWN_MS (optional; ≤10s after release; default 0)
 //      WORKER_MODE=combo|unhedged|all (default combo)
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
@@ -547,7 +550,13 @@ function pendingEntry(p, rfq, contracts, extra) {
     maxContracts: p.max_contracts,
     yesBid: extra && extra.yesBid != null ? extra.yesBid : undefined,
     postedAt: extra && extra.postedAt != null ? extra.postedAt : Date.now(),
+    repeatFingerprint: extra && extra.repeatFingerprint ? extra.repeatFingerprint : undefined,
   };
+}
+
+function releaseRepeatFor(pending) {
+  const fp = pending && pending.repeatFingerprint;
+  if (fp) repeatGuard.release(fp);
 }
 
 // Cancel leftovers only — not a reserve seed. Window matches TTL so hours-old
@@ -654,6 +663,7 @@ function noteReleased(quoteId, pending, reason) {
     cancelledQuotes.add(quoteId);
     markSubmissionNotLive(quoteId);
   }
+  releaseRepeatFor(pending);
   const label = (pending && pending.label) || '(unknown)';
   const rfqBit = pending && pending.rfqId ? ` rfq=${pending.rfqId}` : '';
   const n = pending && pending.contracts != null ? pending.contracts : '';
@@ -710,6 +720,7 @@ async function cancelQuoteAndDrop(quoteId, pending, reason) {
   if (!quoteId) return;
   if (isReserveKey(quoteId)) {
     pendingQuotes.delete(quoteId);
+    releaseRepeatFor(pending);
     return;
   }
   if (cancelingQuotes.has(quoteId) || cancelledQuotes.has(quoteId)) return;
@@ -719,6 +730,7 @@ async function cancelQuoteAndDrop(quoteId, pending, reason) {
   try {
     await cancelQuote(quoteId);
     pendingQuotes.delete(quoteId);
+    releaseRepeatFor(pending);
     cancelledQuotes.add(quoteId);
     markSubmissionNotLive(quoteId);
     console.log(cancelLogLine(quoteId, pending, reason));
@@ -1193,6 +1205,7 @@ async function onQuoteExecuted(evt) {
   if (!fromMemory && pending.alreadyFilled && !evt.isPartial) {
     pendingQuotes.delete(quoteId);
     polyPendingQuotes.delete(quoteId);
+    releaseRepeatFor(pending);
     return;
   }
 
@@ -1201,6 +1214,7 @@ async function onQuoteExecuted(evt) {
   if (!evt.isPartial) {
     pendingQuotes.delete(quoteId);
     polyPendingQuotes.delete(quoteId);
+    releaseRepeatFor(pending);
   }
   counts.filled++;
 
@@ -1427,7 +1441,9 @@ async function onRfq(rfq, env) {
   const fingerprint = fingerprintRfq(rfq);
   const cooldownFp = cooldownFingerprint(rfq);
   const peeked = cooldownFp ? repeatGuard.peek(cooldownFp) : { skip: false, gated: false };
-  const claimed = peeked.skip ? repeatGuard.noteSkip(cooldownFp) : peeked;
+  const claimed = peeked.skip
+    ? repeatGuard.noteSkip(cooldownFp)
+    : (!engaged && cooldownFp ? repeatGuard.claim(cooldownFp) : peeked);
   if (claimed.skip) {
     counts.rfqRepeat++;
     const extra = {
@@ -1469,7 +1485,10 @@ async function onRfq(rfq, env) {
   if (!engaged) {
     // Reserve BEFORE the await so a parallel RFQ sees this size in outstanding.
     const reserveKey = `reserve:${++reserveSeq}`;
-    pendingQuotes.set(reserveKey, pendingEntry(p, rfq, d.contracts, { yesBid }));
+    pendingQuotes.set(reserveKey, pendingEntry(p, rfq, d.contracts, {
+      yesBid,
+      repeatFingerprint: cooldownFp || undefined,
+    }));
     const t2 = performance.now();
     try {
       const result = await postQuote(rfq.rfqId, noBid, yesBid, restRemainder);
@@ -1491,25 +1510,31 @@ async function onRfq(rfq, env) {
 
       counts.posted++;
       pendingQuotes.delete(reserveKey);
-      pendingQuotes.set(result.id, pendingEntry(p, rfq, reservedContracts, { yesBid }));
+      // REST may return rfq_creator_id after we already posted. Persist it
+      // for History; occupy the learned fingerprint so a later WS frame
+      // with creator_id does not stack a second live quote.
+      const restCreator = creatorIdFromQuoteResponse(result);
+      const quotedFingerprint = restCreator && !rfq.creatorId
+        ? fingerprintRfq({ ...rfq, creatorId: restCreator })
+        : fingerprint;
+      let repeatFp = cooldownFp;
+      if (restCreator && !cooldownFp) {
+        const learned = cooldownFingerprint({ ...rfq, creatorId: restCreator });
+        if (learned) {
+          repeatGuard.claim(learned);
+          repeatFp = learned;
+        }
+      }
+      pendingQuotes.set(result.id, pendingEntry(p, rfq, reservedContracts, {
+        yesBid,
+        repeatFingerprint: repeatFp || undefined,
+      }));
 
       console.log(
         `[${MODE}] QUOTED ${p.label} rfq=${rfq.rfqId} quote_id=${result.id} ` +
         `contracts=${reservedContracts} yes_bid=${yesBid} no_bid=${noBid} ` +
         `reserved=${outstanding + reservedContracts}/${d.totalLimit} locks=${d.locks}`
       );
-
-      // REST may return rfq_creator_id after we already posted. Persist it
-      // for History; start the creator-gated window only after POST landed.
-      if (cooldownFp) repeatGuard.claim(cooldownFp);
-      const restCreator = creatorIdFromQuoteResponse(result);
-      const quotedFingerprint = restCreator && !rfq.creatorId
-        ? fingerprintRfq({ ...rfq, creatorId: restCreator })
-        : fingerprint;
-      if (restCreator && !cooldownFp) {
-        const learned = cooldownFingerprint({ ...rfq, creatorId: restCreator });
-        if (learned) repeatGuard.claim(learned);
-      }
 
       // Fire-and-forget after POST (Step 1)
       logAsync(p, rfq, d, 'quoted', {
@@ -1526,6 +1551,7 @@ async function onRfq(rfq, env) {
       ).catch(() => {});
     } catch (e) {
       pendingQuotes.delete(reserveKey);
+      if (cooldownFp) repeatGuard.release(cooldownFp);
       const t3 = performance.now();
       const failReason = quotePostFailReason(e.message) || 'error';
       const totalMs = (t3 - t0).toFixed(1);
@@ -1596,8 +1622,9 @@ async function main() {
     `Unaccepted quotes are DELETE'd after ${RESERVE_TTL_MS / 1000}s. ` +
     `rfq_deleted releases immediately. ` +
     `Skipped oversized/cap RFQs get a targeted tape lookup after close. ` +
-    `RFQ repeat cooldown ${repeatGuard.cooldownMs}ms creator-gated ` +
-    `(RFQ_REPEAT_COOLDOWN_MS; 0 disables; empty creator_id always quotes). ` +
+    `RFQ repeat skips only while a live unaccepted quote occupies that ` +
+    `creator+fingerprint (empty creator_id always quotes; ` +
+    `RFQ_REPEAT_COOLDOWN_MS optional ≤10s after release, default 0). ` +
     `WORKER_MODE=${workerMode}. ` +
     (runUnhedged
       ? `Unhedged RFQ shadow in-process (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(process.env) ? 'on' : 'off'}, ` +
