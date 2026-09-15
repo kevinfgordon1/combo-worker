@@ -3,11 +3,15 @@
 // present). Cooldown / skip rfq_repeat ONLY when creator_id is non-empty —
 // Kalshi WS often omits it, and two real people requesting the same Ari+Jax
 // 6-contract must both quote. Does not change matchParlay / exact-lock matching.
+// Known-creator loops allow RFQ_REPEAT_MAX_QUOTES successful quotes (default 8)
+// then go dark for RFQ_REPEAT_COOLDOWN_MS (default 300s). After dark ends the
+// quote counter resets.
 'use strict';
 const { normalizeLegKey } = require('./rfq');
 const { formatAlertStatus } = require('./venue-alert');
 
-const DEFAULT_COOLDOWN_MS = 90_000;
+const DEFAULT_COOLDOWN_MS = 300_000;
+const DEFAULT_MAX_QUOTES = 8;
 const REPEAT_SKIP_REASON = 'rfq_repeat';
 const MAX_ENTRIES = 256;
 
@@ -71,6 +75,14 @@ function readCooldownMs(env = process.env) {
   return n;
 }
 
+function readMaxQuotes(env = process.env) {
+  const raw = env && env.RFQ_REPEAT_MAX_QUOTES;
+  if (raw == null || raw === '') return DEFAULT_MAX_QUOTES;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_MAX_QUOTES;
+  return Math.floor(n);
+}
+
 function formatRepeatSkipAlert({ label, contracts, cooldownMs, skipCount, venue = 'kalshi' } = {}) {
   const secs = Math.max(0, Math.round((cooldownMs || 0) / 1000));
   const n = contracts != null && contracts !== '' ? String(contracts) : '?';
@@ -84,11 +96,23 @@ function formatRepeatSkipAlert({ label, contracts, cooldownMs, skipCount, venue 
 
 function createRepeatGuard({
   cooldownMs = DEFAULT_COOLDOWN_MS,
+  maxQuotes = DEFAULT_MAX_QUOTES,
   now = () => Date.now(),
   maxEntries = MAX_ENTRIES,
 } = {}) {
   const map = new Map();
   const nowMs = () => (typeof now === 'function' ? now() : now);
+  const quoteCap = Number.isFinite(maxQuotes) && maxQuotes >= 1
+    ? Math.floor(maxQuotes)
+    : DEFAULT_MAX_QUOTES;
+
+  function inDark(entry, t) {
+    return entry && entry.darkAt != null && t - entry.darkAt < cooldownMs;
+  }
+
+  function darkExpired(entry, t) {
+    return entry && entry.darkAt != null && t - entry.darkAt >= cooldownMs;
+  }
 
   function prune(t) {
     if (!(cooldownMs > 0)) {
@@ -96,7 +120,7 @@ function createRepeatGuard({
       return;
     }
     for (const [k, v] of map) {
-      if (t - v.at >= cooldownMs) map.delete(k);
+      if (darkExpired(v, t)) map.delete(k);
     }
     while (map.size > maxEntries) {
       const oldest = map.keys().next().value;
@@ -105,24 +129,39 @@ function createRepeatGuard({
     }
   }
 
+  function activeEntry(fingerprint, t) {
+    const prev = map.get(fingerprint);
+    if (darkExpired(prev, t)) {
+      map.delete(fingerprint);
+      return null;
+    }
+    return prev || null;
+  }
+
+  function openReturn({ skip = false, gated = true, quoteCount = 0 } = {}) {
+    return { skip, cooldownMs, maxQuotes: quoteCap, quoteCount, gated };
+  }
+
   function peek(fingerprint, at) {
     const t = at != null ? at : nowMs();
     if (!fingerprint || isAnonymousFingerprint(fingerprint) || !(cooldownMs > 0)) {
-      return { skip: false, cooldownMs, gated: false };
+      return openReturn({ skip: false, gated: false });
     }
-    const prev = map.get(fingerprint);
-    if (prev && t - prev.at < cooldownMs) {
+    const prev = activeEntry(fingerprint, t);
+    if (inDark(prev, t)) {
       return {
         skip: true,
-        remainingMs: cooldownMs - (t - prev.at),
+        remainingMs: cooldownMs - (t - prev.darkAt),
         skipCount: prev.skipCount,
         skipAlerted: prev.skipAlerted,
         cooldownMs,
-        firstAt: prev.at,
+        maxQuotes: quoteCap,
+        quoteCount: prev.quoteCount,
+        firstAt: prev.darkAt,
         gated: true,
       };
     }
-    return { skip: false, cooldownMs, gated: true };
+    return openReturn({ skip: false, gated: true, quoteCount: prev ? prev.quoteCount : 0 });
   }
 
   function noteSkip(fingerprint, at) {
@@ -140,31 +179,44 @@ function createRepeatGuard({
     };
   }
 
-  // Start the window only after a successful quote POST. Claiming before
-  // send turned 409 rfq_closed into a 90s skip of the next live auction.
+  // Count a successful quote POST. Dark starts only after quoteCap claims.
+  // Claiming before send turned 409 rfq_closed into a skip of the next live auction.
   function claim(fingerprint, at) {
     const t = at != null ? at : nowMs();
     if (!fingerprint || isAnonymousFingerprint(fingerprint) || !(cooldownMs > 0)) {
-      return { skip: false, cooldownMs, gated: false };
+      return openReturn({ skip: false, gated: false });
     }
-    const prev = map.get(fingerprint);
-    if (prev && t - prev.at < cooldownMs) {
+    const prev = activeEntry(fingerprint, t);
+    if (inDark(prev, t)) {
       prev.skipCount += 1;
       const alert = !prev.skipAlerted;
       prev.skipAlerted = true;
       return {
         skip: true,
-        remainingMs: cooldownMs - (t - prev.at),
+        remainingMs: cooldownMs - (t - prev.darkAt),
         skipCount: prev.skipCount,
         alert,
         cooldownMs,
-        firstAt: prev.at,
+        maxQuotes: quoteCap,
+        quoteCount: prev.quoteCount,
+        firstAt: prev.darkAt,
         gated: true,
       };
     }
-    map.set(fingerprint, { at: t, skipCount: 0, skipAlerted: false });
+    const next = prev || { quoteCount: 0, lastQuoteAt: t, darkAt: null, skipCount: 0, skipAlerted: false };
+    next.quoteCount += 1;
+    next.lastQuoteAt = t;
+    if (next.quoteCount >= quoteCap) next.darkAt = t;
+    map.set(fingerprint, next);
     prune(t);
-    return { skip: false, first: true, cooldownMs, gated: true };
+    return {
+      skip: false,
+      first: next.quoteCount === 1,
+      cooldownMs,
+      maxQuotes: quoteCap,
+      quoteCount: next.quoteCount,
+      gated: true,
+    };
   }
 
   return {
@@ -173,11 +225,13 @@ function createRepeatGuard({
     claim,
     get size() { return map.size; },
     cooldownMs,
+    maxQuotes: quoteCap,
   };
 }
 
 module.exports = {
   DEFAULT_COOLDOWN_MS,
+  DEFAULT_MAX_QUOTES,
   REPEAT_SKIP_REASON,
   MAX_ENTRIES,
   compactNum,
@@ -187,6 +241,7 @@ module.exports = {
   isAnonymousFingerprint,
   creatorIdFromQuoteResponse,
   readCooldownMs,
+  readMaxQuotes,
   formatRepeatSkipAlert,
   createRepeatGuard,
 };

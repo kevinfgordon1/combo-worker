@@ -330,7 +330,7 @@ assert.ok(
 );
 assert.ok(
   liveSrc.indexOf('await postQuote(rfq.rfqId') < liveSrc.indexOf('if (cooldownFp) repeatGuard.claim(cooldownFp)'),
-  'claim must sit after postQuote so 409 rfq_closed cannot start the 90s skip'
+  'claim must sit after postQuote so 409 rfq_closed cannot start the dark skip'
 );
 assert.ok(
   /skipReason:\s*REPEAT_SKIP_REASON/.test(liveSrc) && liveSrc.includes('rfq_fingerprint'),
@@ -345,8 +345,11 @@ assert.ok(
   'RFQ REPEAT Telegram is labeled Kalshi (Poly repeat is not wired)'
 );
 assert.ok(
-  /RFQ_REPEAT_COOLDOWN_MS/.test(liveSrc) && /rfqRepeat:\s*0/.test(liveSrc),
-  'cooldown must be env-tunable and tallied'
+  /RFQ_REPEAT_COOLDOWN_MS/.test(liveSrc) &&
+    /RFQ_REPEAT_MAX_QUOTES/.test(liveSrc) &&
+    /readMaxQuotes\(process\.env\)/.test(liveSrc) &&
+    /rfqRepeat:\s*0/.test(liveSrc),
+  'cooldown and max quotes must be env-tunable and tallied'
 );
 assert.ok(
   /creator-gated/.test(liveSrc) && /empty creator_id always quotes/.test(liveSrc),

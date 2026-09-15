@@ -60,9 +60,10 @@
 //   (sorted legs + contracts + target_cost + creator_id when non-empty).
 //   Cooldown / skip rfq_repeat ONLY when creator_id is known. Anonymous
 //   WS RFQs (empty creator — common) always POST, even if Ari+Jax 6-contract
-//   is identical. Known-creator loops use RFQ_REPEAT_COOLDOWN_MS (default
-//   90s; 0 disables): first successful POST starts the window; later persist
-//   skip_reason=rfq_repeat on Miss tape and Telegram once per window.
+//   is identical. Known-creator loops allow RFQ_REPEAT_MAX_QUOTES successful
+//   quotes (default 8) then go dark for RFQ_REPEAT_COOLDOWN_MS (default 300s;
+//   0 disables). During dark, persist skip_reason=rfq_repeat on Miss tape
+//   and Telegram once per window. After dark ends the quote counter resets.
 //   Failed POST (incl. 409 rfq_closed) does not claim — the next live
 //   auction can still quote. History fingerprint is still written for
 //   grouping. Exact-lock matching unchanged. Poly is not wired.
@@ -77,7 +78,8 @@
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
-//      RFQ_REPEAT_COOLDOWN_MS (optional; default 90000; 0 disables)
+//      RFQ_REPEAT_MAX_QUOTES (optional; default 8)
+//      RFQ_REPEAT_COOLDOWN_MS (optional; default 300000; 0 disables)
 //      WORKER_MODE=combo|unhedged|all (default combo)
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
@@ -125,6 +127,7 @@ const {
   creatorIdFromQuoteResponse,
   createRepeatGuard,
   readCooldownMs,
+  readMaxQuotes,
   formatRepeatSkipAlert,
   REPEAT_SKIP_REASON,
 } = require('./rfq-repeat');
@@ -229,7 +232,10 @@ const counts = {
   tapeMatched: 0, tapeNone: 0,
   rfqRepeat: 0,
 };
-const repeatGuard = createRepeatGuard({ cooldownMs: readCooldownMs(process.env) });
+const repeatGuard = createRepeatGuard({
+  cooldownMs: readCooldownMs(process.env),
+  maxQuotes: readMaxQuotes(process.env),
+});
 let lastLockFingerprint = '';
 
 const pendingSkipTapes = new Map(); // submission id → skip row awaiting tape
@@ -1596,8 +1602,8 @@ async function main() {
     `Unaccepted quotes are DELETE'd after ${RESERVE_TTL_MS / 1000}s. ` +
     `rfq_deleted releases immediately. ` +
     `Skipped oversized/cap RFQs get a targeted tape lookup after close. ` +
-    `RFQ repeat cooldown ${repeatGuard.cooldownMs}ms creator-gated ` +
-    `(RFQ_REPEAT_COOLDOWN_MS; 0 disables; empty creator_id always quotes). ` +
+    `RFQ repeat ${repeatGuard.maxQuotes} quotes then ${repeatGuard.cooldownMs}ms dark creator-gated ` +
+    `(RFQ_REPEAT_MAX_QUOTES / RFQ_REPEAT_COOLDOWN_MS; 0 cooldown disables; empty creator_id always quotes). ` +
     `WORKER_MODE=${workerMode}. ` +
     (runUnhedged
       ? `Unhedged RFQ shadow in-process (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(process.env) ? 'on' : 'off'}, ` +
