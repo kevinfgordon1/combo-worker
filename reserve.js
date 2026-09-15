@@ -89,13 +89,16 @@ function dropPendingForRfq(quotes, rfqId, opts = {}) {
 }
 
 // Quotes that should be DELETE'd via cancelQuoteAndDrop: posted >= TTL ago,
-// still pending, never accepted, not currently confirming. Does not mutate.
+// still pending, not currently confirming. Default skips accepted / confirming
+// so Kalshi's 3s HVM window is not cancelled. Polymarket last-look is also ~3s
+// but accepted-and-unfilled quotes otherwise pin remaining forever — pass
+// includeAccepted: true so those release on the same 20s clock. Does not mutate.
 function listStaleUnaccepted(quotes, now = Date.now(), ttlMs = RESERVE_TTL_MS, opts = {}) {
   if (!quotes || typeof quotes.forEach !== 'function') return [];
   const confirming = opts.confirming;
   const stale = [];
   quotes.forEach((q, id) => {
-    if (isAcceptedPending(q)) return;
+    if (isAcceptedPending(q) && !opts.includeAccepted) return;
     if (confirming && confirming.has && confirming.has(id)) return;
     const at = postedAtMs(q);
     if (at == null) return;

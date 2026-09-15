@@ -188,7 +188,10 @@ function hedgeCap({ stake, boostAmerican, fillAmerican, mode = '1x' }) {
 // IMPORTANT: Kalshi maker quotes have NO size — accepting our quote fills the FULL RFQ.
 // So we must DECLINE when rfqContracts > remaining (cannot "partial quote"). Same for
 // rfqContracts > per-fill hedge cap.
-function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican = null, rfqContracts, hedgeMode = '1x', maxContracts = null, filledSoFar = 0, outstanding = 0 }) {
+// Polymarket can size the maker quote (qtyDecimal). Pass allowPartial: true so a
+// leftover remaining > 0 still quotes min(rfq, remaining, per-fill cap) instead
+// of rfq_too_large. Kalshi live-runner must leave allowPartial off.
+function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican = null, rfqContracts, hedgeMode = '1x', maxContracts = null, filledSoFar = 0, outstanding = 0, allowPartial = false }) {
   if (!(parlayStake > 0) || !parlayAmerican || !fillAmerican || !(rfqContracts > 0)) return { ok: false, reason: 'bad_inputs' };
   const dec = aToDec(parlayAmerican), winReturn = parlayStake * dec, bookHit = winReturn - parlayStake, bookMiss = -parlayStake;
   const cap = hedgeCap({ stake: parlayStake, boostAmerican: parlayAmerican, fillAmerican, mode: hedgeMode }); // per-fill hedge shape
@@ -201,31 +204,27 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
   if (remainingBefore <= 0) {
     return { ok: false, reason: 'limit_reached', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved, remaining: 0 };
   }
+  const maxThisFill = Math.min(remainingBefore, cap);
   // Full-RFQ-only venue: never quote if the RFQ is larger than we can still sell.
-  if (rfqContracts > remainingBefore) {
+  if (rfqContracts > maxThisFill && !allowPartial) {
     return {
       ok: false, reason: 'rfq_too_large', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved,
       remaining: remainingBefore, rfqContracts,
     };
   }
-  if (rfqContracts > cap) {
-    return {
-      ok: false, reason: 'rfq_too_large', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved,
-      remaining: remainingBefore, rfqContracts,
-    };
-  }
-  const N = rfqContracts; // quote size == RFQ size (only path Kalshi supports)
+  const N = allowPartial ? Math.min(rfqContracts, maxThisFill) : rfqContracts; // Kalshi: quote size == RFQ size
   if (!(N > 0)) return { ok: false, reason: 'zero_cap', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved, remaining: remainingBefore };
   const s = impliedProb(fillAmerican); // already net of your maker fee
   const hit = bookHit + N * s - N, miss = bookMiss + N * s, worst = Math.min(hit, miss);
   const v = fillView(fillAmerican);
   const remainingAfter = remainingBefore - N;
+  const clipped = N < rfqContracts;
   return {
     ok: true, locks: worst >= 0, hit: r2(hit), miss: r2(miss), worst: r2(worst),
-    partial: false, trimmedByLimit: false, cap, hedgeMode,
+    partial: clipped, trimmedByLimit: clipped, cap, hedgeMode,
     totalLimit, filledSoFar: alreadyFilled, outstanding: reserved, remaining: remainingAfter, limitReached: remainingAfter <= 0,
     competitive: fairAmerican == null ? null : fillAmerican >= fairAmerican, fillAmerican,
-    effTakerOdds: v.effTaker,
+    effTakerOdds: v.effTaker, rfqContracts,
     quote: { yes_bid: YES_DECLINE, no_bid: v.noBid, rest_remainder: false }, contracts: N,
   };
 }

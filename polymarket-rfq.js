@@ -11,7 +11,8 @@
 // doubleheader) so volume-vs-mapping is one line. Near-miss SKIP logs
 // those codes. Unhedged persist writes skip_reason=no_lock_overlap:<code>.
 // Combo Locks Miss tape (combo_submissions) gets quotes + matched-lock
-// declines (oversized / limit_reached / game_started / insufficient_balance).
+// declines (limit_reached / game_started / insufficient_balance; oversized
+// only if remaining is already 0 — leftover RFQs quote a partial qtyDecimal).
 // no_lock_overlap* SKIPs stay in the engine — they are not taped.
 // Live POSTs (create quote, confirm) require POLYMARKET_RFQ_LIVE to be truthy.
 // Successful Combo Lock QUOTED sends Telegram via ctx.sendAlert (same
@@ -563,6 +564,7 @@ function evaluatePolymarketRfq({
     maxContracts: parlay.max_contracts,
     filledSoFar,
     outstanding,
+    allowPartial: true,
   });
   if (!decision.ok) {
     return {
@@ -618,16 +620,31 @@ function parlayFromPending(pending, locks) {
   };
 }
 
+function formatQtyDecimal(n) {
+  const x = Number(n);
+  if (!(x > 0) || !Number.isFinite(x)) return null;
+  if (Number.isInteger(x)) return String(x);
+  return String(Math.round(x * 1e8) / 1e8);
+}
+
 function quoteBodyFromEval(evaluation) {
   const q = evaluation && evaluation.quote;
   const rfq = evaluation && evaluation.rfq;
   if (!q || !rfq) return null;
-  return {
+  const body = {
     rfqId: rfq.rfqId,
     buyPrice: q.buyPrice,
     sellPrice: q.sellPrice,
     restRemainder: false,
   };
+  const d = evaluation.decision;
+  const want = q.estimatedContracts;
+  const n = d && d.contracts;
+  if (d && d.ok && n > 0 && want > n) {
+    const qty = formatQtyDecimal(n);
+    if (qty) body.qtyDecimal = qty;
+  }
+  return body;
 }
 
 function pendingEntry(p, rfq, contracts, extra) {
@@ -1522,6 +1539,8 @@ function startPolymarketRfqLoop(ctx = {}) {
           fallback();
         }
       }
+      try { if (live) await http.deleteQuote(rfqId, quoteId); } catch (_) {}
+      pendingQuotes.delete(quoteId);
       return { confirmed: false, reason: skipReason || 'confirm_failed', error: e.message };
     } finally {
       confirmingQuotes.delete(quoteId);
@@ -1691,10 +1710,12 @@ function startPolymarketRfqLoop(ctx = {}) {
   async function cancelUnaccepted() {
     const stale = listStaleUnaccepted(pendingQuotes, Date.now(), RESERVE_TTL_MS, {
       confirming: confirmingQuotes,
+      includeAccepted: true,
     });
     for (const { id, quote } of stale) {
       if (isReserveKey(id)) {
         pendingQuotes.delete(id);
+        if (quote && quote.rfqId) seenRfqs.delete(quote.rfqId);
         continue;
       }
       try {
@@ -1703,7 +1724,11 @@ function startPolymarketRfqLoop(ctx = {}) {
         console.error(`[${MODE}] TTL delete failed`, e.message);
       }
       pendingQuotes.delete(id);
-      console.log(`[${MODE}] CANCEL unaccepted quote_id=${id} rfq=${quote.rfqId || '?'}`);
+      if (quote && quote.rfqId) seenRfqs.delete(quote.rfqId);
+      console.log(
+        `[${MODE}] CANCEL stale quote_id=${id} rfq=${quote.rfqId || '?'}` +
+        (quote && quote.accepted ? ' accepted' : '')
+      );
     }
   }
 
@@ -1802,6 +1827,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     cancelStartedQuotes,
     cancelPendingIfStarted,
     cancelOpenQuotesForParlay,
+    cancelUnaccepted,
     pendingQuotes,
     seenRfqs,
     missTape,
@@ -1840,6 +1866,7 @@ module.exports = {
   shouldConfirmNow,
   parlayFromPending,
   quoteBodyFromEval,
+  formatQtyDecimal,
   acceptedFromEvent,
   parsePositiveShares,
   orderIdFromExecution,

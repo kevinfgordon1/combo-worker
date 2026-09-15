@@ -217,6 +217,25 @@ assert.strictEqual(wouldExceedCap(MAX, 116, 0, 1), true);
   assert.strictEqual(sumOutstanding(ttl, P), 61 + 64 + 111);
   assert.strictEqual(dropPendingForRfq(ttl, 'rfq-acc').length, 0); // accepted stays for fill
 
+  // Poly: accepted-but-unfilled still expires so leftover remaining is not pinned.
+  const polyTtl = new Map();
+  polyTtl.set('q-acc-stale', {
+    parlayId: P, contracts: 55, rfqId: 'rfq-acc-stale', postedAt: now - 20_000, accepted: true,
+  });
+  polyTtl.set('q-conf-keep', { parlayId: P, contracts: 61, rfqId: 'rfq-conf-keep', postedAt: now - 20_000 });
+  polyTtl.set('q-fresh-acc', {
+    parlayId: P, contracts: 22, rfqId: 'rfq-fresh-acc', postedAt: now, accepted: true,
+  });
+  const polyStale = listStaleUnaccepted(polyTtl, now, RESERVE_TTL_MS, {
+    confirming: new Set(['q-conf-keep']),
+    includeAccepted: true,
+  });
+  assert.deepStrictEqual(polyStale.map((x) => x.id), ['q-acc-stale']);
+  for (const { id } of polyStale) polyTtl.delete(id);
+  assert.strictEqual(polyTtl.has('q-conf-keep'), true);
+  assert.strictEqual(polyTtl.has('q-fresh-acc'), true);
+  assert.strictEqual(sumOutstanding(polyTtl, P), 61 + 22);
+
   assert.strictEqual(postedAtMs({ created_at: '2026-08-23T15:59:50Z' }), Date.parse('2026-08-23T15:59:50Z'));
   assert.strictEqual(isFreshOutstanding({
     quote_id: 'old', is_live: true, order_id: null,
