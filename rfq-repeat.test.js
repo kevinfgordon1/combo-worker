@@ -3,6 +3,7 @@ const assert = require('assert');
 const { normalizeRfq } = require('./rfq');
 const {
   DEFAULT_COOLDOWN_MS,
+  DEFAULT_MAX_QUOTES,
   REPEAT_SKIP_REASON,
   compactNum,
   normalizedCreatorId,
@@ -11,6 +12,7 @@ const {
   isAnonymousFingerprint,
   creatorIdFromQuoteResponse,
   readCooldownMs,
+  readMaxQuotes,
   formatRepeatSkipAlert,
   createRepeatGuard,
 } = require('./rfq-repeat');
@@ -38,19 +40,29 @@ const seaPhiLegs = [
   { side: 'yes', market_ticker: 'KXNFLGAME-26SEP13WASPHI-PHI' },
 ];
 
-assert.strictEqual(DEFAULT_COOLDOWN_MS, 90_000);
+assert.strictEqual(DEFAULT_COOLDOWN_MS, 300_000);
+assert.strictEqual(DEFAULT_MAX_QUOTES, 8);
 assert.strictEqual(REPEAT_SKIP_REASON, 'rfq_repeat');
 assert.strictEqual(compactNum(6), '6');
 assert.strictEqual(compactNum('6.00'), '6');
 assert.strictEqual(compactNum(6.5), '6.5');
 assert.strictEqual(compactNum(null), '');
 
-assert.strictEqual(readCooldownMs({}), 90_000);
-assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '' }), 90_000);
+assert.strictEqual(readCooldownMs({}), 300_000);
+assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '' }), 300_000);
 assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '120000' }), 120_000);
 assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '0' }), 0);
-assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '-5' }), 90_000);
-assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: 'nope' }), 90_000);
+assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: '-5' }), 300_000);
+assert.strictEqual(readCooldownMs({ RFQ_REPEAT_COOLDOWN_MS: 'nope' }), 300_000);
+
+assert.strictEqual(readMaxQuotes({}), 8);
+assert.strictEqual(readMaxQuotes({ RFQ_REPEAT_MAX_QUOTES: '' }), 8);
+assert.strictEqual(readMaxQuotes({ RFQ_REPEAT_MAX_QUOTES: '8' }), 8);
+assert.strictEqual(readMaxQuotes({ RFQ_REPEAT_MAX_QUOTES: '1' }), 1);
+assert.strictEqual(readMaxQuotes({ RFQ_REPEAT_MAX_QUOTES: '0' }), 8);
+assert.strictEqual(readMaxQuotes({ RFQ_REPEAT_MAX_QUOTES: '-2' }), 8);
+assert.strictEqual(readMaxQuotes({ RFQ_REPEAT_MAX_QUOTES: 'nope' }), 8);
+assert.strictEqual(readMaxQuotes({ RFQ_REPEAT_MAX_QUOTES: '8.9' }), 8);
 
 {
   const a = fingerprintRfq(normalizeRfq(kalshiEnv('rfq-1', ariJaxLegs, { contracts: '6.00' })));
@@ -134,7 +146,7 @@ assert.strictEqual(cooldownFingerprint(null), null);
 
 {
   let t = 1_000_000;
-  const g = createRepeatGuard({ cooldownMs: 90_000, now: () => t });
+  const g = createRepeatGuard({ cooldownMs: 300_000, now: () => t });
   const anon = fingerprintRfq(normalizeRfq(kalshiEnv('anon-1', ariJaxLegs, { contracts: 6 })));
   assert.ok(isAnonymousFingerprint(anon));
   assert.strictEqual(g.claim(anon).skip, false);
@@ -146,7 +158,9 @@ assert.strictEqual(cooldownFingerprint(null), null);
 
 {
   let t = 1_000_000;
-  const g = createRepeatGuard({ cooldownMs: 90_000, now: () => t });
+  const g = createRepeatGuard({ cooldownMs: 300_000, maxQuotes: 8, now: () => t });
+  assert.strictEqual(g.maxQuotes, 8);
+  assert.strictEqual(g.cooldownMs, 300_000);
   const alice = cooldownFingerprint(normalizeRfq(kalshiEnv('a1', ariJaxLegs, {
     contracts: 6, creatorId: 'alice',
   })));
@@ -155,12 +169,24 @@ assert.strictEqual(cooldownFingerprint(null), null);
   })));
   assert.strictEqual(g.peek(alice).skip, false, 'peek before first claim must not start the window');
   assert.strictEqual(g.size, 0);
-  const first = g.claim(alice);
-  assert.strictEqual(first.skip, false);
-  assert.strictEqual(first.gated, true);
+
+  for (let i = 1; i <= 8; i++) {
+    const quoted = g.claim(alice);
+    assert.strictEqual(quoted.skip, false, `quote ${i} must be allowed`);
+    assert.strictEqual(quoted.gated, true);
+    assert.strictEqual(quoted.quoteCount, i);
+    if (i < 8) {
+      const mid = g.peek(alice);
+      assert.strictEqual(mid.skip, false, `peek after quote ${i} must still allow`);
+      assert.strictEqual(mid.quoteCount, i);
+    }
+  }
+
   const peeked = g.peek(alice);
-  assert.strictEqual(peeked.skip, true);
+  assert.strictEqual(peeked.skip, true, '9th identical RFQ within dark must skip');
   assert.strictEqual(peeked.skipCount, 0, 'peek must not increment skipCount');
+  assert.strictEqual(peeked.quoteCount, 8);
+  assert.strictEqual(peeked.remainingMs, 300_000);
   const noted = g.noteSkip(alice);
   assert.strictEqual(noted.skip, true);
   assert.strictEqual(noted.alert, true);
@@ -168,15 +194,15 @@ assert.strictEqual(cooldownFingerprint(null), null);
   const notedAgain = g.noteSkip(alice);
   assert.strictEqual(notedAgain.alert, false);
   assert.strictEqual(notedAgain.skipCount, 2);
-  const second = g.claim(alice);
-  assert.strictEqual(second.skip, true);
-  assert.strictEqual(second.alert, false, 'Telegram already fired via noteSkip');
-  assert.strictEqual(second.skipCount, 3);
-  assert.strictEqual(second.remainingMs, 90_000);
-  const third = g.claim(alice);
-  assert.strictEqual(third.skip, true);
-  assert.strictEqual(third.alert, false, 'Telegram only once per cooldown window');
-  assert.strictEqual(third.skipCount, 4);
+  const ninth = g.claim(alice);
+  assert.strictEqual(ninth.skip, true);
+  assert.strictEqual(ninth.alert, false, 'Telegram already fired via noteSkip');
+  assert.strictEqual(ninth.skipCount, 3);
+  assert.strictEqual(ninth.remainingMs, 300_000);
+  const tenth = g.claim(alice);
+  assert.strictEqual(tenth.skip, true);
+  assert.strictEqual(tenth.alert, false, 'Telegram only once per cooldown window');
+  assert.strictEqual(tenth.skipCount, 4);
 
   const otherSize = g.claim(cooldownFingerprint(normalizeRfq(kalshiEnv('a10', ariJaxLegs, {
     contracts: 10, creatorId: 'alice',
@@ -186,14 +212,19 @@ assert.strictEqual(cooldownFingerprint(null), null);
   const otherUser = g.claim(bob);
   assert.strictEqual(otherUser.skip, false, 'different known creators must not share cooldown');
 
-  t += 90_000;
+  t += 300_000;
   const after = g.claim(alice);
-  assert.strictEqual(after.skip, false, 'same creator+fingerprint quotes again after cooldown');
+  assert.strictEqual(after.skip, false, 'same creator+fingerprint quotes again after dark');
+  assert.strictEqual(after.quoteCount, 1, 'quote counter resets when dark expires');
+  for (let i = 2; i <= 8; i++) {
+    assert.strictEqual(g.claim(alice).skip, false, `reset quote ${i} must be allowed`);
+  }
+  assert.strictEqual(g.peek(alice).skip, true, '8th quote after reset starts a new dark window');
 }
 
 {
   let t = 2_000_000;
-  const g = createRepeatGuard({ cooldownMs: 90_000, now: () => t });
+  const g = createRepeatGuard({ cooldownMs: 300_000, maxQuotes: 8, now: () => t });
   const alice = cooldownFingerprint(normalizeRfq(kalshiEnv('late', ariJaxLegs, {
     contracts: 3, creatorId: 'friend',
   })));
@@ -203,7 +234,30 @@ assert.strictEqual(cooldownFingerprint(null), null);
   assert.strictEqual(g.peek(alice).skip, false, 'failed POST must not start cooldown');
   const landed = g.claim(alice);
   assert.strictEqual(landed.skip, false);
-  assert.strictEqual(g.peek(alice).skip, true);
+  assert.strictEqual(landed.quoteCount, 1);
+  assert.strictEqual(g.peek(alice).skip, false, 'first successful quote does not start dark');
+  for (let i = 2; i <= 8; i++) {
+    assert.strictEqual(g.claim(alice).skip, false);
+  }
+  assert.strictEqual(g.peek(alice).skip, true, 'dark starts only after the 8th successful POST');
+}
+
+{
+  const defaults = createRepeatGuard();
+  assert.strictEqual(defaults.cooldownMs, 300_000);
+  assert.strictEqual(defaults.maxQuotes, 8);
+}
+
+{
+  let t = 3_000_000;
+  const g = createRepeatGuard({ cooldownMs: 300_000, maxQuotes: 1, now: () => t });
+  const fp = cooldownFingerprint(normalizeRfq(kalshiEnv('one', ariJaxLegs, {
+    contracts: 6, creatorId: 'alice',
+  })));
+  assert.strictEqual(g.claim(fp).skip, false);
+  assert.strictEqual(g.peek(fp).skip, true, 'maxQuotes=1 restores first-quote dark');
+  t += 300_000;
+  assert.strictEqual(g.claim(fp).skip, false);
 }
 
 {
@@ -220,18 +274,19 @@ assert.strictEqual(cooldownFingerprint(null), null);
   const text = formatRepeatSkipAlert({
     label: 'Arizona + Jacksonville',
     contracts: 6,
-    cooldownMs: 90_000,
+    cooldownMs: 300_000,
     skipCount: 1,
   });
   assert.ok(text.includes('⏭️ RFQ REPEAT (Kalshi) — Arizona + Jacksonville'));
   assert.ok(text.includes('same 6-contract fingerprint'));
-  assert.ok(text.includes('cooling 90s'));
+  assert.ok(text.includes('cooling 300s'));
+  assert.ok(!text.includes('cooling 90s'));
   assert.ok(text.includes('Miss tape: rfq_repeat'));
   assert.ok(!text.includes('×1'));
   const poly = formatRepeatSkipAlert({
     label: 'Arizona + Jacksonville',
     contracts: 6,
-    cooldownMs: 90_000,
+    cooldownMs: 300_000,
     skipCount: 1,
     venue: 'polymarket',
   });
