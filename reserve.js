@@ -65,6 +65,12 @@ function isAcceptedPending(q) {
   return !!(q && (q.accepted || q.acceptedAt != null || q.accepted_at != null));
 }
 
+// Confirm / quoteExecuted submitted a resting order. Remaining must stay
+// reserved until FILL / CANCEL — otherwise Combo Locks requotes past max.
+function isExecutedPending(q) {
+  return !!(q && (q.executed || q.confirmed || q.creatorOrderId));
+}
+
 function selectSeedableOutstanding(rows, now = Date.now(), ttlMs = RESERVE_TTL_MS) {
   return (rows || []).filter((row) => row && row.quote_id && isFreshOutstanding(row, now, ttlMs));
 }
@@ -91,13 +97,16 @@ function dropPendingForRfq(quotes, rfqId, opts = {}) {
 // Quotes that should be DELETE'd via cancelQuoteAndDrop: posted >= TTL ago,
 // still pending, not currently confirming. Default skips accepted / confirming
 // so Kalshi's 3s HVM window is not cancelled. Polymarket last-look is also ~3s
-// but accepted-and-unfilled quotes otherwise pin remaining forever — pass
-// includeAccepted: true so those release on the same 20s clock. Does not mutate.
+// but accepted-and-unconfirmed quotes otherwise pin remaining forever — pass
+// includeAccepted: true so those release on the same 20s clock. Confirmed /
+// executed resting orders stay reserved until FILL / CANCEL unless
+// includeExecuted: true. Does not mutate.
 function listStaleUnaccepted(quotes, now = Date.now(), ttlMs = RESERVE_TTL_MS, opts = {}) {
   if (!quotes || typeof quotes.forEach !== 'function') return [];
   const confirming = opts.confirming;
   const stale = [];
   quotes.forEach((q, id) => {
+    if (isExecutedPending(q) && !opts.includeExecuted) return;
     if (isAcceptedPending(q) && !opts.includeAccepted) return;
     if (confirming && confirming.has && confirming.has(id)) return;
     const at = postedAtMs(q);
@@ -181,6 +190,7 @@ module.exports = {
   isFreshOutstanding,
   selectSeedableOutstanding,
   isAcceptedPending,
+  isExecutedPending,
   dropPendingForRfq,
   listStaleUnaccepted,
 };

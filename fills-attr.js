@@ -182,6 +182,48 @@ function canStampSubmission(sub, fill) {
   return true;
 }
 
+function resolveFillLookup(evt) {
+  if (!evt || typeof evt !== 'object') return { quoteId: null, orderId: null };
+  const fromPending = evt.pending || null;
+  const quoteId = evt.quoteId || evt.quote_id
+    || (fromPending && (fromPending.quoteId || fromPending.quote_id))
+    || null;
+  const orderId = evt.orderId || evt.order_id || evt.fillId || null;
+  return {
+    quoteId: quoteId || null,
+    orderId: orderId || quoteId || null,
+  };
+}
+
+function findPendingFill(maps, quoteId, orderId) {
+  const list = Array.isArray(maps) ? maps : [maps];
+  if (quoteId) {
+    for (const map of list) {
+      if (map && typeof map.get === 'function' && map.has(quoteId)) {
+        const pending = map.get(quoteId);
+        if (pending) return { pending, pendingId: quoteId };
+      }
+    }
+  }
+  if (!orderId) return null;
+  for (const map of list) {
+    if (!map || typeof map.forEach !== 'function') continue;
+    let found = null;
+    map.forEach((q, id) => {
+      if (found || !q) return;
+      if (q.creatorOrderId === orderId || q.orderId === orderId || q.order_id === orderId) {
+        found = { pending: q, pendingId: id };
+      }
+    });
+    if (found) return found;
+  }
+  return null;
+}
+
+function submissionAlreadyFilled(sub) {
+  return !!(sub && String(sub.status || '').toLowerCase() === 'filled');
+}
+
 function liveRunnerFillRow({ quoteId, orderId, fillId, parlayId, count, ticker, rfqId, label, createdAt, venue }) {
   const id = fillId || orderId || quoteId;
   return {
@@ -293,6 +335,9 @@ module.exports = {
   submissionFilledPatch,
   canStampSubmission,
   liveRunnerFillRow,
+  resolveFillLookup,
+  findPendingFill,
+  submissionAlreadyFilled,
   existingFillNeedsParlay,
   isLiveRunnerTwin,
   pickFillForSum,

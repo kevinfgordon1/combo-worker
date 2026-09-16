@@ -245,11 +245,37 @@ function parsePrivateMessage(raw) {
     }
   }
 
-  const order = msg.orderSubscriptionUpdate && msg.orderSubscriptionUpdate.execution;
-  if (order) {
-    return { type: 'orderExecution', execution: order, raw: msg };
+  const executions = executionsFromOrderUpdate(orderUpdateFromMessage(msg));
+  if (executions.length) {
+    return {
+      type: 'orderExecution',
+      execution: executions[0],
+      executions,
+      raw: msg,
+    };
   }
   return { type: 'other', raw: msg };
+}
+
+// Retail private WS docs use snake_case + protobuf numeric enums.
+// RFQ events on the same socket are camelCase. Accept both.
+function orderUpdateFromMessage(msg) {
+  if (!msg || typeof msg !== 'object') return null;
+  return msg.orderSubscriptionUpdate || msg.order_subscription_update || null;
+}
+
+function executionsFromOrderUpdate(update) {
+  if (!update || typeof update !== 'object') return [];
+  if (Array.isArray(update.executions)) {
+    return update.executions.filter((x) => x && typeof x === 'object');
+  }
+  if (update.execution && typeof update.execution === 'object') {
+    return [update.execution];
+  }
+  if (update.update && typeof update.update === 'object') {
+    return executionsFromOrderUpdate(update.update);
+  }
+  return [];
 }
 
 function createPolymarketRfqWs({
@@ -276,8 +302,11 @@ function createPolymarketRfqWs({
       reqs.push({
         subscribe: {
           requestId: 'order-sub-1',
+          request_id: 'order-sub-1',
           subscriptionType: 'SUBSCRIPTION_TYPE_ORDER',
+          subscription_type: 1,
           marketSlugs: [],
+          market_slugs: [],
         },
       });
     }
@@ -338,4 +367,6 @@ module.exports = {
   createPolymarketHttp,
   createPolymarketRfqWs,
   parsePrivateMessage,
+  orderUpdateFromMessage,
+  executionsFromOrderUpdate,
 };

@@ -1,0 +1,354 @@
+From 52e7ff203b91e8010d518b723441a014cafdfb12 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 16 Sep 2026 22:28:33 +0000
+Subject: [PATCH] Keep Combo Lock quote history visible under skip floods.
+
+Per-lock History used newest-first limit(80), so later game_started
+declines hid midday Polymarket quote_id rows. Fetch quotes/fills and
+noisy skips on separate caps, then merge.
+---
+ package.json                     |   2 +-
+ src/ComboLocks.jsx               |  33 ++++----
+ src/comboLockSubmissions.js      |  91 +++++++++++++++++++++
+ src/comboLockSubmissions.test.js | 136 +++++++++++++++++++++++++++++++
+ src/comboTape.test.js            |   3 +
+ 5 files changed, 248 insertions(+), 17 deletions(-)
+ create mode 100644 src/comboLockSubmissions.js
+ create mode 100644 src/comboLockSubmissions.test.js
+
+diff --git a/package.json b/package.json
+index 25ebb6c..3c33595 100644
+--- a/package.json
++++ b/package.json
+@@ -8,7 +8,7 @@
+     "build": "vite build",
+     "preview": "vite preview",
+     "ev-alerts": "node worker/ev-parlay-alerts.js",
+-    "test": "node src/soccerPairing.test.js && node src/soccerPmNo.test.js && node src/sportChips.test.js && node src/comboPrefill.test.js && node src/comboDesk.test.js && node src/comboTape.test.js && node src/comboSettlement.test.js && node src/comboLockProfile.test.js && node src/comboLockHistory.test.js && node src/comboLegResult.test.js && node src/comboAccess.test.js && node src/comboStatement.test.js && node src/statementBoard.test.js && node src/userProfile.test.js && node src/whatsNew.test.js && node src/promoLegExclude.test.js && node src/promoMatchingBooks.test.js && node src/promoMarketScope.test.js && node src/promoLiquidityFilter.test.js && node src/promoTeamFilter.test.js && node src/promoNoSweat.test.js && node src/promoFreeBet.test.js && node src/oddsLoad.test.js && node src/oddsBoard.test.js && node src/dataSourceHealth.test.js && node src/unhedgedTape.test.js && node src/promoParlayScan.test.js && node src/blendAskLadder.test.js && node src/trueOddsLine.test.js && node src/promoOppGuard.test.js && node src/promoBookDepth.test.js && node src/shareCard.test.js && node src/promoLockExplainer.test.js && node src/comboProbe.test.js && node src/betstampNormalize.test.js && node lib/promo-ev.test.js && node lib/soccer-pm-no.test.js && node lib/book-depth.test.js && node lib/odds-fetch-job.test.js && node lib/ev-parlay-alert.test.js && node lib/ev-parlay-scan-flow.test.js && node lib/ev-parlay-scan-job.test.js && node lib/betstamp.test.js && node worker/ev-parlay-alerts.test.js && node api/kalshi-games.test.js && node api/espn-scores.test.js && node api/book-depth.test.js && node api/soccer-pm-no.test.js && node api/share.test.js && node api/fetch-odds.test.js && node api/combo-probe.test.js && node api/betstamp-markets.test.js"
++    "test": "node src/soccerPairing.test.js && node src/soccerPmNo.test.js && node src/sportChips.test.js && node src/comboPrefill.test.js && node src/comboDesk.test.js && node src/comboTape.test.js && node src/comboSettlement.test.js && node src/comboLockProfile.test.js && node src/comboLockHistory.test.js && node src/comboLockSubmissions.test.js && node src/comboLegResult.test.js && node src/comboAccess.test.js && node src/comboStatement.test.js && node src/statementBoard.test.js && node src/userProfile.test.js && node src/whatsNew.test.js && node src/promoLegExclude.test.js && node src/promoMatchingBooks.test.js && node src/promoMarketScope.test.js && node src/promoLiquidityFilter.test.js && node src/promoTeamFilter.test.js && node src/promoNoSweat.test.js && node src/promoFreeBet.test.js && node src/oddsLoad.test.js && node src/oddsBoard.test.js && node src/dataSourceHealth.test.js && node src/unhedgedTape.test.js && node src/promoParlayScan.test.js && node src/blendAskLadder.test.js && node src/trueOddsLine.test.js && node src/promoOppGuard.test.js && node src/promoBookDepth.test.js && node src/shareCard.test.js && node src/promoLockExplainer.test.js && node src/comboProbe.test.js && node src/betstampNormalize.test.js && node lib/promo-ev.test.js && node lib/soccer-pm-no.test.js && node lib/book-depth.test.js && node lib/odds-fetch-job.test.js && node lib/ev-parlay-alert.test.js && node lib/ev-parlay-scan-flow.test.js && node lib/ev-parlay-scan-job.test.js && node lib/betstamp.test.js && node worker/ev-parlay-alerts.test.js && node api/kalshi-games.test.js && node api/espn-scores.test.js && node api/book-depth.test.js && node api/soccer-pm-no.test.js && node api/share.test.js && node api/fetch-odds.test.js && node api/combo-probe.test.js && node api/betstamp-markets.test.js"
+   },
+   "dependencies": {
+     "react": "^18.2.0",
+diff --git a/src/ComboLocks.jsx b/src/ComboLocks.jsx
+index 76a89bc..d718346 100644
+--- a/src/ComboLocks.jsx
++++ b/src/ComboLocks.jsx
+@@ -9,6 +9,8 @@
+ // Per-lock history (armed / quoted / skipped / unfilled / filled) reuses Miss-tape
+ // classification. Matched RFQs uses the same History tape (combo_submissions /
+ // combo_fills) so an empty watcher combo_matches cannot claim "0 total".
++// Per-lock submissions fetch quotes/fills separately from game_started noise
++// (comboLockSubmissions.js) so midday Polymarket quote_id rows stay visible.
+ // Risk/profit uses parlay_stake + fill_american + max_contracts.
+ // Unfilled outcomes: official Kalshi combo ticker, else Kalshi single-game legs,
+ // else ESPN public scoreboard (/api/espn-scores). Never invents scores.
+@@ -31,6 +33,7 @@ import { buildComboStatement } from "./comboStatement";
+ import StatementBoard, { downloadStatementCsv, useStatementView } from "./StatementBoard";
+ import { attemptRepeatLabel, attemptSummaryFilled, attemptSummaryParts, buildLockAttempts, matchedRfqCounts, matchedRfqEmptyText, matchedRfqHeading, matchedRfqWatcherParked, visibleAttempts } from "./comboLockHistory";
+ import { deskFillCounts } from "./comboTape";
++import { lockSubmissionQueriesForParlays, mergeSubmissionRows } from "./comboLockSubmissions";
+ import { settleLegs, uniqueEspnQueries, needsUnderlyingStamp, outcomeChrome } from "./comboLegResult";
+ import { OWNER_EMAIL, canSeeComboLocks, comboLockHash } from "./comboAccess";
+ import { absoluteShareUrl, copyTextToClipboard } from "./shareCard";
+@@ -641,7 +644,7 @@ export default function ComboLocks({ user, prefill = null, focusLockId = null })
+         // parlay can never fall through the gap between the Active and History lists again.
+         supabase.from("combo_parlays").select("*").eq("user_id", user.id).is("archived_at", null).order("created_at", { ascending: false }),
+         supabase.from("combo_settings").select("kill_switch").eq("user_id", user.id).maybeSingle(),
+-        supabase.from("combo_submissions").select("*").eq("user_id", user.id).in("status", ["quoted", "declined", "filled", "unfilled", "shadow"]).order("created_at", { ascending: false }).limit(50),
++        supabase.from("combo_submissions").select("*").eq("user_id", user.id).neq("status", "shadow").or("quote_id.not.is.null,order_id.not.is.null,status.in.(filled,unfilled,quoted)").order("created_at", { ascending: false }).limit(80),
+         supabase.from("combo_parlays").select("*").eq("user_id", user.id).not("archived_at", "is", null).order("archived_at", { ascending: false }).limit(100),
+         // REAL fills, straight from the account (via the read-only fills reader), maker + combo only.
+         supabase.from("combo_fills").select("parlay_id,count,is_combo,is_taker,ticker,raw,fill_id,order_id,kalshi_created_time,recorded_at,no_price,yes_price").eq("is_combo", true).eq("is_taker", false),
+@@ -714,23 +717,21 @@ export default function ComboLocks({ user, prefill = null, focusLockId = null })
+       if (!poll.applyParlays) return;
+       const livingRows = poll.parlays;
+       const archivedForSubs = archivedRows || [];
+-      // Per-lock attempts (quoted / skipped / unfilled), including skip-tape market_ticker.
+-      const livingSubReqs = livingRows.slice(0, 20).map((row) =>
+-        supabase.from("combo_submissions").select("*").eq("user_id", user.id).eq("parlay_id", row.id).neq("status", "shadow").order("created_at", { ascending: false }).limit(80)
+-      );
++      // Per-lock attempts: quotes/fills and noisy skips are separate queries so
++      // a game_started flood cannot hide midday Polymarket quote_id rows.
+       const archivedIds = archivedForSubs.map((row) => row.id).filter(Boolean);
+-      const subSettled = await Promise.allSettled([
+-        archivedIds.length
+-          ? supabase.from("combo_submissions").select("*").eq("user_id", user.id).in("parlay_id", archivedIds).neq("status", "shadow").order("created_at", { ascending: false }).limit(400)
+-          : Promise.resolve({ data: [] }),
+-        ...livingSubReqs,
+-      ]);
+-      const [archivedSubRes, ...livingSubRes] = subSettled.map(comboSettledQuery);
+-      const livingSubsOk = livingSubReqs.length === 0 || livingSubRes.every(comboListQueryOk);
+-      const livingSubRows = livingSubRes.flatMap((r) => (comboListQueryOk(r) ? r.data : []));
+-      const archivedSubRows = comboListQueryOk(archivedSubRes) ? archivedSubRes.data : [];
++      const livingForSubs = livingRows.slice(0, 20);
++      const subReqs = lockSubmissionQueriesForParlays(supabase, {
++        userId: user.id,
++        living: livingForSubs,
++        archivedIds,
++      });
++      const subSettled = await Promise.allSettled(subReqs.length ? subReqs : [Promise.resolve({ data: [] })]);
++      const subRes = subSettled.map(comboSettledQuery);
++      const livingSubsOk = subReqs.length === 0 || subRes.every(comboListQueryOk);
++      const livingSubRows = subRes.flatMap((r) => (comboListQueryOk(r) ? r.data : []));
+       if (livingSubsOk) {
+-        const subRows = [...livingSubRows, ...archivedSubRows];
++        const subRows = mergeSubmissionRows(livingSubRows);
+         setSubmissions(subRows);
+         const deskFills = fillRows ? deskFillCounts(fillRows, subRows) : null;
+         if (deskFills) {
+diff --git a/src/comboLockSubmissions.js b/src/comboLockSubmissions.js
+new file mode 100644
+index 0000000..eee5c55
+--- /dev/null
++++ b/src/comboLockSubmissions.js
+@@ -0,0 +1,91 @@
++// Combo Locks per-lock History / Matched RFQ fetch.
++//
++// combo-worker writes every SKIP (game_started, no_lock_overlap, …) onto
++// combo_submissions. A newest-first .limit(80) on one lock then returns only
++// later declines and drops midday Polymarket/Kalshi quotes that still have
++// quote_id. Fetch quotes/fills and noisy skips on separate caps, then merge.
++
++export const LOCK_QUOTE_LIMIT = 400;
++export const LOCK_SKIP_LIMIT = 40;
++export const LOCK_ARCHIVED_QUOTE_LIMIT = 400;
++export const LOCK_ARCHIVED_SKIP_LIMIT = 80;
++
++// Posted quotes persist as unfilled (worker maps quoted → unfilled) + quote_id.
++export const LOCK_QUOTE_OR =
++  "quote_id.not.is.null,order_id.not.is.null,status.in.(filled,unfilled,quoted)";
++
++// game_started / no_lock_overlap* flood the tape after first pitch.
++export const LOCK_SKIP_OR =
++  "skip_reason.is.null,and(skip_reason.neq.game_started,skip_reason.not.like.no_lock_overlap*)";
++
++export const NOISY_SKIP_REASONS = Object.freeze(["game_started"]);
++
++export function isNoisySkipReason(reason) {
++  if (reason == null || reason === "") return false;
++  const s = String(reason).toLowerCase();
++  if (s === "game_started") return true;
++  return s === "no_lock_overlap" || s.startsWith("no_lock_overlap:");
++}
++
++export function isLockQuoteRow(row) {
++  if (!row) return false;
++  if (row.quote_id || row.order_id) return true;
++  const st = String(row.status || "").toLowerCase();
++  return st === "filled" || st === "unfilled" || st === "quoted";
++}
++
++export function mergeSubmissionRows(...lists) {
++  const byId = new Map();
++  for (const list of lists) {
++    for (const row of list || []) {
++      if (!row || row.id == null) continue;
++      if (!byId.has(row.id)) byId.set(row.id, row);
++    }
++  }
++  return [...byId.values()].sort((a, b) => {
++    const tb = Date.parse(b.created_at || "") || 0;
++    const ta = Date.parse(a.created_at || "") || 0;
++    return tb - ta;
++  });
++}
++
++function applyQuoteFilters(q, { userId, parlayId, parlayIds, limit }) {
++  let next = q.select("*").eq("user_id", userId).neq("status", "shadow");
++  if (parlayId) next = next.eq("parlay_id", parlayId);
++  if (parlayIds && parlayIds.length) next = next.in("parlay_id", parlayIds);
++  return next.or(LOCK_QUOTE_OR).order("created_at", { ascending: false }).limit(limit);
++}
++
++function applySkipFilters(q, { userId, parlayId, parlayIds, limit }) {
++  let next = q.select("*").eq("user_id", userId).eq("status", "declined").is("quote_id", null);
++  if (parlayId) next = next.eq("parlay_id", parlayId);
++  if (parlayIds && parlayIds.length) next = next.in("parlay_id", parlayIds);
++  return next.or(LOCK_SKIP_OR).order("created_at", { ascending: false }).limit(limit);
++}
++
++export function livingLockSubmissionQueries(client, { userId, parlayId }) {
++  const table = () => client.from("combo_submissions");
++  return [
++    applyQuoteFilters(table(), { userId, parlayId, limit: LOCK_QUOTE_LIMIT }),
++    applySkipFilters(table(), { userId, parlayId, limit: LOCK_SKIP_LIMIT }),
++  ];
++}
++
++export function archivedLockSubmissionQueries(client, { userId, parlayIds }) {
++  if (!parlayIds || !parlayIds.length) return [];
++  const table = () => client.from("combo_submissions");
++  return [
++    applyQuoteFilters(table(), { userId, parlayIds, limit: LOCK_ARCHIVED_QUOTE_LIMIT }),
++    applySkipFilters(table(), { userId, parlayIds, limit: LOCK_ARCHIVED_SKIP_LIMIT }),
++  ];
++}
++
++export function lockSubmissionQueriesForParlays(client, { userId, living = [], archivedIds = [] }) {
++  const reqs = [];
++  for (const row of living) {
++    if (!row || !row.id) continue;
++    reqs.push(...livingLockSubmissionQueries(client, { userId, parlayId: row.id }));
++  }
++  reqs.push(...archivedLockSubmissionQueries(client, { userId, parlayIds: archivedIds }));
++  return reqs;
++}
+diff --git a/src/comboLockSubmissions.test.js b/src/comboLockSubmissions.test.js
+new file mode 100644
+index 0000000..006515c
+--- /dev/null
++++ b/src/comboLockSubmissions.test.js
+@@ -0,0 +1,136 @@
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import {
++  LOCK_QUOTE_LIMIT,
++  LOCK_SKIP_LIMIT,
++  LOCK_QUOTE_OR,
++  LOCK_SKIP_OR,
++  isNoisySkipReason,
++  isLockQuoteRow,
++  mergeSubmissionRows,
++  livingLockSubmissionQueries,
++  archivedLockSubmissionQueries,
++  lockSubmissionQueriesForParlays,
++} from "./comboLockSubmissions.js";
++
++assert.equal(isNoisySkipReason("game_started"), true);
++assert.equal(isNoisySkipReason("no_lock_overlap:no_shared_game"), true);
++assert.equal(isNoisySkipReason("no_lock_overlap"), true);
++assert.equal(isNoisySkipReason("oversized"), false);
++assert.equal(isNoisySkipReason("limit_reached"), false);
++assert.equal(isNoisySkipReason(null), false);
++
++assert.equal(isLockQuoteRow({ quote_id: "q1", status: "unfilled" }), true);
++assert.equal(isLockQuoteRow({ order_id: "o1", status: "unfilled" }), true);
++assert.equal(isLockQuoteRow({ status: "filled" }), true);
++assert.equal(isLockQuoteRow({ status: "declined", skip_reason: "game_started" }), false);
++
++{
++  const merged = mergeSubmissionRows(
++    [{ id: "a", created_at: "2026-09-16T16:55:00Z" }],
++    [{ id: "a", created_at: "2026-09-16T16:55:00Z" }, { id: "b", created_at: "2026-09-16T21:00:00Z" }],
++  );
++  assert.deepEqual(merged.map((r) => r.id), ["b", "a"]);
++}
++
++// Guardians/Yankees/Giants: last 80 newest-first are declines; Poly quotes
++// from 12:55–1:10 ET must still appear when quotes are fetched separately.
++{
++  const polyQuotes = [];
++  for (let i = 0; i < 115; i++) {
++    polyQuotes.push({
++      id: `poly-q-${i}`,
++      venue: "polymarket",
++      status: "unfilled",
++      quote_id: `quote-${i}`,
++      created_at: new Date(Date.parse("2026-09-16T16:55:00Z") + i * 6000).toISOString(),
++    });
++  }
++  const laterDeclines = [];
++  for (let i = 0; i < 80; i++) {
++    laterDeclines.push({
++      id: `dec-${i}`,
++      venue: i < 15 ? "polymarket" : "kalshi",
++      status: "declined",
++      quote_id: null,
++      skip_reason: "game_started",
++      created_at: new Date(Date.parse("2026-09-16T21:00:00Z") + i * 1000).toISOString(),
++    });
++  }
++  const newestFirst = [...laterDeclines, ...polyQuotes]
++    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
++  const capped = newestFirst.slice(0, 80);
++  assert.equal(capped.filter(isLockQuoteRow).length, 0, "limit(80) newest-first drops every Poly quote");
++
++  const quotePage = newestFirst.filter(isLockQuoteRow).slice(0, LOCK_QUOTE_LIMIT);
++  const skipPage = newestFirst
++    .filter((r) => r.status === "declined" && !r.quote_id && !isNoisySkipReason(r.skip_reason))
++    .slice(0, LOCK_SKIP_LIMIT);
++  const recovered = mergeSubmissionRows(quotePage, skipPage);
++  assert.equal(recovered.filter((r) => r.venue === "polymarket" && r.quote_id).length, 115);
++  assert.ok(recovered.every((r) => r.skip_reason !== "game_started"));
++}
++
++function mockClient() {
++  const calls = [];
++  return {
++    calls,
++    from(table) {
++      const call = { table, filters: [] };
++      calls.push(call);
++      const chain = {
++        select(v) { call.select = v; return chain; },
++        eq(k, v) { call.filters.push(["eq", k, v]); return chain; },
++        neq(k, v) { call.filters.push(["neq", k, v]); return chain; },
++        in(k, v) { call.filters.push(["in", k, v]); return chain; },
++        is(k, v) { call.filters.push(["is", k, v]); return chain; },
++        or(v) { call.or = v; return chain; },
++        order(k, o) { call.order = [k, o]; return chain; },
++        limit(n) { call.limit = n; return chain; },
++      };
++      return chain;
++    },
++  };
++}
++
++{
++  const client = mockClient();
++  const reqs = livingLockSubmissionQueries(client, {
++    userId: "u1",
++    parlayId: "aee3b29d-2a4b-4dd6-8dd5-37358b0aa294",
++  });
++  assert.equal(reqs.length, 2);
++  assert.equal(client.calls[0].or, LOCK_QUOTE_OR);
++  assert.equal(client.calls[0].limit, LOCK_QUOTE_LIMIT);
++  assert.ok(client.calls[0].filters.some((f) => f[0] === "eq" && f[1] === "parlay_id"));
++  assert.equal(client.calls[1].or, LOCK_SKIP_OR);
++  assert.equal(client.calls[1].limit, LOCK_SKIP_LIMIT);
++  assert.ok(client.calls[1].filters.some((f) => f[0] === "eq" && f[1] === "status" && f[2] === "declined"));
++}
++
++{
++  const client = mockClient();
++  assert.deepEqual(archivedLockSubmissionQueries(client, { userId: "u1", parlayIds: [] }), []);
++  const reqs = lockSubmissionQueriesForParlays(client, {
++    userId: "u1",
++    living: [{ id: "p1" }, { id: "p2" }],
++    archivedIds: ["arch1"],
++  });
++  assert.equal(reqs.length, 6);
++}
++
++{
++  const dir = path.dirname(fileURLToPath(import.meta.url));
++  const locks = fs.readFileSync(path.join(dir, "ComboLocks.jsx"), "utf8");
++  assert.match(locks, /lockSubmissionQueriesForParlays|livingLockSubmissionQueries/);
++  assert.match(locks, /mergeSubmissionRows/);
++  assert.doesNotMatch(
++    locks,
++    /\.neq\("status", "shadow"\)\.order\("created_at", \{ ascending: false \}\)\.limit\(80\)/,
++    "per-lock History must not use a single newest-first limit(80)",
++  );
++}
++
++console.log("comboLockSubmissions.test.js ok");
+diff --git a/src/comboTape.test.js b/src/comboTape.test.js
+index d7748d9..ecfe0d3 100644
+--- a/src/comboTape.test.js
++++ b/src/comboTape.test.js
+@@ -872,6 +872,9 @@ assert.equal(isLiveRunnerTwin({ raw: { source: "live-runner" }, fill_id: "f1", o
+   assert.match(locks, /from\("combo_parlays"\)\.select\("\*"\)\.eq\("user_id", user\.id\)\.is\("archived_at"/);
+   assert.match(locks, /from\("combo_parlays"\)\.select\("\*"\)\.eq\("user_id", user\.id\)\.not\("archived_at"/);
+   assert.match(locks, /attemptSummaryParts/);
++  assert.match(locks, /lockSubmissionQueriesForParlays/);
++  assert.match(locks, /mergeSubmissionRows/);
++  assert.doesNotMatch(locks, /\.limit\(80\)\s*\n\s*\)/);
+   assert.doesNotMatch(locks, /skipFill/);
+   assert.match(tapeUi, /settlementFromStored/);
+   assert.match(tapeUi, /parlay won \(we lost\)|settlement\.text/);
+-- 
+2.43.0
+

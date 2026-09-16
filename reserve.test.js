@@ -14,6 +14,7 @@ const {
   selectSeedableOutstanding,
   dropPendingForRfq,
   listStaleUnaccepted,
+  isExecutedPending,
 } = require('./reserve');
 const { isRfqClosed, normalizeRfqClosed, parseEnvelope } = require('./rfq');
 
@@ -235,6 +236,28 @@ assert.strictEqual(wouldExceedCap(MAX, 116, 0, 1), true);
   assert.strictEqual(polyTtl.has('q-conf-keep'), true);
   assert.strictEqual(polyTtl.has('q-fresh-acc'), true);
   assert.strictEqual(sumOutstanding(polyTtl, P), 61 + 22);
+
+  // Confirmed / executed resting orders must stay reserved past the 20s clock.
+  const executedTtl = new Map();
+  executedTtl.set('q-acc-only', {
+    parlayId: P, contracts: 55, rfqId: 'rfq-acc-only', postedAt: now - 20_000, accepted: true,
+  });
+  executedTtl.set('q-executed', {
+    parlayId: P, contracts: 70, rfqId: 'rfq-exec', postedAt: now - 25_000,
+    accepted: true, executed: true, creatorOrderId: 'poly-order-keep',
+  });
+  executedTtl.set('q-confirmed', {
+    parlayId: P, contracts: 22, rfqId: 'rfq-conf-exec', postedAt: now - 25_000,
+    accepted: true, confirmed: true,
+  });
+  assert.ok(isExecutedPending(executedTtl.get('q-executed')));
+  assert.ok(isExecutedPending(executedTtl.get('q-confirmed')));
+  assert.ok(!isExecutedPending(executedTtl.get('q-acc-only')));
+  const executedStale = listStaleUnaccepted(executedTtl, now, RESERVE_TTL_MS, {
+    includeAccepted: true,
+  });
+  assert.deepStrictEqual(executedStale.map((x) => x.id), ['q-acc-only']);
+  assert.strictEqual(sumOutstanding(executedTtl, P), 55 + 70 + 22);
 
   assert.strictEqual(postedAtMs({ created_at: '2026-08-23T15:59:50Z' }), Date.parse('2026-08-23T15:59:50Z'));
   assert.strictEqual(isFreshOutstanding({

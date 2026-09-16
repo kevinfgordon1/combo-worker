@@ -5,8 +5,11 @@
 //   or Polymarket orderExecution FILL / PARTIAL_FILL (same persist).
 //   Persist combo_fills (parlay_id) FIRST, then stamp combo_submissions
 //   status=filled + order_id. UI Filled tab is combo_fills; History needs
-//   both fields. Restart recovery reads combo_submissions by quote_id.
+//   both fields. Restart recovery reads combo_submissions by quote_id
+//   or order_id (quoteExecuted stamps creatorOrderId before the fill).
 //   Poly quoteExecuted is orders-submitted, not a fill — do not persist there.
+//   Retail WS fills arrive as snake_case order_subscription_update with
+//   protobuf type 1/2; string EXECUTION_TYPE_* still works.
 // RESERVE: outstanding live quotes (pendingQuotes + in-flight POST) count against
 //   remaining so parallel RFQs cannot all clear the same ceiling.
 //   remaining = max - filled - outstanding.
@@ -121,7 +124,7 @@ const {
   applyRefreshKillByUser,
   applyRefreshFilledByParlay,
 } = require('./refresh-state');
-const { liveRunnerFillRow } = require('./fills-attr');
+const { liveRunnerFillRow, resolveFillLookup, findPendingFill, submissionAlreadyFilled } = require('./fills-attr');
 const {
   fingerprintRfq,
   cooldownFingerprint,
@@ -1137,16 +1140,17 @@ async function persistExecutedFill(pending, evt) {
   }
 }
 
-async function pendingFromSubmission(quoteId) {
-  if (!quoteId) return null;
+async function pendingFromSubmission({ quoteId, orderId } = {}) {
+  if (!quoteId && !orderId) return null;
   try {
-    const { data, error } = await supabase
+    let query = supabase
       .from('combo_submissions')
       .select('quote_id,parlay_id,label,rfq_id,contracts,user_id,order_id,status')
-      .eq('quote_id', quoteId)
       .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      .limit(1);
+    if (quoteId) query = query.eq('quote_id', quoteId);
+    else query = query.eq('order_id', orderId);
+    const { data, error } = await query.maybeSingle();
     if (error || !data) return null;
     return {
       parlayId: data.parlay_id,
@@ -1154,18 +1158,31 @@ async function pendingFromSubmission(quoteId) {
       contracts: data.contracts,
       label: data.label,
       rfqId: data.rfq_id,
+      quoteId: data.quote_id,
       maxContracts: null,
-      alreadyFilled: !!(data.order_id || data.status === 'filled'),
+      alreadyFilled: submissionAlreadyFilled(data),
     };
   } catch (_) {
     return null;
   }
 }
 
+function persistQuoteOrder(quoteId, orderId) {
+  if (!quoteId || !orderId || isReserveKey(quoteId)) return;
+  supabase.from('combo_submissions').update({ order_id: orderId, is_live: true })
+    .eq('quote_id', quoteId)
+    .then(({ error }) => {
+      if (error) console.error(`[${MODE}] stamp order_id failed`, error.message);
+    })
+    .catch((e) => console.error(`[${MODE}] stamp order_id failed`, e && e.message));
+}
+
 async function onQuoteExecuted(evt) {
-  if (!evt || !evt.quoteId) return;
-  const { quoteId } = evt;
-  const orderId = evt.orderId || evt.fillId || quoteId || null;
+  if (!evt) return;
+  const looked = resolveFillLookup(evt);
+  let quoteId = looked.quoteId;
+  const orderId = looked.orderId;
+  if (!quoteId && !orderId) return;
   const fillKey = fillKeyOf(evt);
   if (fillKey && seenFillIds.has(fillKey)) {
     console.log(`[${MODE}] quote_executed duplicate fill_id=${fillKey}`);
@@ -1176,25 +1193,30 @@ async function onQuoteExecuted(evt) {
   let pending = evt.pending || null;
   let fromMemory = !!pending;
   if (!pending) {
-    pending = pendingQuotes.get(quoteId);
-    fromMemory = !!pending;
+    const hit = findPendingFill([pendingQuotes, polyPendingQuotes], quoteId, orderId);
+    if (hit) {
+      pending = hit.pending;
+      quoteId = quoteId || hit.pendingId;
+      fromMemory = true;
+    }
   }
   if (!pending) {
-    pending = polyPendingQuotes.get(quoteId);
-    fromMemory = !!pending;
-  }
-  if (!pending) {
-    pending = await pendingFromSubmission(quoteId);
+    pending = await pendingFromSubmission({ quoteId, orderId });
     if (!pending) {
-      console.log(`[${MODE}] quote_executed unknown quote_id=${quoteId} order_id=${orderId}`);
+      console.log(`[${MODE}] quote_executed unknown quote_id=${quoteId || '?'} order_id=${orderId || '?'}`);
       return;
     }
+    quoteId = quoteId || pending.quoteId;
     console.log(`[${MODE}] quote_executed recovered quote_id=${quoteId} from combo_submissions`);
+  }
+  if (!quoteId) {
+    console.log(`[${MODE}] quote_executed missing quote_id order_id=${orderId || '?'}`);
+    return;
   }
 
   const contracts = evt.contracts != null ? evt.contracts : pending.contracts;
   const venue = fillVenueOf(evt);
-  await persistExecutedFill(pending, { ...evt, orderId, venue });
+  await persistExecutedFill(pending, { ...evt, quoteId, orderId, venue });
   // Restart replay of the same full fill: persist is idempotent; do not
   // re-count or re-Telegram. Partials keep a distinct fill_id so they add.
   if (!fromMemory && pending.alreadyFilled && !evt.isPartial) {
@@ -1652,6 +1674,7 @@ async function main() {
       logAsync(p, rfq, d, status, withVenue(extra, 'polymarket')),
     persistQuoteSkip: (quoteId, skipReason, fallback) =>
       persistQuoteSkip(quoteId, skipReason, fallback),
+    persistQuoteOrder,
     sendAlert,
     counts,
     sessionFilledByParlay,
