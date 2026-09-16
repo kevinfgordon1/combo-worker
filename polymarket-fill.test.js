@@ -389,6 +389,9 @@ function startFillLoop(extra = {}) {
     ...pending,
     rfqId: 'rfq-accepted-only',
     accepted: true,
+    creatorOrderId: null,
+    executed: false,
+    confirmed: false,
     postedAt: Date.now() - 25_000,
   });
   const { loop: ttlLoop } = startFillLoop({

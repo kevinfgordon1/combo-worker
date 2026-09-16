@@ -738,7 +738,11 @@ function rfqIdFromExecution(ex) {
 
 function executionFillId(ex, orderId, quoteId) {
   const last = parsePositiveShares(ex && (ex.lastShares ?? ex.last_shares));
-  const raw = ex && (ex.executionId || ex.execution_id || ex.tradeId || ex.trade_id);
+  const raw = ex && (
+    ex.executionId || ex.execution_id
+    || (ex.id && ex.id !== orderId && ex.id !== quoteId ? ex.id : null)
+    || ex.tradeId || ex.trade_id
+  );
   if (raw && raw !== orderId && raw !== quoteId) return raw;
   const maybeId = ex && ex.id;
   if (maybeId && maybeId !== orderId && maybeId !== quoteId) return maybeId;
