@@ -1,7 +1,7 @@
 'use strict';
 const assert = require('assert');
 const { sign, authHeaders } = require('./polymarket-auth');
-const { createPolymarketHttp, queryString } = require('./polymarket-client');
+const { createPolymarketHttp, queryString, parsePrivateMessage } = require('./polymarket-client');
 
 const SEED_B64 = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
 
@@ -108,6 +108,46 @@ assert.strictEqual(queryString({}), '');
   assert.ok(!('POLY-API-KEY' in headerBag[0]));
   assert.ok(!('account' in headerBag[0]));
   headerHttp.close();
+
+  const snakeFill = parsePrivateMessage(JSON.stringify({
+    request_id: 'order-sub-1',
+    subscription_type: 1,
+    order_subscription_update: {
+      execution: {
+        id: 'exec-456',
+        type: 2,
+        last_shares: '50',
+        trade_id: 'trade-789',
+        order: { id: 'order-123', quote_id: 'quote-abc' },
+      },
+    },
+  }));
+  assert.strictEqual(snakeFill.type, 'orderExecution');
+  assert.strictEqual(snakeFill.execution.type, 2);
+  assert.strictEqual(snakeFill.execution.last_shares, '50');
+  assert.strictEqual(snakeFill.execution.order.quote_id, 'quote-abc');
+  assert.strictEqual(snakeFill.executions.length, 1);
+
+  const camelFill = parsePrivateMessage({
+    orderSubscriptionUpdate: {
+      execution: { type: 'EXECUTION_TYPE_PARTIAL_FILL', lastShares: '10', order: { id: 'o1' } },
+    },
+  });
+  assert.strictEqual(camelFill.type, 'orderExecution');
+  assert.strictEqual(camelFill.execution.type, 'EXECUTION_TYPE_PARTIAL_FILL');
+
+  const many = parsePrivateMessage({
+    order_subscription_update: {
+      executions: [
+        { type: 1, last_shares: 20, order: { id: 'o1' } },
+        { type: 2, last_shares: 30, order: { id: 'o1' } },
+      ],
+    },
+  });
+  assert.strictEqual(many.executions.length, 2);
+  assert.strictEqual(many.execution.type, 1);
+
+  assert.strictEqual(parsePrivateMessage({ ping: true }).type, 'other');
 
   console.log('polymarket-client.test.js ok');
 })().catch((e) => {

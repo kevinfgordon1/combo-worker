@@ -2,12 +2,15 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
-const { liveRunnerFillRow } = require('./fills-attr');
+const { liveRunnerFillRow, resolveFillLookup, findPendingFill, submissionAlreadyFilled } = require('./fills-attr');
+const { parsePrivateMessage } = require('./polymarket-client');
+const { decideAtFill } = require('./engine');
 const {
   orderIdFromExecution,
   quoteIdFromExecution,
   rfqIdFromExecution,
   executionFillId,
+  normalizeExecutionType,
   isOrderFillExecution,
   isOrderCancelExecution,
   contractsFromExecution,
@@ -43,6 +46,17 @@ const pending = {
   assert.ok(isOrderFillExecution('execution_type_fill'));
   assert.ok(isOrderCancelExecution('EXECUTION_TYPE_CANCELED'));
   assert.ok(!isOrderFillExecution('quoteExecuted'));
+  assert.strictEqual(normalizeExecutionType(1), 'EXECUTION_TYPE_PARTIAL_FILL');
+  assert.strictEqual(normalizeExecutionType(2), 'EXECUTION_TYPE_FILL');
+  assert.strictEqual(normalizeExecutionType('2'), 'EXECUTION_TYPE_FILL');
+  assert.strictEqual(normalizeExecutionType('PARTIAL_FILL'), 'EXECUTION_TYPE_PARTIAL_FILL');
+  assert.strictEqual(normalizeExecutionType('FILL'), 'EXECUTION_TYPE_FILL');
+  assert.ok(isOrderFillExecution(1));
+  assert.ok(isOrderFillExecution(2));
+  assert.ok(isOrderFillExecution('1'));
+  assert.ok(isOrderCancelExecution(3));
+  assert.ok(isOrderCancelExecution(5));
+  assert.ok(!isOrderFillExecution(0), 'NEW is not a fill');
 }
 
 {
@@ -137,6 +151,25 @@ const pending = {
   assert.strictEqual(row.is_taker, false);
   assert.strictEqual(row.raw.venue, 'polymarket');
   assert.strictEqual(row.raw.source, 'live-runner');
+}
+
+{
+  const fromDocs = resolveFillLookup({
+    orderId: 'poly-order-1',
+    fillId: 'exec-1',
+    pending: { quoteId: 'quote-jets', parlayId: 'p-jets' },
+  });
+  assert.strictEqual(fromDocs.quoteId, 'quote-jets');
+  assert.strictEqual(fromDocs.orderId, 'poly-order-1');
+  assert.strictEqual(resolveFillLookup({}).quoteId, null);
+  assert.ok(!submissionAlreadyFilled({ status: 'unfilled', order_id: 'poly-order-1' }));
+  assert.ok(submissionAlreadyFilled({ status: 'filled' }));
+
+  const maps = [new Map(), new Map()];
+  maps[1].set('quote-jets', { ...pending, creatorOrderId: 'poly-order-1' });
+  const byOrder = findPendingFill(maps, null, 'poly-order-1');
+  assert.strictEqual(byOrder.pendingId, 'quote-jets');
+  assert.strictEqual(findPendingFill(maps, 'quote-jets', null).pendingId, 'quote-jets');
 }
 
 function emptyHttp() {
@@ -271,6 +304,175 @@ function startFillLoop(extra = {}) {
   assert.strictEqual(recovered[0].contracts, 107.68);
   recoverLoop.stop();
 
+  const docsFills = [];
+  const docsPending = new Map();
+  docsPending.set('quote-jets', { ...pending });
+  const { loop: docsLoop } = startFillLoop({
+    pendingQuotes: docsPending,
+    onQuoteExecuted: (evt) => { docsFills.push(evt); },
+  });
+  docsLoop.onWsEvent(parsePrivateMessage(JSON.stringify({
+    request_id: 'order-sub-1',
+    subscription_type: 1,
+    order_subscription_update: {
+      execution: {
+        id: 'exec-docs',
+        type: 2,
+        last_shares: '107.68',
+        trade_id: 'trade-docs',
+        order: { id: 'poly-order-1', quote_id: 'quote-jets' },
+      },
+    },
+  })));
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(docsFills.length, 1, 'snake_case + numeric FILL must persist');
+  assert.strictEqual(docsFills[0].venue, 'polymarket');
+  assert.strictEqual(docsFills[0].quoteId, 'quote-jets');
+  assert.strictEqual(docsFills[0].orderId, 'poly-order-1');
+  assert.strictEqual(docsFills[0].fillId, 'exec-docs');
+  assert.strictEqual(docsFills[0].contracts, 107.68);
+  assert.ok(!docsPending.has('quote-jets'));
+  docsLoop.stop();
+
+  const partialDocs = [];
+  const partialMap = new Map();
+  partialMap.set('quote-jets', { ...pending });
+  const { loop: partialDocsLoop } = startFillLoop({
+    pendingQuotes: partialMap,
+    onQuoteExecuted: (evt) => { partialDocs.push(evt); },
+  });
+  partialDocsLoop.onWsEvent(parsePrivateMessage({
+    order_subscription_update: {
+      executions: [{
+        id: 'exec-partial-docs',
+        type: 1,
+        last_shares: 50,
+        order: { id: 'poly-order-1' },
+      }],
+    },
+  }));
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(partialDocs.length, 1);
+  assert.strictEqual(partialDocs[0].isPartial, true);
+  assert.strictEqual(partialDocs[0].contracts, 50);
+  assert.ok(partialMap.has('quote-jets'), 'PARTIAL_FILL keeps remaining reserved');
+  partialDocsLoop.stop();
+
+  const camelFills = [];
+  const camelMap = new Map();
+  camelMap.set('quote-jets', { ...pending });
+  const { loop: camelLoop } = startFillLoop({
+    pendingQuotes: camelMap,
+    onQuoteExecuted: (evt) => { camelFills.push(evt); },
+  });
+  camelLoop.handleOrderExecution({
+    type: 2,
+    last_shares: '107.68',
+    order: { id: 'poly-order-1', quoteId: 'quote-jets' },
+    executionId: 'exec-num',
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(camelFills.length, 1);
+  assert.strictEqual(camelFills[0].contracts, 107.68);
+  camelLoop.stop();
+
+  const ttlDeletes = [];
+  const ttlMap = new Map();
+  ttlMap.set('quote-executed', {
+    ...pending,
+    accepted: true,
+    executed: true,
+    creatorOrderId: 'poly-order-1',
+    postedAt: Date.now() - 25_000,
+  });
+  ttlMap.set('quote-accepted-only', {
+    ...pending,
+    rfqId: 'rfq-accepted-only',
+    accepted: true,
+    postedAt: Date.now() - 25_000,
+  });
+  const { loop: ttlLoop } = startFillLoop({
+    env: {
+      POLYMARKET_KEY_ID: 'key-id-fixture',
+      POLYMARKET_SECRET_KEY: SEED_B64,
+      POLYMARKET_RFQ_LIVE: 'true',
+    },
+    pendingQuotes: ttlMap,
+    http: {
+      ...emptyHttp(),
+      async deleteQuote(rfqId, quoteId) {
+        ttlDeletes.push({ rfqId, quoteId });
+        return { statusCode: 200 };
+      },
+    },
+  });
+  await ttlLoop.cancelUnaccepted();
+  assert.ok(ttlMap.has('quote-executed'), 'executed resting order must stay reserved past 20s');
+  assert.ok(!ttlMap.has('quote-accepted-only'), 'accepted-only last-look still TTLs');
+  assert.ok(ttlDeletes.some((d) => d.quoteId === 'quote-accepted-only'));
+  assert.ok(!ttlDeletes.some((d) => d.quoteId === 'quote-executed'));
+  ttlLoop.stop();
+
+  const sessionCap = {};
+  const capPending = new Map();
+  capPending.set('quote-jets', { ...pending, maxContracts: 200 });
+  const { loop: capLoop } = startFillLoop({
+    pendingQuotes: capPending,
+    sessionFilledByParlay: sessionCap,
+    onQuoteExecuted: (evt) => {
+      sessionCap[evt.parlayId] = (sessionCap[evt.parlayId] || 0) + evt.contracts;
+    },
+  });
+  capLoop.handleOrderExecution({
+    type: 2,
+    last_shares: '107.68',
+    order: { id: 'poly-order-1', quote_id: 'quote-jets' },
+    executionId: 'exec-cap',
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(sessionCap['p-jets'], 107.68);
+  const leftover = decideAtFill({
+    parlayStake: 50,
+    parlayAmerican: 858,
+    fillAmerican: 609,
+    rfqContracts: 70,
+    hedgeMode: '1x',
+    maxContracts: 200,
+    filledSoFar: sessionCap['p-jets'],
+    outstanding: 0,
+    allowPartial: true,
+  });
+  assert.ok(leftover.ok);
+  assert.ok(leftover.remaining < 200);
+  const over = decideAtFill({
+    parlayStake: 50,
+    parlayAmerican: 858,
+    fillAmerican: 609,
+    rfqContracts: 70,
+    hedgeMode: '1x',
+    maxContracts: 107.68,
+    filledSoFar: sessionCap['p-jets'],
+    outstanding: 0,
+    allowPartial: true,
+  });
+  assert.strictEqual(over.ok, false, 'filled toward max_contracts must stop further Poly quotes');
+  capLoop.stop();
+
+  const stamped = [];
+  const stampMap = new Map();
+  stampMap.set('quote-jets', { ...pending });
+  const { loop: stampLoop } = startFillLoop({
+    pendingQuotes: stampMap,
+    persistQuoteOrder: (quoteId, orderId) => { stamped.push({ quoteId, orderId }); },
+  });
+  stampLoop.handleQuoteExecuted({
+    quote: { id: 'quote-jets', rfqId: 'rfq-jets', creatorOrderId: 'poly-order-1' },
+  });
+  assert.deepStrictEqual(stamped, [{ quoteId: 'quote-jets', orderId: 'poly-order-1' }]);
+  assert.strictEqual(stampMap.get('quote-jets').executed, true);
+  assert.strictEqual(stampMap.get('quote-jets').creatorOrderId, 'poly-order-1');
+  stampLoop.stop();
+
   const polySrc = fs.readFileSync(path.join(__dirname, 'polymarket-rfq.js'), 'utf8');
   assert.ok(
     /function emitOrderFill/.test(polySrc) && /ctx\.onQuoteExecuted/.test(polySrc),
@@ -284,6 +486,23 @@ function startFillLoop(extra = {}) {
   assert.ok(
     /onQuoteExecuted:\s*\(evt\) =>\s*onQuoteExecuted\(\{/.test(liveSrc),
     'live-runner Combo Locks Poly loop must persist fills'
+  );
+  assert.ok(
+    /resolveFillLookup/.test(liveSrc) && /findPendingFill/.test(liveSrc),
+    'Poly fills with orderId but no quoteId must still attribute'
+  );
+  assert.ok(
+    /persistQuoteOrder/.test(liveSrc) && /stamp order_id failed/.test(liveSrc),
+    'quoteExecuted must stamp creatorOrderId onto combo_submissions for restart recovery'
+  );
+  assert.ok(
+    /submissionAlreadyFilled/.test(liveSrc),
+    'order_id stamped at quoteExecuted must not count as already filled'
+  );
+  const clientSrc = fs.readFileSync(path.join(__dirname, 'polymarket-client.js'), 'utf8');
+  assert.ok(
+    /order_subscription_update/.test(clientSrc) && /subscription_type:\s*1/.test(clientSrc),
+    'private WS must accept documented snake_case order updates and subscribe with numeric ORDER type'
   );
   const unhedgedSrc = fs.readFileSync(path.join(__dirname, 'unhedged-runner.js'), 'utf8');
   assert.ok(

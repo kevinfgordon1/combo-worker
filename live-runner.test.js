@@ -128,6 +128,19 @@ assert.ok(
   'quote_executed after restart must recover the quote from combo_submissions'
 );
 assert.ok(
+  /resolveFillLookup/.test(liveSrc) && /findPendingFill/.test(liveSrc)
+    && /eq\('order_id', orderId\)/.test(liveSrc),
+  'Poly ORDER FILL without quoteId must recover pending by creatorOrderId / order_id'
+);
+assert.ok(
+  /persistQuoteOrder/.test(liveSrc),
+  'quoteExecuted stamps order_id so a later FILL can recover after TTL/restart'
+);
+assert.ok(
+  /submissionAlreadyFilled/.test(liveSrc),
+  'alreadyFilled is status=filled only — order_id at quoteExecuted is not a fill'
+);
+assert.ok(
   /alreadyFilled/.test(liveSrc),
   'recovered quote_executed must not re-Telegram or re-count a row already stamped filled'
 );

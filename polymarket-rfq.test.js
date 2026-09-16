@@ -53,7 +53,11 @@ assert.ok(
 );
 assert.ok(
   /includeAccepted:\s*true/.test(polySrc),
-  'Poly TTL must release accepted-but-unfilled reserves'
+  'Poly TTL must release accepted-but-unconfirmed last-look reserves'
+);
+assert.ok(
+  /isExecutedPending/.test(polySrc),
+  'Poly TTL must keep confirmed/executed resting orders reserved until FILL'
 );
 assert.ok(polySrc.includes('persistLockTape'), 'SKIP/QUOTE path must go through persistLockTape');
 assert.ok(
@@ -2708,6 +2712,17 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     label: 'Yankees + White Sox + Dodgers',
     postedAt: reserveNow,
   });
+  reservePending.set('quote_executed_stale', {
+    parlayId: 'pm-parlay',
+    contracts: 40,
+    maxContracts: 623,
+    rfqId: 'rfq_executed_stale',
+    label: 'Yankees + White Sox + Dodgers',
+    postedAt: reserveNow - 25_000,
+    accepted: true,
+    executed: true,
+    creatorOrderId: 'poly-order-keep',
+  });
   const reserveLoop = startPolymarketRfqLoop({
     env: {
       POLYMARKET_KEY_ID: 'key-id-fixture',
@@ -2736,22 +2751,24 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     reconcileMs: 60 * 60 * 1000,
   });
   try {
-    assert.strictEqual(sumOutstanding(reservePending, 'pm-parlay'), 386);
+    assert.strictEqual(sumOutstanding(reservePending, 'pm-parlay'), 426);
     reserveLoop.handleRfqClosed({ rfq: { id: 'rfq_open_reserve' } });
     assert.ok(!reservePending.has('quote_open'));
-    assert.strictEqual(sumOutstanding(reservePending, 'pm-parlay'), 110);
+    assert.strictEqual(sumOutstanding(reservePending, 'pm-parlay'), 150);
 
     reserveLoop.onWsEvent({
       type: 'quoteDeleted',
       quote: { id: 'quote_other', rfqId: 'rfq_still_open' },
     });
     assert.ok(!reservePending.has('quote_other'));
-    assert.strictEqual(sumOutstanding(reservePending, 'pm-parlay'), 55);
+    assert.strictEqual(sumOutstanding(reservePending, 'pm-parlay'), 95);
 
     await reserveLoop.cancelUnaccepted();
     assert.ok(!reservePending.has('quote_accepted_stale'));
+    assert.ok(reservePending.has('quote_executed_stale'), 'executed order stays reserved past TTL');
     assert.ok(reserveDeletes.some((d) => d.quoteId === 'quote_accepted_stale'));
-    assert.strictEqual(sumOutstanding(reservePending, 'pm-parlay'), 0);
+    assert.ok(!reserveDeletes.some((d) => d.quoteId === 'quote_executed_stale'));
+    assert.strictEqual(sumOutstanding(reservePending, 'pm-parlay'), 40);
   } finally {
     reserveLoop.stop();
   }
