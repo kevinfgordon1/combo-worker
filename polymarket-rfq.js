@@ -23,7 +23,9 @@
 // ctx.onQuoteExecuted (same combo_fills + combo_submissions path as Kalshi).
 // Retail private WS sends snake_case order_subscription_update and protobuf
 // ints (1=PARTIAL_FILL, 2=FILL) — parse both those and EXECUTION_TYPE_* strings.
-// Confirmed / executed quotes keep remaining reserved until FILL / CANCEL.
+// A missed WS fill is recovered by periodic GetQuotes(EXECUTED, SELF) +
+// GET /v1/order (cumQuantity). Confirmed / executed quotes keep remaining
+// reserved until FILL / CANCEL.
 // START GATE: never quote or confirm once any lock leg has started (first pitch
 // / kickoff <= now). Resting quotes for that lock are DELETE'd the same way
 // Kalshi cancelStartedQuotes works. Date-only Polymarket slugs are not starts —
@@ -79,9 +81,15 @@ const {
 } = require('./poly-miss-tape');
 const { shortId } = require('./short-id');
 const { formatAlertStatus } = require('./venue-alert');
+const {
+  resolveQuoteFill,
+  reconcilePolymarketLockFills,
+  reconcileLockActivityEvents,
+} = require('./polymarket-fill-reconcile');
 
 const MODE = 'POLY';
 const RECONCILE_MS = 3000;
+const FILL_RECONCILE_MS = 20000;
 const SEEN_RFQS_MAX = 256;
 
 const LEAGUE_SLUG_TOKENS = {
@@ -1505,6 +1513,9 @@ function startPolymarketRfqLoop(ctx = {}) {
     if (pending) {
       pending.accepted = true;
       if (acc.creatorOrderId) pending.creatorOrderId = acc.creatorOrderId;
+      if (quoteId && pending.creatorOrderId && typeof ctx.persistQuoteOrder === 'function') {
+        try { ctx.persistQuoteOrder(quoteId, pending.creatorOrderId); } catch (_) {}
+      }
     }
     const parlay = parlayOfPending(pending);
     const started = parlay ? startedFor(parlay) : { started: false };
@@ -1640,6 +1651,101 @@ function startPolymarketRfqLoop(ctx = {}) {
       `quote_id=${quoteId || '?'} rfq=${q.rfqId || (pending && pending.rfqId) || '?'} ` +
       `creatorOrderId=${q.creatorOrderId || q.creator_order_id || '?'}`
     );
+    confirmQuoteFill(q, pending, quoteId).catch((e) => {
+      console.error(`[${MODE}] quoteExecuted fill-check`, e && e.message);
+    });
+  }
+
+  const seenReconciledQuotes = new Set();
+
+  async function confirmQuoteFill(quote, pending, pendingId) {
+    if (!http) return null;
+    const already = pending && pending.filledContracts ? pending.filledContracts : 0;
+    let fromDb = 0;
+    if (typeof ctx.getFilledForQuote === 'function' && (pendingId || (quote && (quote.id || quote.quoteId)))) {
+      try {
+        fromDb = Number(await ctx.getFilledForQuote(pendingId || quote.id || quote.quoteId)) || 0;
+      } catch (_) { fromDb = 0; }
+    }
+    const evt = await resolveQuoteFill(http, {
+      quote,
+      pending,
+      pendingId,
+      alreadyFilled: Math.max(already, fromDb),
+    });
+    if (!evt || !(evt.contracts > 0)) return null;
+    if (pending && evt.contracts > 0) {
+      pending.filledContracts = (pending.filledContracts || 0) + evt.contracts;
+    }
+    emitOrderFill(evt);
+    console.log(
+      `[${MODE}] ORDER FILL ${(pending && pending.label) || '(reconcile)'} ` +
+      `order_id=${evt.orderId || '?'} quote_id=${evt.quoteId || pendingId || '?'} ` +
+      `contracts=${evt.contracts}` +
+      (evt.isPartial ? ' PARTIAL' : '') +
+      ' RECONCILE'
+    );
+    return evt;
+  }
+
+  async function reconcileLockFills() {
+    if (!http || !enableLocks) return [];
+    let submissions = [];
+    if (typeof ctx.loadUnfilledPolyQuotes === 'function') {
+      try { submissions = (await ctx.loadUnfilledPolyQuotes()) || []; } catch (e) {
+        console.error(`[${MODE}] fill reconcile load quotes`, e && e.message);
+      }
+    }
+    const events = await reconcilePolymarketLockFills(http, {
+      pendingQuotes,
+      submissions,
+      getFilledForQuote: ctx.getFilledForQuote,
+      seenQuoteIds: seenReconciledQuotes,
+      maxPerTick: ctx.fillReconcileMax != null ? ctx.fillReconcileMax : 15,
+    });
+    for (const evt of events) {
+      const pending = evt.pending || (evt.quoteId ? pendingQuotes.get(evt.quoteId) : null);
+      if (pending && evt.contracts > 0) {
+        pending.filledContracts = (pending.filledContracts || 0) + evt.contracts;
+      }
+      emitOrderFill(evt);
+      if (evt.quoteId && !evt.isPartial) seenReconciledQuotes.add(evt.quoteId);
+      console.log(
+        `[${MODE}] ORDER FILL ${(evt.label || (pending && pending.label) || '(reconcile)')} ` +
+        `order_id=${evt.orderId || '?'} quote_id=${evt.quoteId || '?'} ` +
+        `contracts=${evt.contracts}` +
+        (evt.isPartial ? ' PARTIAL' : '') +
+        ' RECONCILE'
+      );
+    }
+
+    let extra = [];
+    if (typeof ctx.loadRecentLocks === 'function') {
+      let locks = [];
+      try { locks = (await ctx.loadRecentLocks()) || []; } catch (_) { locks = []; }
+      if (locks.length) {
+        try {
+          extra = await reconcileLockActivityEvents(http, {
+            locks,
+            seenFillIds: ctx.seenFillIds,
+          });
+        } catch (e) {
+          console.error(`[${MODE}] fill reconcile activities`, e && e.message);
+        }
+      }
+      for (const evt of extra) {
+        emitOrderFill(evt);
+        console.log(
+          `[${MODE}] ORDER FILL ${evt.label || '(lock-match)'} ` +
+          `order_id=${evt.orderId || '?'} quote_id=${evt.quoteId || '?'} ` +
+          `contracts=${evt.contracts} ${String(evt.source || 'RECONCILE').toUpperCase()}`
+        );
+      }
+    }
+    if (events.length || extra.length) {
+      console.log(`[${MODE}] fill reconcile booked=${events.length + extra.length}`);
+    }
+    return events.concat(extra);
   }
 
   function emitOrderFill(evt) {
@@ -1844,6 +1950,13 @@ function startPolymarketRfqLoop(ctx = {}) {
   const reconcileTimer = setInterval(() => {
     reconcileOpenRfqs().catch((e) => console.error(`[${MODE}] reconcile`, e.message));
   }, ctx.reconcileMs != null ? ctx.reconcileMs : RECONCILE_MS);
+  const fillReconcileMs = ctx.fillReconcileMs != null ? ctx.fillReconcileMs : FILL_RECONCILE_MS;
+  if (ctx.initialFillReconcile) {
+    reconcileLockFills().catch((e) => console.error(`[${MODE}] initial fill reconcile`, e.message));
+  }
+  const fillReconcileTimer = setInterval(() => {
+    reconcileLockFills().catch((e) => console.error(`[${MODE}] fill reconcile`, e.message));
+  }, fillReconcileMs);
   const ttlTimer = setInterval(() => {
     cancelUnaccepted().catch((e) => console.error(`[${MODE}] ttl`, e.message));
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start`, e.message));
@@ -1856,6 +1969,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     if (fillTimer.unref) fillTimer.unref();
   }
   if (reconcileTimer.unref) reconcileTimer.unref();
+  if (fillReconcileTimer.unref) fillReconcileTimer.unref();
   if (ttlTimer.unref) ttlTimer.unref();
 
   return {
@@ -1863,6 +1977,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       stopped = true;
       clearInterval(reconcileTimer);
       clearInterval(ttlTimer);
+      clearInterval(fillReconcileTimer);
       if (fillTimer) clearInterval(fillTimer);
       try { ws && ws.stop && ws.stop(); } catch (_) {}
       try { http.close && http.close(); } catch (_) {}
@@ -1872,6 +1987,8 @@ function startPolymarketRfqLoop(ctx = {}) {
     handleRfqClosed,
     handleQuoteExecuted,
     handleOrderExecution,
+    confirmQuoteFill,
+    reconcileLockFills,
     onWsEvent,
     cancelStartedQuotes,
     cancelPendingIfStarted,
@@ -1929,6 +2046,7 @@ module.exports = {
   findPendingForOrderExecution,
   orderFillEvent,
   startPolymarketRfqLoop,
+  FILL_RECONCILE_MS,
   NEAR_MISS_CODES,
   fetchPolymarketUnhedgedRfq,
   fetchPolymarketUnhedgedTrades,
