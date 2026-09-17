@@ -141,14 +141,18 @@ function createPolyMissTape({
         : evaluation && evaluation.decision && evaluation.decision.contracts != null
           ? evaluation.decision.contracts
           : evaluation && evaluation.quote && evaluation.quote.estimatedContracts;
+    const marketTicker = extra.market_ticker || extra.marketTicker
+      || rfq.symbol || rfq.marketTicker || rfq.market_ticker || null;
     const persistExtra = {
       ...skipPersistExtra({
         skipReason: decision.skipReason,
         contracts,
         remaining: evaluation && evaluation.decision ? evaluation.decision.remaining : null,
+        marketTicker,
       }),
       ...extra,
     };
+    if (marketTicker && persistExtra.market_ticker == null) persistExtra.market_ticker = marketTicker;
     delete persistExtra.locks;
     delete persistExtra.rfqId;
 

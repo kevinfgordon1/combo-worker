@@ -10,6 +10,11 @@ const {
   fillEventFromReconcile,
   lockLabelMatchesMarket,
   uniqueLockForMarket,
+  normalizeMarketSlug,
+  isComboActivitySlug,
+  slugMapFromRecords,
+  slugMapFromQuotes,
+  buildActivitySlugMap,
   tradeFromActivity,
   matchActivitiesToLocks,
   matchPositionsToLocks,
@@ -129,6 +134,98 @@ const LOCK = {
   assert.ok(!lockLabelMatchesMarket(LOCK.label, 'Yankees only', 'nyy'));
   assert.strictEqual(uniqueLockForMarket([LOCK, { id: 'other', label: 'Bills ML + Chiefs ML' }], LOCK.label, ''), LOCK);
   assert.strictEqual(uniqueLockForMarket([LOCK, { ...LOCK, id: 'dup' }], LOCK.label, ''), null);
+  assert.strictEqual(normalizeMarketSlug('  '), null);
+  assert.strictEqual(normalizeMarketSlug('caoc-1d16e8345207a66c'), 'caoc-1d16e8345207a66c');
+  assert.ok(isComboActivitySlug('caoc-1d16e8345207a66c'));
+  assert.ok(!isComboActivitySlug('aec-mlb-cle-cws-2026-09-16'));
+}
+
+const CAOC_SLUG = 'caoc-1d16e8345207a66c';
+const CLE_CASHOUTS = [
+  { id: 'CHFYRFW40VAY', cost: '285.25' },
+  { id: 'CHFXQ9XHEVAY', cost: '47.58' },
+  { id: 'CHG1HTPY6VAY', cost: '4.75' },
+];
+
+function emptyTitleCaocTrade(id, cost, { aggressor = true } = {}) {
+  return {
+    type: 'ACTIVITY_TYPE_TRADE',
+    trade: {
+      id,
+      marketSlug: CAOC_SLUG,
+      cost: { value: String(cost), currency: 'USD' },
+      isAggressor: aggressor,
+      state: 'TRADE_STATE_CLEARED',
+      marketMetadata: { title: '', slug: CAOC_SLUG },
+    },
+  };
+}
+
+{
+  const emptyHay = matchActivitiesToLocks(
+    [emptyTitleCaocTrade('CHFYRFW40VAY', '285.25')],
+    [LOCK]
+  );
+  assert.strictEqual(emptyHay.length, 0, 'opaque caoc slug + empty title cannot use team tokens');
+
+  const viaFillTicker = slugMapFromRecords([
+    { ticker: CAOC_SLUG, parlay_id: LOCK.id, raw: { venue: 'polymarket' } },
+  ]);
+  assert.strictEqual(viaFillTicker.get(CAOC_SLUG), LOCK.id);
+
+  const viaQuote = slugMapFromQuotes(
+    [{ id: 'RV__Df859d3kQKJex6AkWCuzw1ZudaOra7T6Fp4cCf8', symbol: CAOC_SLUG }],
+    [{ quote_id: 'RV__Df859d3kQKJex6AkWCuzw1ZudaOra7T6Fp4cCf8', parlay_id: LOCK.id }]
+  );
+  assert.strictEqual(viaQuote.get(CAOC_SLUG), LOCK.id);
+
+  const mapped = matchActivitiesToLocks(
+    [emptyTitleCaocTrade('CHFYRFW40VAY', '285.25')],
+    [LOCK],
+    { slugMap: viaFillTicker }
+  );
+  assert.strictEqual(mapped.length, 1, 'empty-title caoc activity matches via slug map');
+  assert.strictEqual(mapped[0].parlayId, LOCK.id);
+  assert.strictEqual(mapped[0].fillId, 'poly-act:CHFYRFW40VAY');
+  assert.strictEqual(mapped[0].contracts, 285.25, 'CLE $285.25 cashout sizes from activity cost');
+  assert.strictEqual(mapped[0].marketTicker, CAOC_SLUG);
+
+  const lots = CLE_CASHOUTS.map((row) => emptyTitleCaocTrade(row.id, row.cost));
+  const three = matchActivitiesToLocks(lots, [LOCK], { slugMap: viaQuote });
+  assert.strictEqual(three.length, 3, 'multiple cashouts on the same caoc lock all book');
+  assert.deepStrictEqual(three.map((e) => e.fillId).sort(), [
+    'poly-act:CHFYRFW40VAY',
+    'poly-act:CHFXQ9XHEVAY',
+    'poly-act:CHG1HTPY6VAY',
+  ].sort());
+  assert.deepStrictEqual(three.map((e) => e.contracts).sort((a, b) => b - a), [285.25, 47.58, 4.75]);
+
+  const seen = new Set(['poly-act:CHFYRFW40VAY']);
+  const rest = matchActivitiesToLocks(lots, [LOCK], { slugMap: viaFillTicker, seenFillIds: seen });
+  assert.strictEqual(rest.length, 2, 'already-booked CLE $285 row is skipped');
+  assert.ok(rest.every((e) => e.fillId !== 'poly-act:CHFYRFW40VAY'));
+  const replay = matchActivitiesToLocks(lots, [LOCK], { slugMap: viaFillTicker, seenFillIds: seen });
+  assert.strictEqual(replay.length, 2, 'idempotent replay does not claim remaining keys early');
+  seen.add('poly-act:CHFXQ9XHEVAY');
+  seen.add('poly-act:CHG1HTPY6VAY');
+  assert.strictEqual(
+    matchActivitiesToLocks(lots, [LOCK], { slugMap: viaFillTicker, seenFillIds: seen }).length,
+    0,
+    'full replay of CLE cashouts is a no-op'
+  );
+
+  const ambiguous = buildActivitySlugMap({
+    slugRecords: [
+      { market_ticker: CAOC_SLUG, parlay_id: LOCK.id },
+      { market_ticker: CAOC_SLUG, parlay_id: 'other-lock' },
+    ],
+  });
+  assert.strictEqual(ambiguous.get(CAOC_SLUG), false);
+  assert.strictEqual(
+    matchActivitiesToLocks(lots, [LOCK, { id: 'other-lock', label: LOCK.label }], { slugMap: ambiguous }).length,
+    0,
+    'do not guess when two locks share a caoc slug'
+  );
 }
 
 function comboTrade(id, qty, { aggressor = false, payout } = {}) {
@@ -363,6 +460,36 @@ function comboTrade(id, qty, { aggressor = false, payout } = {}) {
   const posOnly = await reconcileLockActivityEvents(uncoveredHttp, { locks: [LOCK] });
   assert.strictEqual(posOnly.length, 1, 'positions are a fallback only when the lock has no activity hits');
   assert.strictEqual(posOnly[0].source, 'poly-position');
+
+  const caocHttp = {
+    async listQuotes(query) {
+      if (query && query.userFilter === 'USER_FILTER_SELF' && query.status === 'QUOTE_STATUS_EXECUTED') {
+        return {
+          quotes: [{
+            id: 'RV__Df859d3kQKJex6AkWCuzw1ZudaOra7T6Fp4cCf8',
+            symbol: CAOC_SLUG,
+            status: 'QUOTE_STATUS_EXECUTED',
+          }],
+        };
+      }
+      return { quotes: [] };
+    },
+    async listActivities() {
+      return {
+        activities: CLE_CASHOUTS.map((row) => emptyTitleCaocTrade(row.id, row.cost)),
+      };
+    },
+    async listPositions() { return { positions: [] }; },
+  };
+  const viaStoredQuotes = await reconcileLockActivityEvents(caocHttp, {
+    locks: [LOCK],
+    submissions: [{
+      quote_id: 'RV__Df859d3kQKJex6AkWCuzw1ZudaOra7T6Fp4cCf8',
+      parlay_id: LOCK.id,
+    }],
+  });
+  assert.strictEqual(viaStoredQuotes.length, 3, 'reconcile joins executed quote symbol to activity caoc slug');
+  assert.ok(viaStoredQuotes.some((e) => e.fillId === 'poly-act:CHFYRFW40VAY' && e.contracts === 285.25));
 
   console.log('polymarket-fill-reconcile.test.js ok');
 })().catch((e) => {

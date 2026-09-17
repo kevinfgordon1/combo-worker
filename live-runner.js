@@ -1117,6 +1117,7 @@ async function persistExecutedFill(pending, evt) {
 
   try {
     const patch = { status: 'filled', order_id: orderId, is_live: true };
+    if (ticker) patch.market_ticker = ticker;
     const { data: updated, error } = await supabase
       .from('combo_submissions')
       .update(patch)
@@ -1131,11 +1132,12 @@ async function persistExecutedFill(pending, evt) {
         label: pending.label,
         contracts,
         status: 'filled',
-        quote_id: quoteId,
-        order_id: orderId,
-        is_live: true,
-        venue,
-      });
+          quote_id: quoteId,
+          order_id: orderId,
+          is_live: true,
+          venue,
+          market_ticker: ticker,
+        });
       if (insErr) console.error(`[${MODE}] insert filled failed`, insErr.message);
     }
   } catch (e) {
@@ -1177,7 +1179,7 @@ async function loadUnfilledPolyQuotes() {
   try {
     const { data, error } = await supabase
       .from('combo_submissions')
-      .select('id,quote_id,order_id,rfq_id,parlay_id,label,contracts,user_id,status,created_at')
+      .select('id,quote_id,order_id,rfq_id,parlay_id,label,contracts,user_id,status,created_at,market_ticker')
       .eq('venue', 'polymarket')
       .not('quote_id', 'is', null)
       .neq('status', 'filled')
@@ -1226,19 +1228,84 @@ async function getFilledForQuote(quoteId) {
 async function loadRecentLocks() {
   const cutoff = new Date(Date.now() - POLY_FILL_LOOKBACK_MS).toISOString();
   try {
-    const { data, error } = await supabase
-      .from('combo_parlays')
-      .select('id,label,user_id,max_contracts,active,created_at,archived_at')
-      .gte('created_at', cutoff)
-      .limit(200);
-    if (error) {
-      console.error(`[${MODE}] load recent locks`, error.message);
+    const [locksQ, quotedQ] = await Promise.all([
+      supabase
+        .from('combo_parlays')
+        .select('id,label,user_id,max_contracts,active,created_at,archived_at')
+        .gte('created_at', cutoff)
+        .limit(200),
+      supabase
+        .from('combo_submissions')
+        .select('parlay_id')
+        .eq('venue', 'polymarket')
+        .not('quote_id', 'is', null)
+        .gte('created_at', cutoff)
+        .limit(2000),
+    ]);
+    if (locksQ.error) {
+      console.error(`[${MODE}] load recent locks`, locksQ.error.message);
       return parlays.slice();
     }
-    return data || parlays.slice();
+    const recent = locksQ.data || [];
+    const have = new Set(recent.map((p) => p && p.id).filter(Boolean));
+    const missing = [];
+    for (const row of quotedQ.data || []) {
+      if (row && row.parlay_id && !have.has(row.parlay_id)) {
+        have.add(row.parlay_id);
+        missing.push(row.parlay_id);
+      }
+    }
+    if (!missing.length) return recent.length ? recent : parlays.slice();
+    const extraQ = await supabase
+      .from('combo_parlays')
+      .select('id,label,user_id,max_contracts,active,created_at,archived_at')
+      .in('id', missing);
+    if (extraQ.error) {
+      console.error(`[${MODE}] load quoted locks`, extraQ.error.message);
+      return recent.length ? recent : parlays.slice();
+    }
+    return recent.concat(extraQ.data || []);
   } catch (e) {
     console.error(`[${MODE}] load recent locks`, e && e.message);
     return parlays.slice();
+  }
+}
+
+async function loadPolySlugRecords() {
+  const cutoff = new Date(Date.now() - POLY_FILL_LOOKBACK_MS).toISOString();
+  try {
+    const [fillsQ, subsQ] = await Promise.all([
+      supabase
+        .from('combo_fills')
+        .select('ticker,parlay_id,raw')
+        .eq('is_combo', true)
+        .gte('recorded_at', cutoff)
+        .limit(1000),
+      supabase
+        .from('combo_submissions')
+        .select('quote_id,parlay_id,market_ticker')
+        .eq('venue', 'polymarket')
+        .not('quote_id', 'is', null)
+        .gte('created_at', cutoff)
+        .limit(2000),
+    ]);
+    if (fillsQ.error) console.error(`[${MODE}] load poly fill slugs`, fillsQ.error.message);
+    if (subsQ.error) console.error(`[${MODE}] load poly quote slugs`, subsQ.error.message);
+    const rows = [];
+    for (const row of fillsQ.data || []) {
+      if (!row || !row.parlay_id) continue;
+      const venue = row.raw && row.raw.venue;
+      if (venue === 'polymarket' || (row.ticker && /^caoc-/i.test(row.ticker))) {
+        rows.push({ ticker: row.ticker, market_ticker: row.ticker, parlay_id: row.parlay_id });
+      }
+    }
+    for (const row of subsQ.data || []) {
+      if (row && row.parlay_id) rows.push(row);
+    }
+    return rows;
+  } catch (e) {
+    console.error(`[${MODE}] load poly slug records`, e && e.message);
+    return [];
   }
 }
 
@@ -1755,6 +1822,7 @@ async function main() {
     loadUnfilledPolyQuotes,
     getFilledForQuote,
     loadRecentLocks,
+    loadPolySlugRecords,
     seenFillIds,
     initialFillReconcile: true,
     sendAlert,
