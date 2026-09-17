@@ -149,6 +149,32 @@ assert.strictEqual(queryString({}), '');
 
   assert.strictEqual(parsePrivateMessage({ ping: true }).type, 'other');
 
+  const bareExec = parsePrivateMessage({
+    type: 2,
+    last_shares: '12',
+    order: { id: 'order-bare', quote_id: 'quote-bare' },
+  });
+  assert.strictEqual(bareExec.type, 'orderExecution');
+  assert.strictEqual(bareExec.execution.order.quote_id, 'quote-bare');
+
+  const orderCalls = [];
+  const orderHttp = createPolymarketHttp({
+    keyId: 'key-id-fixture',
+    secretKey: SEED_B64,
+    requestFn: async (req) => {
+      orderCalls.push(req);
+      if (req.path.endsWith('/missing')) return { statusCode: 404, json: null, text: '' };
+      return { statusCode: 200, json: { order: { id: 'o1', cumQuantity: 10, state: 'ORDER_STATE_FILLED' } } };
+    },
+  });
+  const missing = await orderHttp.getOrder('missing');
+  assert.strictEqual(missing, null);
+  const got = await orderHttp.getOrder('o1');
+  assert.strictEqual(got.id, 'o1');
+  assert.strictEqual(got.cumQuantity, 10);
+  assert.ok(orderCalls.some((c) => c.path === '/v1/order/o1'));
+  orderHttp.close();
+
   console.log('polymarket-client.test.js ok');
 })().catch((e) => {
   console.error(e);

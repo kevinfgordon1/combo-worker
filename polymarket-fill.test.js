@@ -2,7 +2,7 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
-const { liveRunnerFillRow, resolveFillLookup, findPendingFill, submissionAlreadyFilled } = require('./fills-attr');
+const { liveRunnerFillRow, resolveFillLookup, findPendingFill, submissionAlreadyFilled, claimFillKey } = require('./fills-attr');
 const { parsePrivateMessage } = require('./polymarket-client');
 const { decideAtFill } = require('./engine');
 const {
@@ -180,6 +180,9 @@ function emptyHttp() {
     async createQuote() { throw new Error('must not POST'); },
     async confirmQuote() { throw new Error('must not confirm'); },
     async deleteQuote() { return { statusCode: 200 }; },
+    async getOrder() { return null; },
+    async listPositions() { return { positions: {} }; },
+    async listActivities() { return { activities: [] }; },
     close() {},
   };
 }
@@ -205,6 +208,8 @@ function startFillLoop(extra = {}) {
     getOutstanding: () => 0,
     pendingQuotes,
     reconcileMs: 60 * 60 * 1000,
+    fillReconcileMs: 60 * 60 * 1000,
+    skipInitialFillReconcile: true,
     ...extra,
   });
   return { loop, pendingQuotes };
@@ -476,6 +481,104 @@ function startFillLoop(extra = {}) {
   assert.strictEqual(stampMap.get('quote-jets').creatorOrderId, 'poly-order-1');
   stampLoop.stop();
 
+  const evicted = [];
+  const evictMap = new Map();
+  evictMap.set('quote-jets', {
+    ...pending,
+    postedAt: Date.now() - 25_000,
+    accepted: false,
+    executed: false,
+    confirmed: false,
+    creatorOrderId: null,
+  });
+  const { loop: evictLoop } = startFillLoop({
+    pendingQuotes: evictMap,
+    onQuoteExecuted: (evt) => { evicted.push(evt); },
+  });
+  await evictLoop.cancelUnaccepted();
+  assert.ok(!evictMap.has('quote-jets'), 'unaccepted quote is evicted from pending');
+  evictLoop.handleOrderExecution({
+    type: 'EXECUTION_TYPE_FILL',
+    lastShares: '107.68',
+    order: { id: 'poly-order-late', quoteId: 'quote-jets' },
+    executionId: 'exec-after-ttl',
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(evicted.length, 1, 'FILL after pending eviction still persists via quoteId');
+  assert.strictEqual(evicted[0].quoteId, 'quote-jets');
+  assert.strictEqual(evicted[0].contracts, 107.68);
+  evictLoop.stop();
+
+  const seenKeys = new Set();
+  const idempotent = [];
+  const { loop: dupeLoop } = startFillLoop({
+    onQuoteExecuted: (evt) => {
+      const key = evt.fillId || evt.orderId || evt.quoteId;
+      if (!claimFillKey(seenKeys, key)) return;
+      idempotent.push(evt);
+    },
+  });
+  const dupeEx = {
+    type: 'EXECUTION_TYPE_FILL',
+    lastShares: '107.68',
+    order: { id: 'poly-order-1', quoteId: 'quote-jets' },
+    executionId: 'exec-dupe',
+  };
+  dupeLoop.handleOrderExecution(dupeEx);
+  dupeLoop.handleOrderExecution(dupeEx);
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(idempotent.length, 1, 'duplicate execution is idempotent at persist');
+  dupeLoop.stop();
+
+  const reconFills = [];
+  const reconHttp = {
+    ...emptyHttp(),
+    async listQuotes(query) {
+      if (query && query.status === 'QUOTE_STATUS_EXECUTED') {
+        return {
+          quotes: [{
+            id: 'quote-missed',
+            rfqId: 'rfq-missed',
+            status: 'QUOTE_STATUS_EXECUTED',
+            creatorOrderId: 'poly-order-missed',
+            buyQtyDecimal: '48.55',
+          }],
+        };
+      }
+      return { quotes: [] };
+    },
+    async getOrder(id) {
+      return { id, cumQuantity: 48.55, state: 'ORDER_STATE_FILLED' };
+    },
+  };
+  const { loop: reconLoop } = startFillLoop({
+    skipSeed: true,
+    pendingQuotes: new Map(),
+    http: reconHttp,
+    loadUnfilledPolyQuotes: async () => [{
+      quote_id: 'quote-missed',
+      rfq_id: 'rfq-missed',
+      parlay_id: pending.parlayId,
+      label: pending.label,
+      contracts: 48.55,
+      user_id: pending.userId,
+      status: 'unfilled',
+    }],
+    onQuoteExecuted: (evt) => { reconFills.push(evt); },
+  });
+  const recon = await reconLoop.reconcileLockFills();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(recon.length, 1, 'reconcile recovers a fill the live path missed');
+  assert.strictEqual(reconFills.length, 1);
+  assert.strictEqual(reconFills[0].quoteId, 'quote-missed');
+  assert.strictEqual(reconFills[0].contracts, 48.55);
+  assert.strictEqual(reconFills[0].source, 'poly-reconcile');
+  const reconAgain = await reconLoop.reconcileLockFills();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(reconAgain.length, 0, 'second reconcile of the same full fill is a no-op');
+  assert.strictEqual(reconFills.length, 1);
+  reconLoop.stop();
+
   const polySrc = fs.readFileSync(path.join(__dirname, 'polymarket-rfq.js'), 'utf8');
   assert.ok(
     /function emitOrderFill/.test(polySrc) && /ctx\.onQuoteExecuted/.test(polySrc),
@@ -497,6 +600,14 @@ function startFillLoop(extra = {}) {
   assert.ok(
     /persistQuoteOrder/.test(liveSrc) && /stamp order_id failed/.test(liveSrc),
     'quoteExecuted must stamp creatorOrderId onto combo_submissions for restart recovery'
+  );
+  assert.ok(
+    /loadUnfilledPolyQuotes/.test(liveSrc) && /getFilledForQuote/.test(liveSrc),
+    'live-runner must feed Poly fill reconcile from combo_submissions / combo_fills'
+  );
+  assert.ok(
+    /function reconcileLockFills/.test(polySrc) && /RECONCILE/.test(polySrc),
+    'Poly loop must periodically reconcile EXECUTED quotes against GET /v1/order'
   );
   assert.ok(
     /submissionAlreadyFilled/.test(liveSrc),

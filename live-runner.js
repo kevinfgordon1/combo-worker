@@ -9,7 +9,9 @@
 //   or order_id (quoteExecuted stamps creatorOrderId before the fill).
 //   Poly quoteExecuted is orders-submitted, not a fill — do not persist there.
 //   Retail WS fills arrive as snake_case order_subscription_update with
-//   protobuf type 1/2; string EXECUTION_TYPE_* still works.
+//   protobuf type 1/2; string EXECUTION_TYPE_* still works. A missed WS
+//   event is recovered by GetQuotes(EXECUTED)+GET /v1/order (and, if
+//   still dark, portfolio activities/positions matched to a unique lock).
 // RESERVE: outstanding live quotes (pendingQuotes + in-flight POST) count against
 //   remaining so parallel RFQs cannot all clear the same ceiling.
 //   remaining = max - filled - outstanding.
@@ -124,7 +126,7 @@ const {
   applyRefreshKillByUser,
   applyRefreshFilledByParlay,
 } = require('./refresh-state');
-const { liveRunnerFillRow, resolveFillLookup, findPendingFill, submissionAlreadyFilled } = require('./fills-attr');
+const { liveRunnerFillRow, resolveFillLookup, findPendingFill, submissionAlreadyFilled, claimFillKey } = require('./fills-attr');
 const {
   fingerprintRfq,
   cooldownFingerprint,
@@ -1104,6 +1106,7 @@ async function persistExecutedFill(pending, evt) {
         rfqId: pending.rfqId || evt.rfqId,
         label: pending.label,
         venue,
+        source: evt.source || 'live-runner',
       }),
       { onConflict: 'fill_id' },
     );
@@ -1167,6 +1170,78 @@ async function pendingFromSubmission({ quoteId, orderId } = {}) {
   }
 }
 
+const POLY_FILL_LOOKBACK_MS = 72 * 3600 * 1000;
+
+async function loadUnfilledPolyQuotes() {
+  const cutoff = new Date(Date.now() - POLY_FILL_LOOKBACK_MS).toISOString();
+  try {
+    const { data, error } = await supabase
+      .from('combo_submissions')
+      .select('id,quote_id,order_id,rfq_id,parlay_id,label,contracts,user_id,status,created_at')
+      .eq('venue', 'polymarket')
+      .not('quote_id', 'is', null)
+      .neq('status', 'filled')
+      .neq('status', 'shadow')
+      .gte('created_at', cutoff)
+      .limit(300);
+    if (error) {
+      console.error(`[${MODE}] load unfilled poly quotes`, error.message);
+      return [];
+    }
+    return data || [];
+  } catch (e) {
+    console.error(`[${MODE}] load unfilled poly quotes`, e && e.message);
+    return [];
+  }
+}
+
+async function getFilledForQuote(quoteId) {
+  if (!quoteId) return 0;
+  try {
+    const cutoff = new Date(Date.now() - POLY_FILL_LOOKBACK_MS).toISOString();
+    const { data, error } = await supabase
+      .from('combo_fills')
+      .select('count,raw,fill_id')
+      .eq('is_combo', true)
+      .gte('recorded_at', cutoff)
+      .limit(500);
+    if (error) {
+      console.error(`[${MODE}] filled-for-quote`, error.message);
+      return 0;
+    }
+    let sum = 0;
+    for (const row of data || []) {
+      const raw = row && row.raw;
+      if (!raw || raw.quote_id !== quoteId) continue;
+      const n = Number(row.count);
+      if (Number.isFinite(n)) sum += n;
+    }
+    return sum;
+  } catch (e) {
+    console.error(`[${MODE}] filled-for-quote`, e && e.message);
+    return 0;
+  }
+}
+
+async function loadRecentLocks() {
+  const cutoff = new Date(Date.now() - POLY_FILL_LOOKBACK_MS).toISOString();
+  try {
+    const { data, error } = await supabase
+      .from('combo_parlays')
+      .select('id,label,user_id,max_contracts,active,created_at,archived_at')
+      .gte('created_at', cutoff)
+      .limit(200);
+    if (error) {
+      console.error(`[${MODE}] load recent locks`, error.message);
+      return parlays.slice();
+    }
+    return data || parlays.slice();
+  } catch (e) {
+    console.error(`[${MODE}] load recent locks`, e && e.message);
+    return parlays.slice();
+  }
+}
+
 function persistQuoteOrder(quoteId, orderId) {
   if (!quoteId || !orderId || isReserveKey(quoteId)) return;
   supabase.from('combo_submissions').update({ order_id: orderId, is_live: true })
@@ -1184,11 +1259,10 @@ async function onQuoteExecuted(evt) {
   const orderId = looked.orderId;
   if (!quoteId && !orderId) return;
   const fillKey = fillKeyOf(evt);
-  if (fillKey && seenFillIds.has(fillKey)) {
+  if (!claimFillKey(seenFillIds, fillKey)) {
     console.log(`[${MODE}] quote_executed duplicate fill_id=${fillKey}`);
     return;
   }
-  if (fillKey) seenFillIds.add(fillKey);
 
   let pending = evt.pending || null;
   let fromMemory = !!pending;
@@ -1208,6 +1282,9 @@ async function onQuoteExecuted(evt) {
     }
     quoteId = quoteId || pending.quoteId;
     console.log(`[${MODE}] quote_executed recovered quote_id=${quoteId} from combo_submissions`);
+  }
+  if (!quoteId && pending && pending.parlayId) {
+    quoteId = evt.fillId || orderId || `poly-orphan:${pending.parlayId}`;
   }
   if (!quoteId) {
     console.log(`[${MODE}] quote_executed missing quote_id order_id=${orderId || '?'}`);
@@ -1675,6 +1752,10 @@ async function main() {
     persistQuoteSkip: (quoteId, skipReason, fallback) =>
       persistQuoteSkip(quoteId, skipReason, fallback),
     persistQuoteOrder,
+    loadUnfilledPolyQuotes,
+    getFilledForQuote,
+    loadRecentLocks,
+    initialFillReconcile: true,
     sendAlert,
     counts,
     sessionFilledByParlay,

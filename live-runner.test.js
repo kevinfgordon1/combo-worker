@@ -90,8 +90,14 @@ assert.ok(
   'Kalshi decideAtFill must keep full-RFQ decline (no allowPartial)'
 );
 assert.ok(
-  /seenFillIds/.test(liveSrc) && /duplicate fill_id/.test(liveSrc),
+  /seenFillIds/.test(liveSrc) && /duplicate fill_id/.test(liveSrc)
+    && /claimFillKey/.test(liveSrc),
   'in-process duplicate fill events must not re-count or re-Telegram'
+);
+assert.ok(
+  /loadUnfilledPolyQuotes/.test(liveSrc) && /getFilledForQuote/.test(liveSrc)
+    && /loadRecentLocks/.test(liveSrc) && /initialFillReconcile:\s*true/.test(liveSrc),
+  'Poly fill reconcile reads recent unfilled quotes, booked size, and locks'
 );
 assert.ok(
   /polyLoop\.cancelOpenQuotesForParlay/.test(liveSrc),

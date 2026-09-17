@@ -224,7 +224,14 @@ function submissionAlreadyFilled(sub) {
   return !!(sub && String(sub.status || '').toLowerCase() === 'filled');
 }
 
-function liveRunnerFillRow({ quoteId, orderId, fillId, parlayId, count, ticker, rfqId, label, createdAt, venue }) {
+function claimFillKey(seen, fillKey) {
+  if (!fillKey) return true;
+  if (seen && typeof seen.has === 'function' && seen.has(fillKey)) return false;
+  if (seen && typeof seen.add === 'function') seen.add(fillKey);
+  return true;
+}
+
+function liveRunnerFillRow({ quoteId, orderId, fillId, parlayId, count, ticker, rfqId, label, createdAt, venue, source }) {
   const id = fillId || orderId || quoteId;
   return {
     fill_id: id,
@@ -238,7 +245,7 @@ function liveRunnerFillRow({ quoteId, orderId, fillId, parlayId, count, ticker, 
     action: 'sell',
     kalshi_created_time: createdAt || new Date().toISOString(),
     raw: {
-      source: 'live-runner',
+      source: source || 'live-runner',
       quote_id: quoteId || null,
       rfq_id: rfqId || null,
       label: label || null,
@@ -335,6 +342,7 @@ module.exports = {
   submissionFilledPatch,
   canStampSubmission,
   liveRunnerFillRow,
+  claimFillKey,
   resolveFillLookup,
   findPendingFill,
   submissionAlreadyFilled,

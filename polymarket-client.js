@@ -158,6 +158,19 @@ function createPolymarketHttp({
     listRfqs: (query) => getJson('/v1/rfqs', query),
     listQuotes: (query) => getJson('/v1/rfqs/quotes', query),
     getCombo: (symbol) => getJson('/v1/combos', { symbol }),
+    async getOrder(orderId) {
+      if (orderId == null || orderId === '') return null;
+      const path = `/v1/order/${encodeURIComponent(orderId)}`;
+      const res = await request('GET', path);
+      if (res.statusCode === 404) return null;
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        throwHttpError('GET', path, res, { signMode: res.signMode || signModeLatched || 'path' });
+      }
+      const j = res.json;
+      return (j && j.order) || j;
+    },
+    listPositions: (query) => getJson('/v1/portfolio/positions', query),
+    listActivities: (query) => getJson('/v1/portfolio/activities', query),
     getMarketBySlug: async (slug) => {
       const path = `/v1/market/slug/${encodeURIComponent(slug)}`;
       const res = await request('GET', path);
@@ -245,7 +258,8 @@ function parsePrivateMessage(raw) {
     }
   }
 
-  const executions = executionsFromOrderUpdate(orderUpdateFromMessage(msg));
+  let executions = executionsFromOrderUpdate(orderUpdateFromMessage(msg));
+  if (!executions.length) executions = executionsFromOrderUpdate(msg);
   if (executions.length) {
     return {
       type: 'orderExecution',
@@ -258,10 +272,27 @@ function parsePrivateMessage(raw) {
 }
 
 // Retail private WS docs use snake_case + protobuf numeric enums.
-// RFQ events on the same socket are camelCase. Accept both.
+// RFQ events on the same socket are camelCase. Accept both. Also accept
+// a bare execution / drop-copy wrapper so a missed ORDER subscription
+// shape cannot silently drop a fill.
+function looksLikeExecution(obj) {
+  if (!obj || typeof obj !== 'object') return false;
+  return obj.type != null
+    || obj.lastShares != null || obj.last_shares != null
+    || obj.executionId != null || obj.execution_id != null
+    || obj.tradeId != null || obj.trade_id != null
+    || (obj.order && typeof obj.order === 'object');
+}
+
 function orderUpdateFromMessage(msg) {
   if (!msg || typeof msg !== 'object') return null;
-  return msg.orderSubscriptionUpdate || msg.order_subscription_update || null;
+  return msg.orderSubscriptionUpdate
+    || msg.order_subscription_update
+    || msg.dropCopy
+    || msg.drop_copy
+    || msg.executionReport
+    || msg.execution_report
+    || null;
 }
 
 function executionsFromOrderUpdate(update) {
@@ -274,6 +305,9 @@ function executionsFromOrderUpdate(update) {
   }
   if (update.update && typeof update.update === 'object') {
     return executionsFromOrderUpdate(update.update);
+  }
+  if (looksLikeExecution(update) && (update.type != null || update.order)) {
+    return [update];
   }
   return [];
 }
