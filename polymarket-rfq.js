@@ -667,6 +667,8 @@ function pendingEntry(p, rfq, contracts, extra) {
     contracts,
     label: p.label,
     rfqId: rfq && rfq.rfqId,
+    marketTicker: (rfq && (rfq.symbol || rfq.marketTicker || rfq.market_ticker))
+      || (extra && extra.marketTicker) || null,
     starts_at: p.starts_at,
     legs: p.legs,
     leg_keys: p.leg_keys || p.legKeys,
@@ -839,7 +841,7 @@ function orderFillEvent(ex, pending, pendingId) {
     venue: 'polymarket',
     isPartial: typ === 'EXECUTION_TYPE_PARTIAL_FILL',
     rfqId: (pending && pending.rfqId) || rfqIdFromExecution(ex) || null,
-    marketTicker: null,
+    marketTicker: (pending && (pending.marketTicker || pending.market_ticker || pending.symbol)) || null,
     label: pending && pending.label,
     parlayId: pending && pending.parlayId,
     pending: pending
@@ -1723,11 +1725,17 @@ function startPolymarketRfqLoop(ctx = {}) {
     if (typeof ctx.loadRecentLocks === 'function') {
       let locks = [];
       try { locks = (await ctx.loadRecentLocks()) || []; } catch (_) { locks = []; }
+      let slugRecords = [];
+      if (typeof ctx.loadPolySlugRecords === 'function') {
+        try { slugRecords = (await ctx.loadPolySlugRecords()) || []; } catch (_) { slugRecords = []; }
+      }
       if (locks.length) {
         try {
           extra = await reconcileLockActivityEvents(http, {
             locks,
             seenFillIds: ctx.seenFillIds,
+            submissions,
+            slugRecords,
           });
         } catch (e) {
           console.error(`[${MODE}] fill reconcile activities`, e && e.message);

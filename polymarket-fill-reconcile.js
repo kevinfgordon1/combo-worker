@@ -7,6 +7,10 @@
 // This module turns those durable reads into the same onQuoteExecuted
 // events live-runner already persists (combo_fills + filled submissions
 // + Telegram).
+//
+// Retail activity for Combo markets uses opaque slugs (caoc-*) and empty
+// marketMetadata.title. Do not invent titles — join marketSlug to quote /
+// order / fill / submission ticker records we already stored.
 'use strict';
 
 const USER_FILTER_SELF = 'USER_FILTER_SELF';
@@ -87,6 +91,14 @@ function contractsFromQuote(q) {
   );
 }
 
+function firstPositiveAmount(...vals) {
+  for (const v of vals) {
+    const n = amountValue(v);
+    if (n > 0) return n;
+  }
+  return 0;
+}
+
 function incrementFromCum(cumQty, alreadyFilled) {
   const cum = parsePositive(cumQty);
   const have = parsePositive(alreadyFilled);
@@ -136,6 +148,7 @@ function pendingFromSubmission(row) {
     label: row.label || null,
     rfqId: row.rfq_id || row.rfqId || null,
     quoteId: row.quote_id || row.quoteId || null,
+    marketTicker: row.market_ticker || row.marketTicker || row.symbol || null,
     maxContracts: row.max_contracts != null ? Number(row.max_contracts) : null,
     alreadyFilled: String(row.status || '').toLowerCase() === 'filled',
   };
@@ -219,7 +232,97 @@ function lockLabelMatchesMarket(label, title, slug) {
   return tokens.every((t) => hay.includes(t));
 }
 
-function uniqueLockForMarket(locks, title, slug) {
+function normalizeMarketSlug(slug) {
+  const s = String(slug == null ? '' : slug).trim().toLowerCase();
+  return s || null;
+}
+
+function isComboActivitySlug(slug) {
+  const s = normalizeMarketSlug(slug);
+  return !!(s && s.startsWith('caoc-'));
+}
+
+function slugOfRecord(row) {
+  if (!row || typeof row !== 'object') return null;
+  const raw = row.raw && typeof row.raw === 'object' ? row.raw : {};
+  return normalizeMarketSlug(
+    row.marketSlug || row.market_slug || row.market_ticker || row.marketTicker
+    || row.ticker || row.symbol
+    || raw.market_ticker || raw.marketTicker || raw.symbol || raw.marketSlug
+  );
+}
+
+function parlayIdOfRecord(row) {
+  return (row && (row.parlay_id || row.parlayId)) || null;
+}
+
+function coerceSlugMap(input) {
+  if (input instanceof Map) return new Map(input);
+  const map = new Map();
+  if (input && typeof input === 'object') {
+    for (const [key, value] of Object.entries(input)) rememberSlug(map, key, value);
+  }
+  return map;
+}
+
+function rememberSlug(map, slug, parlayId) {
+  const key = normalizeMarketSlug(slug);
+  const id = parlayId || null;
+  if (!key || !id || !map) return map;
+  const prev = map.get(key);
+  if (prev == null) map.set(key, id);
+  else if (prev !== id) map.set(key, false);
+  return map;
+}
+
+function slugMapFromRecords(records, map) {
+  const out = map instanceof Map ? map : new Map();
+  for (const row of records || []) {
+    rememberSlug(out, slugOfRecord(row), parlayIdOfRecord(row));
+  }
+  return out;
+}
+
+function slugMapFromQuotes(quotes, submissions, map) {
+  const out = map instanceof Map ? map : new Map();
+  const byQuote = new Map();
+  for (const row of submissions || []) {
+    const quoteId = row && (row.quote_id || row.quoteId);
+    const parlayId = parlayIdOfRecord(row);
+    if (quoteId && parlayId) {
+      const prev = byQuote.get(quoteId);
+      if (prev == null) byQuote.set(quoteId, parlayId);
+      else if (prev !== parlayId) byQuote.set(quoteId, false);
+    }
+    rememberSlug(out, slugOfRecord(row), parlayId);
+  }
+  for (const quote of quotes || []) {
+    const quoteId = quoteIdOf(quote);
+    const mapped = quoteId ? byQuote.get(quoteId) : null;
+    const parlayId = mapped || parlayIdOfRecord(quote);
+    if (parlayId) rememberSlug(out, symbolOf(quote) || slugOfRecord(quote), parlayId);
+  }
+  return out;
+}
+
+function buildActivitySlugMap({ slugMap, slugRecords, quotes, submissions } = {}) {
+  const map = coerceSlugMap(slugMap);
+  slugMapFromRecords(slugRecords, map);
+  slugMapFromQuotes(quotes, [...(submissions || []), ...(slugRecords || [])], map);
+  return map;
+}
+
+function lockForMappedSlug(locks, slug, slugMap) {
+  const key = normalizeMarketSlug(slug);
+  if (!key || !slugMap) return null;
+  const id = slugMap instanceof Map ? slugMap.get(key) : slugMap[key];
+  if (!id) return null;
+  return (locks || []).find((p) => p && p.id === id) || null;
+}
+
+function uniqueLockForMarket(locks, title, slug, slugMap) {
+  const mapped = lockForMappedSlug(locks, slug, slugMap);
+  if (mapped) return mapped;
   const hits = (locks || []).filter((p) => p && lockLabelMatchesMarket(p.label, title, slug));
   if (hits.length !== 1) return null;
   return hits[0];
@@ -267,10 +370,12 @@ function tradeFromActivity(activity) {
     || (activityTypeLooksFill(type) ? activity : null);
   if (!trade || typeof trade !== 'object') return null;
   if (trade.state && normalizeStatus(trade.state) === 'TRADE_STATE_BUSTED') return null;
-  const qty = parsePositive(
-    trade.qtyDecimal ?? trade.qty_decimal ?? trade.qty ?? trade.size
-    ?? amountValue(trade.payout) ?? amountValue(activity.payout)
-    ?? amountValue(trade.cashPayout || trade.cash_payout)
+  const qty = firstPositiveAmount(
+    trade.qtyDecimal, trade.qty_decimal, trade.qty, trade.size,
+    trade.payout, activity.payout,
+    trade.cashPayout || trade.cash_payout,
+    trade.cost, activity.cost,
+    trade.costBasis || trade.cost_basis
   );
   if (!(qty > 0)) return null;
   const meta = trade.marketMetadata || trade.market_metadata
@@ -405,6 +510,7 @@ function mergeQuoteCandidates(executedQuotes, submissions, pendingQuotes) {
       rfqId: row.rfq_id || row.rfqId,
       creatorOrderId: row.order_id || row.orderId || null,
       buyQtyDecimal: row.contracts,
+      symbol: row.market_ticker || row.marketTicker || row.symbol || null,
     }, pendingFromSubmission(row));
   }
   if (pendingQuotes && typeof pendingQuotes.forEach === 'function') {
@@ -416,6 +522,7 @@ function mergeQuoteCandidates(executedQuotes, submissions, pendingQuotes) {
         creatorOrderId: pending.creatorOrderId || pending.orderId || null,
         buyQtyDecimal: pending.contracts,
         status: pending.executed ? QUOTE_STATUS_EXECUTED : null,
+        symbol: pending.marketTicker || pending.market_ticker || pending.symbol || null,
       }, { ...pending, quoteId: pending.quoteId || id });
     });
   }
@@ -520,16 +627,19 @@ function activityFillEvent({ trade, lock, source }) {
   };
 }
 
-function matchActivitiesToLocks(activities, locks, { requireMaker = false, seenFillIds } = {}) {
+function matchActivitiesToLocks(activities, locks, { requireMaker = false, seenFillIds, slugMap } = {}) {
   const events = [];
   const matchedLockIds = new Set();
   const booked = seenFillIds && typeof seenFillIds.has === 'function' ? seenFillIds : null;
   const local = new Set();
+  const map = slugMap instanceof Map || (slugMap && typeof slugMap === 'object')
+    ? coerceSlugMap(slugMap)
+    : null;
   for (const activity of activities || []) {
     const trade = tradeFromActivity(activity);
     if (!trade) continue;
     if (requireMaker && trade.isAggressor) continue;
-    const lock = uniqueLockForMarket(locks, trade.hay || trade.title, trade.marketSlug);
+    const lock = uniqueLockForMarket(locks, trade.hay || trade.title, trade.marketSlug, map);
     if (!lock) continue;
     const evt = activityFillEvent({ trade, lock });
     if (!evt) continue;
@@ -566,15 +676,26 @@ async function reconcileLockActivityEvents(http, {
   seenFillIds,
   includePositions = true,
   maxPages = 8,
+  slugMap,
+  slugRecords,
+  submissions,
+  quotes,
 } = {}) {
   if (!locks.length) return [];
+  const map = buildActivitySlugMap({ slugMap, slugRecords, quotes, submissions });
+  if (!quotes && http && typeof http.listQuotes === 'function') {
+    try {
+      const listed = await listSelfExecutedQuotes(http, { limit: 100 });
+      slugMapFromQuotes(listed.quotes, [...(submissions || []), ...(slugRecords || [])], map);
+    } catch (_) { /* slug map stays at records / explicit map */ }
+  }
   let activities = [];
   try {
     activities = await listAllActivities(http, { maxPages });
   } catch (_) {
     activities = [];
   }
-  const events = matchActivitiesToLocks(activities, locks, { seenFillIds });
+  const events = matchActivitiesToLocks(activities, locks, { seenFillIds, slugMap: map });
   const covered = new Set([
     ...events.map((e) => e.parlayId).filter(Boolean),
     ...(events.matchedLockIds || []),
@@ -617,16 +738,19 @@ function positionFillEvent({ pos, lock, source = 'poly-position' }) {
   };
 }
 
-function matchPositionsToLocks(positions, locks, { seenFillIds } = {}) {
+function matchPositionsToLocks(positions, locks, { seenFillIds, slugMap } = {}) {
   const events = [];
   const booked = seenFillIds && typeof seenFillIds.has === 'function' ? seenFillIds : null;
   const local = new Set();
+  const map = slugMap instanceof Map || (slugMap && typeof slugMap === 'object')
+    ? coerceSlugMap(slugMap)
+    : null;
   for (const pos of positions || []) {
     const meta = (pos && pos.marketMetadata) || {};
     const title = meta.title || pos.title || '';
     const slug = pos.marketSlug || meta.slug || '';
     const hay = activityMarketHay(pos, { marketMetadata: meta, marketSlug: slug, title });
-    const lock = uniqueLockForMarket(locks, hay || title, slug);
+    const lock = uniqueLockForMarket(locks, hay || title, slug, map);
     if (!lock) continue;
     const evt = positionFillEvent({ pos, lock });
     if (!evt || local.has(evt.fillId) || (booked && booked.has(evt.fillId))) continue;
@@ -651,6 +775,7 @@ module.exports = {
   isPartialOrderState,
   cumQuantityOf,
   contractsFromQuote,
+  firstPositiveAmount,
   incrementFromCum,
   reconcileFillId,
   quotesFromListed,
@@ -659,6 +784,13 @@ module.exports = {
   pendingFromSubmission,
   fillEventFromReconcile,
   lockLabelMatchesMarket,
+  normalizeMarketSlug,
+  isComboActivitySlug,
+  slugOfRecord,
+  rememberSlug,
+  slugMapFromRecords,
+  slugMapFromQuotes,
+  buildActivitySlugMap,
   uniqueLockForMarket,
   tradeFromActivity,
   activityMarketHay,

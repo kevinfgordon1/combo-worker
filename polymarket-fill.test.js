@@ -679,6 +679,70 @@ function startFillLoop(extra = {}) {
   assert.strictEqual(multiFills.length, 4);
   multiLoop.stop();
 
+  const caocFills = [];
+  const caocKeys = new Set();
+  const caocHttp = {
+    ...emptyHttp(),
+    async listQuotes(query) {
+      if (query && query.status === 'QUOTE_STATUS_EXECUTED') {
+        return {
+          quotes: [{
+            id: 'RV__Df859d3kQKJex6AkWCuzw1ZudaOra7T6Fp4cCf8',
+            symbol: 'caoc-1d16e8345207a66c',
+            status: 'QUOTE_STATUS_EXECUTED',
+            creatorOrderId: 'CH6775WYRVB8',
+            buyQtyDecimal: '2023.4',
+          }],
+        };
+      }
+      return { quotes: [] };
+    },
+    async getOrder() { return null; },
+    async listActivities() {
+      return {
+        activities: [
+          {
+            type: 'ACTIVITY_TYPE_TRADE',
+            trade: {
+              id: 'CHFYRFW40VAY',
+              marketSlug: 'caoc-1d16e8345207a66c',
+              cost: { value: '285.25', currency: 'USD' },
+              isAggressor: true,
+              state: 'TRADE_STATE_CLEARED',
+              marketMetadata: { title: '', slug: 'caoc-1d16e8345207a66c' },
+            },
+          },
+        ],
+      };
+    },
+  };
+  const { loop: caocLoop } = startFillLoop({
+    skipSeed: true,
+    pendingQuotes: new Map(),
+    http: caocHttp,
+    seenFillIds: caocKeys,
+    loadUnfilledPolyQuotes: async () => [],
+    loadRecentLocks: async () => [LOCK],
+    loadPolySlugRecords: async () => [{
+      quote_id: 'RV__Df859d3kQKJex6AkWCuzw1ZudaOra7T6Fp4cCf8',
+      parlay_id: LOCK.id,
+      market_ticker: 'caoc-1d16e8345207a66c',
+    }],
+    onQuoteExecuted: (evt) => {
+      const key = evt.fillId || evt.orderId || evt.quoteId;
+      if (!claimFillKey(caocKeys, key)) return;
+      caocFills.push(evt);
+    },
+  });
+  const caoc = await caocLoop.reconcileLockFills();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.ok(caoc.some((e) => e.fillId === 'poly-act:CHFYRFW40VAY' && e.contracts === 285.25));
+  assert.strictEqual(caocFills.filter((e) => e.fillId === 'poly-act:CHFYRFW40VAY').length, 1);
+  const caocAgain = await caocLoop.reconcileLockFills();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(caocAgain.filter((e) => e.fillId === 'poly-act:CHFYRFW40VAY').length, 0);
+  caocLoop.stop();
+
   const polySrc = fs.readFileSync(path.join(__dirname, 'polymarket-rfq.js'), 'utf8');
   assert.ok(
     /function emitOrderFill/.test(polySrc) && /ctx\.onQuoteExecuted/.test(polySrc),
@@ -702,13 +766,16 @@ function startFillLoop(extra = {}) {
     'quoteExecuted must stamp creatorOrderId onto combo_submissions for restart recovery'
   );
   assert.ok(
-    /loadUnfilledPolyQuotes/.test(liveSrc) && /getFilledForQuote/.test(liveSrc),
-    'live-runner must feed Poly fill reconcile from combo_submissions / combo_fills'
+    /loadUnfilledPolyQuotes/.test(liveSrc) && /getFilledForQuote/.test(liveSrc)
+      && /loadPolySlugRecords/.test(liveSrc),
+    'live-runner must feed Poly fill reconcile from combo_submissions / combo_fills / caoc slugs'
   );
   assert.ok(
     /function reconcileLockFills/.test(polySrc) && /RECONCILE/.test(polySrc)
       && /reconcileLockActivityEvents/.test(polySrc)
       && /loadRecentLocks/.test(polySrc)
+      && /loadPolySlugRecords/.test(polySrc)
+      && /slugRecords/.test(polySrc)
       && !/if\s*\(\s*!events\.length/.test(polySrc),
     'Poly loop must always scan lock-matching activities, not only when quote reconcile is empty'
   );
@@ -716,6 +783,12 @@ function startFillLoop(extra = {}) {
     /submissionAlreadyFilled/.test(liveSrc),
     'order_id stamped at quoteExecuted must not count as already filled'
   );
+  const backfillSrc = fs.readFileSync(path.join(__dirname, 'scripts/backfill-poly-combo-fills.js'), 'utf8');
+  assert.ok(
+    /BACKFILL_PARLAY_ID/.test(backfillSrc) && /parlay=ALL/.test(backfillSrc) && /slugRecords/.test(backfillSrc),
+    'backfill must cover all locks unless BACKFILL_PARLAY_ID is set'
+  );
+  assert.ok(/BACKFILL_DRY_RUN/.test(backfillSrc) && /BACKFILL_LOOKBACK_HOURS/.test(backfillSrc));
   const clientSrc = fs.readFileSync(path.join(__dirname, 'polymarket-client.js'), 'utf8');
   assert.ok(
     /order_subscription_update/.test(clientSrc) && /subscription_type:\s*1/.test(clientSrc),

@@ -30,11 +30,11 @@ function overlapEval(rfqId, code = 'same_games_no_match') {
   };
 }
 
-function quoteEval(rfqId) {
+function quoteEval(rfqId, extraRfq = {}) {
   return {
     action: 'quoteable',
     reason: null,
-    rfq: { rfqId, id: rfqId },
+    rfq: { rfqId, id: rfqId, ...extraRfq },
     parlay: lock,
     decision: { contracts: 10, remaining: 140, fillAmerican: 400, worst: 2 },
     quote: { estimatedContracts: 10, buyPrice: 0.2, sellPrice: 0.8 },
@@ -187,6 +187,7 @@ function capDecision() {
         quote_id: extra && extra.quote_id,
         is_live: extra && extra.is_live,
         contracts: extra && extra.contracts,
+        market_ticker: extra && extra.market_ticker,
         venue: 'polymarket',
       });
     },
@@ -239,6 +240,7 @@ function capDecision() {
   assert.strictEqual(quoted.quote_id, 'q1');
   assert.strictEqual(quoted.skip_reason, undefined);
   assert.strictEqual(quoted.venue, 'polymarket');
+  assert.strictEqual(quoted.market_ticker, undefined);
 
   const fundRow = rows.find((r) => r.rfq_id === 'rfq_fund');
   assert.ok(fundRow);
@@ -284,6 +286,17 @@ function capDecision() {
   const silent = createPolyMissTape({});
   assert.strictEqual(silent.persist(quoteEval('x'), 'quoted').reason, 'no_logger');
   assert.deepStrictEqual(silent.flushNoise(), []);
+}
+
+{
+  const extras = [];
+  const tape = createPolyMissTape({
+    logAsync: (_p, _rfq, _d, _status, extra) => { extras.push(extra); },
+  });
+  tape.persist(quoteEval('rfq_caoc', { symbol: 'caoc-1d16e8345207a66c' }), 'quoted', {
+    quote_id: 'q-caoc', is_live: true, contracts: 70,
+  });
+  assert.strictEqual(extras[0].market_ticker, 'caoc-1d16e8345207a66c');
 }
 
 assert.strictEqual(
