@@ -91,6 +91,14 @@ function contractsFromQuote(q) {
   );
 }
 
+function firstPositiveAmount(...vals) {
+  for (const v of vals) {
+    const n = amountValue(v);
+    if (n > 0) return n;
+  }
+  return 0;
+}
+
 function incrementFromCum(cumQty, alreadyFilled) {
   const cum = parsePositive(cumQty);
   const have = parsePositive(alreadyFilled);
@@ -362,12 +370,12 @@ function tradeFromActivity(activity) {
     || (activityTypeLooksFill(type) ? activity : null);
   if (!trade || typeof trade !== 'object') return null;
   if (trade.state && normalizeStatus(trade.state) === 'TRADE_STATE_BUSTED') return null;
-  const qty = parsePositive(
-    trade.qtyDecimal ?? trade.qty_decimal ?? trade.qty ?? trade.size
-    ?? amountValue(trade.payout) ?? amountValue(activity.payout)
-    ?? amountValue(trade.cashPayout || trade.cash_payout)
-    ?? amountValue(trade.cost) ?? amountValue(activity.cost)
-    ?? amountValue(trade.costBasis || trade.cost_basis)
+  const qty = firstPositiveAmount(
+    trade.qtyDecimal, trade.qty_decimal, trade.qty, trade.size,
+    trade.payout, activity.payout,
+    trade.cashPayout || trade.cash_payout,
+    trade.cost, activity.cost,
+    trade.costBasis || trade.cost_basis
   );
   if (!(qty > 0)) return null;
   const meta = trade.marketMetadata || trade.market_metadata
@@ -767,6 +775,7 @@ module.exports = {
   isPartialOrderState,
   cumQuantityOf,
   contractsFromQuote,
+  firstPositiveAmount,
   incrementFromCum,
   reconcileFillId,
   quotesFromListed,
