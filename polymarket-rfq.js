@@ -84,10 +84,7 @@ const { formatAlertStatus } = require('./venue-alert');
 const {
   resolveQuoteFill,
   reconcilePolymarketLockFills,
-  matchActivitiesToLocks,
-  matchPositionsToLocks,
-  activitiesFromListed,
-  positionsFromListed,
+  reconcileLockActivityEvents,
 } = require('./polymarket-fill-reconcile');
 
 const MODE = 'POLY';
@@ -1723,26 +1720,17 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
 
     let extra = [];
-    if (!events.length && typeof ctx.loadRecentLocks === 'function') {
+    if (typeof ctx.loadRecentLocks === 'function') {
       let locks = [];
       try { locks = (await ctx.loadRecentLocks()) || []; } catch (_) { locks = []; }
-      if (locks.length && typeof http.listActivities === 'function') {
+      if (locks.length) {
         try {
-          const listed = await http.listActivities({
-            types: 'ACTIVITY_TYPE_TRADE',
-            limit: 100,
+          extra = await reconcileLockActivityEvents(http, {
+            locks,
+            seenFillIds: ctx.seenFillIds,
           });
-          extra = extra.concat(matchActivitiesToLocks(activitiesFromListed(listed), locks));
         } catch (e) {
           console.error(`[${MODE}] fill reconcile activities`, e && e.message);
-        }
-      }
-      if (!extra.length && locks.length && typeof http.listPositions === 'function') {
-        try {
-          const listed = await http.listPositions({ limit: 100 });
-          extra = extra.concat(matchPositionsToLocks(positionsFromListed(listed), locks));
-        } catch (e) {
-          console.error(`[${MODE}] fill reconcile positions`, e && e.message);
         }
       }
       for (const evt of extra) {

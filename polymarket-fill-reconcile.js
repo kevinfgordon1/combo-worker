@@ -197,11 +197,25 @@ function significantLockTokens(label) {
     .filter((w) => w.length >= 4 && !/^(PLUS|WITH|FROM|THAT|THIS|OVER|UNDER|MONEY|LINE)$/.test(w));
 }
 
+// "Cleveland Guardians ML + New York Yankees ML + San Francisco Giants ML"
+// → GUARDIANS, YANKEES, GIANTS. Combo cards often omit the city.
+function lockTeamNicknames(label) {
+  return String(label || '')
+    .split(/\s*\+\s*/)
+    .map((part) => {
+      const words = String(part || '').replace(/\bM[Ll]\b/g, '').trim().split(/\s+/);
+      return String(words[words.length - 1] || '').toUpperCase().replace(/[^A-Z]/g, '');
+    })
+    .filter((w) => w.length >= 3);
+}
+
 function lockLabelMatchesMarket(label, title, slug) {
-  const tokens = significantLockTokens(label);
-  if (tokens.length < 2) return false;
   const hay = `${title || ''} ${slug || ''}`.toUpperCase();
   if (!hay.trim()) return false;
+  const nicknames = lockTeamNicknames(label);
+  if (nicknames.length >= 2 && nicknames.every((t) => hay.includes(t))) return true;
+  const tokens = significantLockTokens(label);
+  if (tokens.length < 2) return false;
   return tokens.every((t) => hay.includes(t));
 }
 
@@ -211,21 +225,69 @@ function uniqueLockForMarket(locks, title, slug) {
   return hits[0];
 }
 
+function activityTypeLooksFill(type) {
+  const s = normalizeStatus(type);
+  return s.includes('TRADE') || s.includes('SETTLE') || s.includes('REDEEM')
+    || s.includes('CASH') || s.includes('SOLD') || s.includes('PAYOUT')
+    || s.includes('POSITION');
+}
+
+function collectMarketParts(node, out) {
+  if (!node) return;
+  if (typeof node === 'string' || typeof node === 'number') {
+    out.push(String(node));
+    return;
+  }
+  if (Array.isArray(node)) {
+    for (const item of node) collectMarketParts(item, out);
+    return;
+  }
+  if (typeof node !== 'object') return;
+  for (const key of ['title', 'name', 'slug', 'marketSlug', 'market_slug', 'symbol', 'question']) {
+    if (node[key]) out.push(String(node[key]));
+  }
+  const meta = node.marketMetadata || node.market_metadata;
+  if (meta && meta !== node) collectMarketParts(meta, out);
+  for (const key of ['markets', 'legs', 'outcomes', 'games', 'events']) {
+    if (node[key]) collectMarketParts(node[key], out);
+  }
+}
+
+function activityMarketHay(activity, trade) {
+  const parts = [];
+  collectMarketParts(activity, parts);
+  collectMarketParts(trade, parts);
+  return parts.join(' ');
+}
+
 function tradeFromActivity(activity) {
   if (!activity || typeof activity !== 'object') return null;
-  const trade = activity.trade || (normalizeStatus(activity.type).includes('TRADE') ? activity : null);
+  const type = normalizeStatus(activity.type);
+  const trade = activity.trade || activity.order
+    || (activityTypeLooksFill(type) ? activity : null);
   if (!trade || typeof trade !== 'object') return null;
   if (trade.state && normalizeStatus(trade.state) === 'TRADE_STATE_BUSTED') return null;
-  const qty = parsePositive(trade.qtyDecimal ?? trade.qty_decimal ?? trade.qty);
+  const qty = parsePositive(
+    trade.qtyDecimal ?? trade.qty_decimal ?? trade.qty ?? trade.size
+    ?? amountValue(trade.payout) ?? amountValue(activity.payout)
+    ?? amountValue(trade.cashPayout || trade.cash_payout)
+  );
   if (!(qty > 0)) return null;
+  const meta = trade.marketMetadata || trade.market_metadata
+    || activity.marketMetadata || activity.market_metadata || {};
+  const hay = activityMarketHay(activity, trade);
   return {
     id: trade.id || activity.id || null,
-    marketSlug: trade.marketSlug || trade.market_slug || null,
+    marketSlug: trade.marketSlug || trade.market_slug || meta.slug || null,
+    title: meta.title || trade.title || activity.title || hay || null,
+    hay,
     qty,
     price: amountValue(trade.price),
-    cost: amountValue(trade.costBasis || trade.cost_basis) || (amountValue(trade.price) * qty),
-    isAggressor: !!(trade.isAggressor || trade.is_aggressor),
-    createTime: trade.createTime || trade.create_time || null,
+    cost: amountValue(trade.costBasis || trade.cost_basis)
+      || amountValue(trade.cost) || amountValue(activity.cost)
+      || (amountValue(trade.price) * qty),
+    isAggressor: !!(trade.isAggressor || trade.is_aggressor || /SOLD|CASH/.test(type)),
+    createTime: trade.createTime || trade.create_time || activity.createTime || null,
   };
 }
 
@@ -431,9 +493,10 @@ async function reconcilePolymarketLockFills(http, {
   return events;
 }
 
-function activityFillEvent({ trade, lock, source = 'poly-activity' }) {
+function activityFillEvent({ trade, lock, source }) {
   if (!trade || !lock || !(trade.qty > 0)) return null;
   const fillId = trade.id ? `poly-act:${trade.id}` : `poly-act:${lock.id}:${trade.qty}`;
+  const kind = source || (trade.isAggressor ? 'poly-activity-sold' : 'poly-activity');
   return {
     quoteId: null,
     orderId: trade.id || null,
@@ -445,7 +508,7 @@ function activityFillEvent({ trade, lock, source = 'poly-activity' }) {
     marketTicker: trade.marketSlug || null,
     label: lock.label || null,
     parlayId: lock.id,
-    source,
+    source: kind,
     pending: {
       parlayId: lock.id,
       userId: lock.user_id || lock.userId || null,
@@ -457,18 +520,74 @@ function activityFillEvent({ trade, lock, source = 'poly-activity' }) {
   };
 }
 
-function matchActivitiesToLocks(activities, locks, { requireMaker = false } = {}) {
+function matchActivitiesToLocks(activities, locks, { requireMaker = false, seenFillIds } = {}) {
   const events = [];
+  const matchedLockIds = new Set();
+  const booked = seenFillIds && typeof seenFillIds.has === 'function' ? seenFillIds : null;
+  const local = new Set();
   for (const activity of activities || []) {
     const trade = tradeFromActivity(activity);
     if (!trade) continue;
     if (requireMaker && trade.isAggressor) continue;
-    const lock = uniqueLockForMarket(locks, trade.marketSlug, trade.marketSlug);
+    const lock = uniqueLockForMarket(locks, trade.hay || trade.title, trade.marketSlug);
     if (!lock) continue;
     const evt = activityFillEvent({ trade, lock });
-    if (evt) events.push(evt);
+    if (!evt) continue;
+    matchedLockIds.add(lock.id);
+    if (local.has(evt.fillId) || (booked && booked.has(evt.fillId))) continue;
+    local.add(evt.fillId);
+    events.push(evt);
   }
+  events.matchedLockIds = matchedLockIds;
   return events;
+}
+
+async function listAllActivities(http, { limit = 100, maxPages = 8 } = {}) {
+  if (!http || typeof http.listActivities !== 'function') return [];
+  const out = [];
+  let cursor;
+  for (let page = 0; page < maxPages; page += 1) {
+    const listed = await http.listActivities({
+      types: 'ACTIVITY_TYPE_TRADE',
+      limit,
+      cursor,
+      sortOrder: 'SORT_ORDER_DESCENDING',
+    });
+    const rows = activitiesFromListed(listed);
+    out.push(...rows);
+    cursor = listed && (listed.nextCursor || listed.next_cursor || listed.cursor) || null;
+    if (!cursor || (listed && listed.eof) || !rows.length) break;
+  }
+  return out;
+}
+
+async function reconcileLockActivityEvents(http, {
+  locks = [],
+  seenFillIds,
+  includePositions = true,
+  maxPages = 8,
+} = {}) {
+  if (!locks.length) return [];
+  let activities = [];
+  try {
+    activities = await listAllActivities(http, { maxPages });
+  } catch (_) {
+    activities = [];
+  }
+  const events = matchActivitiesToLocks(activities, locks, { seenFillIds });
+  const covered = new Set([
+    ...events.map((e) => e.parlayId).filter(Boolean),
+    ...(events.matchedLockIds || []),
+  ]);
+  if (!includePositions || typeof http.listPositions !== 'function') return events;
+  const uncovered = locks.filter((p) => p && p.id && !covered.has(p.id));
+  if (!uncovered.length) return events;
+  try {
+    const listed = await http.listPositions({ limit: 100 });
+    return events.concat(matchPositionsToLocks(positionsFromListed(listed), uncovered, { seenFillIds }));
+  } catch (_) {
+    return events;
+  }
 }
 
 function positionFillEvent({ pos, lock, source = 'poly-position' }) {
@@ -498,16 +617,21 @@ function positionFillEvent({ pos, lock, source = 'poly-position' }) {
   };
 }
 
-function matchPositionsToLocks(positions, locks) {
+function matchPositionsToLocks(positions, locks, { seenFillIds } = {}) {
   const events = [];
+  const booked = seenFillIds && typeof seenFillIds.has === 'function' ? seenFillIds : null;
+  const local = new Set();
   for (const pos of positions || []) {
     const meta = (pos && pos.marketMetadata) || {};
     const title = meta.title || pos.title || '';
     const slug = pos.marketSlug || meta.slug || '';
-    const lock = uniqueLockForMarket(locks, title, slug);
+    const hay = activityMarketHay(pos, { marketMetadata: meta, marketSlug: slug, title });
+    const lock = uniqueLockForMarket(locks, hay || title, slug);
     if (!lock) continue;
     const evt = positionFillEvent({ pos, lock });
-    if (evt) events.push(evt);
+    if (!evt || local.has(evt.fillId) || (booked && booked.has(evt.fillId))) continue;
+    local.add(evt.fillId);
+    events.push(evt);
   }
   return events;
 }
@@ -537,8 +661,12 @@ module.exports = {
   lockLabelMatchesMarket,
   uniqueLockForMarket,
   tradeFromActivity,
+  activityMarketHay,
   activityFillEvent,
   matchActivitiesToLocks,
+  listAllActivities,
+  reconcileLockActivityEvents,
+  lockTeamNicknames,
   positionQty,
   positionCost,
   positionFillEvent,

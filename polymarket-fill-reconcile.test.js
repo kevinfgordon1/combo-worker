@@ -13,6 +13,9 @@ const {
   tradeFromActivity,
   matchActivitiesToLocks,
   matchPositionsToLocks,
+  listAllActivities,
+  reconcileLockActivityEvents,
+  lockTeamNicknames,
   pendingFromSubmission,
   mergeQuoteCandidates,
   pickReconcileCandidates,
@@ -112,34 +115,74 @@ const LOCK = {
 }
 
 {
+  assert.deepStrictEqual(lockTeamNicknames(LOCK.label), ['GUARDIANS', 'YANKEES', 'GIANTS']);
   assert.ok(lockLabelMatchesMarket(
     LOCK.label,
     'Chicago White Sox vs Cleveland Guardians / San Francisco Giants vs St Louis / New York Yankees',
     'combo-cle-nyy-sf'
   ));
+  assert.ok(lockLabelMatchesMarket(
+    LOCK.label,
+    'Combo 3 Markets',
+    'white-sox-guardians giants-cardinals yankees-twins'
+  ), 'screenshot-style per-game titles still identify the lock');
   assert.ok(!lockLabelMatchesMarket(LOCK.label, 'Yankees only', 'nyy'));
   assert.strictEqual(uniqueLockForMarket([LOCK, { id: 'other', label: 'Bills ML + Chiefs ML' }], LOCK.label, ''), LOCK);
   assert.strictEqual(uniqueLockForMarket([LOCK, { ...LOCK, id: 'dup' }], LOCK.label, ''), null);
 }
 
-{
-  const trade = tradeFromActivity({
+function comboTrade(id, qty, { aggressor = false, payout } = {}) {
+  return {
     type: 'ACTIVITY_TYPE_TRADE',
     trade: {
-      id: 't1',
-      marketSlug: 'cleveland-guardians-new-york-yankees-san-francisco-giants',
-      qtyDecimal: '2394.34',
+      id,
+      marketSlug: 'chicago-white-sox-cleveland-guardians-san-francisco-giants-st-louis-new-york-yankees',
+      qtyDecimal: qty,
+      payout: payout ? { value: String(payout), currency: 'USD' } : undefined,
       price: { value: '0.859', currency: 'USD' },
-      isAggressor: false,
+      isAggressor: aggressor,
       state: 'TRADE_STATE_CLEARED',
+      marketMetadata: {
+        title: 'Combo 3 Markets',
+        markets: [
+          { title: 'Chicago White Sox vs. Cleveland Guardians Final' },
+          { title: 'San Francisco Giants vs. St. Louis Cardinals Final' },
+          { title: 'New York Yankees vs. Minnesota Twins Final' },
+        ],
+      },
     },
-  });
+  };
+}
+
+{
+  const trade = tradeFromActivity(comboTrade('t1', '2394.34'));
   assert.strictEqual(trade.qty, 2394.34);
-  const evts = matchActivitiesToLocks([{ trade: trade }], [LOCK]);
+  const evts = matchActivitiesToLocks([comboTrade('t1', '2394.34')], [LOCK]);
   assert.strictEqual(evts.length, 1);
   assert.strictEqual(evts[0].parlayId, LOCK.id);
   assert.strictEqual(evts[0].contracts, 2394.34);
   assert.strictEqual(evts[0].fillId, 'poly-act:t1');
+}
+
+{
+  const lots = [
+    comboTrade('won-settlement', '2394.34', { aggressor: false, payout: '2394.34' }),
+    comboTrade('sold-288', '288.36', { aggressor: true, payout: '288.36' }),
+    comboTrade('sold-48', '48.06', { aggressor: true, payout: '48.06' }),
+  ];
+  const evts = matchActivitiesToLocks(lots, [LOCK]);
+  assert.strictEqual(evts.length, 3, 'all three YOU WON / CASHED OUT lots must book');
+  assert.deepStrictEqual(evts.map((e) => e.contracts).sort((a, b) => b - a), [2394.34, 288.36, 48.06]);
+  assert.deepStrictEqual(evts.map((e) => e.fillId).sort(), [
+    'poly-act:sold-288',
+    'poly-act:sold-48',
+    'poly-act:won-settlement',
+  ]);
+  assert.ok(evts.some((e) => e.source === 'poly-activity-sold'), 'sold/cashed lots use the sold source');
+  const booked = new Set(['poly-act:won-settlement']);
+  const rest = matchActivitiesToLocks(lots, [LOCK], { seenFillIds: booked });
+  assert.strictEqual(rest.length, 2, 'already-persisted lot is skipped; remaining cashouts still book');
+  assert.strictEqual(booked.size, 1, 'match must not claim persist keys before live-runner books');
 }
 
 {
@@ -241,6 +284,85 @@ const LOCK = {
     hydrate: false,
   });
   assert.strictEqual(again.length, 0, 'reconcile of an already-booked cum qty is a no-op');
+
+  let pages = 0;
+  const paged = await listAllActivities({
+    async listActivities({ cursor }) {
+      pages += 1;
+      if (!cursor) {
+        return {
+          activities: [comboTrade('won-settlement', '2394.34')],
+          nextCursor: 'p2',
+        };
+      }
+      if (cursor === 'p2') {
+        return {
+          activities: [
+            comboTrade('sold-288', '288.36', { aggressor: true }),
+            comboTrade('sold-48', '48.06', { aggressor: true }),
+          ],
+          eof: true,
+        };
+      }
+      throw new Error('should stop paging');
+    },
+  });
+  assert.strictEqual(pages, 2);
+  assert.strictEqual(paged.length, 3);
+
+  const activityHttp = {
+    async listActivities() {
+      return {
+        activities: [
+          comboTrade('won-settlement', '2394.34'),
+          comboTrade('sold-288', '288.36', { aggressor: true }),
+          comboTrade('sold-48', '48.06', { aggressor: true }),
+        ],
+      };
+    },
+    async listPositions() {
+      return {
+        positions: [{
+          marketSlug: 'cle-nyy-sf-combo',
+          qtyBoughtDecimal: '9999',
+          marketMetadata: { title: LOCK.label, slug: 'cle-nyy-sf-combo' },
+        }],
+      };
+    },
+  };
+  const three = await reconcileLockActivityEvents(activityHttp, { locks: [LOCK] });
+  assert.strictEqual(three.length, 3, 'positions must not add a fourth lot once activities covered the lock');
+  assert.deepStrictEqual(three.map((e) => e.contracts).sort((a, b) => b - a), [2394.34, 288.36, 48.06]);
+
+  const payoutOnly = tradeFromActivity({
+    type: 'ACTIVITY_TYPE_TRADE',
+    trade: {
+      id: 'sold-payout',
+      isAggressor: true,
+      payout: { value: '48.06', currency: 'USD' },
+      marketMetadata: {
+        title: LOCK.label,
+        slug: 'cle-nyy-sf-combo',
+      },
+    },
+  });
+  assert.strictEqual(payoutOnly.qty, 48.06, 'cashed-out cards without qtyDecimal still size from payout');
+
+  const uncoveredHttp = {
+    async listActivities() { return { activities: [] }; },
+    async listPositions() {
+      return {
+        positions: [{
+          marketSlug: 'cle-nyy-sf-combo',
+          qtyBoughtDecimal: '2394.34',
+          marketMetadata: { title: LOCK.label, slug: 'cle-nyy-sf-combo' },
+        }],
+      };
+    },
+  };
+  const posOnly = await reconcileLockActivityEvents(uncoveredHttp, { locks: [LOCK] });
+  assert.strictEqual(posOnly.length, 1, 'positions are a fallback only when the lock has no activity hits');
+  assert.strictEqual(posOnly[0].source, 'poly-position');
 
   console.log('polymarket-fill-reconcile.test.js ok');
 })().catch((e) => {

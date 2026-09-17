@@ -579,6 +579,106 @@ function startFillLoop(extra = {}) {
   assert.strictEqual(reconFills.length, 1);
   reconLoop.stop();
 
+  const LOCK = {
+    id: 'aee3b29d-2a4b-4dd6-8dd5-37358b0aa294',
+    label: 'Cleveland Guardians ML + New York Yankees ML + San Francisco Giants ML',
+    user_id: 'u1',
+    max_contracts: 479,
+  };
+  function comboLot(id, qty, aggressor) {
+    return {
+      type: 'ACTIVITY_TYPE_TRADE',
+      trade: {
+        id,
+        qtyDecimal: String(qty),
+        isAggressor: !!aggressor,
+        state: 'TRADE_STATE_CLEARED',
+        marketMetadata: {
+          title: 'Combo 3 Markets',
+          markets: [
+            { title: 'Chicago White Sox vs. Cleveland Guardians Final' },
+            { title: 'San Francisco Giants vs. St. Louis Cardinals Final' },
+            { title: 'New York Yankees vs. Minnesota Twins Final' },
+          ],
+        },
+      },
+    };
+  }
+  const multiFills = [];
+  const persistKeys = new Set();
+  const multiHttp = {
+    ...emptyHttp(),
+    async listQuotes(query) {
+      if (query && query.status === 'QUOTE_STATUS_EXECUTED') {
+        return {
+          quotes: [{
+            id: 'quote-one',
+            rfqId: 'rfq-one',
+            status: 'QUOTE_STATUS_EXECUTED',
+            creatorOrderId: 'poly-order-one',
+            buyQtyDecimal: '70',
+          }],
+        };
+      }
+      return { quotes: [] };
+    },
+    async getOrder(id) {
+      return { id, cumQuantity: 70, state: 'ORDER_STATE_FILLED' };
+    },
+    async listActivities() {
+      return {
+        activities: [
+          comboLot('won-settlement', 2394.34, false),
+          comboLot('sold-288', 288.36, true),
+          comboLot('sold-48', 48.06, true),
+        ],
+      };
+    },
+    async listPositions() {
+      return {
+        positions: [{
+          qtyBoughtDecimal: '9999',
+          marketMetadata: { title: LOCK.label, slug: 'cle-nyy-sf-combo' },
+        }],
+      };
+    },
+  };
+  const { loop: multiLoop } = startFillLoop({
+    skipSeed: true,
+    pendingQuotes: new Map(),
+    http: multiHttp,
+    seenFillIds: persistKeys,
+    loadUnfilledPolyQuotes: async () => [{
+      quote_id: 'quote-one',
+      rfq_id: 'rfq-one',
+      parlay_id: LOCK.id,
+      label: LOCK.label,
+      contracts: 70,
+      user_id: LOCK.user_id,
+      status: 'unfilled',
+    }],
+    loadRecentLocks: async () => [LOCK],
+    onQuoteExecuted: (evt) => {
+      const key = evt.fillId || evt.orderId || evt.quoteId;
+      if (!claimFillKey(persistKeys, key)) return;
+      multiFills.push(evt);
+    },
+  });
+  const multi = await multiLoop.reconcileLockFills();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(multi.length, 4, 'quote fill plus all three lock-matching cashout/settlement lots');
+  assert.strictEqual(multiFills.length, 4, 'persist must not treat activity ids as already claimed');
+  assert.ok(multiFills.some((e) => e.quoteId === 'quote-one' && e.contracts === 70));
+  assert.deepStrictEqual(
+    multiFills.filter((e) => String(e.fillId || '').startsWith('poly-act:')).map((e) => e.contracts).sort((a, b) => b - a),
+    [2394.34, 288.36, 48.06]
+  );
+  const multiAgain = await multiLoop.reconcileLockFills();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(multiAgain.length, 0, 'repeat reconcile of the same lots is silent');
+  assert.strictEqual(multiFills.length, 4);
+  multiLoop.stop();
+
   const polySrc = fs.readFileSync(path.join(__dirname, 'polymarket-rfq.js'), 'utf8');
   assert.ok(
     /function emitOrderFill/.test(polySrc) && /ctx\.onQuoteExecuted/.test(polySrc),
@@ -606,8 +706,11 @@ function startFillLoop(extra = {}) {
     'live-runner must feed Poly fill reconcile from combo_submissions / combo_fills'
   );
   assert.ok(
-    /function reconcileLockFills/.test(polySrc) && /RECONCILE/.test(polySrc),
-    'Poly loop must periodically reconcile EXECUTED quotes against GET /v1/order'
+    /function reconcileLockFills/.test(polySrc) && /RECONCILE/.test(polySrc)
+      && /reconcileLockActivityEvents/.test(polySrc)
+      && /loadRecentLocks/.test(polySrc)
+      && !/if\s*\(\s*!events\.length/.test(polySrc),
+    'Poly loop must always scan lock-matching activities, not only when quote reconcile is empty'
   );
   assert.ok(
     /submissionAlreadyFilled/.test(liveSrc),

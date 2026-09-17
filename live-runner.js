@@ -1755,6 +1755,7 @@ async function main() {
     loadUnfilledPolyQuotes,
     getFilledForQuote,
     loadRecentLocks,
+    seenFillIds,
     initialFillReconcile: true,
     sendAlert,
     counts,

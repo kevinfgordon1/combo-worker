@@ -3,6 +3,9 @@
 // + combo_submissions using the same GetQuotes / GET order / activity
 // / position rules as the worker reconcile loop.
 //
+// Always pages kaygosports TRADE/sold/cashed activity for the lock — a
+// quote match must not hide later cashouts on the same parlay.
+//
 // Env: SUPABASE_URL, SUPABASE_SERVICE_KEY, POLYMARKET_KEY_ID, POLYMARKET_SECRET_KEY
 // Optional: TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID
 // Optional: BACKFILL_PARLAY_ID (default CLE/NYY/SF 2026-09-16 lock)
@@ -15,10 +18,7 @@ const { createPolymarketHttp } = require('../polymarket-client');
 const { liveRunnerFillRow, claimFillKey } = require('../fills-attr');
 const {
   reconcilePolymarketLockFills,
-  matchActivitiesToLocks,
-  matchPositionsToLocks,
-  activitiesFromListed,
-  positionsFromListed,
+  reconcileLockActivityEvents,
 } = require('../polymarket-fill-reconcile');
 const { formatAlertStatus } = require('../venue-alert');
 const { shortId } = require('../short-id');
@@ -105,21 +105,16 @@ async function main() {
   console.log(`[BACKFILL] quote/order matches=${quoteEvents.length}`);
 
   let extra = [];
-  if (!quoteEvents.length) {
-    try {
-      const listed = await http.listActivities({ types: 'ACTIVITY_TYPE_TRADE', limit: 100 });
-      extra = extra.concat(matchActivitiesToLocks(activitiesFromListed(listed), [parlay]));
-    } catch (e) {
-      console.error('[BACKFILL] activities', e.message);
-    }
-    try {
-      const listed = await http.listPositions({ limit: 100 });
-      extra = extra.concat(matchPositionsToLocks(positionsFromListed(listed), [parlay]));
-    } catch (e) {
-      console.error('[BACKFILL] positions', e.message);
-    }
-    console.log(`[BACKFILL] activity/position matches=${extra.length}`);
+  try {
+    extra = await reconcileLockActivityEvents(http, {
+      locks: [parlay],
+      seenFillIds: seen,
+      maxPages: 8,
+    });
+  } catch (e) {
+    console.error('[BACKFILL] activities', e.message);
   }
+  console.log(`[BACKFILL] activity/position matches=${extra.length} (always scanned; quote hits do not hide cashouts)`);
 
   const events = quoteEvents.concat(extra).filter((evt) => claimFillKey(seen, evt.fillId || evt.orderId || evt.quoteId));
   let booked = 0;
@@ -208,8 +203,9 @@ async function main() {
   if (!events.length) {
     console.log(
       '[BACKFILL] evidence: 0 EXECUTED self-quotes with fillable cumQuantity ' +
-      'and 0 unique lock-matching trades/positions. The $2056.74 YOU WON card ' +
-      'cannot be attributed to worker quotes from this key.'
+      'and 0 unique lock-matching trades/cashouts/positions for this key. ' +
+      'Kevin\'s three lots (YOU WON $2056.74→$2394.34, CASHED OUT $285.25→$288.36, ' +
+      'CASHED OUT $47.58→$48.06) cannot be attributed without kaygosports activity rows.'
     );
   }
 }

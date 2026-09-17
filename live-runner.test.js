@@ -96,8 +96,9 @@ assert.ok(
 );
 assert.ok(
   /loadUnfilledPolyQuotes/.test(liveSrc) && /getFilledForQuote/.test(liveSrc)
-    && /loadRecentLocks/.test(liveSrc) && /initialFillReconcile:\s*true/.test(liveSrc),
-  'Poly fill reconcile reads recent unfilled quotes, booked size, and locks'
+    && /loadRecentLocks/.test(liveSrc) && /initialFillReconcile:\s*true/.test(liveSrc)
+    && /seenFillIds,/.test(liveSrc),
+  'Poly fill reconcile reads recent unfilled quotes, booked size, locks, and persist fill keys'
 );
 assert.ok(
   /polyLoop\.cancelOpenQuotesForParlay/.test(liveSrc),
