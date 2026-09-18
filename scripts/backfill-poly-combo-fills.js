@@ -183,6 +183,7 @@ async function main() {
       seenFillIds: seen,
       submissions: allSubs,
       slugRecords,
+      bookedFills: quoteEvents.concat(existingPoly),
       maxPages: 20,
     });
   } catch (e) {

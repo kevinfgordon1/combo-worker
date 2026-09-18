@@ -743,6 +743,156 @@ function startFillLoop(extra = {}) {
   assert.strictEqual(caocAgain.filter((e) => e.fillId === 'poly-act:CHFYRFW40VAY').length, 0);
   caocLoop.stop();
 
+  const ravens = {
+    id: '86917686-1ed3-4d3a-9d30-499c9f433b94',
+    label: 'Baltimore Ravens ML + Tampa Bay Buccaneers ML + New York Jets ML',
+    user_id: 'u1',
+    max_contracts: 505,
+  };
+  const ravensFills = [];
+  const ravensKeys = new Set();
+  const ravensHttp = {
+    ...emptyHttp(),
+    async listQuotes(query) {
+      if (query && query.status === 'QUOTE_STATUS_EXECUTED') {
+        return {
+          quotes: [{
+            id: 'DP9qb_kO-3EK-RNRaoBRybVoRsPoOOBWGANmHeGzBrw',
+            symbol: 'caoc-23f1fca1ea3441ed',
+            status: 'QUOTE_STATUS_EXECUTED',
+            creatorOrderId: 'o-cleared',
+            buyQtyDecimal: '43',
+          }],
+        };
+      }
+      return { quotes: [] };
+    },
+    async getOrder() {
+      return { id: 'o-cleared', cumQuantity: 629.82, state: 'ORDER_STATE_FILLED' };
+    },
+    async listActivities() {
+      return {
+        activities: [{
+          type: 'ACTIVITY_TYPE_TRADE',
+          trade: {
+            id: 'poly-act-invent',
+            marketSlug: 'caoc-23f1fca1ea3441ed',
+            qtyDecimal: '629.82',
+            isAggressor: false,
+            state: 'TRADE_STATE_CLEARED',
+            marketMetadata: { title: '', slug: 'caoc-23f1fca1ea3441ed' },
+          },
+        }],
+      };
+    },
+  };
+  const { loop: ravensLoop } = startFillLoop({
+    skipSeed: true,
+    pendingQuotes: new Map(),
+    http: ravensHttp,
+    seenFillIds: ravensKeys,
+    loadUnfilledPolyQuotes: async () => [{
+      quote_id: 'DP9qb_kO-3EK-RNRaoBRybVoRsPoOOBWGANmHeGzBrw',
+      rfq_id: 'rfq-43',
+      parlay_id: ravens.id,
+      label: ravens.label,
+      contracts: 43,
+      user_id: ravens.user_id,
+      status: 'unfilled',
+      market_ticker: 'caoc-23f1fca1ea3441ed',
+    }],
+    loadRecentLocks: async () => [ravens],
+    loadPolySlugRecords: async () => [{
+      quote_id: 'DP9qb_kO-3EK-RNRaoBRybVoRsPoOOBWGANmHeGzBrw',
+      parlay_id: ravens.id,
+      market_ticker: 'caoc-23f1fca1ea3441ed',
+      contracts: 43,
+    }],
+    onQuoteExecuted: (evt) => {
+      const key = evt.fillId || evt.orderId || evt.quoteId;
+      if (!claimFillKey(ravensKeys, key)) return;
+      ravensFills.push(evt);
+    },
+  });
+  const ravensEvts = await ravensLoop.reconcileLockFills();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(ravensEvts.length, 0, '43-quote must not book a 629.82 order or invent the same trade via activity');
+  assert.strictEqual(ravensFills.length, 0);
+  ravensLoop.stop();
+
+  const matchedFills = [];
+  const matchedKeys = new Set();
+  const matchedHttp = {
+    ...emptyHttp(),
+    async listQuotes(query) {
+      if (query && query.status === 'QUOTE_STATUS_EXECUTED') {
+        return {
+          quotes: [{
+            id: 'q-43-real',
+            symbol: 'caoc-23f1fca1ea3441ed',
+            status: 'QUOTE_STATUS_EXECUTED',
+            creatorOrderId: 'o-43-real',
+            buyQtyDecimal: '43',
+          }],
+        };
+      }
+      return { quotes: [] };
+    },
+    async getOrder() {
+      return { id: 'o-43-real', cumQuantity: 43, state: 'ORDER_STATE_FILLED' };
+    },
+    async listActivities() {
+      return {
+        activities: [{
+          type: 'ACTIVITY_TYPE_TRADE',
+          trade: {
+            id: 'same-43-trade',
+            marketSlug: 'caoc-23f1fca1ea3441ed',
+            qtyDecimal: '43',
+            isAggressor: false,
+            state: 'TRADE_STATE_CLEARED',
+            marketMetadata: { title: '', slug: 'caoc-23f1fca1ea3441ed' },
+          },
+        }],
+      };
+    },
+  };
+  const { loop: matchedLoop } = startFillLoop({
+    skipSeed: true,
+    pendingQuotes: new Map(),
+    http: matchedHttp,
+    seenFillIds: matchedKeys,
+    loadUnfilledPolyQuotes: async () => [{
+      quote_id: 'q-43-real',
+      rfq_id: 'rfq-43-real',
+      parlay_id: ravens.id,
+      label: ravens.label,
+      contracts: 43,
+      user_id: ravens.user_id,
+      status: 'unfilled',
+      market_ticker: 'caoc-23f1fca1ea3441ed',
+    }],
+    loadRecentLocks: async () => [ravens],
+    loadPolySlugRecords: async () => [{
+      quote_id: 'q-43-real',
+      parlay_id: ravens.id,
+      market_ticker: 'caoc-23f1fca1ea3441ed',
+      contracts: 43,
+    }],
+    onQuoteExecuted: (evt) => {
+      const key = evt.fillId || evt.orderId || evt.quoteId;
+      if (!claimFillKey(matchedKeys, key)) return;
+      matchedFills.push(evt);
+    },
+  });
+  const matchedEvts = await matchedLoop.reconcileLockFills();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(matchedEvts.length, 1, 'matching 43-contract order books once via reconcile');
+  assert.strictEqual(matchedEvts[0].source, 'poly-reconcile');
+  assert.strictEqual(matchedEvts[0].contracts, 43);
+  assert.ok(!matchedFills.some((e) => String(e.fillId || '').startsWith('poly-act:')), 'activity must not double-book the reconciled 43');
+  matchedLoop.stop();
+
   const polySrc = fs.readFileSync(path.join(__dirname, 'polymarket-rfq.js'), 'utf8');
   assert.ok(
     /function emitOrderFill/.test(polySrc) && /ctx\.onQuoteExecuted/.test(polySrc),
@@ -776,6 +926,7 @@ function startFillLoop(extra = {}) {
       && /loadRecentLocks/.test(polySrc)
       && /loadPolySlugRecords/.test(polySrc)
       && /slugRecords/.test(polySrc)
+      && /bookedFills:\s*events/.test(polySrc)
       && !/if\s*\(\s*!events\.length/.test(polySrc),
     'Poly loop must always scan lock-matching activities, not only when quote reconcile is empty'
   );

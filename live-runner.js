@@ -1277,13 +1277,13 @@ async function loadPolySlugRecords() {
     const [fillsQ, subsQ] = await Promise.all([
       supabase
         .from('combo_fills')
-        .select('ticker,parlay_id,raw')
+        .select('ticker,parlay_id,raw,count,fill_id')
         .eq('is_combo', true)
         .gte('recorded_at', cutoff)
         .limit(1000),
       supabase
         .from('combo_submissions')
-        .select('quote_id,parlay_id,market_ticker')
+        .select('quote_id,parlay_id,market_ticker,contracts')
         .eq('venue', 'polymarket')
         .not('quote_id', 'is', null)
         .gte('created_at', cutoff)
@@ -1296,7 +1296,14 @@ async function loadPolySlugRecords() {
       if (!row || !row.parlay_id) continue;
       const venue = row.raw && row.raw.venue;
       if (venue === 'polymarket' || (row.ticker && /^caoc-/i.test(row.ticker))) {
-        rows.push({ ticker: row.ticker, market_ticker: row.ticker, parlay_id: row.parlay_id });
+        rows.push({
+          ticker: row.ticker,
+          market_ticker: row.ticker,
+          parlay_id: row.parlay_id,
+          contracts: row.count,
+          fill_id: row.fill_id,
+          source: row.raw && row.raw.source,
+        });
       }
     }
     for (const row of subsQ.data || []) {
