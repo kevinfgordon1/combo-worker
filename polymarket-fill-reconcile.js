@@ -11,6 +11,9 @@
 // Retail activity for Combo markets uses opaque slugs (caoc-*) and empty
 // marketMetadata.title. Do not invent titles — join marketSlug to quote /
 // order / fill / submission ticker records we already stored.
+// Reconcile never attaches an order whose cumQuantity ≠ posted quote size
+// (partials may be smaller). Activity never re-books a trade already booked
+// via poly-recon (same lock/slug + size).
 'use strict';
 
 const USER_FILTER_SELF = 'USER_FILTER_SELF';
@@ -107,6 +110,97 @@ function incrementFromCum(cumQty, alreadyFilled) {
   return inc > 1e-9 ? inc : 0;
 }
 
+const SIZE_EPS = 1e-4;
+
+function sizesEqual(a, b) {
+  return Math.abs(parsePositive(a) - parsePositive(b)) <= SIZE_EPS;
+}
+
+function sizeKey(n) {
+  return Math.round(parsePositive(n) / SIZE_EPS);
+}
+
+function quotedContractsForReconcile(quote, pending) {
+  const pendingQty = pending ? parsePositive(pending.contracts) : 0;
+  const quoteQty = contractsFromQuote(quote);
+  if (pendingQty > 0 && quoteQty > 0 && !sizesEqual(pendingQty, quoteQty)) {
+    return { quoted: 0, mismatch: true, pendingQty, quoteQty };
+  }
+  return { quoted: pendingQty || quoteQty, mismatch: false, pendingQty, quoteQty };
+}
+
+// Full fill must equal the posted quote. PARTIALLY_FILLED may be smaller.
+// Never attach a 629.82 order/trade to a 43-contract quote.
+function orderQtyMatchesQuoted(cumQty, quoted, state) {
+  const cum = parsePositive(cumQty);
+  const want = parsePositive(quoted);
+  if (!(want > 0)) return true;
+  if (!(cum > 0)) return false;
+  if (sizesEqual(cum, want)) return true;
+  return cum + SIZE_EPS < want && isPartialOrderState(state);
+}
+
+function isReconcileFillRecord(row) {
+  if (!row) return false;
+  const src = String(row.source || (row.raw && row.raw.source) || '');
+  const fillId = row.fillId || row.fill_id;
+  return src.startsWith('poly-recon') || String(fillId || '').startsWith('poly-recon:');
+}
+
+function reconcileSizeFromFillId(fillId) {
+  const m = /^poly-recon:[^:]+:(\d+(?:\.\d+)?)$/.exec(String(fillId || ''));
+  return m ? parsePositive(m[1]) : 0;
+}
+
+function quotedSizesByLock(submissions, pendingQuotes) {
+  const map = new Map();
+  const add = (parlayId, qty) => {
+    const n = parsePositive(qty);
+    if (!parlayId || !(n > 0)) return;
+    if (!map.has(parlayId)) map.set(parlayId, new Set());
+    map.get(parlayId).add(sizeKey(n));
+  };
+  for (const row of submissions || []) {
+    add(row.parlay_id || row.parlayId, row.contracts);
+  }
+  if (pendingQuotes && typeof pendingQuotes.forEach === 'function') {
+    pendingQuotes.forEach((pending) => {
+      if (pending) add(pending.parlayId, pending.contracts);
+    });
+  }
+  return map;
+}
+
+function bookedReconcileKeys({ bookedFills, seenFillIds } = {}) {
+  const keys = new Set();
+  for (const row of bookedFills || []) {
+    if (!isReconcileFillRecord(row)) continue;
+    const qty = parsePositive(row.contracts ?? row.count ?? row.qty);
+    if (!(qty > 0)) continue;
+    const parlayId = row.parlayId || row.parlay_id || '';
+    keys.add(`${parlayId}:${sizeKey(qty)}`);
+    const slug = normalizeMarketSlug(row.marketTicker || row.ticker || row.market_ticker);
+    if (slug) keys.add(`${slug}:${sizeKey(qty)}`);
+  }
+  if (seenFillIds && typeof seenFillIds.forEach === 'function') {
+    seenFillIds.forEach((id) => {
+      const qty = reconcileSizeFromFillId(id);
+      if (qty > 0) keys.add(`:${sizeKey(qty)}`);
+    });
+  }
+  return keys;
+}
+
+function activityAlreadyReconciled(trade, lock, bookedKeys) {
+  if (!trade || !bookedKeys || typeof bookedKeys.has !== 'function') return false;
+  const qty = sizeKey(trade.qty);
+  if (!(qty > 0)) return false;
+  if (lock && lock.id && bookedKeys.has(`${lock.id}:${qty}`)) return true;
+  const slug = normalizeMarketSlug(trade.marketSlug);
+  if (slug && bookedKeys.has(`${slug}:${qty}`)) return true;
+  return bookedKeys.has(`:${qty}`);
+}
+
 function reconcileFillId(quoteId, orderId, cumQty) {
   const cum = parsePositive(cumQty);
   if (quoteId && cum) return `poly-recon:${quoteId}:${cum}`;
@@ -168,14 +262,17 @@ function fillEventFromReconcile({
     || orderIdOfQuote(quote)
     || (pending && (pending.creatorOrderId || pending.orderId || pending.order_id))
     || null;
-  const quoted = contractsFromQuote(quote) || (pending && pending.contracts) || 0;
+  const sized = quotedContractsForReconcile(quote, pending);
+  if (sized.mismatch) return null;
+  const quoted = sized.quoted;
   let cum = cumQuantityOf(order);
   if (!(cum > 0) && allowExecutedWithoutOrder && isExecutedQuoteStatus(quote && quote.status) && quoted > 0) {
     cum = quoted;
   }
+  const state = orderStateOf(order);
+  if (cum > 0 && quoted > 0 && !orderQtyMatchesQuoted(cum, quoted, state)) return null;
   const contracts = incrementFromCum(cum, alreadyFilled);
   if (!(contracts > 0) || (!quoteId && !orderId)) return null;
-  const state = orderStateOf(order);
   return {
     quoteId,
     orderId: orderId || null,
@@ -321,11 +418,18 @@ function lockForMappedSlug(locks, slug, slugMap) {
 }
 
 function uniqueLockForMarket(locks, title, slug, slugMap) {
+  return lockMatchForActivity(locks, title, slug, slugMap).lock;
+}
+
+function lockMatchForActivity(locks, title, slug, slugMap) {
   const mapped = lockForMappedSlug(locks, slug, slugMap);
-  if (mapped) return mapped;
-  const hits = (locks || []).filter((p) => p && lockLabelMatchesMarket(p.label, title, slug));
-  if (hits.length !== 1) return null;
-  return hits[0];
+  const titleHits = (locks || []).filter((p) => p && lockLabelMatchesMarket(p.label, title, slug));
+  const titled = titleHits.length === 1 ? titleHits[0] : null;
+  if (mapped) {
+    return { lock: mapped, via: titled && titled.id === mapped.id ? 'both' : 'slug' };
+  }
+  if (titled) return { lock: titled, via: 'title' };
+  return { lock: null, via: null };
 }
 
 function activityTypeLooksFill(type) {
@@ -627,7 +731,13 @@ function activityFillEvent({ trade, lock, source }) {
   };
 }
 
-function matchActivitiesToLocks(activities, locks, { requireMaker = false, seenFillIds, slugMap } = {}) {
+function matchActivitiesToLocks(activities, locks, {
+  requireMaker = false,
+  seenFillIds,
+  slugMap,
+  bookedFills,
+  quotedByLock,
+} = {}) {
   const events = [];
   const matchedLockIds = new Set();
   const booked = seenFillIds && typeof seenFillIds.has === 'function' ? seenFillIds : null;
@@ -635,15 +745,27 @@ function matchActivitiesToLocks(activities, locks, { requireMaker = false, seenF
   const map = slugMap instanceof Map || (slugMap && typeof slugMap === 'object')
     ? coerceSlugMap(slugMap)
     : null;
+  const reconcileKeys = bookedReconcileKeys({ bookedFills, seenFillIds });
+  const quoteSizes = quotedByLock instanceof Map
+    ? quotedByLock
+    : quotedSizesByLock(quotedByLock);
   for (const activity of activities || []) {
     const trade = tradeFromActivity(activity);
     if (!trade) continue;
     if (requireMaker && trade.isAggressor) continue;
-    const lock = uniqueLockForMarket(locks, trade.hay || trade.title, trade.marketSlug, map);
+    const hit = lockMatchForActivity(locks, trade.hay || trade.title, trade.marketSlug, map);
+    const lock = hit.lock;
     if (!lock) continue;
+    matchedLockIds.add(lock.id);
+    if (activityAlreadyReconciled(trade, lock, reconcileKeys)) continue;
+    // Opaque caoc maker hedges must match a posted quote size. Do not invent
+    // a 629.82 fill against a 43-contract quote on the same slug.
+    if (!trade.isAggressor && hit.via === 'slug') {
+      const sizes = quoteSizes && quoteSizes.get(lock.id);
+      if (sizes && sizes.size && !sizes.has(sizeKey(trade.qty))) continue;
+    }
     const evt = activityFillEvent({ trade, lock });
     if (!evt) continue;
-    matchedLockIds.add(lock.id);
     if (local.has(evt.fillId) || (booked && booked.has(evt.fillId))) continue;
     local.add(evt.fillId);
     events.push(evt);
@@ -680,9 +802,16 @@ async function reconcileLockActivityEvents(http, {
   slugRecords,
   submissions,
   quotes,
+  bookedFills,
+  pendingQuotes,
 } = {}) {
   if (!locks.length) return [];
   const map = buildActivitySlugMap({ slugMap, slugRecords, quotes, submissions });
+  const quotedByLock = quotedSizesByLock(
+    [...(submissions || []), ...(slugRecords || [])],
+    pendingQuotes
+  );
+  const booked = [...(bookedFills || []), ...(slugRecords || [])];
   if (!quotes && http && typeof http.listQuotes === 'function') {
     try {
       const listed = await listSelfExecutedQuotes(http, { limit: 100 });
@@ -695,7 +824,12 @@ async function reconcileLockActivityEvents(http, {
   } catch (_) {
     activities = [];
   }
-  const events = matchActivitiesToLocks(activities, locks, { seenFillIds, slugMap: map });
+  const events = matchActivitiesToLocks(activities, locks, {
+    seenFillIds,
+    slugMap: map,
+    bookedFills: booked,
+    quotedByLock,
+  });
   const covered = new Set([
     ...events.map((e) => e.parlayId).filter(Boolean),
     ...(events.matchedLockIds || []),
@@ -777,6 +911,15 @@ module.exports = {
   contractsFromQuote,
   firstPositiveAmount,
   incrementFromCum,
+  sizesEqual,
+  sizeKey,
+  quotedContractsForReconcile,
+  orderQtyMatchesQuoted,
+  isReconcileFillRecord,
+  reconcileSizeFromFillId,
+  quotedSizesByLock,
+  bookedReconcileKeys,
+  activityAlreadyReconciled,
   reconcileFillId,
   quotesFromListed,
   activitiesFromListed,
@@ -792,6 +935,7 @@ module.exports = {
   slugMapFromQuotes,
   buildActivitySlugMap,
   uniqueLockForMarket,
+  lockMatchForActivity,
   tradeFromActivity,
   activityMarketHay,
   activityFillEvent,

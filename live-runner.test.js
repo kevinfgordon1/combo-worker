@@ -97,6 +97,7 @@ assert.ok(
 assert.ok(
   /loadUnfilledPolyQuotes/.test(liveSrc) && /getFilledForQuote/.test(liveSrc)
     && /loadRecentLocks/.test(liveSrc) && /loadPolySlugRecords/.test(liveSrc)
+    && /fill_id/.test(liveSrc) && /row\.count/.test(liveSrc)
     && /initialFillReconcile:\s*true/.test(liveSrc)
     && /seenFillIds,/.test(liveSrc),
   'Poly fill reconcile reads recent unfilled quotes, booked size, locks, and persist fill keys'

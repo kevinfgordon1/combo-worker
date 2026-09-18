@@ -1736,6 +1736,8 @@ function startPolymarketRfqLoop(ctx = {}) {
             seenFillIds: ctx.seenFillIds,
             submissions,
             slugRecords,
+            pendingQuotes,
+            bookedFills: events.concat(Array.isArray(ctx.bookedPolyFills) ? ctx.bookedPolyFills : []),
           });
         } catch (e) {
           console.error(`[${MODE}] fill reconcile activities`, e && e.message);

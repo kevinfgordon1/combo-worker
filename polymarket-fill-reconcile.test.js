@@ -8,6 +8,11 @@ const {
   incrementFromCum,
   reconcileFillId,
   fillEventFromReconcile,
+  sizesEqual,
+  orderQtyMatchesQuoted,
+  activityAlreadyReconciled,
+  bookedReconcileKeys,
+  quotedSizesByLock,
   lockLabelMatchesMarket,
   uniqueLockForMarket,
   normalizeMarketSlug,
@@ -52,6 +57,13 @@ const LOCK = {
   assert.strictEqual(incrementFromCum(0, 0), 0);
   assert.strictEqual(reconcileFillId('q1', 'o1', 50), 'poly-recon:q1:50');
   assert.strictEqual(reconcileFillId('q1', 'o1', 50), reconcileFillId('q1', 'o1', 50));
+  assert.ok(sizesEqual(43, 43));
+  assert.ok(sizesEqual(629.82, 629.82000001));
+  assert.ok(!sizesEqual(43, 629.82));
+  assert.ok(orderQtyMatchesQuoted(43, 43, 'ORDER_STATE_FILLED'));
+  assert.ok(orderQtyMatchesQuoted(50, 70, 'ORDER_STATE_PARTIALLY_FILLED'));
+  assert.ok(!orderQtyMatchesQuoted(629.82, 43, 'ORDER_STATE_FILLED'));
+  assert.ok(!orderQtyMatchesQuoted(629.82, 43, 'ORDER_STATE_PARTIALLY_FILLED'));
 }
 
 {
@@ -116,6 +128,25 @@ const LOCK = {
     }),
     null,
     'EXECUTED without an order snapshot is not a fill'
+  );
+
+  assert.strictEqual(
+    fillEventFromReconcile({
+      quote: { id: 'q-43', creatorOrderId: 'o-junk', buyQtyDecimal: '43' },
+      order: { id: 'o-junk', cumQuantity: 629.82, state: 'ORDER_STATE_FILLED' },
+      pending: { parlayId: LOCK.id, contracts: 43, label: LOCK.label },
+    }),
+    null,
+    'poly-reconcile must not attach a 629.82 trade to a 43-contract quote'
+  );
+  assert.strictEqual(
+    fillEventFromReconcile({
+      quote: { id: 'q-43', creatorOrderId: 'o-ex', buyQtyDecimal: '629.82' },
+      order: { id: 'o-ex', cumQuantity: 629.82, state: 'ORDER_STATE_FILLED' },
+      pending: { parlayId: LOCK.id, contracts: 43, label: LOCK.label },
+    }),
+    null,
+    'exchange buyQty ≠ posted contracts is not this lock quote'
   );
 }
 
@@ -226,6 +257,72 @@ function emptyTitleCaocTrade(id, cost, { aggressor = true } = {}) {
     0,
     'do not guess when two locks share a caoc slug'
   );
+
+  const ravensLock = {
+    id: '86917686-1ed3-4d3a-9d30-499c9f433b94',
+    label: 'Baltimore Ravens ML + Tampa Bay Buccaneers ML + New York Jets ML',
+    max_contracts: 505,
+  };
+  const ravensSlug = 'caoc-23f1fca1ea3441ed';
+  const ravensMap = slugMapFromRecords([
+    { market_ticker: ravensSlug, parlay_id: ravensLock.id, contracts: 43 },
+  ]);
+  const junkTrade = {
+    type: 'ACTIVITY_TYPE_TRADE',
+    trade: {
+      id: 'poly-act-invent',
+      marketSlug: ravensSlug,
+      qtyDecimal: '629.82',
+      isAggressor: false,
+      state: 'TRADE_STATE_CLEARED',
+      marketMetadata: { title: '', slug: ravensSlug },
+    },
+  };
+  const reconBooked = [{
+    parlayId: ravensLock.id,
+    contracts: 629.82,
+    source: 'poly-reconcile',
+    fillId: 'poly-recon:q-43:629.82',
+    marketTicker: ravensSlug,
+  }];
+  assert.strictEqual(
+    matchActivitiesToLocks([junkTrade], [ravensLock], {
+      slugMap: ravensMap,
+      bookedFills: reconBooked,
+    }).length,
+    0,
+    'poly-activity must not double-book a trade already booked via reconcile'
+  );
+  assert.ok(activityAlreadyReconciled(
+    { qty: 629.82, marketSlug: ravensSlug },
+    ravensLock,
+    bookedReconcileKeys({ bookedFills: reconBooked })
+  ));
+  assert.strictEqual(
+    matchActivitiesToLocks([junkTrade], [ravensLock], {
+      slugMap: ravensMap,
+      quotedByLock: quotedSizesByLock([{ parlay_id: ravensLock.id, contracts: 43 }]),
+    }).length,
+    0,
+    'slug-only maker trade whose size ≠ posted quote must not invent a fill'
+  );
+  const matchedQuote = {
+    type: 'ACTIVITY_TYPE_TRADE',
+    trade: {
+      id: 'poly-act-43',
+      marketSlug: ravensSlug,
+      qtyDecimal: '43',
+      isAggressor: false,
+      state: 'TRADE_STATE_CLEARED',
+      marketMetadata: { title: '', slug: ravensSlug },
+    },
+  };
+  const ok43 = matchActivitiesToLocks([matchedQuote], [ravensLock], {
+    slugMap: ravensMap,
+    quotedByLock: quotedSizesByLock([{ parlay_id: ravensLock.id, contracts: 43 }]),
+  });
+  assert.strictEqual(ok43.length, 1, 'slug-mapped maker fill may book when size equals the quote');
+  assert.strictEqual(ok43[0].contracts, 43);
 }
 
 function comboTrade(id, qty, { aggressor = false, payout } = {}) {
