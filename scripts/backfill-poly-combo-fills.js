@@ -8,6 +8,9 @@
 // that fell off the global window still book. Opaque Retail slugs join
 // to quote/order/fill ticker records — empty marketMetadata.title is
 // not required. No / short Yes positions use |netPosition|.
+// A fill books onto a lock only when its caoc ticker is that lock's
+// mapped slug or its quote_id is one of that lock's submissions.
+// BACKFILL_PARLAY_ID never inherits foreign executed quotes.
 //
 // Env: SUPABASE_URL, SUPABASE_SERVICE_KEY, POLYMARKET_KEY_ID, POLYMARKET_SECRET_KEY
 // Optional: TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID
@@ -22,6 +25,7 @@ const { liveRunnerFillRow, claimFillKey } = require('../fills-attr');
 const {
   reconcilePolymarketLockFills,
   reconcileLockActivityEvents,
+  lockForFillEvent,
 } = require('../polymarket-fill-reconcile');
 const { formatAlertStatus } = require('../venue-alert');
 const { shortId } = require('../short-id');
@@ -198,10 +202,16 @@ async function main() {
   let contracts = 0;
   const byLock = new Map();
   for (const evt of events) {
-    const parlayId = evt.parlayId || (evt.pending && evt.pending.parlayId) || PARLAY_ID || null;
-    const parlay = (parlayId && locksById.get(parlayId)) || null;
+    const parlay = lockForFillEvent(evt, locks, {
+      submissions: allSubs,
+      slugRecords,
+    });
     if (!parlay) {
-      console.error(`[BACKFILL] skip unmatched parlay fill_id=${evt.fillId || '?'}`);
+      console.error(
+        `[BACKFILL] skip foreign/unscoped fill_id=${evt.fillId || '?'} ` +
+        `ticker=${evt.marketTicker || '—'} quote=${evt.quoteId || '—'} ` +
+        `count=${evt.contracts}`
+      );
       continue;
     }
     const pending = evt.pending || {

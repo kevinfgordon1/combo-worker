@@ -15,6 +15,10 @@ const {
   quotedSizesByLock,
   slugMakerSizeAllowed,
   positionQty,
+  fillBelongsToLock,
+  lockForFillEvent,
+  scopeQuoteCandidates,
+  mergeQuoteCandidates,
   lockLabelMatchesMarket,
   uniqueLockForMarket,
   normalizeMarketSlug,
@@ -29,7 +33,6 @@ const {
   reconcileLockActivityEvents,
   lockTeamNicknames,
   pendingFromSubmission,
-  mergeQuoteCandidates,
   pickReconcileCandidates,
   resolveQuoteFill,
   reconcilePolymarketLockFills,
@@ -381,6 +384,78 @@ function emptyTitleCaocTrade(id, cost, { aggressor = true } = {}) {
   });
   assert.strictEqual(costHit.length, 1, 'No combo sized from cost still books when cost < posted quote');
   assert.strictEqual(costHit[0].contracts, 70.95);
+}
+
+{
+  const giantsLock = {
+    id: 'e28a732e-b901-4556-800e-e359758b550b',
+    label: 'New York Giants ML + New England Patriots ML + Washington Commanders ML',
+  };
+  const giantsSlug = 'caoc-ee31bd7977a36124';
+  const giantsSubs = [
+    { quote_id: 'q-g-80', parlay_id: giantsLock.id, market_ticker: giantsSlug, contracts: 80 },
+    { quote_id: 'q-g-161', parlay_id: giantsLock.id, market_ticker: giantsSlug, contracts: 161 },
+  ];
+  const slugs = new Map([[giantsLock.id, new Set([giantsSlug])]]);
+  const quoteIds = new Map(giantsSubs.map((s) => [s.quote_id, s.parlay_id]));
+
+  assert.ok(fillBelongsToLock(
+    { quoteId: null, marketTicker: giantsSlug, contracts: 75.64, parlayId: giantsLock.id },
+    giantsLock,
+    { quoteIds, slugs }
+  ), 'same-ticker Giants activity belongs on the lock');
+  assert.ok(!fillBelongsToLock(
+    { quoteId: 'q-ravens', marketTicker: 'caoc-23f1fca1ea3441ed', contracts: 629.82 },
+    giantsLock,
+    { quoteIds, slugs }
+  ), 'Ravens 629.82 caoc must not attach to Giants');
+  assert.ok(!fillBelongsToLock(
+    { quoteId: 'q-eagles', marketTicker: 'caoc-1f0613a434f23f94', contracts: 24.63 },
+    giantsLock,
+    { quoteIds, slugs }
+  ), 'Eagles/Bills/Jets caoc must not attach to Giants');
+  assert.ok(!fillBelongsToLock(
+    { quoteId: 'q-other', marketTicker: 'caoc-e0bed519fe46b9a2', contracts: 70.9 },
+    giantsLock,
+    { quoteIds, slugs }
+  ), 'foreign caoc-e0bed5 must not attach to Giants');
+  assert.ok(fillBelongsToLock(
+    { quoteId: 'q-g-80', marketTicker: giantsSlug, contracts: 80 },
+    giantsLock,
+    { quoteIds, slugs }
+  ), 'this lock quote_id may book');
+
+  const merged = mergeQuoteCandidates(
+    [
+      { id: 'q-ravens', status: 'QUOTE_STATUS_EXECUTED', symbol: 'caoc-23f1fca1ea3441ed', buyQtyDecimal: '629.82' },
+      { id: 'q-eagles', status: 'QUOTE_STATUS_EXECUTED', symbol: 'caoc-1f0613a434f23f94', buyQtyDecimal: '24.63' },
+      { id: 'q-other', status: 'QUOTE_STATUS_EXECUTED', symbol: 'caoc-e0bed519fe46b9a2', buyQtyDecimal: '70.9' },
+      { id: 'q-g-80', status: 'QUOTE_STATUS_EXECUTED', symbol: giantsSlug, buyQtyDecimal: '80' },
+    ],
+    giantsSubs,
+    null
+  );
+  const scoped = scopeQuoteCandidates(merged, { submissions: giantsSubs });
+  assert.ok(scoped.every((c) => c.id === 'q-g-80' || c.id === 'q-g-161'), 'scope drops foreign executed quotes');
+  assert.ok(!scoped.some((c) => c.id === 'q-ravens' || c.id === 'q-eagles' || c.id === 'q-other'));
+
+  assert.strictEqual(
+    lockForFillEvent(
+      { fillId: 'poly-recon:q-ravens:629.82', quoteId: 'q-ravens', marketTicker: 'caoc-23f1fca1ea3441ed', contracts: 629.82 },
+      [giantsLock],
+      { submissions: giantsSubs }
+    ),
+    null,
+    'BACKFILL_PARLAY_ID must not inherit the Ravens 629.82 quote'
+  );
+  assert.strictEqual(
+    lockForFillEvent(
+      { fillId: 'poly-act:giants', marketTicker: giantsSlug, contracts: 75.64, parlayId: giantsLock.id },
+      [giantsLock],
+      { submissions: giantsSubs }
+    ),
+    giantsLock
+  );
 }
 
 function comboTrade(id, qty, { aggressor = false, payout } = {}) {
@@ -759,6 +834,78 @@ function comboTrade(id, qty, { aggressor = false, payout } = {}) {
   );
   assert.strictEqual(oversizedThenPos[0].source, 'poly-position');
   assert.strictEqual(oversizedThenPos[0].contracts, 75.64);
+
+  const dryRunHttp = {
+    async listQuotes(query) {
+      if (query && query.userFilter === 'USER_FILTER_SELF' && query.status === 'QUOTE_STATUS_EXECUTED') {
+        return {
+          quotes: [
+            { id: 'q-other', status: 'QUOTE_STATUS_EXECUTED', symbol: 'caoc-e0bed519fe46b9a2', buyQtyDecimal: '70.9', creatorOrderId: 'o-other' },
+            { id: 'q-ravens', status: 'QUOTE_STATUS_EXECUTED', symbol: 'caoc-23f1fca1ea3441ed', buyQtyDecimal: '629.82', creatorOrderId: 'o-ravens' },
+            { id: 'q-eagles', status: 'QUOTE_STATUS_EXECUTED', symbol: 'caoc-1f0613a434f23f94', buyQtyDecimal: '24.63', creatorOrderId: 'o-eagles' },
+          ],
+        };
+      }
+      return { quotes: [] };
+    },
+    async getOrder(id) {
+      const qty = { 'o-other': 70.9, 'o-ravens': 629.82, 'o-eagles': 24.63 }[id];
+      return qty ? { id, cumQuantity: qty, state: 'ORDER_STATE_FILLED' } : null;
+    },
+    async listActivities() {
+      return {
+        activities: [{
+          type: 'ACTIVITY_TYPE_TRADE',
+          trade: {
+            id: 'giants-correct',
+            marketSlug: giantsSlug,
+            qtyDecimal: '75.64',
+            isAggressor: false,
+            state: 'TRADE_STATE_CLEARED',
+            marketMetadata: { title: '', slug: giantsSlug, outcome: 'No' },
+          },
+        }],
+      };
+    },
+    async listPositions() { return { positions: [] }; },
+  };
+  const giantsSubs = [{
+    quote_id: 'q-g-80',
+    parlay_id: giantsLock.id,
+    market_ticker: giantsSlug,
+    contracts: 80,
+    status: 'unfilled',
+    label: giantsLock.label,
+  }];
+  const quoteHits = await reconcilePolymarketLockFills(dryRunHttp, {
+    submissions: giantsSubs,
+    allowExecutedWithoutOrder: true,
+    maxPerTick: 400,
+    hydrate: false,
+  });
+  assert.strictEqual(quoteHits.length, 0, 'Giants-only submissions must not book foreign executed quotes');
+  const actHits = await reconcileLockActivityEvents(dryRunHttp, {
+    locks: [giantsLock],
+    submissions: giantsSubs,
+  });
+  assert.strictEqual(actHits.length, 1, 'only the same-ticker 75.64 activity books');
+  assert.strictEqual(actHits[0].contracts, 75.64);
+  assert.strictEqual(actHits[0].marketTicker, giantsSlug);
+  assert.strictEqual(
+    lockForFillEvent(actHits[0], [giantsLock], { submissions: giantsSubs }),
+    giantsLock
+  );
+  for (const evt of quoteHits.concat([
+    { quoteId: 'q-ravens', marketTicker: 'caoc-23f1fca1ea3441ed', contracts: 629.82 },
+    { quoteId: 'q-eagles', marketTicker: 'caoc-1f0613a434f23f94', contracts: 24.63 },
+    { quoteId: 'q-other', marketTicker: 'caoc-e0bed519fe46b9a2', contracts: 70.9 },
+  ])) {
+    assert.strictEqual(
+      lockForFillEvent(evt, [giantsLock], { submissions: giantsSubs }),
+      null,
+      `foreign ${evt.marketTicker} must not inherit BACKFILL_PARLAY_ID`
+    );
+  }
 
   console.log('polymarket-fill-reconcile.test.js ok');
 })().catch((e) => {
