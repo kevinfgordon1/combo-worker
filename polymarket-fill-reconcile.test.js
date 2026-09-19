@@ -13,6 +13,8 @@ const {
   activityAlreadyReconciled,
   bookedReconcileKeys,
   quotedSizesByLock,
+  slugMakerSizeAllowed,
+  positionQty,
   lockLabelMatchesMarket,
   uniqueLockForMarket,
   normalizeMarketSlug,
@@ -323,6 +325,62 @@ function emptyTitleCaocTrade(id, cost, { aggressor = true } = {}) {
   });
   assert.strictEqual(ok43.length, 1, 'slug-mapped maker fill may book when size equals the quote');
   assert.strictEqual(ok43[0].contracts, 43);
+
+  assert.ok(slugMakerSizeAllowed(75.64, quotedSizesByLock([{ parlay_id: 'x', contracts: 80 }]).get('x')));
+  assert.ok(slugMakerSizeAllowed(80, quotedSizesByLock([{ parlay_id: 'x', contracts: 80 }]).get('x')));
+  assert.ok(!slugMakerSizeAllowed(629.82, quotedSizesByLock([{ parlay_id: 'x', contracts: 43 }]).get('x')));
+
+  const giantsLock = {
+    id: 'e28a732e-b901-4556-800e-e359758b550b',
+    label: 'New York Giants ML + New England Patriots ML + Washington Commanders ML',
+    max_contracts: 3680,
+  };
+  const giantsSlug = 'caoc-ee31bd7977a36124';
+  const giantsMap = slugMapFromRecords([
+    { market_ticker: giantsSlug, parlay_id: giantsLock.id, contracts: 80 },
+    { market_ticker: giantsSlug, parlay_id: giantsLock.id, contracts: 161 },
+  ]);
+  const giantsPartial = {
+    type: 'ACTIVITY_TYPE_TRADE',
+    trade: {
+      id: 'giants-no-partial',
+      marketSlug: giantsSlug,
+      qtyDecimal: '75.64',
+      cost: { value: '70.95', currency: 'USD' },
+      isAggressor: false,
+      state: 'TRADE_STATE_CLEARED',
+      marketMetadata: { title: '', slug: giantsSlug, outcome: 'No' },
+    },
+  };
+  const giantsQuoted = quotedSizesByLock([
+    { parlay_id: giantsLock.id, contracts: 80 },
+    { parlay_id: giantsLock.id, contracts: 161 },
+  ]);
+  const giantsHit = matchActivitiesToLocks([giantsPartial], [giantsLock], {
+    slugMap: giantsMap,
+    quotedByLock: giantsQuoted,
+  });
+  assert.strictEqual(giantsHit.length, 1, 'empty-title caoc No partial (75.64 of 80) must book');
+  assert.strictEqual(giantsHit[0].contracts, 75.64);
+  assert.strictEqual(giantsHit[0].parlayId, giantsLock.id);
+
+  const costOnly = {
+    type: 'ACTIVITY_TYPE_TRADE',
+    trade: {
+      id: 'giants-cost-only',
+      marketSlug: giantsSlug,
+      cost: { value: '70.95', currency: 'USD' },
+      isAggressor: false,
+      state: 'TRADE_STATE_CLEARED',
+      marketMetadata: { title: '', slug: giantsSlug },
+    },
+  };
+  const costHit = matchActivitiesToLocks([costOnly], [giantsLock], {
+    slugMap: giantsMap,
+    quotedByLock: giantsQuoted,
+  });
+  assert.strictEqual(costHit.length, 1, 'No combo sized from cost still books when cost < posted quote');
+  assert.strictEqual(costHit[0].contracts, 70.95);
 }
 
 function comboTrade(id, qty, { aggressor = false, payout } = {}) {
@@ -389,6 +447,40 @@ function comboTrade(id, qty, { aggressor = false, payout } = {}) {
   assert.strictEqual(evts.length, 1);
   assert.strictEqual(evts[0].contracts, 2394.34);
   assert.ok(evts[0].fillId.startsWith('poly-pos:'));
+}
+
+{
+  assert.strictEqual(positionQty({
+    qtyBoughtDecimal: '0',
+    qtySoldDecimal: '75.64',
+    netPositionDecimal: '-75.64',
+  }), 75.64, 'No / short Yes uses |netPosition|, not qtyBought=0');
+  assert.strictEqual(positionQty({
+    qtyBoughtDecimal: '19.6',
+    netPositionDecimal: '19.6',
+  }), 19.6);
+  assert.strictEqual(positionQty({
+    qtyBoughtDecimal: '100',
+    netPositionDecimal: '0',
+  }), 0, 'flat net is not an open hedge');
+
+  const giantsLock = {
+    id: 'e28a732e-b901-4556-800e-e359758b550b',
+    label: 'New York Giants ML + New England Patriots ML + Washington Commanders ML',
+  };
+  const giantsSlug = 'caoc-ee31bd7977a36124';
+  const noPos = matchPositionsToLocks([{
+    marketSlug: giantsSlug,
+    qtyBoughtDecimal: '0',
+    qtySoldDecimal: '75.64',
+    netPositionDecimal: '-75.64',
+    cost: { value: '70.95', currency: 'USD' },
+    marketMetadata: { title: '', slug: giantsSlug, outcome: 'No' },
+  }], [giantsLock], {
+    slugMap: slugMapFromRecords([{ market_ticker: giantsSlug, parlay_id: giantsLock.id }]),
+  });
+  assert.strictEqual(noPos.length, 1, 'empty-title caoc No position matches via slug map');
+  assert.strictEqual(noPos[0].contracts, 75.64);
 }
 
 {
@@ -587,6 +679,86 @@ function comboTrade(id, qty, { aggressor = false, payout } = {}) {
   });
   assert.strictEqual(viaStoredQuotes.length, 3, 'reconcile joins executed quote symbol to activity caoc slug');
   assert.ok(viaStoredQuotes.some((e) => e.fillId === 'poly-act:CHFYRFW40VAY' && e.contracts === 285.25));
+
+  const giantsLock = {
+    id: 'e28a732e-b901-4556-800e-e359758b550b',
+    label: 'New York Giants ML + New England Patriots ML + Washington Commanders ML',
+  };
+  const giantsSlug = 'caoc-ee31bd7977a36124';
+  const slugsSeen = [];
+  const giantsHttp = {
+    async listActivities({ marketSlug }) {
+      slugsSeen.push(marketSlug || null);
+      if (marketSlug === giantsSlug) {
+        return {
+          activities: [{
+            type: 'ACTIVITY_TYPE_TRADE',
+            trade: {
+              id: 'giants-old-page',
+              marketSlug: giantsSlug,
+              qtyDecimal: '75.64',
+              isAggressor: false,
+              state: 'TRADE_STATE_CLEARED',
+              marketMetadata: { title: '', slug: giantsSlug, outcome: 'No' },
+            },
+          }],
+        };
+      }
+      return { activities: [] };
+    },
+    async listPositions() { return { positions: [] }; },
+  };
+  const viaSlugPage = await reconcileLockActivityEvents(giantsHttp, {
+    locks: [giantsLock],
+    submissions: [{
+      market_ticker: giantsSlug,
+      parlay_id: giantsLock.id,
+      contracts: 80,
+    }],
+  });
+  assert.ok(slugsSeen.includes(giantsSlug), 'reconcile pages TRADE activity for each mapped caoc slug');
+  assert.strictEqual(viaSlugPage.length, 1, 'older caoc No fill off the global window still books via slug page');
+  assert.strictEqual(viaSlugPage[0].fillId, 'poly-act:giants-old-page');
+
+  const oversizedThenPos = await reconcileLockActivityEvents({
+    async listActivities() {
+      return {
+        activities: [{
+          type: 'ACTIVITY_TYPE_TRADE',
+          trade: {
+            id: 'poly-act-invent',
+            marketSlug: giantsSlug,
+            qtyDecimal: '629.82',
+            isAggressor: false,
+            state: 'TRADE_STATE_CLEARED',
+            marketMetadata: { title: '', slug: giantsSlug },
+          },
+        }],
+      };
+    },
+    async listPositions() {
+      return {
+        positions: {
+          [giantsSlug]: {
+            qtyBoughtDecimal: '0',
+            netPositionDecimal: '-75.64',
+            cost: { value: '70.95', currency: 'USD' },
+            marketMetadata: { title: '', slug: giantsSlug, outcome: 'No' },
+          },
+        },
+      };
+    },
+  }, {
+    locks: [giantsLock],
+    submissions: [{ market_ticker: giantsSlug, parlay_id: giantsLock.id, contracts: 80 }],
+  });
+  assert.strictEqual(
+    oversizedThenPos.length,
+    1,
+    'oversized slug-only maker skip must not hide the No position fallback'
+  );
+  assert.strictEqual(oversizedThenPos[0].source, 'poly-position');
+  assert.strictEqual(oversizedThenPos[0].contracts, 75.64);
 
   console.log('polymarket-fill-reconcile.test.js ok');
 })().catch((e) => {

@@ -14,6 +14,12 @@
 // Reconcile never attaches an order whose cumQuantity ≠ posted quote size
 // (partials may be smaller). Activity never re-books a trade already booked
 // via poly-recon (same lock/slug + size).
+//
+// Combo Lock hedges are No / short Yes. Position qty must use |netPosition|
+// (qtyBoughtDecimal is often "0"). Slug-only maker trades may be smaller
+// than a posted quote (partial of 80 → 75.64) but never larger than every
+// quote on that lock (629.82 vs 43). Per-slug activity pages catch older
+// caoc fills that fall off the global TRADE window.
 'use strict';
 
 const USER_FILTER_SELF = 'USER_FILTER_SELF';
@@ -199,6 +205,36 @@ function activityAlreadyReconciled(trade, lock, bookedKeys) {
   const slug = normalizeMarketSlug(trade.marketSlug);
   if (slug && bookedKeys.has(`${slug}:${qty}`)) return true;
   return bookedKeys.has(`:${qty}`);
+}
+
+// Opaque caoc maker hedges: allow exact quote size or a partial below a
+// posted quote. Reject trades larger than every quote (629.82 vs 43).
+function slugMakerSizeAllowed(qty, quotedSizeKeys) {
+  if (!quotedSizeKeys || !quotedSizeKeys.size) return true;
+  const key = sizeKey(qty);
+  if (!(key > 0)) return false;
+  if (quotedSizeKeys.has(key)) return true;
+  let maxQ = 0;
+  for (const q of quotedSizeKeys) {
+    if (q > maxQ) maxQ = q;
+  }
+  return key < maxQ;
+}
+
+function comboSlugsFromMap(slugMap, ...recordLists) {
+  const slugs = new Set();
+  const add = (slug) => {
+    if (isComboActivitySlug(slug)) slugs.add(normalizeMarketSlug(slug));
+  };
+  if (slugMap && typeof slugMap.keys === 'function') {
+    for (const key of slugMap.keys()) add(key);
+  } else if (slugMap && typeof slugMap === 'object') {
+    for (const key of Object.keys(slugMap)) add(key);
+  }
+  for (const records of recordLists) {
+    for (const row of records || []) add(slugOfRecord(row));
+  }
+  return [...slugs];
 }
 
 function reconcileFillId(quoteId, orderId, cumQty) {
@@ -500,11 +536,27 @@ function tradeFromActivity(activity) {
   };
 }
 
+function absQty(v) {
+  const n = parseFloat(typeof v === 'object' && v != null ? v.value : v);
+  if (!Number.isFinite(n) || n === 0) return 0;
+  return parsePositive(Math.abs(n));
+}
+
+// Open Combo Lock hedges are No / short Yes. qtyBoughtDecimal is often "0"
+// (?? would stop there) and netPositionDecimal is negative.
 function positionQty(pos) {
   if (!pos || typeof pos !== 'object') return 0;
-  return parsePositive(
-    pos.qtyBoughtDecimal ?? pos.qty_bought_decimal ?? pos.netPositionDecimal
-    ?? pos.net_position_decimal ?? pos.qtyBought ?? pos.netPosition
+  if (
+    pos.netPositionDecimal != null || pos.net_position_decimal != null
+    || pos.netPosition != null
+  ) {
+    return absQty(pos.netPositionDecimal ?? pos.net_position_decimal ?? pos.netPosition);
+  }
+  return firstPositiveAmount(
+    pos.qtyAvailableDecimal, pos.qty_available_decimal,
+    pos.qtyBoughtDecimal, pos.qty_bought_decimal,
+    pos.qtySoldDecimal, pos.qty_sold_decimal,
+    pos.qtyBought, pos.qtySold
   );
 }
 
@@ -756,25 +808,32 @@ function matchActivitiesToLocks(activities, locks, {
     const hit = lockMatchForActivity(locks, trade.hay || trade.title, trade.marketSlug, map);
     const lock = hit.lock;
     if (!lock) continue;
-    matchedLockIds.add(lock.id);
-    if (activityAlreadyReconciled(trade, lock, reconcileKeys)) continue;
-    // Opaque caoc maker hedges must match a posted quote size. Do not invent
-    // a 629.82 fill against a 43-contract quote on the same slug.
+    if (activityAlreadyReconciled(trade, lock, reconcileKeys)) {
+      matchedLockIds.add(lock.id);
+      continue;
+    }
+    // Opaque caoc maker hedges: exact quote or partial below a quote.
+    // Oversized (629.82 vs 43) is a different trade — do not invent, and
+    // do not mark the lock covered so positions can still recover the hedge.
     if (!trade.isAggressor && hit.via === 'slug') {
       const sizes = quoteSizes && quoteSizes.get(lock.id);
-      if (sizes && sizes.size && !sizes.has(sizeKey(trade.qty))) continue;
+      if (!slugMakerSizeAllowed(trade.qty, sizes)) continue;
     }
     const evt = activityFillEvent({ trade, lock });
     if (!evt) continue;
-    if (local.has(evt.fillId) || (booked && booked.has(evt.fillId))) continue;
+    if (local.has(evt.fillId) || (booked && booked.has(evt.fillId))) {
+      matchedLockIds.add(lock.id);
+      continue;
+    }
     local.add(evt.fillId);
+    matchedLockIds.add(lock.id);
     events.push(evt);
   }
   events.matchedLockIds = matchedLockIds;
   return events;
 }
 
-async function listAllActivities(http, { limit = 100, maxPages = 8 } = {}) {
+async function listActivitiesPage(http, { limit = 100, maxPages = 8, marketSlug } = {}) {
   if (!http || typeof http.listActivities !== 'function') return [];
   const out = [];
   let cursor;
@@ -784,11 +843,51 @@ async function listAllActivities(http, { limit = 100, maxPages = 8 } = {}) {
       limit,
       cursor,
       sortOrder: 'SORT_ORDER_DESCENDING',
+      ...(marketSlug ? { marketSlug } : {}),
     });
     const rows = activitiesFromListed(listed);
     out.push(...rows);
     cursor = listed && (listed.nextCursor || listed.next_cursor || listed.cursor) || null;
     if (!cursor || (listed && listed.eof) || !rows.length) break;
+  }
+  return out;
+}
+
+async function listAllActivities(http, opts) {
+  return listActivitiesPage(http, opts);
+}
+
+function activityDedupeKey(activity) {
+  if (!activity || typeof activity !== 'object') return null;
+  const trade = activity.trade || activity.order;
+  return (trade && (trade.id || trade.tradeId)) || activity.id || null;
+}
+
+function mergeActivities(...lists) {
+  const out = [];
+  const seen = new Set();
+  for (const list of lists) {
+    for (const activity of list || []) {
+      const key = activityDedupeKey(activity);
+      if (key) {
+        if (seen.has(key)) continue;
+        seen.add(key);
+      }
+      out.push(activity);
+    }
+  }
+  return out;
+}
+
+async function listActivitiesForMarketSlugs(http, slugs, { limit = 100, maxPages = 4 } = {}) {
+  const out = [];
+  for (const slug of slugs || []) {
+    const key = normalizeMarketSlug(slug);
+    if (!isComboActivitySlug(key)) continue;
+    try {
+      const rows = await listActivitiesPage(http, { limit, maxPages, marketSlug: key });
+      out.push(...rows);
+    } catch (_) { /* keep other slugs */ }
   }
   return out;
 }
@@ -824,6 +923,15 @@ async function reconcileLockActivityEvents(http, {
   } catch (_) {
     activities = [];
   }
+  const slugs = comboSlugsFromMap(map, submissions, slugRecords, quotes);
+  if (slugs.length) {
+    try {
+      activities = mergeActivities(
+        activities,
+        await listActivitiesForMarketSlugs(http, slugs)
+      );
+    } catch (_) { /* global page still used */ }
+  }
   const events = matchActivitiesToLocks(activities, locks, {
     seenFillIds,
     slugMap: map,
@@ -839,7 +947,10 @@ async function reconcileLockActivityEvents(http, {
   if (!uncovered.length) return events;
   try {
     const listed = await http.listPositions({ limit: 100 });
-    return events.concat(matchPositionsToLocks(positionsFromListed(listed), uncovered, { seenFillIds }));
+    return events.concat(matchPositionsToLocks(positionsFromListed(listed), uncovered, {
+      seenFillIds,
+      slugMap: map,
+    }));
   } catch (_) {
     return events;
   }
@@ -920,6 +1031,8 @@ module.exports = {
   quotedSizesByLock,
   bookedReconcileKeys,
   activityAlreadyReconciled,
+  slugMakerSizeAllowed,
+  comboSlugsFromMap,
   reconcileFillId,
   quotesFromListed,
   activitiesFromListed,
@@ -941,9 +1054,12 @@ module.exports = {
   activityFillEvent,
   matchActivitiesToLocks,
   listAllActivities,
+  listActivitiesForMarketSlugs,
+  mergeActivities,
   reconcileLockActivityEvents,
   lockTeamNicknames,
   positionQty,
+  absQty,
   positionCost,
   positionFillEvent,
   matchPositionsToLocks,
