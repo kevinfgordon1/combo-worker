@@ -20,6 +20,10 @@
 // than a posted quote (partial of 80 → 75.64) but never larger than every
 // quote on that lock (629.82 vs 43). Per-slug activity pages catch older
 // caoc fills that fall off the global TRADE window.
+// Quote/order reconcile never attaches a foreign caoc ticker. A fill books
+// onto a lock only when marketSlug matches that lock's mapped caoc or the
+// quote_id is one of that lock's submissions. BACKFILL_PARLAY_ID is not a
+// fallback for unmatched executed quotes.
 'use strict';
 
 const USER_FILTER_SELF = 'USER_FILTER_SELF';
@@ -235,6 +239,145 @@ function comboSlugsFromMap(slugMap, ...recordLists) {
     for (const row of records || []) add(slugOfRecord(row));
   }
   return [...slugs];
+}
+
+function addQuoteId(map, quoteId, parlayId) {
+  const id = quoteId || null;
+  const pid = parlayId || null;
+  if (!id || !pid || !map) return map;
+  const prev = map.get(id);
+  if (prev == null) map.set(id, pid);
+  else if (prev !== pid) map.set(id, false);
+  return map;
+}
+
+function quoteIdLockMap(submissions, pendingQuotes) {
+  const map = new Map();
+  for (const row of submissions || []) {
+    addQuoteId(map, row && (row.quote_id || row.quoteId), parlayIdOfRecord(row));
+  }
+  if (pendingQuotes && typeof pendingQuotes.forEach === 'function') {
+    pendingQuotes.forEach((pending, id) => {
+      if (!pending || String(id).startsWith('reserve:')) return;
+      addQuoteId(map, pending.quoteId || id, pending.parlayId || pending.parlay_id);
+    });
+  }
+  return map;
+}
+
+function slugsByLockId(submissions, slugRecords, pendingQuotes) {
+  const byLock = new Map();
+  const add = (parlayId, slug) => {
+    const key = normalizeMarketSlug(slug);
+    if (!parlayId || !key) return;
+    if (!byLock.has(parlayId)) byLock.set(parlayId, new Set());
+    byLock.get(parlayId).add(key);
+  };
+  for (const row of [...(submissions || []), ...(slugRecords || [])]) {
+    add(parlayIdOfRecord(row), slugOfRecord(row));
+  }
+  if (pendingQuotes && typeof pendingQuotes.forEach === 'function') {
+    pendingQuotes.forEach((pending) => {
+      if (!pending) return;
+      add(pending.parlayId || pending.parlay_id, pending.marketTicker || pending.market_ticker || pending.symbol);
+    });
+  }
+  return byLock;
+}
+
+function allowedSlugsFromScope(submissions, pendingQuotes) {
+  const slugs = new Set();
+  slugsByLockId(submissions, null, pendingQuotes).forEach((set) => {
+    set.forEach((slug) => slugs.add(slug));
+  });
+  return slugs;
+}
+
+// A fill may book onto a lock only when its caoc ticker is that lock's mapped
+// slug, or its quote_id is one of that lock's submissions. Foreign caoc
+// tickers (Ravens 629.82, Eagles/Bills/Jets 24.63) never attach.
+function fillBelongsToLock(evt, lock, { quoteIds, slugs } = {}) {
+  if (!evt || !lock) return false;
+  const ticker = normalizeMarketSlug(evt.marketTicker);
+  const lockSlugs = slugs instanceof Set
+    ? slugs
+    : (slugs && typeof slugs.get === 'function' ? slugs.get(lock.id) : null);
+  const lockQuotes = quoteIds instanceof Set
+    ? quoteIds
+    : (quoteIds && typeof quoteIds.has === 'function' && !(quoteIds instanceof Map)
+      ? quoteIds
+      : null);
+  const quoteMap = quoteIds instanceof Map ? quoteIds : null;
+  if (ticker && isComboActivitySlug(ticker) && lockSlugs && lockSlugs.size && !lockSlugs.has(ticker)) {
+    return false;
+  }
+  if (evt.quoteId && lockQuotes && lockQuotes.has(evt.quoteId)) return true;
+  if (evt.quoteId && quoteMap && quoteMap.get(evt.quoteId) === lock.id) return true;
+  if (ticker && lockSlugs && lockSlugs.has(ticker)) return true;
+  // Title-matched non-caoc trades already assigned to this lock stay.
+  if (evt.parlayId === lock.id && !(ticker && isComboActivitySlug(ticker))) return true;
+  return false;
+}
+
+function lockForFillEvent(evt, locks, {
+  submissions,
+  slugRecords,
+  pendingQuotes,
+  slugMap,
+} = {}) {
+  if (!evt) return null;
+  const list = Array.isArray(locks) ? locks : [];
+  const byId = new Map(list.filter((p) => p && p.id).map((p) => [p.id, p]));
+  const quotes = quoteIdLockMap(submissions, pendingQuotes);
+  const slugs = slugsByLockId(submissions, slugRecords, pendingQuotes);
+  const map = slugMap instanceof Map || (slugMap && typeof slugMap === 'object')
+    ? coerceSlugMap(slugMap)
+    : buildActivitySlugMap({ submissions, slugRecords });
+
+  const candidates = [];
+  const pendingId = evt.parlayId || (evt.pending && evt.pending.parlayId) || null;
+  if (pendingId && byId.has(pendingId)) candidates.push(byId.get(pendingId));
+  const qLock = evt.quoteId ? quotes.get(evt.quoteId) : null;
+  if (qLock && qLock !== false && byId.has(qLock)) candidates.push(byId.get(qLock));
+  const ticker = normalizeMarketSlug(evt.marketTicker);
+  const mapped = ticker ? (map.get(ticker) || map[ticker]) : null;
+  if (mapped && mapped !== false && byId.has(mapped)) candidates.push(byId.get(mapped));
+
+  const seen = new Set();
+  for (const lock of candidates) {
+    if (!lock || seen.has(lock.id)) continue;
+    seen.add(lock.id);
+    if (fillBelongsToLock(evt, lock, { quoteIds: quotes, slugs })) return lock;
+  }
+  if (list.length === 1) {
+    const only = list[0];
+    if (fillBelongsToLock(evt, only, { quoteIds: quotes, slugs })) return only;
+  }
+  return null;
+}
+
+function quoteCandidateInLockScope(c, allowedQuoteIds, allowedSlugs) {
+  if (!c) return false;
+  const ticker = normalizeMarketSlug(symbolOf(c.quote) || (c.pending && (
+    c.pending.marketTicker || c.pending.market_ticker || c.pending.symbol
+  )));
+  if (ticker && isComboActivitySlug(ticker) && allowedSlugs && allowedSlugs.size && !allowedSlugs.has(ticker)) {
+    return false;
+  }
+  if (c.pending && c.pending.parlayId) return true;
+  if (c.id && allowedQuoteIds && allowedQuoteIds.has(c.id)) return true;
+  if (ticker && allowedSlugs && allowedSlugs.has(ticker)) return true;
+  return false;
+}
+
+function scopeQuoteCandidates(candidates, { submissions, pendingQuotes } = {}) {
+  const quotes = quoteIdLockMap(submissions, pendingQuotes);
+  const slugs = allowedSlugsFromScope(submissions, pendingQuotes);
+  const scoped = !!(quotes.size || slugs.size);
+  if (!scoped) {
+    return (candidates || []).filter((c) => c && c.pending && c.pending.parlayId);
+  }
+  return (candidates || []).filter((c) => quoteCandidateInLockScope(c, quotes, slugs));
 }
 
 function reconcileFillId(quoteId, orderId, cumQty) {
@@ -731,9 +874,14 @@ async function reconcilePolymarketLockFills(http, {
   } catch (_) {
     executed = [];
   }
-  const candidates = mergeQuoteCandidates(executed, submissions, pendingQuotes);
+  const candidates = scopeQuoteCandidates(
+    mergeQuoteCandidates(executed, submissions, pendingQuotes),
+    { submissions, pendingQuotes }
+  );
   if (hydrate) await hydrateMissingQuotes(http, candidates, maxPerTick);
   const picked = pickReconcileCandidates(candidates, { maxPerTick, seenQuoteIds });
+  const quoteIds = quoteIdLockMap(submissions, pendingQuotes);
+  const slugs = slugsByLockId(submissions, null, pendingQuotes);
   const events = [];
   for (const c of picked) {
     const quoteId = c.id;
@@ -748,7 +896,19 @@ async function reconcilePolymarketLockFills(http, {
       alreadyFilled: already,
       allowExecutedWithoutOrder,
     });
-    if (evt && evt.contracts > 0) events.push(evt);
+    if (evt && evt.contracts > 0) {
+      const lockId = (c.pending && c.pending.parlayId) || quoteIds.get(quoteId);
+      if (lockId && lockId !== false) {
+        if (!fillBelongsToLock(evt, { id: lockId }, { quoteIds, slugs })) continue;
+        if (!evt.parlayId) evt.parlayId = lockId;
+      } else if (evt.marketTicker && isComboActivitySlug(evt.marketTicker)) {
+        const allowed = allowedSlugsFromScope(submissions, pendingQuotes);
+        if (allowed.size && !allowed.has(normalizeMarketSlug(evt.marketTicker))) continue;
+      } else if (!c.pending) {
+        continue;
+      }
+      events.push(evt);
+    }
     else if (seenQuoteIds && c.quote && isExecutedQuoteStatus(c.quote.status) && already > 0) {
       seenQuoteIds.add(quoteId);
     }
@@ -1033,6 +1193,11 @@ module.exports = {
   activityAlreadyReconciled,
   slugMakerSizeAllowed,
   comboSlugsFromMap,
+  quoteIdLockMap,
+  slugsByLockId,
+  fillBelongsToLock,
+  lockForFillEvent,
+  scopeQuoteCandidates,
   reconcileFillId,
   quotesFromListed,
   activitiesFromListed,
