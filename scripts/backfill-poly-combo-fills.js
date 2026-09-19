@@ -4,8 +4,10 @@
 // / position rules as the worker reconcile loop.
 //
 // Always pages kaygosports TRADE/sold/cashed activity for every lock in
-// lookback. Opaque Retail caoc-* slugs join to quote/order/fill ticker
-// records — empty marketMetadata.title is not required.
+// lookback, then again per mapped caoc-* slug so older No combo fills
+// that fell off the global window still book. Opaque Retail slugs join
+// to quote/order/fill ticker records — empty marketMetadata.title is
+// not required. No / short Yes positions use |netPosition|.
 //
 // Env: SUPABASE_URL, SUPABASE_SERVICE_KEY, POLYMARKET_KEY_ID, POLYMARKET_SECRET_KEY
 // Optional: TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID
