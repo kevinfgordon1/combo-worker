@@ -1056,7 +1056,8 @@ function startFillLoop(extra = {}) {
   );
   assert.ok(
     /loadUnfilledPolyQuotes/.test(liveSrc) && /getFilledForQuote/.test(liveSrc)
-      && /loadPolySlugRecords/.test(liveSrc),
+      && /loadPolySlugRecords/.test(liveSrc)
+      && /POLY_SLUG_CACHE_MS/.test(liveSrc),
     'live-runner must feed Poly fill reconcile from combo_submissions / combo_fills / caoc slugs'
   );
   assert.ok(

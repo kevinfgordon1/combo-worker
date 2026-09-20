@@ -97,6 +97,7 @@ assert.ok(
 assert.ok(
   /loadUnfilledPolyQuotes/.test(liveSrc) && /getFilledForQuote/.test(liveSrc)
     && /loadRecentLocks/.test(liveSrc) && /loadPolySlugRecords/.test(liveSrc)
+    && /POLY_SLUG_CACHE_MS/.test(liveSrc) && /polySlugCacheRows/.test(liveSrc)
     && /fill_id/.test(liveSrc) && /row\.count/.test(liveSrc)
     && /initialFillReconcile:\s*true/.test(liveSrc)
     && /seenFillIds,/.test(liveSrc),
@@ -228,6 +229,14 @@ assert.ok(
 assert.ok(
   liveSrc.includes('LOCK-MISS'),
   'Kalshi lock misses must log keys so date-only vs HHMM is visible'
+);
+assert.ok(
+  /activeCount=/.test(liveSrc) && !/active=\$\{parlays\.map/.test(liveSrc),
+  'LOCK-MISS must not dump every lock label — activeCount only'
+);
+assert.ok(
+  /LOCK_MISS_LOG_MS/.test(liveSrc) && /lastLockMissLogAt/.test(liveSrc),
+  'LOCK-MISS must rate-limit so RFQ flood cannot string-build on every miss'
 );
 assert.ok(
   /if \(rfq\.targetCostDollars > 0\) counts\.dollarRfqs\+\+/.test(liveSrc),

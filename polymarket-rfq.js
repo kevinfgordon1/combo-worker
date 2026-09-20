@@ -8,8 +8,10 @@
 // Unmatched firehose RFQs are a cheap no-op — no seenRfqs / market-cache growth.
 // Reconcile always prints a reason histogram plus overlap codes
 // (no_shared_game vs same_games_no_match / leg_count / missing_team /
-// doubleheader) so volume-vs-mapping is one line. Near-miss SKIP logs
-// those codes. Unhedged persist writes skip_reason=no_lock_overlap:<code>.
+// doubleheader) so volume-vs-mapping is one line. no_lock_overlap and
+// other firehose SKIPs are a 10s count summary — never per-RFQ legs /
+// keys / lock-label dumps (that string-build starved the Kalshi WS).
+// Unhedged persist writes skip_reason=no_lock_overlap:<code>.
 // Combo Locks Miss tape (combo_submissions) gets quotes + matched-lock
 // declines (limit_reached / game_started / insufficient_balance; oversized
 // only if remaining is already 0 — leftover RFQs quote a partial qtyDecimal).
@@ -93,6 +95,37 @@ const MODE = 'POLY';
 const RECONCILE_MS = 3000;
 const FILL_RECONCILE_MS = 20000;
 const SEEN_RFQS_MAX = 256;
+const SKIP_SUMMARY_MS = 10000;
+const NOISY_SKIP_REASONS = new Set([
+  'no_lock_overlap',
+  'unmatched',
+  'unmatched_leg',
+  'no_legs',
+]);
+const skipSummary = {
+  at: 0,
+  counts: Object.create(null),
+};
+
+function resetSkipSummary() {
+  skipSummary.at = 0;
+  skipSummary.counts = Object.create(null);
+}
+
+function noteNoisySkip(evaluation) {
+  const reason = (evaluation && evaluation.reason) || 'unknown';
+  const code = evaluation && evaluation.overlap && evaluation.overlap.code;
+  const key = code ? `${reason}:${code}` : reason;
+  skipSummary.counts[key] = (skipSummary.counts[key] || 0) + 1;
+  const now = Date.now();
+  if (now - skipSummary.at < SKIP_SUMMARY_MS) return;
+  skipSummary.at = now;
+  const parts = Object.entries(skipSummary.counts)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([k, n]) => `${k}=${n}`);
+  skipSummary.counts = Object.create(null);
+  console.log(`[${MODE}] SKIP summary ${parts.join(' ')}`);
+}
 
 const LEAGUE_SLUG_TOKENS = {
   mlb: ['mlb', 'baseball'],
@@ -860,6 +893,10 @@ function orderFillEvent(ex, pending, pendingId) {
 }
 
 function logSkip(evaluation, extra) {
+  if (NOISY_SKIP_REASONS.has(evaluation.reason)) {
+    noteNoisySkip(evaluation);
+    return;
+  }
   const rfq = evaluation.rfq || {};
   const p = evaluation.parlay;
   const symbols = (rfq.comboLegs || []).map((l) => (l && l.symbol) || '?').join(',');
@@ -868,10 +905,8 @@ function logSkip(evaluation, extra) {
     `[${MODE}] SKIP ${evaluation.reason} ${label} rfq=${rfq.rfqId || '?'}`,
   ];
   if (
-    evaluation.reason === 'unmatched' || evaluation.reason === 'unmatched_leg'
-    || evaluation.reason === 'no_legs' || evaluation.reason === 'missing_metadata'
+    evaluation.reason === 'missing_metadata'
     || evaluation.reason === 'not_priceable' || evaluation.reason === 'ambiguous'
-    || evaluation.reason === 'no_lock_overlap'
   ) {
     bits.push(`legs=${symbols || '(none)'} keys=${(rfq.legKeys || []).join('|') || '(none)'}`);
     if (evaluation.identityKeys && evaluation.identityKeys.length) {
@@ -1164,6 +1199,7 @@ async function fetchPolymarketUnhedgedRfq(http, rfqId) {
 }
 
 function startPolymarketRfqLoop(ctx = {}) {
+  resetSkipSummary();
   const env = ctx.env || process.env;
   const keyId = env.POLYMARKET_KEY_ID;
   const secretKey = env.POLYMARKET_SECRET_KEY;
@@ -2074,6 +2110,9 @@ module.exports = {
   findPendingForOrderExecution,
   orderFillEvent,
   startPolymarketRfqLoop,
+  logSkip,
+  resetSkipSummary,
+  SKIP_SUMMARY_MS,
   FILL_RECONCILE_MS,
   NEAR_MISS_CODES,
   fetchPolymarketUnhedgedRfq,

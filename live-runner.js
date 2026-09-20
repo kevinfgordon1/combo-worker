@@ -41,8 +41,10 @@
 //   findStartedEvent (polymarket-rfq.js) — date-only PM slugs are not starts.
 // LOCK-MISS: combo RFQ that matchParlay missed. Distinct from noLock
 //   (matched, hedge does not lock). Tallies lockMiss + emptyLegs; sample
-//   logs include RFQ keys vs staged lock overlap. NFL date-only Combo
-//   Locks vs timed Kalshi tickers match via identity / HHMM strip.
+//   logs include RFQ keys, activeCount, and staged lock overlap — never
+//   the full active= lock-label dump (that string-build starved Kalshi WS).
+//   ≤1 LOCK-MISS line per 5s. NFL date-only Combo Locks vs timed Kalshi
+//   tickers match via identity / HHMM strip.
 // WS STALL: handshake 401 (header_timestamp_expired) is ignored — ws
 //   does not emit close — or a zombie OPEN socket that neither messages
 //   nor pongs. Keepalive pong is liveness; a quiet Saturday book must
@@ -245,6 +247,8 @@ const repeatGuard = createRepeatGuard({
   maxQuotes: readMaxQuotes(process.env),
 });
 let lastLockFingerprint = '';
+const LOCK_MISS_LOG_MS = 5000;
+let lastLockMissLogAt = 0;
 
 const pendingSkipTapes = new Map(); // submission id → skip row awaiting tape
 let unhedgedFills = null; // WORKER_MODE=all only — default combo leaves this null
@@ -1175,6 +1179,10 @@ async function pendingFromSubmission({ quoteId, orderId } = {}) {
 }
 
 const POLY_FILL_LOOKBACK_MS = 72 * 3600 * 1000;
+const POLY_SLUG_CACHE_MS = 15000;
+let polySlugCacheAt = 0;
+let polySlugCacheRows = null;
+let polySlugInflight = null;
 
 async function loadUnfilledPolyQuotes() {
   const cutoff = new Date(Date.now() - POLY_FILL_LOOKBACK_MS).toISOString();
@@ -1273,7 +1281,7 @@ async function loadRecentLocks() {
   }
 }
 
-async function loadPolySlugRecords() {
+async function loadPolySlugRecordsUncached() {
   const cutoff = new Date(Date.now() - POLY_FILL_LOOKBACK_MS).toISOString();
   try {
     const [fillsQ, subsQ] = await Promise.all([
@@ -1316,6 +1324,22 @@ async function loadPolySlugRecords() {
     console.error(`[${MODE}] load poly slug records`, e && e.message);
     return [];
   }
+}
+
+async function loadPolySlugRecords() {
+  const now = Date.now();
+  if (polySlugCacheRows && (now - polySlugCacheAt) < POLY_SLUG_CACHE_MS) {
+    return polySlugCacheRows;
+  }
+  if (polySlugInflight) return polySlugInflight;
+  polySlugInflight = loadPolySlugRecordsUncached().then((rows) => {
+    polySlugCacheRows = rows;
+    polySlugCacheAt = Date.now();
+    return rows;
+  }).finally(() => {
+    polySlugInflight = null;
+  });
+  return polySlugInflight;
 }
 
 function persistQuoteOrder(quoteId, orderId) {
@@ -1485,15 +1509,18 @@ async function onRfq(rfq, env) {
       }
     }
     counts.lockMiss++;
-    if (counts.lockMiss <= 8 || counts.lockMiss % 2000 === 0) {
+    const nowMiss = Date.now();
+    if (nowMiss - lastLockMissLogAt >= LOCK_MISS_LOG_MS) {
+      lastLockMissLogAt = nowMiss;
       const missRfq = rfq;
       const missKeys = keys;
+      const activeCount = parlays.length;
       setImmediate(() => {
         const overlap = describeLockOverlap(missRfq, parlays);
         console.log(
           `[${MODE}] LOCK-MISS rfq=${missRfq.rfqId} legs=${missKeys.length} ` +
           `keys=${missKeys.join('|') || '(none)'} ` +
-          `active=${parlays.map((x) => x.label || x.id).join(',') || '(none)'}` +
+          `activeCount=${activeCount}` +
           (overlap ? ` overlap=${overlap}` : '')
         );
       });

@@ -41,6 +41,8 @@ const {
   quoteBodyFromEval,
   startPolymarketRfqLoop,
   fetchPolymarketUnhedgedRfq,
+  logSkip,
+  resetSkipSummary,
 } = require('./polymarket-rfq');
 const { createUnhedgedFillTracker, isUnhedgedFillStatus } = require('./unhedged-rfq');
 const { createMarketCache } = require('./polymarket-market-cache');
@@ -87,6 +89,14 @@ assert.ok(
   'quote matching gate must stay couldMatchActiveLocks'
 );
 assert.ok(
+  /NOISY_SKIP_REASONS/.test(polySrc) && /SKIP summary/.test(polySrc) && /SKIP_SUMMARY_MS/.test(polySrc),
+  'no_lock_overlap SKIPs must rate-limit to a summary — no per-RFQ leg dumps'
+);
+assert.ok(
+  /if \(NOISY_SKIP_REASONS\.has\(evaluation\.reason\)\)/.test(polySrc),
+  'logSkip must no-op noisy overlap/unmatched reasons before building legs/keys strings'
+);
+assert.ok(
   /const enableLocks = ctx\.enableLocks !== false/.test(polySrc) &&
     /const enableUnhedged = ctx\.enableUnhedged !== false/.test(polySrc),
   'Poly loop must honor enableLocks / enableUnhedged so the process split can isolate quoting vs paper tape'
@@ -95,6 +105,43 @@ assert.ok(
   /if \(!enableLocks\) \{[\s\S]*?reason: 'locks_off'/.test(polySrc),
   'Unhedged-only Poly loop must not POST/confirm Combo Lock quotes'
 );
+
+{
+  const floodLogs = [];
+  const origFloodLog = console.log;
+  console.log = (...args) => { floodLogs.push(args.join(' ')); };
+  try {
+    resetSkipSummary();
+    for (let i = 0; i < 80; i += 1) {
+      logSkip({
+        reason: 'no_lock_overlap',
+        rfq: {
+          rfqId: `rfq_flood_${i}`,
+          comboLegs: [
+            { symbol: 'aec-mlb-laa-pit-2026-09-04' },
+            { symbol: 'aec-mlb-tb-tex-2026-09-04' },
+          ],
+          legKeys: ['mlb:laa-pit', 'mlb:tb-tex'],
+        },
+        parlay: { label: 'Texas Rangers + Los Angeles Angels' },
+        overlap: {
+          code: 'same_games_no_match',
+          lock: 'Texas Rangers + Los Angeles Angels',
+          detail: 'rfq=huge-identity-dump lock=huge-identity-dump',
+        },
+      });
+    }
+    const summaries = floodLogs.filter((l) => l.includes('[POLY] SKIP summary'));
+    assert.strictEqual(summaries.length, 1, 'no_lock_overlap flood must emit one summary, not per-RFQ lines');
+    assert.ok(summaries[0].includes('no_lock_overlap:same_games_no_match='));
+    assert.ok(!floodLogs.some((l) => l.includes('[POLY] SKIP no_lock_overlap')));
+    assert.ok(!floodLogs.some((l) => l.includes('legs=') || l.includes('rfq_flood_79')));
+    assert.ok(!floodLogs.some((l) => l.includes('Texas Rangers + Los Angeles Angels')));
+  } finally {
+    console.log = origFloodLog;
+    resetSkipSummary();
+  }
+}
 
 // Fixed seed / timestamp / path — do not rotate these; they are the signing fixture.
 const SEED_B64 = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
@@ -2282,7 +2329,10 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     assert.strictEqual(gameAlerts.length, 1, 'only the quoted lock RFQ Telegrams — lock-miss stays silent');
     assert.ok(gameAlerts[0].startsWith('✅ QUOTED (Polymarket) — Texas Rangers'));
     assert.ok(gameLogs.some((l) => (
-      l.includes('[POLY] SKIP no_lock_overlap') && l.includes('code=same_games_no_match')
+      l.includes('[POLY] SKIP summary') && l.includes('no_lock_overlap:same_games_no_match')
+    )));
+    assert.ok(!gameLogs.some((l) => (
+      l.includes('[POLY] SKIP no_lock_overlap') && (l.includes('legs=') || l.includes('keys='))
     )));
     assert.ok(gameLogs.some((l) => (
       l.includes('[POLY] reconcile open=3 locks=1 priceable=1 live=true')
@@ -2348,9 +2398,11 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     assert.strictEqual(ariJacPosts[0].rfqId, 'rfq_ari_jac_quote');
     assert.ok(ariJacLogs.some((l) => l.includes('[POLY] QUOTED') && l.includes('Arizona + Jacksonville')));
     assert.ok(ariJacLogs.some((l) => (
-      l.includes('[POLY] SKIP no_lock_overlap')
-      && l.includes('code=same_games_no_match')
-      && l.includes('Arizona + Jacksonville')
+      l.includes('[POLY] SKIP summary')
+      && l.includes('no_lock_overlap:same_games_no_match')
+    )));
+    assert.ok(!ariJacLogs.some((l) => (
+      l.includes('[POLY] SKIP no_lock_overlap') && l.includes('Arizona + Jacksonville')
     )));
     assert.ok(ariJacLogs.some((l) => (
       l.includes('[POLY] reconcile open=2 locks=1 priceable=1 live=true')
@@ -2412,7 +2464,10 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     });
     assert.strictEqual(wsSkip.reason, 'no_lock_overlap');
     assert.ok(ariJacLogs.some((l) => (
-      l.includes('SKIP no_lock_overlap') && l.includes('rfq_ari_jac_ws_opp') && l.includes('same_games_no_match')
+      l.includes('[POLY] SKIP summary') && l.includes('same_games_no_match')
+    )));
+    assert.ok(!ariJacLogs.some((l) => (
+      l.includes('SKIP no_lock_overlap') && l.includes('rfq_ari_jac_ws_opp')
     )));
   } finally {
     console.log = origAriLog;
