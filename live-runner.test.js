@@ -228,15 +228,27 @@ assert.ok(
 );
 assert.ok(
   liveSrc.includes('LOCK-MISS'),
-  'Kalshi lock misses must log keys so date-only vs HHMM is visible'
+  'Kalshi lock misses must emit a LOCK-MISS sample so flood vs match is visible'
 );
 assert.ok(
   /activeCount=/.test(liveSrc) && !/active=\$\{parlays\.map/.test(liveSrc),
   'LOCK-MISS must not dump every lock label — activeCount only'
 );
 assert.ok(
-  /LOCK_MISS_LOG_MS/.test(liveSrc) && /lastLockMissLogAt/.test(liveSrc),
-  'LOCK-MISS must rate-limit so RFQ flood cannot string-build on every miss'
+  /LOCK_MISS_LOG_MS\s*=\s*10000/.test(liveSrc) && /lastLockMissLogAt/.test(liveSrc),
+  'LOCK-MISS must rate-limit ≤1/10s so RFQ flood cannot string-build on every miss'
+);
+assert.ok(
+  /LOCK-MISS rfq=\$\{missId\} legs=\$\{missLegs\} activeCount=\$\{activeCount\}/.test(liveSrc) &&
+    !/describeLockOverlap/.test(liveSrc) &&
+    !/missKeys\.join/.test(liveSrc) &&
+    !/keys=\$\{missKeys/.test(liveSrc) &&
+    !/overlap=\$\{/.test(liveSrc),
+  'LOCK-MISS format is rfq=/legs=/activeCount= only — no keys dump or overlap joins'
+);
+assert.ok(
+  /if \(nowMiss - lastLockMissLogAt >= LOCK_MISS_LOG_MS\) \{[\s\S]*?setImmediate\(/.test(liveSrc),
+  'LOCK-MISS rate-limit check must run before any log string is built'
 );
 assert.ok(
   /if \(rfq\.targetCostDollars > 0\) counts\.dollarRfqs\+\+/.test(liveSrc),
@@ -295,8 +307,8 @@ assert.ok(
   'do not count dollarRfqs only after a lock match'
 );
 assert.ok(
-  /describeLockOverlap/.test(liveSrc),
-  'LOCK-MISS logs should include overlap against staged locks'
+  !/describeLockOverlap/.test(liveSrc),
+  'LOCK-MISS must not compute overlap labels on the quote/miss path'
 );
 
 assert.ok(
@@ -421,7 +433,7 @@ assert.ok(
 assert.ok(
   /setImmediate\(\(\) => \{[\s\S]*?RFQ-SAMPLE/.test(liveSrc) &&
     /setImmediate\(\(\) => \{[\s\S]*?EMPTY-LEGS/.test(liveSrc) &&
-    /setImmediate\(\(\) => \{[\s\S]*?describeLockOverlap/.test(liveSrc),
+    /setImmediate\(\(\) => \{[\s\S]*?LOCK-MISS/.test(liveSrc),
   'RFQ-SAMPLE / EMPTY-LEGS / LOCK-MISS logs must not run on the quote tick'
 );
 assert.ok(
