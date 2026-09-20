@@ -11,6 +11,8 @@
 // doubleheader) so volume-vs-mapping is one line. no_lock_overlap and
 // other firehose SKIPs are a 10s count summary — never per-RFQ legs /
 // keys / lock-label dumps (that string-build starved the Kalshi WS).
+// lock-identity-fail / lock-unpriceable-on-poly are ≤1 compact line / 10s
+// (rate-limit before label/keys joins) — not every 3s reconcile.
 // Unhedged persist writes skip_reason=no_lock_overlap:<code>.
 // Combo Locks Miss tape (combo_submissions) gets quotes + matched-lock
 // declines (limit_reached / game_started / insufficient_balance; oversized
@@ -96,6 +98,8 @@ const RECONCILE_MS = 3000;
 const FILL_RECONCILE_MS = 20000;
 const SEEN_RFQS_MAX = 256;
 const SKIP_SUMMARY_MS = 10000;
+const LOCK_DIAG_LOG_MS = 10000;
+const lockDiagLog = { identityAt: 0, unpriceableAt: 0 };
 const NOISY_SKIP_REASONS = new Set([
   'no_lock_overlap',
   'unmatched',
@@ -110,6 +114,11 @@ const skipSummary = {
 function resetSkipSummary() {
   skipSummary.at = 0;
   skipSummary.counts = Object.create(null);
+}
+
+function resetLockDiagLogs() {
+  lockDiagLog.identityAt = 0;
+  lockDiagLog.unpriceableAt = 0;
 }
 
 function noteNoisySkip(evaluation) {
@@ -340,18 +349,26 @@ function isKalshiMoneylineLock(parlay) {
 
 // Active Kalshi ML locks that identitiesFromParlay cannot read (e.g. a
 // previously unknown team blob) are otherwise a silent no_lock_overlap.
-// Log once per reconcile — not per firehose RFQ — so silence is diagnosable.
+// Count every reconcile; log ≤1 compact line / 10s so a long lock list
+// cannot join keys= on every 3s tick. Rate-limit before string building.
 function logActiveLockIdentityFails(parlays, log = console.log) {
   if (!Array.isArray(parlays) || !parlays.length) return 0;
+  const now = Date.now();
+  const allowLog = now - lockDiagLog.identityAt >= LOCK_DIAG_LOG_MS;
   let n = 0;
+  let sample = null;
   for (const p of parlays) {
     if (!isKalshiMoneylineLock(p)) continue;
     const lock = identitiesFromParlay(p);
     if (lock.ok) continue;
-    const label = (p && (p.label || p.id)) || '?';
-    const keys = kalshiMlTickersFromParlay(p);
-    log(`[${MODE}] lock-identity-fail label=${label} keys=${keys.join('|') || '(none)'}`);
     n += 1;
+    if (allowLog && !sample) sample = p;
+  }
+  if (allowLog && n) {
+    lockDiagLog.identityAt = now;
+    const label = (sample && (sample.label || sample.id)) || '?';
+    const keys = kalshiMlTickersFromParlay(sample);
+    log(`[${MODE}] lock-identity-fail n=${n} label=${label} keys=${keys.join('|') || '(none)'}`);
   }
   return n;
 }
@@ -422,16 +439,23 @@ function explainLockOverlapMiss(rfq, parlays) {
 
 function logUnpriceablePolyLocks(parlays, log = console.log) {
   if (!Array.isArray(parlays) || !parlays.length) return 0;
+  const now = Date.now();
+  const allowLog = now - lockDiagLog.unpriceableAt >= LOCK_DIAG_LOG_MS;
   let n = 0;
+  let sample = null;
   for (const p of parlays) {
     const lock = identitiesFromParlay(p);
     if (lock.ok) continue;
     const tickers = kalshiMlTickersFromParlay(p);
     const series = tickers.map((t) => String(t).split('-')[0].split(':')[0].toUpperCase());
     if (!series.some((s) => /SPREAD|TOTAL|PROP/.test(s))) continue;
-    const label = (p && (p.label || p.id)) || '?';
-    log(`[${MODE}] lock-unpriceable-on-poly reason=not_moneyline label=${label}`);
     n += 1;
+    if (allowLog && !sample) sample = p;
+  }
+  if (allowLog && n) {
+    lockDiagLog.unpriceableAt = now;
+    const label = (sample && (sample.label || sample.id)) || '?';
+    log(`[${MODE}] lock-unpriceable-on-poly reason=not_moneyline n=${n} label=${label}`);
   }
   return n;
 }
@@ -2112,7 +2136,9 @@ module.exports = {
   startPolymarketRfqLoop,
   logSkip,
   resetSkipSummary,
+  resetLockDiagLogs,
   SKIP_SUMMARY_MS,
+  LOCK_DIAG_LOG_MS,
   FILL_RECONCILE_MS,
   NEAR_MISS_CODES,
   fetchPolymarketUnhedgedRfq,

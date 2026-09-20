@@ -40,11 +40,12 @@
 //   Polymarket confirm + resting-quote cancel uses the same startedFor /
 //   findStartedEvent (polymarket-rfq.js) — date-only PM slugs are not starts.
 // LOCK-MISS: combo RFQ that matchParlay missed. Distinct from noLock
-//   (matched, hedge does not lock). Tallies lockMiss + emptyLegs; sample
-//   logs include RFQ keys, activeCount, and staged lock overlap — never
-//   the full active= lock-label dump (that string-build starved Kalshi WS).
-//   ≤1 LOCK-MISS line per 5s. NFL date-only Combo Locks vs timed Kalshi
-//   tickers match via identity / HHMM strip.
+//   (matched, hedge does not lock). Tallies lockMiss + emptyLegs.
+//   Sample logs are ≤1/10s and ONLY rfq= / legs=N / activeCount=N —
+//   never keys= dumps or overlap label joins (that CPU work starved
+//   Kalshi WS under NFL Sunday RFQ flood after #87). Rate-limit check
+//   runs before any string building. NFL date-only Combo Locks vs
+//   timed Kalshi tickers match via identity / HHMM strip.
 // WS STALL: handshake 401 (header_timestamp_expired) is ignored — ws
 //   does not emit close — or a zombie OPEN socket that neither messages
 //   nor pongs. Keepalive pong is liveness; a quiet Saturday book must
@@ -96,7 +97,7 @@
 const { createClient } = require('@supabase/supabase-js');
 const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem, clockOffset, signedRequest } = require('./kalshi-auth');
-const { matchParlay, describeLockOverlap } = require('./rfq');
+const { matchParlay } = require('./rfq');
 const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, isRfqClosedFailure, quotePostFailReason, formatQuoteLatency, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
 const { findStartedEvent } = require('./started');
 const {
@@ -247,7 +248,7 @@ const repeatGuard = createRepeatGuard({
   maxQuotes: readMaxQuotes(process.env),
 });
 let lastLockFingerprint = '';
-const LOCK_MISS_LOG_MS = 5000;
+const LOCK_MISS_LOG_MS = 10000;
 let lastLockMissLogAt = 0;
 
 const pendingSkipTapes = new Map(); // submission id → skip row awaiting tape
@@ -1512,16 +1513,12 @@ async function onRfq(rfq, env) {
     const nowMiss = Date.now();
     if (nowMiss - lastLockMissLogAt >= LOCK_MISS_LOG_MS) {
       lastLockMissLogAt = nowMiss;
-      const missRfq = rfq;
-      const missKeys = keys;
+      const missId = rfq.rfqId;
+      const missLegs = keys.length;
       const activeCount = parlays.length;
       setImmediate(() => {
-        const overlap = describeLockOverlap(missRfq, parlays);
         console.log(
-          `[${MODE}] LOCK-MISS rfq=${missRfq.rfqId} legs=${missKeys.length} ` +
-          `keys=${missKeys.join('|') || '(none)'} ` +
-          `activeCount=${activeCount}` +
-          (overlap ? ` overlap=${overlap}` : '')
+          `[${MODE}] LOCK-MISS rfq=${missId} legs=${missLegs} activeCount=${activeCount}`
         );
       });
     }

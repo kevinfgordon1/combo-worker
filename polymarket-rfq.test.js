@@ -43,6 +43,7 @@ const {
   fetchPolymarketUnhedgedRfq,
   logSkip,
   resetSkipSummary,
+  resetLockDiagLogs,
 } = require('./polymarket-rfq');
 const { createUnhedgedFillTracker, isUnhedgedFillStatus } = require('./unhedged-rfq');
 const { createMarketCache } = require('./polymarket-market-cache');
@@ -95,6 +96,15 @@ assert.ok(
 assert.ok(
   /if \(NOISY_SKIP_REASONS\.has\(evaluation\.reason\)\)/.test(polySrc),
   'logSkip must no-op noisy overlap/unmatched reasons before building legs/keys strings'
+);
+assert.ok(
+  /LOCK_DIAG_LOG_MS/.test(polySrc) && /resetLockDiagLogs/.test(polySrc),
+  'lock-identity-fail / lock-unpriceable-on-poly must share a 10s rate-limit'
+);
+assert.ok(
+  /const allowLog = now - lockDiagLog\.identityAt >= LOCK_DIAG_LOG_MS/.test(polySrc) &&
+    /const allowLog = now - lockDiagLog\.unpriceableAt >= LOCK_DIAG_LOG_MS/.test(polySrc),
+  'lock-identity-fail / lock-unpriceable rate-limit must run before label/keys joins'
 );
 assert.ok(
   /const enableLocks = ctx\.enableLocks !== false/.test(polySrc) &&
@@ -964,9 +974,17 @@ const ncaafSpreadLock = {
   ],
 };
 const unpriceableLogs = [];
+resetLockDiagLogs();
 assert.strictEqual(logUnpriceablePolyLocks([ncaafSpreadLock, texLaaSept4Lock], (m) => unpriceableLogs.push(m)), 1);
 assert.ok(unpriceableLogs.some((l) => l.includes('lock-unpriceable-on-poly reason=not_moneyline')));
 assert.ok(unpriceableLogs.some((l) => l.includes('Baylor Bears')));
+{
+  const flood = [];
+  for (let i = 0; i < 20; i += 1) {
+    assert.strictEqual(logUnpriceablePolyLocks([ncaafSpreadLock, texLaaSept4Lock], (m) => flood.push(m)), 1);
+  }
+  assert.strictEqual(flood.length, 0, 'lock-unpriceable-on-poly flood must not rebuild labels after the first 10s window');
+}
 assert.strictEqual(countPriceableLocks([texLaaSept4Lock, ncaafSpreadLock]), 1);
 
 const identityFailLogs = [];
@@ -979,11 +997,20 @@ const unparseableMl = {
   label: 'Garbage ML lock',
   leg_keys: ['KXMLBGAME-26SEP031840XXXXX-XXX:yes'],
 };
+resetLockDiagLogs();
 assert.strictEqual(logActiveLockIdentityFails([unparseableMl], (m) => identityFailLogs.push(m)), 1);
 assert.ok(identityFailLogs.some((l) => (
-  l.includes('[POLY] lock-identity-fail label=Garbage ML lock')
+  l.includes('[POLY] lock-identity-fail')
+  && l.includes('label=Garbage ML lock')
   && l.includes('keys=KXMLBGAME-26SEP031840XXXXX-XXX:yes')
 )));
+{
+  const flood = [];
+  for (let i = 0; i < 20; i += 1) {
+    assert.strictEqual(logActiveLockIdentityFails([unparseableMl], (m) => flood.push(m)), 1);
+  }
+  assert.strictEqual(flood.length, 0, 'lock-identity-fail flood must not rebuild keys= after the first 10s window');
+}
 
 const quoteable = evaluatePolymarketRfq({
   rfq: pmRfq,
