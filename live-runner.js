@@ -12,6 +12,8 @@
 //   protobuf type 1/2; string EXECUTION_TYPE_* still works. A missed WS
 //   event is recovered by GetQuotes(EXECUTED)+GET /v1/order (and, if
 //   still dark, portfolio activities/positions matched to a unique lock).
+//   Poly activity / reconcile / position share one economic size per
+//   lock+caoc — distinct fill_ids must not stack on the Combo Lock card.
 // RESERVE: outstanding live quotes (pendingQuotes + in-flight POST) count against
 //   remaining so parallel RFQs cannot all clear the same ceiling.
 //   remaining = max - filled - outstanding.

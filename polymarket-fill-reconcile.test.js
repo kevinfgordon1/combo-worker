@@ -12,6 +12,10 @@ const {
   orderQtyMatchesQuoted,
   activityAlreadyReconciled,
   bookedReconcileKeys,
+  bookedActivityKeys,
+  alreadyBookedSameSize,
+  lockHasPolyContractsForCaoc,
+  selectDuplicatePolyFillsToDrop,
   quotedSizesByLock,
   slugMakerSizeAllowed,
   positionQty,
@@ -556,6 +560,105 @@ function comboTrade(id, qty, { aggressor = false, payout } = {}) {
   });
   assert.strictEqual(noPos.length, 1, 'empty-title caoc No position matches via slug map');
   assert.strictEqual(noPos[0].contracts, 75.64);
+
+  const activityBooked = [{
+    parlay_id: giantsLock.id,
+    ticker: giantsSlug,
+    count: 75.64,
+    source: 'poly-activity',
+    fill_id: 'poly-act:CKBRGP9B0W1E',
+  }];
+  assert.ok(lockHasPolyContractsForCaoc(giantsLock, giantsSlug, activityBooked));
+  assert.strictEqual(
+    matchPositionsToLocks([{
+      marketSlug: giantsSlug,
+      netPositionDecimal: '-75.64',
+      marketMetadata: { title: '', slug: giantsSlug },
+    }], [giantsLock], {
+      slugMap: slugMapFromRecords([{ market_ticker: giantsSlug, parlay_id: giantsLock.id }]),
+      bookedFills: activityBooked,
+    }).length,
+    0,
+    'activity then position → one fill (position skips the same caoc)'
+  );
+
+  const reconBookedPos = [{
+    parlayId: giantsLock.id,
+    marketTicker: giantsSlug,
+    contracts: 75.64,
+    source: 'poly-reconcile',
+    fillId: 'poly-recon:q-g-80:75.64',
+  }];
+  assert.strictEqual(
+    matchPositionsToLocks([{
+      marketSlug: giantsSlug,
+      netPositionDecimal: '-75.64',
+      marketMetadata: { title: '', slug: giantsSlug },
+    }], [giantsLock], {
+      slugMap: slugMapFromRecords([{ market_ticker: giantsSlug, parlay_id: giantsLock.id }]),
+      bookedFills: reconBookedPos,
+    }).length,
+    0,
+    'reconcile then position → one fill (position skips the same caoc)'
+  );
+
+  const eaglesLock = {
+    id: 'ec1d7fa9-6cf4-4c15-9949-84566ffd3396',
+    label: 'Philadelphia Eagles ML + Buffalo Bills ML + New York Jets ML',
+  };
+  const eaglesSlug = 'caoc-1f0613a434f23f94';
+  const eaglesTrades = [
+    { parlay_id: eaglesLock.id, ticker: eaglesSlug, count: 49.32, source: 'poly-activity', fill_id: 'poly-act:a' },
+    { parlay_id: eaglesLock.id, ticker: eaglesSlug, count: 24.63, source: 'poly-activity', fill_id: 'poly-act:b' },
+  ];
+  assert.strictEqual(
+    matchPositionsToLocks([{
+      marketSlug: eaglesSlug,
+      netPositionDecimal: '-73.95',
+      marketMetadata: { title: '', slug: eaglesSlug },
+    }], [eaglesLock], {
+      slugMap: slugMapFromRecords([{ market_ticker: eaglesSlug, parlay_id: eaglesLock.id }]),
+      bookedFills: eaglesTrades,
+    }).length,
+    0,
+    'position 73.95 must not stack on 49.32+24.63 activity for the same caoc'
+  );
+}
+
+{
+  const eagles = 'ec1d7fa9-6cf4-4c15-9949-84566ffd3396';
+  const ravens = '86917686-1ed3-4d3a-9d30-499c9f433b94';
+  const broncos = 'ee790534-2e44-4920-bcff-9b03a537928f';
+  const colts = '11060463-5c3c-47cb-9b87-1f5bb2e77ac2';
+  const giants = 'e28a732e-b901-4556-800e-e359758b550b';
+  const liveDupes = [
+    { fill_id: 'poly-recon:q-e1:49.32', parlay_id: eagles, ticker: 'caoc-1f0613a434f23f94', count: 49.32, source: 'poly-reconcile' },
+    { fill_id: 'poly-act:CJ9CZXCJTVAY', parlay_id: eagles, ticker: 'caoc-1f0613a434f23f94', count: 49.32, source: 'poly-activity' },
+    { fill_id: 'poly-recon:q-e2:24.63', parlay_id: eagles, ticker: 'caoc-1f0613a434f23f94', count: 24.63, source: 'poly-reconcile' },
+    { fill_id: 'poly-act:CJAADJR8RVAY', parlay_id: eagles, ticker: 'caoc-1f0613a434f23f94', count: 24.63, source: 'poly-activity' },
+    { fill_id: 'poly-pos:eagles:caoc-1f0613a434f23f94:73.95', parlay_id: eagles, ticker: 'caoc-1f0613a434f23f94', count: 73.95, source: 'poly-position' },
+    { fill_id: 'poly-recon:q-rav:629.82', parlay_id: ravens, ticker: 'caoc-23f1fca1ea3441ed', count: 629.82, source: 'poly-reconcile' },
+    { fill_id: 'poly-pos:ravens:caoc-23f1fca1ea3441ed:629.82', parlay_id: ravens, ticker: 'caoc-23f1fca1ea3441ed', count: 629.82, source: 'poly-position' },
+    { fill_id: 'poly-act:CKDPCH25CW1E', parlay_id: broncos, ticker: 'caoc-e0bed519fe46b9a2', count: 70.9, source: 'poly-activity' },
+    { fill_id: 'poly-pos:broncos:caoc-e0bed519fe46b9a2:70.9', parlay_id: broncos, ticker: 'caoc-e0bed519fe46b9a2', count: 70.9, source: 'poly-position' },
+    { fill_id: 'poly-act:CKH1J42SAW1E', parlay_id: colts, ticker: 'caoc-ea194abfb78d8326', count: 616.57, source: 'poly-activity' },
+    { fill_id: 'poly-pos:colts:caoc-ea194abfb78d8326:616.57', parlay_id: colts, ticker: 'caoc-ea194abfb78d8326', count: 616.57, source: 'poly-position' },
+    { fill_id: 'poly-act:CKBRGP9B0W1E', parlay_id: giants, ticker: 'caoc-ee31bd7977a36124', count: 75.64, source: 'poly-activity' },
+    { fill_id: 'poly-pos:giants:caoc-ee31bd7977a36124:75.64', parlay_id: giants, ticker: 'caoc-ee31bd7977a36124', count: 75.64, source: 'poly-position' },
+  ];
+  const drop = selectDuplicatePolyFillsToDrop(liveDupes);
+  const dropIds = new Set(drop.map((row) => row.fill_id));
+  assert.ok(dropIds.has('poly-recon:q-e1:49.32'));
+  assert.ok(dropIds.has('poly-recon:q-e2:24.63'));
+  assert.ok(dropIds.has('poly-pos:eagles:caoc-1f0613a434f23f94:73.95'));
+  assert.ok(dropIds.has('poly-pos:ravens:caoc-23f1fca1ea3441ed:629.82'));
+  assert.ok(dropIds.has('poly-pos:broncos:caoc-e0bed519fe46b9a2:70.9'));
+  assert.ok(dropIds.has('poly-pos:colts:caoc-ea194abfb78d8326:616.57'));
+  assert.ok(dropIds.has('poly-pos:giants:caoc-ee31bd7977a36124:75.64'));
+  assert.ok(!dropIds.has('poly-act:CJ9CZXCJTVAY'));
+  assert.ok(!dropIds.has('poly-act:CJAADJR8RVAY'));
+  assert.ok(!dropIds.has('poly-recon:q-rav:629.82'));
+  assert.strictEqual(drop.length, 7, 'keep activity/reconcile trades; drop duplicate recon + every position snapshot');
 }
 
 {
@@ -895,6 +998,108 @@ function comboTrade(id, qty, { aggressor = false, payout } = {}) {
     lockForFillEvent(actHits[0], [giantsLock], { submissions: giantsSubs }),
     giantsLock
   );
+
+  const activityThenPos = await reconcileLockActivityEvents({
+    async listActivities() { return { activities: [] }; },
+    async listPositions() {
+      return {
+        positions: {
+          [giantsSlug]: {
+            qtyBoughtDecimal: '0',
+            netPositionDecimal: '-75.64',
+            marketMetadata: { title: '', slug: giantsSlug, outcome: 'No' },
+          },
+        },
+      };
+    },
+  }, {
+    locks: [giantsLock],
+    submissions: [{ market_ticker: giantsSlug, parlay_id: giantsLock.id, contracts: 80 }],
+    bookedFills: [{
+      parlay_id: giantsLock.id,
+      ticker: giantsSlug,
+      count: 75.64,
+      source: 'poly-activity',
+      fill_id: 'poly-act:CKBRGP9B0W1E',
+    }],
+  });
+  assert.strictEqual(activityThenPos.length, 0, 'activity then position → one fill (aged-off activity still blocks position)');
+
+  const reconThenPos = await reconcileLockActivityEvents({
+    async listActivities() { return { activities: [] }; },
+    async listPositions() {
+      return {
+        positions: {
+          [giantsSlug]: {
+            qtyBoughtDecimal: '0',
+            netPositionDecimal: '-75.64',
+            marketMetadata: { title: '', slug: giantsSlug, outcome: 'No' },
+          },
+        },
+      };
+    },
+  }, {
+    locks: [giantsLock],
+    submissions: [{ market_ticker: giantsSlug, parlay_id: giantsLock.id, contracts: 80 }],
+    bookedFills: [{
+      parlayId: giantsLock.id,
+      marketTicker: giantsSlug,
+      contracts: 75.64,
+      source: 'poly-reconcile',
+      fillId: 'poly-recon:q-g-80:75.64',
+    }],
+  });
+  assert.strictEqual(reconThenPos.length, 0, 'reconcile then position → one fill');
+
+  const actThenReconHttp = {
+    async listQuotes(query) {
+      if (query && query.userFilter === 'USER_FILTER_SELF' && query.status === 'QUOTE_STATUS_EXECUTED') {
+        return {
+          quotes: [{
+            id: 'q-g-80',
+            status: 'QUOTE_STATUS_EXECUTED',
+            symbol: giantsSlug,
+            buyQtyDecimal: '75.64',
+            creatorOrderId: 'o-g-80',
+          }],
+        };
+      }
+      return { quotes: [] };
+    },
+    async getOrder() {
+      return { id: 'o-g-80', cumQuantity: 75.64, state: 'ORDER_STATE_FILLED' };
+    },
+  };
+  const actThenRecon = await reconcilePolymarketLockFills(actThenReconHttp, {
+    submissions: [{
+      quote_id: 'q-g-80',
+      parlay_id: giantsLock.id,
+      market_ticker: giantsSlug,
+      contracts: 75.64,
+      status: 'unfilled',
+      label: giantsLock.label,
+    }],
+    bookedFills: [{
+      parlay_id: giantsLock.id,
+      ticker: giantsSlug,
+      count: 75.64,
+      source: 'poly-activity',
+      fill_id: 'poly-act:CKBRGP9B0W1E',
+    }],
+    hydrate: false,
+  });
+  assert.strictEqual(actThenRecon.length, 0, 'activity+reconcile same size → one fill');
+  assert.ok(alreadyBookedSameSize(
+    { qty: 75.64, marketSlug: giantsSlug },
+    giantsLock,
+    bookedActivityKeys({ bookedFills: [{
+      parlay_id: giantsLock.id,
+      ticker: giantsSlug,
+      count: 75.64,
+      source: 'poly-activity',
+      fill_id: 'poly-act:CKBRGP9B0W1E',
+    }] })
+  ));
   for (const evt of quoteHits.concat([
     { quoteId: 'q-ravens', marketTicker: 'caoc-23f1fca1ea3441ed', contracts: 629.82 },
     { quoteId: 'q-eagles', marketTicker: 'caoc-1f0613a434f23f94', contracts: 24.63 },

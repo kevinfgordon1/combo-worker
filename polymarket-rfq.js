@@ -85,6 +85,8 @@ const {
   resolveQuoteFill,
   reconcilePolymarketLockFills,
   reconcileLockActivityEvents,
+  alreadyBookedSameSize,
+  bookedActivityKeys,
 } = require('./polymarket-fill-reconcile');
 
 const MODE = 'POLY';
@@ -1676,6 +1678,17 @@ function startPolymarketRfqLoop(ctx = {}) {
       alreadyFilled: Math.max(already, fromDb),
     });
     if (!evt || !(evt.contracts > 0)) return null;
+    let bookedPrior = Array.isArray(ctx.bookedPolyFills) ? ctx.bookedPolyFills.slice() : [];
+    if (typeof ctx.loadPolySlugRecords === 'function') {
+      try { bookedPrior = bookedPrior.concat((await ctx.loadPolySlugRecords()) || []); } catch (_) { /* keep prior */ }
+    }
+    if (alreadyBookedSameSize(
+      evt,
+      { id: evt.parlayId || (pending && pending.parlayId) },
+      bookedActivityKeys({ bookedFills: bookedPrior })
+    )) {
+      return null;
+    }
     if (pending && evt.contracts > 0) {
       pending.filledContracts = (pending.filledContracts || 0) + evt.contracts;
     }
@@ -1698,11 +1711,20 @@ function startPolymarketRfqLoop(ctx = {}) {
         console.error(`[${MODE}] fill reconcile load quotes`, e && e.message);
       }
     }
+    let slugRecords = [];
+    if (typeof ctx.loadPolySlugRecords === 'function') {
+      try { slugRecords = (await ctx.loadPolySlugRecords()) || []; } catch (e) {
+        console.error(`[${MODE}] fill reconcile load slugs`, e && e.message);
+      }
+    }
+    const bookedPrior = (Array.isArray(ctx.bookedPolyFills) ? ctx.bookedPolyFills : []).concat(slugRecords);
     const events = await reconcilePolymarketLockFills(http, {
       pendingQuotes,
       submissions,
       getFilledForQuote: ctx.getFilledForQuote,
       seenQuoteIds: seenReconciledQuotes,
+      seenFillIds: ctx.seenFillIds,
+      bookedFills: bookedPrior,
       maxPerTick: ctx.fillReconcileMax != null ? ctx.fillReconcileMax : 15,
     });
     for (const evt of events) {
@@ -1725,10 +1747,6 @@ function startPolymarketRfqLoop(ctx = {}) {
     if (typeof ctx.loadRecentLocks === 'function') {
       let locks = [];
       try { locks = (await ctx.loadRecentLocks()) || []; } catch (_) { locks = []; }
-      let slugRecords = [];
-      if (typeof ctx.loadPolySlugRecords === 'function') {
-        try { slugRecords = (await ctx.loadPolySlugRecords()) || []; } catch (_) { slugRecords = []; }
-      }
       if (locks.length) {
         try {
           extra = await reconcileLockActivityEvents(http, {
@@ -1737,7 +1755,7 @@ function startPolymarketRfqLoop(ctx = {}) {
             submissions,
             slugRecords,
             pendingQuotes,
-            bookedFills: events.concat(Array.isArray(ctx.bookedPolyFills) ? ctx.bookedPolyFills : []),
+            bookedFills: events.concat(bookedPrior),
           });
         } catch (e) {
           console.error(`[${MODE}] fill reconcile activities`, e && e.message);

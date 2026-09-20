@@ -12,8 +12,14 @@
 // marketMetadata.title. Do not invent titles — join marketSlug to quote /
 // order / fill / submission ticker records we already stored.
 // Reconcile never attaches an order whose cumQuantity ≠ posted quote size
-// (partials may be smaller). Activity never re-books a trade already booked
-// via poly-recon (same lock/slug + size).
+// (partials may be smaller). Activity / reconcile / position share one
+// economic size: same lock + caoc slug + size books once. claimFillKey
+// cannot catch this — fill_ids are poly-act: / poly-recon: / poly-pos:.
+// Activity never re-books a trade already booked via poly-recon or
+// poly-position (same lock/slug + size). Reconcile never duplicates an
+// activity/position row of that size. Position is a fallback only — skip
+// when the lock already has any poly contracts for that caoc ticker.
+// Cleanup prefers poly-activity, then poly-reconcile, over poly-position.
 //
 // Combo Lock hedges are No / short Yes. Position qty must use |netPosition|
 // (qtyBoughtDecimal is often "0"). Slug-only maker trades may be smaller
@@ -150,16 +156,64 @@ function orderQtyMatchesQuoted(cumQty, quoted, state) {
   return cum + SIZE_EPS < want && isPartialOrderState(state);
 }
 
+function sourceOfFill(row) {
+  return String((row && (row.source || (row.raw && row.raw.source))) || '');
+}
+
+function fillIdOf(row) {
+  return (row && (row.fillId || row.fill_id)) || null;
+}
+
 function isReconcileFillRecord(row) {
   if (!row) return false;
-  const src = String(row.source || (row.raw && row.raw.source) || '');
-  const fillId = row.fillId || row.fill_id;
-  return src.startsWith('poly-recon') || String(fillId || '').startsWith('poly-recon:');
+  return sourceOfFill(row).startsWith('poly-recon')
+    || String(fillIdOf(row) || '').startsWith('poly-recon:');
+}
+
+function isActivityFillRecord(row) {
+  if (!row) return false;
+  return sourceOfFill(row).startsWith('poly-activity')
+    || String(fillIdOf(row) || '').startsWith('poly-act:');
+}
+
+function isPositionFillRecord(row) {
+  if (!row) return false;
+  return sourceOfFill(row).startsWith('poly-position')
+    || String(fillIdOf(row) || '').startsWith('poly-pos:');
+}
+
+function isPolyFillRecord(row) {
+  if (!row) return false;
+  if (isReconcileFillRecord(row) || isActivityFillRecord(row) || isPositionFillRecord(row)) {
+    return true;
+  }
+  if (sourceOfFill(row).startsWith('poly-')) return true;
+  const venue = String((row.venue || (row.raw && row.raw.venue)) || '');
+  return venue === 'polymarket' && !!fillIdOf(row);
+}
+
+function polyFillQty(row) {
+  return parsePositive(row && (row.contracts ?? row.count ?? row.qty));
+}
+
+function polyFillKeepRank(row) {
+  if (isActivityFillRecord(row)) return 3;
+  if (isReconcileFillRecord(row)) return 2;
+  if (isPositionFillRecord(row)) return 0;
+  return isPolyFillRecord(row) ? 1 : -1;
+}
+
+function sizeFromPolyFillId(fillId) {
+  const s = String(fillId || '');
+  let m = /^poly-recon:[^:]+:(\d+(?:\.\d+)?)$/.exec(s);
+  if (m) return parsePositive(m[1]);
+  m = /^poly-pos:[^:]+:[^:]+:(\d+(?:\.\d+)?)$/.exec(s);
+  if (m) return parsePositive(m[1]);
+  return 0;
 }
 
 function reconcileSizeFromFillId(fillId) {
-  const m = /^poly-recon:[^:]+:(\d+(?:\.\d+)?)$/.exec(String(fillId || ''));
-  return m ? parsePositive(m[1]) : 0;
+  return sizeFromPolyFillId(fillId);
 }
 
 function quotedSizesByLock(submissions, pendingQuotes) {
@@ -181,34 +235,148 @@ function quotedSizesByLock(submissions, pendingQuotes) {
   return map;
 }
 
-function bookedReconcileKeys({ bookedFills, seenFillIds } = {}) {
+function bookedPolySizeKeys({ bookedFills, seenFillIds, include } = {}) {
+  const want = include || {
+    activity: true, reconcile: true, position: true, other: true,
+  };
   const keys = new Set();
+  const add = (parlayId, slug, qty) => {
+    const n = parsePositive(qty);
+    if (!(n > 0)) return;
+    const sk = sizeKey(n);
+    if (parlayId) keys.add(`${parlayId}:${sk}`);
+    if (slug) keys.add(`${slug}:${sk}`);
+    if (parlayId && slug) keys.add(`${parlayId}:${slug}:${sk}`);
+  };
   for (const row of bookedFills || []) {
-    if (!isReconcileFillRecord(row)) continue;
-    const qty = parsePositive(row.contracts ?? row.count ?? row.qty);
-    if (!(qty > 0)) continue;
-    const parlayId = row.parlayId || row.parlay_id || '';
-    keys.add(`${parlayId}:${sizeKey(qty)}`);
-    const slug = normalizeMarketSlug(row.marketTicker || row.ticker || row.market_ticker);
-    if (slug) keys.add(`${slug}:${sizeKey(qty)}`);
+    if (!isPolyFillRecord(row)) continue;
+    if (isActivityFillRecord(row) && !want.activity) continue;
+    if (isReconcileFillRecord(row) && !want.reconcile) continue;
+    if (isPositionFillRecord(row) && !want.position) continue;
+    if (
+      !isActivityFillRecord(row) && !isReconcileFillRecord(row) && !isPositionFillRecord(row)
+      && !want.other
+    ) continue;
+    add(
+      parlayIdOfRecord(row),
+      slugOfRecord(row) || normalizeMarketSlug(row.marketTicker || row.ticker || row.market_ticker),
+      polyFillQty(row)
+    );
   }
   if (seenFillIds && typeof seenFillIds.forEach === 'function') {
     seenFillIds.forEach((id) => {
-      const qty = reconcileSizeFromFillId(id);
+      const s = String(id || '');
+      if (s.startsWith('poly-recon:') && !want.reconcile) return;
+      if (s.startsWith('poly-pos:') && !want.position) return;
+      if (s.startsWith('poly-act:') && !want.activity) return;
+      const qty = sizeFromPolyFillId(s);
       if (qty > 0) keys.add(`:${sizeKey(qty)}`);
     });
   }
   return keys;
 }
 
-function activityAlreadyReconciled(trade, lock, bookedKeys) {
+// Activity skips when reconcile, position, or a live WS row already booked
+// this lock/slug + size. Other activity lots of the same size still book.
+function bookedReconcileKeys({ bookedFills, seenFillIds } = {}) {
+  return bookedPolySizeKeys({
+    bookedFills,
+    seenFillIds,
+    include: { activity: false, reconcile: true, position: true, other: true },
+  });
+}
+
+// Reconcile skips when activity, position, or a live WS row already booked
+// this lock/slug + size.
+function bookedActivityKeys({ bookedFills, seenFillIds } = {}) {
+  return bookedPolySizeKeys({
+    bookedFills,
+    seenFillIds,
+    include: { activity: true, reconcile: false, position: true, other: true },
+  });
+}
+
+function alreadyBookedSameSize(trade, lock, bookedKeys) {
   if (!trade || !bookedKeys || typeof bookedKeys.has !== 'function') return false;
-  const qty = sizeKey(trade.qty);
+  const qty = sizeKey(trade.qty ?? trade.contracts ?? trade.count);
   if (!(qty > 0)) return false;
-  if (lock && lock.id && bookedKeys.has(`${lock.id}:${qty}`)) return true;
-  const slug = normalizeMarketSlug(trade.marketSlug);
+  const parlayId = (lock && lock.id) || trade.parlayId || trade.parlay_id || '';
+  if (parlayId && bookedKeys.has(`${parlayId}:${qty}`)) return true;
+  const slug = normalizeMarketSlug(
+    trade.marketSlug || trade.marketTicker || trade.ticker || trade.market_ticker
+  );
   if (slug && bookedKeys.has(`${slug}:${qty}`)) return true;
+  if (parlayId && slug && bookedKeys.has(`${parlayId}:${slug}:${qty}`)) return true;
   return bookedKeys.has(`:${qty}`);
+}
+
+function activityAlreadyReconciled(trade, lock, bookedKeys) {
+  return alreadyBookedSameSize(trade, lock, bookedKeys);
+}
+
+// Position fallback: any poly contracts already on this lock's caoc ticker.
+function lockHasPolyContractsForCaoc(lock, slug, bookedFills) {
+  const s = normalizeMarketSlug(slug);
+  if (!isComboActivitySlug(s)) return false;
+  const pid = lock && (lock.id || lock.parlayId || lock.parlay_id);
+  for (const row of bookedFills || []) {
+    if (!isPolyFillRecord(row)) continue;
+    if (!(polyFillQty(row) > 0)) continue;
+    if (slugOfRecord(row) !== s) continue;
+    const rowPid = parlayIdOfRecord(row);
+    if (pid && rowPid && rowPid !== pid) continue;
+    return true;
+  }
+  return false;
+}
+
+// One-time cleanup: drop lower-rank duplicates per (parlay_id, caoc, size).
+// Rank: poly-activity > poly-reconcile > other poly > poly-position.
+// Position snapshots are also dropped whenever any trade row remains on
+// that lock+caoc (Eagles 49.32+24.63 activity vs position 73.95).
+function selectDuplicatePolyFillsToDrop(rows) {
+  const groups = new Map();
+  for (const row of rows || []) {
+    if (!isPolyFillRecord(row)) continue;
+    const slug = slugOfRecord(row);
+    if (!isComboActivitySlug(slug)) continue;
+    const key = `${parlayIdOfRecord(row) || ''}|${slug}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  const drop = [];
+  const seen = new Set();
+  const remember = (row) => {
+    const id = fillIdOf(row);
+    if (id) {
+      if (seen.has(id)) return;
+      seen.add(id);
+    }
+    drop.push(row);
+  };
+  for (const group of groups.values()) {
+    const positions = group.filter(isPositionFillRecord);
+    const trades = group.filter((row) => !isPositionFillRecord(row));
+    if (trades.length && positions.length) {
+      for (const row of positions) remember(row);
+    } else if (!trades.length && positions.length > 1) {
+      for (const row of positions.slice(1)) remember(row);
+    }
+    const bySize = new Map();
+    for (const row of trades) {
+      const sk = sizeKey(polyFillQty(row));
+      if (!bySize.has(sk)) bySize.set(sk, []);
+      bySize.get(sk).push(row);
+    }
+    for (const same of bySize.values()) {
+      if (same.length < 2) continue;
+      const best = Math.max(...same.map(polyFillKeepRank));
+      for (const row of same) {
+        if (polyFillKeepRank(row) < best) remember(row);
+      }
+    }
+  }
+  return drop;
 }
 
 // Opaque caoc maker hedges: allow exact quote size or a partial below a
@@ -865,6 +1033,8 @@ async function reconcilePolymarketLockFills(http, {
   allowExecutedWithoutOrder = false,
   maxPerTick = DEFAULT_MAX_PER_TICK,
   seenQuoteIds,
+  seenFillIds,
+  bookedFills,
   hydrate = true,
 } = {}) {
   let executed = [];
@@ -898,6 +1068,11 @@ async function reconcilePolymarketLockFills(http, {
     });
     if (evt && evt.contracts > 0) {
       const lockId = (c.pending && c.pending.parlayId) || quoteIds.get(quoteId);
+      const lock = lockId && lockId !== false ? { id: lockId } : { id: evt.parlayId };
+      if (alreadyBookedSameSize(evt, lock, bookedActivityKeys({ bookedFills, seenFillIds }))) {
+        if (seenQuoteIds && quoteId) seenQuoteIds.add(quoteId);
+        continue;
+      }
       if (lockId && lockId !== false) {
         if (!fillBelongsToLock(evt, { id: lockId }, { quoteIds, slugs })) continue;
         if (!evt.parlayId) evt.parlayId = lockId;
@@ -1102,6 +1277,16 @@ async function reconcileLockActivityEvents(http, {
     ...events.map((e) => e.parlayId).filter(Boolean),
     ...(events.matchedLockIds || []),
   ]);
+  for (const lock of locks) {
+    if (!lock || !lock.id || covered.has(lock.id)) continue;
+    const already = booked.some((row) => (
+      isPolyFillRecord(row)
+      && parlayIdOfRecord(row) === lock.id
+      && isComboActivitySlug(slugOfRecord(row))
+      && polyFillQty(row) > 0
+    ));
+    if (already) covered.add(lock.id);
+  }
   if (!includePositions || typeof http.listPositions !== 'function') return events;
   const uncovered = locks.filter((p) => p && p.id && !covered.has(p.id));
   if (!uncovered.length) return events;
@@ -1110,6 +1295,7 @@ async function reconcileLockActivityEvents(http, {
     return events.concat(matchPositionsToLocks(positionsFromListed(listed), uncovered, {
       seenFillIds,
       slugMap: map,
+      bookedFills: booked,
     }));
   } catch (_) {
     return events;
@@ -1143,7 +1329,7 @@ function positionFillEvent({ pos, lock, source = 'poly-position' }) {
   };
 }
 
-function matchPositionsToLocks(positions, locks, { seenFillIds, slugMap } = {}) {
+function matchPositionsToLocks(positions, locks, { seenFillIds, slugMap, bookedFills } = {}) {
   const events = [];
   const booked = seenFillIds && typeof seenFillIds.has === 'function' ? seenFillIds : null;
   const local = new Set();
@@ -1157,6 +1343,7 @@ function matchPositionsToLocks(positions, locks, { seenFillIds, slugMap } = {}) 
     const hay = activityMarketHay(pos, { marketMetadata: meta, marketSlug: slug, title });
     const lock = uniqueLockForMarket(locks, hay || title, slug, map);
     if (!lock) continue;
+    if (lockHasPolyContractsForCaoc(lock, slug, bookedFills)) continue;
     const evt = positionFillEvent({ pos, lock });
     if (!evt || local.has(evt.fillId) || (booked && booked.has(evt.fillId))) continue;
     local.add(evt.fillId);
@@ -1187,10 +1374,20 @@ module.exports = {
   quotedContractsForReconcile,
   orderQtyMatchesQuoted,
   isReconcileFillRecord,
+  isActivityFillRecord,
+  isPositionFillRecord,
+  isPolyFillRecord,
+  polyFillQty,
+  polyFillKeepRank,
   reconcileSizeFromFillId,
   quotedSizesByLock,
+  bookedPolySizeKeys,
   bookedReconcileKeys,
+  bookedActivityKeys,
+  alreadyBookedSameSize,
   activityAlreadyReconciled,
+  lockHasPolyContractsForCaoc,
+  selectDuplicatePolyFillsToDrop,
   slugMakerSizeAllowed,
   comboSlugsFromMap,
   quoteIdLockMap,

@@ -10,6 +10,7 @@
 // not required. No / short Yes positions use |netPosition|.
 // A fill books onto a lock only when its caoc ticker is that lock's
 // mapped slug or its quote_id is one of that lock's submissions.
+// Same lock+caoc+size is not booked twice across activity/reconcile/position.
 // BACKFILL_PARLAY_ID never inherits foreign executed quotes.
 //
 // Env: SUPABASE_URL, SUPABASE_SERVICE_KEY, POLYMARKET_KEY_ID, POLYMARKET_SECRET_KEY
@@ -176,6 +177,8 @@ async function main() {
   const quoteEvents = await reconcilePolymarketLockFills(http, {
     submissions,
     alreadyFilledByQuote,
+    bookedFills: existingPoly,
+    seenFillIds: seen,
     allowExecutedWithoutOrder: true,
     maxPerTick: 400,
     hydrate: true,
