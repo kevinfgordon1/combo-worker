@@ -893,6 +893,145 @@ function startFillLoop(extra = {}) {
   assert.ok(!matchedFills.some((e) => String(e.fillId || '').startsWith('poly-act:')), 'activity must not double-book the reconciled 43');
   matchedLoop.stop();
 
+  const giantsLockFill = {
+    id: 'e28a732e-b901-4556-800e-e359758b550b',
+    label: 'New York Giants ML + New England Patriots ML + Washington Commanders ML',
+    user_id: 'u1',
+  };
+  const giantsSlugFill = 'caoc-ee31bd7977a36124';
+  const giantsPos = {
+    [giantsSlugFill]: {
+      qtyBoughtDecimal: '0',
+      netPositionDecimal: '-75.64',
+      marketMetadata: { title: '', slug: giantsSlugFill, outcome: 'No' },
+    },
+  };
+
+  const priorActivity = [{
+    parlay_id: giantsLockFill.id,
+    ticker: giantsSlugFill,
+    count: 75.64,
+    source: 'poly-activity',
+    fill_id: 'poly-act:CKBRGP9B0W1E',
+  }];
+  const actThenPosFills = [];
+  const { loop: actThenPosLoop } = startFillLoop({
+    skipSeed: true,
+    pendingQuotes: new Map(),
+    http: {
+      ...emptyHttp(),
+      async listPositions() { return { positions: giantsPos }; },
+    },
+    seenFillIds: new Set(),
+    loadUnfilledPolyQuotes: async () => [],
+    loadRecentLocks: async () => [giantsLockFill],
+    loadPolySlugRecords: async () => priorActivity,
+    bookedPolyFills: priorActivity,
+    onQuoteExecuted: (evt) => { actThenPosFills.push(evt); },
+  });
+  const actThenPos = await actThenPosLoop.reconcileLockFills();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(actThenPos.length, 0, 'activity then position → one fill');
+  assert.strictEqual(actThenPosFills.length, 0);
+  actThenPosLoop.stop();
+
+  const priorRecon = [{
+    parlay_id: giantsLockFill.id,
+    ticker: giantsSlugFill,
+    count: 75.64,
+    source: 'poly-reconcile',
+    fill_id: 'poly-recon:q-g-80:75.64',
+  }];
+  const reconThenPosFills = [];
+  const { loop: reconThenPosLoop } = startFillLoop({
+    skipSeed: true,
+    pendingQuotes: new Map(),
+    http: {
+      ...emptyHttp(),
+      async listPositions() { return { positions: giantsPos }; },
+    },
+    seenFillIds: new Set(),
+    loadUnfilledPolyQuotes: async () => [],
+    loadRecentLocks: async () => [giantsLockFill],
+    loadPolySlugRecords: async () => priorRecon,
+    bookedPolyFills: priorRecon,
+    onQuoteExecuted: (evt) => { reconThenPosFills.push(evt); },
+  });
+  const reconThenPos = await reconThenPosLoop.reconcileLockFills();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(reconThenPos.length, 0, 'reconcile then position → one fill');
+  assert.strictEqual(reconThenPosFills.length, 0);
+  reconThenPosLoop.stop();
+
+  const actPlusReconFills = [];
+  const { loop: actPlusReconLoop } = startFillLoop({
+    skipSeed: true,
+    pendingQuotes: new Map(),
+    http: {
+      ...emptyHttp(),
+      async listQuotes(query) {
+        if (query && query.status === 'QUOTE_STATUS_EXECUTED') {
+          return {
+            quotes: [{
+              id: 'q-g-80',
+              symbol: giantsSlugFill,
+              status: 'QUOTE_STATUS_EXECUTED',
+              creatorOrderId: 'o-g-80',
+              buyQtyDecimal: '75.64',
+            }],
+          };
+        }
+        return { quotes: [] };
+      },
+      async getOrder() {
+        return { id: 'o-g-80', cumQuantity: 75.64, state: 'ORDER_STATE_FILLED' };
+      },
+      async listActivities() {
+        return {
+          activities: [{
+            type: 'ACTIVITY_TYPE_TRADE',
+            trade: {
+              id: 'CKBRGP9B0W1E',
+              marketSlug: giantsSlugFill,
+              qtyDecimal: '75.64',
+              isAggressor: false,
+              state: 'TRADE_STATE_CLEARED',
+              marketMetadata: { title: '', slug: giantsSlugFill, outcome: 'No' },
+            },
+          }],
+        };
+      },
+    },
+    seenFillIds: new Set(),
+    loadUnfilledPolyQuotes: async () => [{
+      quote_id: 'q-g-80',
+      rfq_id: 'rfq-g-80',
+      parlay_id: giantsLockFill.id,
+      label: giantsLockFill.label,
+      contracts: 75.64,
+      user_id: giantsLockFill.user_id,
+      status: 'unfilled',
+      market_ticker: giantsSlugFill,
+    }],
+    loadRecentLocks: async () => [giantsLockFill],
+    loadPolySlugRecords: async () => [{
+      quote_id: 'q-g-80',
+      parlay_id: giantsLockFill.id,
+      market_ticker: giantsSlugFill,
+      contracts: 75.64,
+    }],
+    onQuoteExecuted: (evt) => { actPlusReconFills.push(evt); },
+  });
+  const actPlusRecon = await actPlusReconLoop.reconcileLockFills();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.strictEqual(actPlusRecon.length, 1, 'activity+reconcile same size → one fill');
+  assert.strictEqual(actPlusReconFills.length, 1);
+  assert.ok(
+    actPlusReconFills.every((e) => e.source === 'poly-reconcile' || e.source === 'poly-activity'),
+    'same-size activity and reconcile must not both persist'
+  );
+  actPlusReconLoop.stop();
+
   const polySrc = fs.readFileSync(path.join(__dirname, 'polymarket-rfq.js'), 'utf8');
   assert.ok(
     /function emitOrderFill/.test(polySrc) && /ctx\.onQuoteExecuted/.test(polySrc),
@@ -927,6 +1066,7 @@ function startFillLoop(extra = {}) {
       && /loadPolySlugRecords/.test(polySrc)
       && /slugRecords/.test(polySrc)
       && /bookedFills:\s*events/.test(polySrc)
+      && /bookedFills:\s*bookedPrior/.test(polySrc)
       && !/if\s*\(\s*!events\.length/.test(polySrc),
     'Poly loop must always scan lock-matching activities, not only when quote reconcile is empty'
   );
