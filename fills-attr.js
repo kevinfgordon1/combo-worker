@@ -266,6 +266,40 @@ function isLiveRunnerTwin(row) {
   return !!(row.fill_id && row.order_id && row.fill_id === row.order_id);
 }
 
+function isPolyishFill(row) {
+  if (!row) return false;
+  const id = String(row.fill_id || '');
+  const src = String((row.raw && row.raw.source) || row.source || '');
+  const ticker = String(row.ticker || '');
+  return id.startsWith('poly-') || src.startsWith('poly-') || /^caoc-/i.test(ticker);
+}
+
+// Real Kalshi portfolio trade (trade_id / count_fp payload). Not a live-runner
+// order stub (fill_id === order_id, raw.source=live-runner, no trade payload).
+function isKalshiTradeFill(row) {
+  if (!row || isLiveRunnerTwin(row) || isPolyishFill(row)) return false;
+  if (row.raw && (row.raw.trade_id || row.raw.count_fp != null)) return true;
+  return !!(row.fill_id && row.order_id && row.fill_id !== row.order_id);
+}
+
+// Drop live-runner order stubs once a real Kalshi trade exists for that order_id.
+function selectLiveRunnerStubsToDrop(rows) {
+  const byOrder = new Map();
+  for (const row of rows || []) {
+    if (!row || !row.order_id || isPolyishFill(row)) continue;
+    if (!byOrder.has(row.order_id)) byOrder.set(row.order_id, []);
+    byOrder.get(row.order_id).push(row);
+  }
+  const drop = [];
+  for (const group of byOrder.values()) {
+    if (!group.some(isKalshiTradeFill)) continue;
+    for (const row of group) {
+      if (isLiveRunnerTwin(row)) drop.push(row);
+    }
+  }
+  return drop;
+}
+
 function pickFillForSum(rows) {
   const list = (rows || []).filter(Boolean);
   const byKey = new Map();
@@ -348,6 +382,9 @@ module.exports = {
   submissionAlreadyFilled,
   existingFillNeedsParlay,
   isLiveRunnerTwin,
+  isPolyishFill,
+  isKalshiTradeFill,
+  selectLiveRunnerStubsToDrop,
   pickFillForSum,
   sumAttributedFillCounts,
   contractsCoverFill,

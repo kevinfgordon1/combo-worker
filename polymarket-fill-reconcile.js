@@ -15,10 +15,14 @@
 // (partials may be smaller). Activity / reconcile / position share one
 // economic size: same lock + caoc slug + size books once. claimFillKey
 // cannot catch this — fill_ids are poly-act: / poly-recon: / poly-pos:.
-// Activity never re-books a trade already booked via poly-recon or
-// poly-position (same lock/slug + size). Reconcile never duplicates an
+// Activity never re-books a trade already booked via poly-recon,
+// poly-position, or a prior activity of the same lock/slug + size
+// (2026-09-21 06:41 UTC re-booked Ravens 629.82 and Cubs 83.57 on top
+// of existing reconcile rows). Reconcile never duplicates an
 // activity/position row of that size. Position is a fallback only — skip
 // when the lock already has any poly contracts for that caoc ticker.
+// persistExecutedFill also refuses a second economic twin (last line of
+// defense when bookedFills is empty after restart).
 // Cleanup prefers poly-activity, then poly-reconcile, over poly-position.
 //
 // Combo Lock hedges are No / short Yes. Position qty must use |netPosition|
@@ -310,8 +314,40 @@ function alreadyBookedSameSize(trade, lock, bookedKeys) {
   return bookedKeys.has(`:${qty}`);
 }
 
+function bookedAnyPolyKeys({ bookedFills, seenFillIds } = {}) {
+  return bookedPolySizeKeys({
+    bookedFills,
+    seenFillIds,
+    include: { activity: true, reconcile: true, position: true, other: true },
+  });
+}
+
 function activityAlreadyReconciled(trade, lock, bookedKeys) {
   return alreadyBookedSameSize(trade, lock, bookedKeys);
+}
+
+// Same lock + caoc + size already booked under a different fill_id
+// (poly-act vs poly-recon). Used at persist time so a restart with an
+// empty seenFillIds / stale slug cache cannot insert the 06:41 twin.
+function findPolyEconomicTwin(trade, lock, bookedFills) {
+  const qty = sizeKey(trade && (trade.qty ?? trade.contracts ?? trade.count));
+  if (!(qty > 0)) return null;
+  const parlayId = (lock && lock.id) || (trade && (trade.parlayId || trade.parlay_id)) || '';
+  const slug = normalizeMarketSlug(
+    trade && (trade.marketSlug || trade.marketTicker || trade.ticker || trade.market_ticker)
+  );
+  const selfId = fillIdOf(trade);
+  for (const row of bookedFills || []) {
+    if (!isPolyFillRecord(row)) continue;
+    if (selfId && fillIdOf(row) === selfId) continue;
+    if (sizeKey(polyFillQty(row)) !== qty) continue;
+    const rowPid = parlayIdOfRecord(row);
+    const rowSlug = slugOfRecord(row);
+    if (parlayId && rowPid && rowPid !== parlayId) continue;
+    if (slug && rowSlug && rowSlug !== slug) continue;
+    if ((parlayId && rowPid === parlayId) || (slug && rowSlug === slug)) return row;
+  }
+  return null;
 }
 
 // Position fallback: any poly contracts already on this lock's caoc ticker.
@@ -1132,7 +1168,7 @@ function matchActivitiesToLocks(activities, locks, {
   const map = slugMap instanceof Map || (slugMap && typeof slugMap === 'object')
     ? coerceSlugMap(slugMap)
     : null;
-  const reconcileKeys = bookedReconcileKeys({ bookedFills, seenFillIds });
+  const bookedKeys = bookedAnyPolyKeys({ bookedFills, seenFillIds });
   const quoteSizes = quotedByLock instanceof Map
     ? quotedByLock
     : quotedSizesByLock(quotedByLock);
@@ -1143,7 +1179,7 @@ function matchActivitiesToLocks(activities, locks, {
     const hit = lockMatchForActivity(locks, trade.hay || trade.title, trade.marketSlug, map);
     const lock = hit.lock;
     if (!lock) continue;
-    if (activityAlreadyReconciled(trade, lock, reconcileKeys)) {
+    if (activityAlreadyReconciled(trade, lock, bookedKeys)) {
       matchedLockIds.add(lock.id);
       continue;
     }
@@ -1384,8 +1420,10 @@ module.exports = {
   bookedPolySizeKeys,
   bookedReconcileKeys,
   bookedActivityKeys,
+  bookedAnyPolyKeys,
   alreadyBookedSameSize,
   activityAlreadyReconciled,
+  findPolyEconomicTwin,
   lockHasPolyContractsForCaoc,
   selectDuplicatePolyFillsToDrop,
   slugMakerSizeAllowed,

@@ -134,6 +134,17 @@ assert.ok(
   'fill persist must not share a try/catch with submissions (Telegram used to fire after both failed)'
 );
 assert.ok(
+  /findPolyEconomicTwin/.test(liveSrc)
+    && /skip poly fill — economic twin/.test(liveSrc)
+    && /skip live-runner stub — real Kalshi fill/.test(liveSrc)
+    && /isKalshiTradeFill/.test(liveSrc),
+  'persist must refuse Poly same-size twins and lingering Kalshi live-runner stubs'
+);
+assert.ok(
+  /POLY_FILL_LOOKBACK_MS = 21 \* 24 \* 3600 \* 1000/.test(liveSrc),
+  'booked Poly fills look back 21d so aged recon rows still block activity'
+);
+assert.ok(
   /pendingFromSubmission/.test(liveSrc) && /recovered quote_id/.test(liveSrc),
   'quote_executed after restart must recover the quote from combo_submissions'
 );

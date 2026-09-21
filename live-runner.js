@@ -131,7 +131,8 @@ const {
   applyRefreshKillByUser,
   applyRefreshFilledByParlay,
 } = require('./refresh-state');
-const { liveRunnerFillRow, resolveFillLookup, findPendingFill, submissionAlreadyFilled, claimFillKey } = require('./fills-attr');
+const { liveRunnerFillRow, resolveFillLookup, findPendingFill, submissionAlreadyFilled, claimFillKey, isKalshiTradeFill } = require('./fills-attr');
+const { findPolyEconomicTwin } = require('./polymarket-fill-reconcile');
 const {
   fingerprintRfq,
   cooldownFingerprint,
@@ -1102,22 +1103,64 @@ async function persistExecutedFill(pending, evt) {
   // Combo Locks "Filled — awaiting settlement" keys off combo_fills.parlay_id.
   // Write fills first so a submissions error cannot hide the position.
   try {
-    const { error: fillErr } = await supabase.from('combo_fills').upsert(
-      liveRunnerFillRow({
-        quoteId,
-        orderId,
-        fillId: evt.fillId,
-        parlayId: pending.parlayId,
-        count: contracts,
-        ticker,
-        rfqId: pending.rfqId || evt.rfqId,
-        label: pending.label,
-        venue,
-        source: evt.source || 'live-runner',
-      }),
-      { onConflict: 'fill_id' },
-    );
-    if (fillErr) console.error(`[${MODE}] combo_fills upsert failed`, fillErr.message);
+    let skipFill = false;
+    if (venue === 'polymarket' && pending.parlayId) {
+      const { data: booked, error: bookedErr } = await supabase
+        .from('combo_fills')
+        .select('fill_id,parlay_id,ticker,count,raw')
+        .eq('parlay_id', pending.parlayId)
+        .eq('is_combo', true)
+        .limit(500);
+      if (bookedErr) console.error(`[${MODE}] poly twin lookup`, bookedErr.message);
+      const twin = findPolyEconomicTwin(
+        {
+          qty: contracts,
+          contracts,
+          marketSlug: ticker,
+          parlay_id: pending.parlayId,
+          fill_id: evt.fillId,
+          fillId: evt.fillId,
+        },
+        { id: pending.parlayId },
+        booked || [],
+      );
+      if (twin && (twin.fill_id || twin.fillId) !== evt.fillId) {
+        skipFill = true;
+        console.log(
+          `[${MODE}] skip poly fill — economic twin fill_id=${twin.fill_id || twin.fillId} ` +
+          `already booked on ${pending.parlayId} ${ticker || ''} size=${contracts}`
+        );
+      }
+    } else if (orderId) {
+      const { data: sameOrder, error: orderErr } = await supabase
+        .from('combo_fills')
+        .select('fill_id,order_id,raw,ticker')
+        .eq('order_id', orderId)
+        .limit(20);
+      if (orderErr) console.error(`[${MODE}] kalshi stub lookup`, orderErr.message);
+      if ((sameOrder || []).some(isKalshiTradeFill)) {
+        skipFill = true;
+        console.log(`[${MODE}] skip live-runner stub — real Kalshi fill already on order_id=${orderId}`);
+      }
+    }
+    if (!skipFill) {
+      const { error: fillErr } = await supabase.from('combo_fills').upsert(
+        liveRunnerFillRow({
+          quoteId,
+          orderId,
+          fillId: evt.fillId,
+          parlayId: pending.parlayId,
+          count: contracts,
+          ticker,
+          rfqId: pending.rfqId || evt.rfqId,
+          label: pending.label,
+          venue,
+          source: evt.source || 'live-runner',
+        }),
+        { onConflict: 'fill_id' },
+      );
+      if (fillErr) console.error(`[${MODE}] combo_fills upsert failed`, fillErr.message);
+    }
   } catch (e) {
     console.error(`[${MODE}] combo_fills persist`, e.message);
   }
@@ -1179,7 +1222,7 @@ async function pendingFromSubmission({ quoteId, orderId } = {}) {
   }
 }
 
-const POLY_FILL_LOOKBACK_MS = 72 * 3600 * 1000;
+const POLY_FILL_LOOKBACK_MS = 21 * 24 * 3600 * 1000;
 const POLY_SLUG_CACHE_MS = 15000;
 let polySlugCacheAt = 0;
 let polySlugCacheRows = null;

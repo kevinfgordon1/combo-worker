@@ -16,6 +16,8 @@ const {
   submissionFilledPatch,
   canStampSubmission,
   pickFillForSum,
+  isKalshiTradeFill,
+  selectLiveRunnerStubsToDrop,
 } = require('./fills-attr');
 
 const soxLabel = 'Chicago White Sox ML + Pittsburgh Pirates ML + Baltimore Orioles ML';
@@ -307,6 +309,35 @@ const fillRow = {
   assert.strictEqual(picked.length, 1);
   assert.strictEqual(picked[0].fill_id, fill.fill_id);
 
+  const coltsStub = {
+    fill_id: '01a0bf23-1ac0-7c2c-829c-272a04e9445f',
+    order_id: '01a0bf23-1ac0-7c2c-829c-272a04e9445f',
+    count: 1200,
+    raw: { source: 'live-runner', venue: 'kalshi', quote_id: 'q', rfq_id: 'r' },
+  };
+  const coltsReal = {
+    fill_id: '072243af-71c1-9ba2-dde5-0190e58d0097',
+    order_id: '01a0bf23-1ac0-7c2c-829c-272a04e9445f',
+    count: 1124.12,
+    raw: { trade_id: '072243af-71c1-9ba2-dde5-0190e58d0097', count_fp: '1124.12' },
+  };
+  assert.ok(!isKalshiTradeFill(coltsStub));
+  assert.ok(isKalshiTradeFill(coltsReal));
+  const dropStubs = selectLiveRunnerStubsToDrop([coltsStub, coltsReal]);
+  assert.strictEqual(dropStubs.length, 1);
+  assert.strictEqual(dropStubs[0].fill_id, coltsStub.fill_id);
+  assert.strictEqual(selectLiveRunnerStubsToDrop([coltsStub]).length, 0, 'keep stub until a real trade exists');
+  assert.strictEqual(
+    selectLiveRunnerStubsToDrop([{
+      fill_id: 'poly-act:CJDEG0BFCVAY',
+      order_id: 'CJDEG0BFCVAY',
+      ticker: 'caoc-23f1fca1ea3441ed',
+      raw: { source: 'poly-activity', venue: 'polymarket' },
+    }]).length,
+    0,
+    'poly rows are not Kalshi stubs'
+  );
+
   // Two parlays both quoted covering size in-window → do not guess
   const ambiguous = attributeFromSubmissions(fill, [
     ...subs,
@@ -329,6 +360,7 @@ const fillRow = {
   assert.ok(!/ignoreDuplicates:\s*true/.test(src), 'must update parlay_id on existing unattributed fill_id');
   assert.ok(/attributeComboFill/.test(src) && /stampSubmissionFilled/.test(src));
   assert.ok(/REATTRIBUTED/.test(src));
+  assert.ok(/deleteLiveRunnerTwins/.test(src) && /dropped live-runner stub/.test(src));
   const repair = fs.readFileSync(path.join(__dirname, 'sql/repair_20260908_sea_phi_lar_fill.sql'), 'utf8');
   assert.ok(repair.includes('07228709-6229-8235-5047-44b3103ff56b'));
   assert.ok(repair.includes('01a081a8-4a08-7823-a57f-2273007cd403'));
