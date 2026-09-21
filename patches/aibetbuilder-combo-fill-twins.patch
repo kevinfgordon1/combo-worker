@@ -1,0 +1,246 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 21 Sep 2026 14:00:00 +0000
+Subject: [PATCH] Dedupe Poly activity+reconcile twins on Combo Locks desk sums
+
+Card/History already collapsed Kalshi live-runner stubs per order_id.
+Profile P/L still raw-summed combo_fills, and no path collapsed the
+same-size Poly activity/reconcile pairs (Ravens 629.82, Cubs 83.57).
+
+Apply on aibetbuilder:
+
+  git apply patches/aibetbuilder-combo-fill-twins.patch
+
+This environment could not push to kevinfgordon1/aibetbuilder (403).
+---
+diff --git a/src/UserProfile.jsx b/src/UserProfile.jsx
+index 17e0406..3ce1b0a 100644
+--- a/src/UserProfile.jsx
++++ b/src/UserProfile.jsx
+@@ -9,6 +9,7 @@ import { identityFromUser, profileDisplayName } from "./userProfile";
+ import { sportChipSelected, toggleSportChip } from "./sportChips";
+ import WhatsNewComposer from "./WhatsNewComposer";
+ import { buildComboStatement } from "./comboStatement";
++import { deskFillCounts } from "./comboTape";
+ import StatementBoard, { downloadStatementCsv, useStatementView } from "./StatementBoard";
+ 
+ const supabase = createClient(import.meta.env.VITE_SUPABASE_URL, import.meta.env.VITE_SUPABASE_ANON_KEY);
+@@ -56,16 +57,12 @@ export default function UserProfile({
+     try {
+       const [{ data: parlays, error: pErr }, { data: fills, error: fErr }] = await Promise.all([
+         supabase.from("combo_parlays").select("*").eq("user_id", user.id).order("created_at", { ascending: false }).limit(200),
+-        supabase.from("combo_fills").select("parlay_id,count,is_combo,is_taker").eq("is_combo", true).eq("is_taker", false),
++        supabase.from("combo_fills").select("parlay_id,count,is_combo,is_taker,fill_id,order_id,ticker,raw").eq("is_combo", true).eq("is_taker", false),
+       ]);
+       if (pErr) throw pErr;
+       if (fErr) throw fErr;
+-      const fillsById = {};
+-      (fills || []).forEach((f) => {
+-        if (!f.parlay_id) return;
+-        fillsById[f.parlay_id] = (fillsById[f.parlay_id] || 0) + Number(f.count || 0);
+-      });
+-      setStatement(buildComboStatement({ parlays: parlays || [], fillsById, fills: fills || [] }));
++      const desk = deskFillCounts(fills || [], []);
++      setStatement(buildComboStatement({ parlays: parlays || [], fillsById: desk.byParlay, fills: fills || [] }));
+     } catch (err) {
+       setStmtError(err && err.message ? err.message : "Could not load statement.");
+     } finally {
+diff --git a/src/comboTape.js b/src/comboTape.js
+index 94599dd..4442c19 100644
+--- a/src/comboTape.js
++++ b/src/comboTape.js
+@@ -381,10 +381,71 @@ export function dedupeFillsByOrder(fills = []) {
+   return [...byKey.values(), ...unkeyed];
+ }
+ 
++const POLY_SIZE_EPS = 1e-4;
++
++function polySizeKey(n) {
++  const x = toNum(n);
++  if (x == null || !(x > 0)) return 0;
++  return Math.round(x / POLY_SIZE_EPS);
++}
++
++export function isPolyFillRow(fill) {
++  if (!fill) return false;
++  const id = String(fill.fill_id || "");
++  const src = String((fill.raw && fill.raw.source) || fill.source || "");
++  const ticker = String(fill.ticker || "");
++  return id.startsWith("poly-") || src.startsWith("poly-") || /^caoc-/i.test(ticker);
++}
++
++export function polyFillKeepRank(fill) {
++  const id = String((fill && fill.fill_id) || "");
++  const src = String((fill && fill.raw && fill.raw.source) || (fill && fill.source) || "");
++  if (id.startsWith("poly-act:") || src.startsWith("poly-activity")) return 3;
++  if (id.startsWith("poly-recon:") || src.startsWith("poly-recon")) return 2;
++  if (id.startsWith("poly-pos:") || src.startsWith("poly-position")) return 0;
++  return isPolyFillRow(fill) ? 1 : -1;
++}
++
++// Same lock + caoc + size from activity and reconcile is one economic fill.
++// Prefer the poly-act trade id (combo-worker cleanup does the same).
++export function dedupePolyFillsBySize(fills = []) {
++  const poly = [];
++  const rest = [];
++  (fills || []).forEach((f) => {
++    if (!f) return;
++    if (isPolyFillRow(f)) poly.push(f);
++    else rest.push(f);
++  });
++  const groups = new Map();
++  poly.forEach((f) => {
++    const key = `${f.parlay_id || ""}|${String(f.ticker || "").toLowerCase()}|${polySizeKey(f.count)}`;
++    if (!groups.has(key)) groups.set(key, []);
++    groups.get(key).push(f);
++  });
++  const kept = [];
++  groups.forEach((same) => {
++    let best = same[0];
++    let bestRank = polyFillKeepRank(best);
++    same.slice(1).forEach((row) => {
++      const r = polyFillKeepRank(row);
++      if (r > bestRank) {
++        best = row;
++        bestRank = r;
++      }
++    });
++    kept.push(best);
++  });
++  return [...rest, ...kept];
++}
++
++export function dedupeFillsForDesk(fills = []) {
++  return dedupePolyFillsBySize(dedupeFillsByOrder(fills));
++}
++
+ export function sumAttributedFills(fills = []) {
+   const byParlay = {};
+   let unattributed = 0;
+-  dedupeFillsByOrder(fills).forEach((f) => {
++  dedupeFillsForDesk(fills).forEach((f) => {
+     const c = Math.max(0, toNum(f.count) || 0);
+     if (f.parlay_id) byParlay[f.parlay_id] = (byParlay[f.parlay_id] || 0) + c;
+     else unattributed += c;
+@@ -422,7 +483,7 @@ export function deskFillCounts(fills = [], submissions = []) {
+     if (s && s.order_id && s.parlay_id) assigned.add(s.order_id);
+   });
+   let unattributed = 0;
+-  dedupeFillsByOrder(fills).forEach((f) => {
++  dedupeFillsForDesk(fills).forEach((f) => {
+     if (f.parlay_id) return;
+     if (f.order_id && assigned.has(f.order_id)) return;
+     unattributed += Math.max(0, toNum(f.count) || 0);
+@@ -432,7 +493,7 @@ export function deskFillCounts(fills = [], submissions = []) {
+ 
+ export function liveFilledContracts(fills = [], startsAt) {
+   let n = 0;
+-  dedupeFillsByOrder(fills).forEach((f) => {
++  dedupeFillsForDesk(fills).forEach((f) => {
+     if (!isLiveQuotingTs(fillEventAt(f), startsAt)) return;
+     n += Math.max(0, toNum(f.count) || 0);
+   });
+@@ -849,7 +910,7 @@ export function buildLockTape({
+     b.submission = bySub[rfq];
+     if (byRfq[rfq]) b.outcome = byRfq[rfq];
+   });
+-  (fills || []).forEach((f) => {
++  dedupeFillsForDesk(fills).forEach((f) => {
+     if (!f || !sameParlay(f, parlay)) return;
+     const viaOrder = f.order_id && subByOrder[f.order_id] ? subByOrder[f.order_id].rfq_id : null;
+     const rfq = fillRfqId(f) || viaOrder || null;
+diff --git a/src/comboTape.test.js b/src/comboTape.test.js
+index ecfe0d3..16082dc 100644
+--- a/src/comboTape.test.js
++++ b/src/comboTape.test.js
+@@ -37,6 +37,8 @@ import {
+   pickFillRow,
+   isLiveRunnerTwin,
+   dedupeFillsByOrder,
++  dedupePolyFillsBySize,
++  dedupeFillsForDesk,
+   sumAttributedFills,
+   mergeSubmissionFillCounts,
+   deskFillCounts,
+@@ -810,6 +812,55 @@ assert.equal(isLiveRunnerTwin({ raw: { source: "live-runner" }, fill_id: "f1", o
+   assert.equal(quotingState({ active: true, kill: false, filled: naive, ceiling: 201 }).key, "ceiling");
+ }
+ 
++{
++  const ravens = "86917686-1ed3-4d3a-9d30-499c9f433b94";
++  const cubs = "cae9b7ae-4cb8-4d8f-9aab-086af8c5c770";
++  const twins = [
++    {
++      fill_id: "poly-recon:DP9qb_kO-3EK-RNRaoBRybVoRsPoOOBWGANmHeGzBrw:629.82",
++      parlay_id: ravens,
++      ticker: "caoc-23f1fca1ea3441ed",
++      count: 629.82,
++      raw: { source: "poly-reconcile", venue: "polymarket" },
++    },
++    {
++      fill_id: "poly-act:CJDEG0BFCVAY",
++      parlay_id: ravens,
++      ticker: "caoc-23f1fca1ea3441ed",
++      count: 629.82,
++      raw: { source: "poly-activity", venue: "polymarket" },
++    },
++    {
++      fill_id: "poly-recon:GNESocXBvU9SGBMM3IS-n4O5rkSxza-dBdA5-bSsE2Y:83.57",
++      parlay_id: cubs,
++      ticker: "caoc-480e44754843a011",
++      count: 83.57,
++      raw: { source: "poly-reconcile", venue: "polymarket" },
++    },
++    {
++      fill_id: "poly-act:CKHWA67BPW1E",
++      parlay_id: cubs,
++      ticker: "caoc-480e44754843a011",
++      count: 83.57,
++      raw: { source: "poly-activity", venue: "polymarket" },
++    },
++  ];
++  const kept = dedupePolyFillsBySize(twins);
++  assert.equal(kept.length, 2);
++  assert.equal(kept.find((f) => f.parlay_id === ravens).fill_id, "poly-act:CJDEG0BFCVAY");
++  assert.equal(kept.find((f) => f.parlay_id === cubs).fill_id, "poly-act:CKHWA67BPW1E");
++  const desk = deskFillCounts(twins, []);
++  assert.equal(Math.round(desk.byParlay[ravens] * 100) / 100, 629.82);
++  assert.equal(Math.round(desk.byParlay[cubs] * 100) / 100, 83.57);
++  const tape = buildLockTape({
++    parlay: { id: ravens, active: false, max_contracts: 700, archived_at: "2026-09-21T00:00:00Z" },
++    fills: twins.filter((f) => f.parlay_id === ravens),
++  });
++  assert.equal(tape.rows.filter((r) => r.bucket === "filled").length, 1);
++  assert.equal(Math.round(tape.fill.filled * 100) / 100, 629.82);
++  assert.equal(dedupeFillsForDesk(twins).length, 2);
++}
++
+ {
+   const scoped = buildLockTape({
+     parlay: { id: "p-a", active: true, max_contracts: 50 },
+@@ -830,6 +881,9 @@ assert.equal(isLiveRunnerTwin({ raw: { source: "live-runner" }, fill_id: "f1", o
+   assert.match(locks, /buildParlayDesk/);
+   assert.match(locks, /deskFillCounts/);
+   assert.doesNotMatch(locks, /fillRows\.forEach\(\(f\) => \{ const c = Number\(f\.count \|\| 0\)/);
++  const profile = fs.readFileSync(path.join(dir, "UserProfile.jsx"), "utf8");
++  assert.match(profile, /deskFillCounts/);
++  assert.doesNotMatch(profile, /fillsById\[f\.parlay_id\] = \(fillsById\[f\.parlay_id\] \|\| 0\) \+ Number\(f\.count/);
+   const app = fs.readFileSync(path.join(dir, "App.jsx"), "utf8");
+   assert.match(app, /Miss tape/);
+   assert.match(app, /<ComboTape /);
+diff --git a/src/userProfile.test.js b/src/userProfile.test.js
+index d39dc51..ba0ce72 100644
+--- a/src/userProfile.test.js
++++ b/src/userProfile.test.js
+@@ -210,6 +210,8 @@ assert.equal(PROFILE_PREFS_KEY, "aibetbuilder.profilePrefs");
+   assert.match(ui, /canSeeOwnerTools\(user\)/);
+   assert.match(ui, /WhatsNewComposer/);
+   assert.match(ui, /buildComboStatement/);
++  assert.match(ui, /deskFillCounts/);
++  assert.match(ui, /fill_id,order_id,ticker,raw/);
+   assert.match(ui, /StatementBoard/);
+   assert.match(ui, /useStatementView/);
+   assert.match(ui, /downloadStatementCsv/);
+-- 
+2.43.0
+

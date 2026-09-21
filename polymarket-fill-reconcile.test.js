@@ -14,6 +14,8 @@ const {
   bookedReconcileKeys,
   bookedActivityKeys,
   alreadyBookedSameSize,
+  bookedAnyPolyKeys,
+  findPolyEconomicTwin,
   lockHasPolyContractsForCaoc,
   selectDuplicatePolyFillsToDrop,
   quotedSizesByLock,
@@ -306,6 +308,57 @@ function emptyTitleCaocTrade(id, cost, { aggressor = true } = {}) {
     { qty: 629.82, marketSlug: ravensSlug },
     ravensLock,
     bookedReconcileKeys({ bookedFills: reconBooked })
+  ));
+  const slugCacheRecon = [{
+    ticker: ravensSlug,
+    market_ticker: ravensSlug,
+    parlay_id: ravensLock.id,
+    contracts: 629.82,
+    fill_id: 'poly-recon:DP9qb_kO-3EK-RNRaoBRybVoRsPoOOBWGANmHeGzBrw:629.82',
+    source: 'poly-reconcile',
+  }];
+  assert.strictEqual(
+    matchActivitiesToLocks([junkTrade], [ravensLock], {
+      slugMap: ravensMap,
+      bookedFills: slugCacheRecon,
+    }).length,
+    0,
+    '06:41-style activity must not re-book when slug-cache recon already has 629.82'
+  );
+  assert.ok(findPolyEconomicTwin(
+    { qty: 629.82, marketSlug: ravensSlug, fill_id: 'poly-act:CJDEG0BFCVAY' },
+    ravensLock,
+    slugCacheRecon
+  ));
+  const priorAct = [{
+    parlay_id: ravensLock.id,
+    ticker: ravensSlug,
+    count: 629.82,
+    fill_id: 'poly-act:CJDEG0BFCVAY',
+    source: 'poly-activity',
+  }];
+  assert.strictEqual(
+    matchActivitiesToLocks([{
+      type: 'ACTIVITY_TYPE_TRADE',
+      trade: {
+        id: 'poly-act-second',
+        marketSlug: ravensSlug,
+        qtyDecimal: '629.82',
+        isAggressor: false,
+        state: 'TRADE_STATE_CLEARED',
+        marketMetadata: { title: '', slug: ravensSlug },
+      },
+    }], [ravensLock], {
+      slugMap: ravensMap,
+      bookedFills: priorAct,
+    }).length,
+    0,
+    'prior activity of the same economic size blocks a second activity insert'
+  );
+  assert.ok(alreadyBookedSameSize(
+    { qty: 629.82, marketSlug: ravensSlug },
+    ravensLock,
+    bookedAnyPolyKeys({ bookedFills: priorAct })
   ));
   assert.strictEqual(
     matchActivitiesToLocks([junkTrade], [ravensLock], {
@@ -659,6 +712,43 @@ function comboTrade(id, qty, { aggressor = false, payout } = {}) {
   assert.ok(!dropIds.has('poly-act:CJAADJR8RVAY'));
   assert.ok(!dropIds.has('poly-recon:q-rav:629.82'));
   assert.strictEqual(drop.length, 7, 'keep activity/reconcile trades; drop duplicate recon + every position snapshot');
+
+  const liveTwins = [
+    {
+      fill_id: 'poly-recon:DP9qb_kO-3EK-RNRaoBRybVoRsPoOOBWGANmHeGzBrw:629.82',
+      parlay_id: ravens,
+      ticker: 'caoc-23f1fca1ea3441ed',
+      count: 629.82,
+      source: 'poly-reconcile',
+    },
+    {
+      fill_id: 'poly-act:CJDEG0BFCVAY',
+      parlay_id: ravens,
+      ticker: 'caoc-23f1fca1ea3441ed',
+      count: 629.82,
+      source: 'poly-activity',
+    },
+    {
+      fill_id: 'poly-recon:GNESocXBvU9SGBMM3IS-n4O5rkSxza-dBdA5-bSsE2Y:83.57',
+      parlay_id: 'cae9b7ae-4cb8-4d8f-9aab-086af8c5c770',
+      ticker: 'caoc-480e44754843a011',
+      count: 83.57,
+      source: 'poly-reconcile',
+    },
+    {
+      fill_id: 'poly-act:CKHWA67BPW1E',
+      parlay_id: 'cae9b7ae-4cb8-4d8f-9aab-086af8c5c770',
+      ticker: 'caoc-480e44754843a011',
+      count: 83.57,
+      source: 'poly-activity',
+    },
+  ];
+  const liveDrop = selectDuplicatePolyFillsToDrop(liveTwins);
+  const liveDropIds = new Set(liveDrop.map((row) => row.fill_id));
+  assert.ok(liveDropIds.has('poly-recon:DP9qb_kO-3EK-RNRaoBRybVoRsPoOOBWGANmHeGzBrw:629.82'));
+  assert.ok(liveDropIds.has('poly-recon:GNESocXBvU9SGBMM3IS-n4O5rkSxza-dBdA5-bSsE2Y:83.57'));
+  assert.ok(!liveDropIds.has('poly-act:CJDEG0BFCVAY'));
+  assert.ok(!liveDropIds.has('poly-act:CKHWA67BPW1E'));
 }
 
 {

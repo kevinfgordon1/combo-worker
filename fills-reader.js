@@ -37,6 +37,8 @@ const {
   existingFillNeedsParlay,
   submissionFilledPatch,
   canStampSubmission,
+  isKalshiTradeFill,
+  selectLiveRunnerStubsToDrop,
   QUOTE_WINDOW_BEFORE_MS,
 } = require('./fills-attr');
 
@@ -138,6 +140,29 @@ async function stampSubmissionFilled(attr, fill) {
   if (error) console.error(`[${MODE}] stamp submission failed`, error.message);
 }
 
+// Real trade arrived: delete the live-runner order stub (fill_id === order_id)
+// so Combo Locks History / SQL / exports do not keep both.
+async function deleteLiveRunnerTwins(orderId) {
+  if (!orderId) return 0;
+  const twins = await loadFillsByOrderId(orderId);
+  const drop = selectLiveRunnerStubsToDrop(twins);
+  let n = 0;
+  for (const row of drop) {
+    if (!row.fill_id) continue;
+    const { error } = await supabase
+      .from('combo_fills')
+      .delete()
+      .eq('fill_id', row.fill_id);
+    if (error) {
+      console.error(`[${MODE}] stub delete failed`, row.fill_id, error.message);
+      continue;
+    }
+    n += 1;
+    console.log(`[${MODE}] dropped live-runner stub fill_id=${row.fill_id} order_id=${orderId}`);
+  }
+  return n;
+}
+
 // Signed READ of the fills endpoint. No query string is signed (Kalshi signs ts+METHOD+path only).
 async function fetchFills(minTs) {
   const signPath = '/trade-api/v2/portfolio/fills';
@@ -228,6 +253,10 @@ async function poll() {
         else {
           console.log(`[${MODE}] REATTRIBUTED ${row.ticker} count=${row.count} → ${parlay.label || parlay.id}`);
         }
+      }
+
+      if (row.is_combo && !row.is_taker && isKalshiTradeFill(row) && row.order_id) {
+        await deleteLiveRunnerTwins(row.order_id);
       }
 
       if (row.is_combo && !row.is_taker && parlay) {
