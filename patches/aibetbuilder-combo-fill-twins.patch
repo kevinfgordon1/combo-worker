@@ -13,700 +13,234 @@ Apply on aibetbuilder:
 
 This environment could not push to kevinfgordon1/aibetbuilder (403).
 ---
-diff --git a/fills-attr.js b/fills-attr.js
-index 5f7d50f..99cec9e 100644
---- a/fills-attr.js
-+++ b/fills-attr.js
-@@ -266,6 +266,40 @@ function isLiveRunnerTwin(row) {
-   return !!(row.fill_id && row.order_id && row.fill_id === row.order_id);
+diff --git a/src/UserProfile.jsx b/src/UserProfile.jsx
+index 17e0406..3ce1b0a 100644
+--- a/src/UserProfile.jsx
++++ b/src/UserProfile.jsx
+@@ -9,6 +9,7 @@ import { identityFromUser, profileDisplayName } from "./userProfile";
+ import { sportChipSelected, toggleSportChip } from "./sportChips";
+ import WhatsNewComposer from "./WhatsNewComposer";
+ import { buildComboStatement } from "./comboStatement";
++import { deskFillCounts } from "./comboTape";
+ import StatementBoard, { downloadStatementCsv, useStatementView } from "./StatementBoard";
+ 
+ const supabase = createClient(import.meta.env.VITE_SUPABASE_URL, import.meta.env.VITE_SUPABASE_ANON_KEY);
+@@ -56,16 +57,12 @@ export default function UserProfile({
+     try {
+       const [{ data: parlays, error: pErr }, { data: fills, error: fErr }] = await Promise.all([
+         supabase.from("combo_parlays").select("*").eq("user_id", user.id).order("created_at", { ascending: false }).limit(200),
+-        supabase.from("combo_fills").select("parlay_id,count,is_combo,is_taker").eq("is_combo", true).eq("is_taker", false),
++        supabase.from("combo_fills").select("parlay_id,count,is_combo,is_taker,fill_id,order_id,ticker,raw").eq("is_combo", true).eq("is_taker", false),
+       ]);
+       if (pErr) throw pErr;
+       if (fErr) throw fErr;
+-      const fillsById = {};
+-      (fills || []).forEach((f) => {
+-        if (!f.parlay_id) return;
+-        fillsById[f.parlay_id] = (fillsById[f.parlay_id] || 0) + Number(f.count || 0);
+-      });
+-      setStatement(buildComboStatement({ parlays: parlays || [], fillsById, fills: fills || [] }));
++      const desk = deskFillCounts(fills || [], []);
++      setStatement(buildComboStatement({ parlays: parlays || [], fillsById: desk.byParlay, fills: fills || [] }));
+     } catch (err) {
+       setStmtError(err && err.message ? err.message : "Could not load statement.");
+     } finally {
+diff --git a/src/comboTape.js b/src/comboTape.js
+index 94599dd..4442c19 100644
+--- a/src/comboTape.js
++++ b/src/comboTape.js
+@@ -381,10 +381,71 @@ export function dedupeFillsByOrder(fills = []) {
+   return [...byKey.values(), ...unkeyed];
  }
  
-+function isPolyishFill(row) {
-+  if (!row) return false;
-+  const id = String(row.fill_id || '');
-+  const src = String((row.raw && row.raw.source) || row.source || '');
-+  const ticker = String(row.ticker || '');
-+  return id.startsWith('poly-') || src.startsWith('poly-') || /^caoc-/i.test(ticker);
++const POLY_SIZE_EPS = 1e-4;
++
++function polySizeKey(n) {
++  const x = toNum(n);
++  if (x == null || !(x > 0)) return 0;
++  return Math.round(x / POLY_SIZE_EPS);
 +}
 +
-+// Real Kalshi portfolio trade (trade_id / count_fp payload). Not a live-runner
-+// order stub (fill_id === order_id, raw.source=live-runner, no trade payload).
-+function isKalshiTradeFill(row) {
-+  if (!row || isLiveRunnerTwin(row) || isPolyishFill(row)) return false;
-+  if (row.raw && (row.raw.trade_id || row.raw.count_fp != null)) return true;
-+  return !!(row.fill_id && row.order_id && row.fill_id !== row.order_id);
++export function isPolyFillRow(fill) {
++  if (!fill) return false;
++  const id = String(fill.fill_id || "");
++  const src = String((fill.raw && fill.raw.source) || fill.source || "");
++  const ticker = String(fill.ticker || "");
++  return id.startsWith("poly-") || src.startsWith("poly-") || /^caoc-/i.test(ticker);
 +}
 +
-+// Drop live-runner order stubs once a real Kalshi trade exists for that order_id.
-+function selectLiveRunnerStubsToDrop(rows) {
-+  const byOrder = new Map();
-+  for (const row of rows || []) {
-+    if (!row || !row.order_id || isPolyishFill(row)) continue;
-+    if (!byOrder.has(row.order_id)) byOrder.set(row.order_id, []);
-+    byOrder.get(row.order_id).push(row);
-+  }
-+  const drop = [];
-+  for (const group of byOrder.values()) {
-+    if (!group.some(isKalshiTradeFill)) continue;
-+    for (const row of group) {
-+      if (isLiveRunnerTwin(row)) drop.push(row);
-+    }
-+  }
-+  return drop;
++export function polyFillKeepRank(fill) {
++  const id = String((fill && fill.fill_id) || "");
++  const src = String((fill && fill.raw && fill.raw.source) || (fill && fill.source) || "");
++  if (id.startsWith("poly-act:") || src.startsWith("poly-activity")) return 3;
++  if (id.startsWith("poly-recon:") || src.startsWith("poly-recon")) return 2;
++  if (id.startsWith("poly-pos:") || src.startsWith("poly-position")) return 0;
++  return isPolyFillRow(fill) ? 1 : -1;
 +}
 +
- function pickFillForSum(rows) {
-   const list = (rows || []).filter(Boolean);
-   const byKey = new Map();
-@@ -348,6 +382,9 @@ module.exports = {
-   submissionAlreadyFilled,
-   existingFillNeedsParlay,
-   isLiveRunnerTwin,
-+  isPolyishFill,
-+  isKalshiTradeFill,
-+  selectLiveRunnerStubsToDrop,
-   pickFillForSum,
-   sumAttributedFillCounts,
-   contractsCoverFill,
-diff --git a/fills-reader.js b/fills-reader.js
-index 36c3b86..b67976d 100644
---- a/fills-reader.js
-+++ b/fills-reader.js
-@@ -37,6 +37,8 @@ const {
-   existingFillNeedsParlay,
-   submissionFilledPatch,
-   canStampSubmission,
-+  isKalshiTradeFill,
-+  selectLiveRunnerStubsToDrop,
-   QUOTE_WINDOW_BEFORE_MS,
- } = require('./fills-attr');
- 
-@@ -138,6 +140,29 @@ async function stampSubmissionFilled(attr, fill) {
-   if (error) console.error(`[${MODE}] stamp submission failed`, error.message);
- }
- 
-+// Real trade arrived: delete the live-runner order stub (fill_id === order_id)
-+// so Combo Locks History / SQL / exports do not keep both.
-+async function deleteLiveRunnerTwins(orderId) {
-+  if (!orderId) return 0;
-+  const twins = await loadFillsByOrderId(orderId);
-+  const drop = selectLiveRunnerStubsToDrop(twins);
-+  let n = 0;
-+  for (const row of drop) {
-+    if (!row.fill_id) continue;
-+    const { error } = await supabase
-+      .from('combo_fills')
-+      .delete()
-+      .eq('fill_id', row.fill_id);
-+    if (error) {
-+      console.error(`[${MODE}] stub delete failed`, row.fill_id, error.message);
-+      continue;
-+    }
-+    n += 1;
-+    console.log(`[${MODE}] dropped live-runner stub fill_id=${row.fill_id} order_id=${orderId}`);
-+  }
-+  return n;
-+}
-+
- // Signed READ of the fills endpoint. No query string is signed (Kalshi signs ts+METHOD+path only).
- async function fetchFills(minTs) {
-   const signPath = '/trade-api/v2/portfolio/fills';
-@@ -230,6 +255,10 @@ async function poll() {
-         }
-       }
- 
-+      if (row.is_combo && !row.is_taker && isKalshiTradeFill(row) && row.order_id) {
-+        await deleteLiveRunnerTwins(row.order_id);
-+      }
-+
-       if (row.is_combo && !row.is_taker && parlay) {
-         await stampSubmissionFilled(attr, row);
-       }
-diff --git a/fills-reader.test.js b/fills-reader.test.js
-index cfb19a5..2786978 100644
---- a/fills-reader.test.js
-+++ b/fills-reader.test.js
-@@ -16,6 +16,8 @@ const {
-   submissionFilledPatch,
-   canStampSubmission,
-   pickFillForSum,
-+  isKalshiTradeFill,
-+  selectLiveRunnerStubsToDrop,
- } = require('./fills-attr');
- 
- const soxLabel = 'Chicago White Sox ML + Pittsburgh Pirates ML + Baltimore Orioles ML';
-@@ -307,6 +309,35 @@ const fillRow = {
-   assert.strictEqual(picked.length, 1);
-   assert.strictEqual(picked[0].fill_id, fill.fill_id);
- 
-+  const coltsStub = {
-+    fill_id: '01a0bf23-1ac0-7c2c-829c-272a04e9445f',
-+    order_id: '01a0bf23-1ac0-7c2c-829c-272a04e9445f',
-+    count: 1200,
-+    raw: { source: 'live-runner', venue: 'kalshi', quote_id: 'q', rfq_id: 'r' },
-+  };
-+  const coltsReal = {
-+    fill_id: '072243af-71c1-9ba2-dde5-0190e58d0097',
-+    order_id: '01a0bf23-1ac0-7c2c-829c-272a04e9445f',
-+    count: 1124.12,
-+    raw: { trade_id: '072243af-71c1-9ba2-dde5-0190e58d0097', count_fp: '1124.12' },
-+  };
-+  assert.ok(!isKalshiTradeFill(coltsStub));
-+  assert.ok(isKalshiTradeFill(coltsReal));
-+  const dropStubs = selectLiveRunnerStubsToDrop([coltsStub, coltsReal]);
-+  assert.strictEqual(dropStubs.length, 1);
-+  assert.strictEqual(dropStubs[0].fill_id, coltsStub.fill_id);
-+  assert.strictEqual(selectLiveRunnerStubsToDrop([coltsStub]).length, 0, 'keep stub until a real trade exists');
-+  assert.strictEqual(
-+    selectLiveRunnerStubsToDrop([{
-+      fill_id: 'poly-act:CJDEG0BFCVAY',
-+      order_id: 'CJDEG0BFCVAY',
-+      ticker: 'caoc-23f1fca1ea3441ed',
-+      raw: { source: 'poly-activity', venue: 'polymarket' },
-+    }]).length,
-+    0,
-+    'poly rows are not Kalshi stubs'
-+  );
-+
-   // Two parlays both quoted covering size in-window → do not guess
-   const ambiguous = attributeFromSubmissions(fill, [
-     ...subs,
-@@ -329,6 +360,7 @@ const fillRow = {
-   assert.ok(!/ignoreDuplicates:\s*true/.test(src), 'must update parlay_id on existing unattributed fill_id');
-   assert.ok(/attributeComboFill/.test(src) && /stampSubmissionFilled/.test(src));
-   assert.ok(/REATTRIBUTED/.test(src));
-+  assert.ok(/deleteLiveRunnerTwins/.test(src) && /dropped live-runner stub/.test(src));
-   const repair = fs.readFileSync(path.join(__dirname, 'sql/repair_20260908_sea_phi_lar_fill.sql'), 'utf8');
-   assert.ok(repair.includes('07228709-6229-8235-5047-44b3103ff56b'));
-   assert.ok(repair.includes('01a081a8-4a08-7823-a57f-2273007cd403'));
-diff --git a/live-runner.js b/live-runner.js
-index ee0dc47..b925ffd 100644
---- a/live-runner.js
-+++ b/live-runner.js
-@@ -131,7 +131,8 @@ const {
-   applyRefreshKillByUser,
-   applyRefreshFilledByParlay,
- } = require('./refresh-state');
--const { liveRunnerFillRow, resolveFillLookup, findPendingFill, submissionAlreadyFilled, claimFillKey } = require('./fills-attr');
-+const { liveRunnerFillRow, resolveFillLookup, findPendingFill, submissionAlreadyFilled, claimFillKey, isKalshiTradeFill } = require('./fills-attr');
-+const { findPolyEconomicTwin } = require('./polymarket-fill-reconcile');
- const {
-   fingerprintRfq,
-   cooldownFingerprint,
-@@ -1102,22 +1103,64 @@ async function persistExecutedFill(pending, evt) {
-   // Combo Locks "Filled — awaiting settlement" keys off combo_fills.parlay_id.
-   // Write fills first so a submissions error cannot hide the position.
-   try {
--    const { error: fillErr } = await supabase.from('combo_fills').upsert(
--      liveRunnerFillRow({
--        quoteId,
--        orderId,
--        fillId: evt.fillId,
--        parlayId: pending.parlayId,
--        count: contracts,
--        ticker,
--        rfqId: pending.rfqId || evt.rfqId,
--        label: pending.label,
--        venue,
--        source: evt.source || 'live-runner',
--      }),
--      { onConflict: 'fill_id' },
--    );
--    if (fillErr) console.error(`[${MODE}] combo_fills upsert failed`, fillErr.message);
-+    let skipFill = false;
-+    if (venue === 'polymarket' && pending.parlayId) {
-+      const { data: booked, error: bookedErr } = await supabase
-+        .from('combo_fills')
-+        .select('fill_id,parlay_id,ticker,count,raw')
-+        .eq('parlay_id', pending.parlayId)
-+        .eq('is_combo', true)
-+        .limit(500);
-+      if (bookedErr) console.error(`[${MODE}] poly twin lookup`, bookedErr.message);
-+      const twin = findPolyEconomicTwin(
-+        {
-+          qty: contracts,
-+          contracts,
-+          marketSlug: ticker,
-+          parlay_id: pending.parlayId,
-+          fill_id: evt.fillId,
-+          fillId: evt.fillId,
-+        },
-+        { id: pending.parlayId },
-+        booked || [],
-+      );
-+      if (twin && (twin.fill_id || twin.fillId) !== evt.fillId) {
-+        skipFill = true;
-+        console.log(
-+          `[${MODE}] skip poly fill — economic twin fill_id=${twin.fill_id || twin.fillId} ` +
-+          `already booked on ${pending.parlayId} ${ticker || ''} size=${contracts}`
-+        );
-+      }
-+    } else if (orderId) {
-+      const { data: sameOrder, error: orderErr } = await supabase
-+        .from('combo_fills')
-+        .select('fill_id,order_id,raw,ticker')
-+        .eq('order_id', orderId)
-+        .limit(20);
-+      if (orderErr) console.error(`[${MODE}] kalshi stub lookup`, orderErr.message);
-+      if ((sameOrder || []).some(isKalshiTradeFill)) {
-+        skipFill = true;
-+        console.log(`[${MODE}] skip live-runner stub — real Kalshi fill already on order_id=${orderId}`);
-+      }
-+    }
-+    if (!skipFill) {
-+      const { error: fillErr } = await supabase.from('combo_fills').upsert(
-+        liveRunnerFillRow({
-+          quoteId,
-+          orderId,
-+          fillId: evt.fillId,
-+          parlayId: pending.parlayId,
-+          count: contracts,
-+          ticker,
-+          rfqId: pending.rfqId || evt.rfqId,
-+          label: pending.label,
-+          venue,
-+          source: evt.source || 'live-runner',
-+        }),
-+        { onConflict: 'fill_id' },
-+      );
-+      if (fillErr) console.error(`[${MODE}] combo_fills upsert failed`, fillErr.message);
-+    }
-   } catch (e) {
-     console.error(`[${MODE}] combo_fills persist`, e.message);
-   }
-@@ -1179,7 +1222,7 @@ async function pendingFromSubmission({ quoteId, orderId } = {}) {
-   }
- }
- 
--const POLY_FILL_LOOKBACK_MS = 72 * 3600 * 1000;
-+const POLY_FILL_LOOKBACK_MS = 21 * 24 * 3600 * 1000;
- const POLY_SLUG_CACHE_MS = 15000;
- let polySlugCacheAt = 0;
- let polySlugCacheRows = null;
-diff --git a/live-runner.test.js b/live-runner.test.js
-index 38c8ff9..5165396 100644
---- a/live-runner.test.js
-+++ b/live-runner.test.js
-@@ -133,6 +133,17 @@ assert.ok(
-     && /onQuoteExecuted submission/.test(liveSrc),
-   'fill persist must not share a try/catch with submissions (Telegram used to fire after both failed)'
- );
-+assert.ok(
-+  /findPolyEconomicTwin/.test(liveSrc)
-+    && /skip poly fill — economic twin/.test(liveSrc)
-+    && /skip live-runner stub — real Kalshi fill/.test(liveSrc)
-+    && /isKalshiTradeFill/.test(liveSrc),
-+  'persist must refuse Poly same-size twins and lingering Kalshi live-runner stubs'
-+);
-+assert.ok(
-+  /POLY_FILL_LOOKBACK_MS = 21 \* 24 \* 3600 \* 1000/.test(liveSrc),
-+  'booked Poly fills look back 21d so aged recon rows still block activity'
-+);
- assert.ok(
-   /pendingFromSubmission/.test(liveSrc) && /recovered quote_id/.test(liveSrc),
-   'quote_executed after restart must recover the quote from combo_submissions'
-diff --git a/package.json b/package.json
-index 5ac3d7a..494fc42 100644
---- a/package.json
-+++ b/package.json
-@@ -11,6 +11,7 @@
-     "start:all": "node start-all.js",
-     "backfill:poly-fills": "node scripts/backfill-poly-combo-fills.js",
-     "dedupe:poly-fills": "node scripts/dedupe-poly-combo-fills.js",
-+    "cleanup:combo-fills": "node scripts/cleanup-combo-fill-twins.js",
-     "test": "node tape.test.js && node engine.test.js && node fills-reader.test.js && node started.test.js && node reserve.test.js && node polymarket-quote.test.js && node skip-tape.test.js && node poly-miss-tape.test.js && node live-runner.test.js && node refresh-state.test.js && node rfq-debug.test.js && node polymarket-client.test.js && node polymarket-rfq.test.js && node polymarket-fill.test.js && node polymarket-fill-reconcile.test.js && node leg-identity.test.js && node rfq.test.js && node rfq-repeat.test.js && node unhedged-rfq.test.js && node unhedged-quote.test.js && node unhedged-price-cache.test.js && node kalshi-ws.test.js && node kalshi-auth.test.js && node kalshi-http.test.js && node quote-hot.test.js && node worker-mode.test.js && node unhedged-boot.test.js && node supabase-http.test.js && node ws-status-alert.test.js && node quote-watcher.test.js && node venue-alert.test.js"
-   },
-   "engines": {
-diff --git a/polymarket-fill-reconcile.js b/polymarket-fill-reconcile.js
-index 9ed3c5c..814a08a 100644
---- a/polymarket-fill-reconcile.js
-+++ b/polymarket-fill-reconcile.js
-@@ -15,10 +15,14 @@
- // (partials may be smaller). Activity / reconcile / position share one
- // economic size: same lock + caoc slug + size books once. claimFillKey
- // cannot catch this — fill_ids are poly-act: / poly-recon: / poly-pos:.
--// Activity never re-books a trade already booked via poly-recon or
--// poly-position (same lock/slug + size). Reconcile never duplicates an
-+// Activity never re-books a trade already booked via poly-recon,
-+// poly-position, or a prior activity of the same lock/slug + size
-+// (2026-09-21 06:41 UTC re-booked Ravens 629.82 and Cubs 83.57 on top
-+// of existing reconcile rows). Reconcile never duplicates an
- // activity/position row of that size. Position is a fallback only — skip
- // when the lock already has any poly contracts for that caoc ticker.
-+// persistExecutedFill also refuses a second economic twin (last line of
-+// defense when bookedFills is empty after restart).
- // Cleanup prefers poly-activity, then poly-reconcile, over poly-position.
- //
- // Combo Lock hedges are No / short Yes. Position qty must use |netPosition|
-@@ -310,10 +314,42 @@ function alreadyBookedSameSize(trade, lock, bookedKeys) {
-   return bookedKeys.has(`:${qty}`);
- }
- 
-+function bookedAnyPolyKeys({ bookedFills, seenFillIds } = {}) {
-+  return bookedPolySizeKeys({
-+    bookedFills,
-+    seenFillIds,
-+    include: { activity: true, reconcile: true, position: true, other: true },
++// Same lock + caoc + size from activity and reconcile is one economic fill.
++// Prefer the poly-act trade id (combo-worker cleanup does the same).
++export function dedupePolyFillsBySize(fills = []) {
++  const poly = [];
++  const rest = [];
++  (fills || []).forEach((f) => {
++    if (!f) return;
++    if (isPolyFillRow(f)) poly.push(f);
++    else rest.push(f);
 +  });
++  const groups = new Map();
++  poly.forEach((f) => {
++    const key = `${f.parlay_id || ""}|${String(f.ticker || "").toLowerCase()}|${polySizeKey(f.count)}`;
++    if (!groups.has(key)) groups.set(key, []);
++    groups.get(key).push(f);
++  });
++  const kept = [];
++  groups.forEach((same) => {
++    let best = same[0];
++    let bestRank = polyFillKeepRank(best);
++    same.slice(1).forEach((row) => {
++      const r = polyFillKeepRank(row);
++      if (r > bestRank) {
++        best = row;
++        bestRank = r;
++      }
++    });
++    kept.push(best);
++  });
++  return [...rest, ...kept];
 +}
 +
- function activityAlreadyReconciled(trade, lock, bookedKeys) {
-   return alreadyBookedSameSize(trade, lock, bookedKeys);
++export function dedupeFillsForDesk(fills = []) {
++  return dedupePolyFillsBySize(dedupeFillsByOrder(fills));
++}
++
+ export function sumAttributedFills(fills = []) {
+   const byParlay = {};
+   let unattributed = 0;
+-  dedupeFillsByOrder(fills).forEach((f) => {
++  dedupeFillsForDesk(fills).forEach((f) => {
+     const c = Math.max(0, toNum(f.count) || 0);
+     if (f.parlay_id) byParlay[f.parlay_id] = (byParlay[f.parlay_id] || 0) + c;
+     else unattributed += c;
+@@ -422,7 +483,7 @@ export function deskFillCounts(fills = [], submissions = []) {
+     if (s && s.order_id && s.parlay_id) assigned.add(s.order_id);
+   });
+   let unattributed = 0;
+-  dedupeFillsByOrder(fills).forEach((f) => {
++  dedupeFillsForDesk(fills).forEach((f) => {
+     if (f.parlay_id) return;
+     if (f.order_id && assigned.has(f.order_id)) return;
+     unattributed += Math.max(0, toNum(f.count) || 0);
+@@ -432,7 +493,7 @@ export function deskFillCounts(fills = [], submissions = []) {
+ 
+ export function liveFilledContracts(fills = [], startsAt) {
+   let n = 0;
+-  dedupeFillsByOrder(fills).forEach((f) => {
++  dedupeFillsForDesk(fills).forEach((f) => {
+     if (!isLiveQuotingTs(fillEventAt(f), startsAt)) return;
+     n += Math.max(0, toNum(f.count) || 0);
+   });
+@@ -849,7 +910,7 @@ export function buildLockTape({
+     b.submission = bySub[rfq];
+     if (byRfq[rfq]) b.outcome = byRfq[rfq];
+   });
+-  (fills || []).forEach((f) => {
++  dedupeFillsForDesk(fills).forEach((f) => {
+     if (!f || !sameParlay(f, parlay)) return;
+     const viaOrder = f.order_id && subByOrder[f.order_id] ? subByOrder[f.order_id].rfq_id : null;
+     const rfq = fillRfqId(f) || viaOrder || null;
+diff --git a/src/comboTape.test.js b/src/comboTape.test.js
+index ecfe0d3..16082dc 100644
+--- a/src/comboTape.test.js
++++ b/src/comboTape.test.js
+@@ -37,6 +37,8 @@ import {
+   pickFillRow,
+   isLiveRunnerTwin,
+   dedupeFillsByOrder,
++  dedupePolyFillsBySize,
++  dedupeFillsForDesk,
+   sumAttributedFills,
+   mergeSubmissionFillCounts,
+   deskFillCounts,
+@@ -810,6 +812,55 @@ assert.equal(isLiveRunnerTwin({ raw: { source: "live-runner" }, fill_id: "f1", o
+   assert.equal(quotingState({ active: true, kill: false, filled: naive, ceiling: 201 }).key, "ceiling");
  }
  
-+// Same lock + caoc + size already booked under a different fill_id
-+// (poly-act vs poly-recon). Used at persist time so a restart with an
-+// empty seenFillIds / stale slug cache cannot insert the 06:41 twin.
-+function findPolyEconomicTwin(trade, lock, bookedFills) {
-+  const qty = sizeKey(trade && (trade.qty ?? trade.contracts ?? trade.count));
-+  if (!(qty > 0)) return null;
-+  const parlayId = (lock && lock.id) || (trade && (trade.parlayId || trade.parlay_id)) || '';
-+  const slug = normalizeMarketSlug(
-+    trade && (trade.marketSlug || trade.marketTicker || trade.ticker || trade.market_ticker)
-+  );
-+  const selfId = fillIdOf(trade);
-+  for (const row of bookedFills || []) {
-+    if (!isPolyFillRecord(row)) continue;
-+    if (selfId && fillIdOf(row) === selfId) continue;
-+    if (sizeKey(polyFillQty(row)) !== qty) continue;
-+    const rowPid = parlayIdOfRecord(row);
-+    const rowSlug = slugOfRecord(row);
-+    if (parlayId && rowPid && rowPid !== parlayId) continue;
-+    if (slug && rowSlug && rowSlug !== slug) continue;
-+    if ((parlayId && rowPid === parlayId) || (slug && rowSlug === slug)) return row;
-+  }
-+  return null;
-+}
-+
- // Position fallback: any poly contracts already on this lock's caoc ticker.
- function lockHasPolyContractsForCaoc(lock, slug, bookedFills) {
-   const s = normalizeMarketSlug(slug);
-@@ -1132,7 +1168,7 @@ function matchActivitiesToLocks(activities, locks, {
-   const map = slugMap instanceof Map || (slugMap && typeof slugMap === 'object')
-     ? coerceSlugMap(slugMap)
-     : null;
--  const reconcileKeys = bookedReconcileKeys({ bookedFills, seenFillIds });
-+  const bookedKeys = bookedAnyPolyKeys({ bookedFills, seenFillIds });
-   const quoteSizes = quotedByLock instanceof Map
-     ? quotedByLock
-     : quotedSizesByLock(quotedByLock);
-@@ -1143,7 +1179,7 @@ function matchActivitiesToLocks(activities, locks, {
-     const hit = lockMatchForActivity(locks, trade.hay || trade.title, trade.marketSlug, map);
-     const lock = hit.lock;
-     if (!lock) continue;
--    if (activityAlreadyReconciled(trade, lock, reconcileKeys)) {
-+    if (activityAlreadyReconciled(trade, lock, bookedKeys)) {
-       matchedLockIds.add(lock.id);
-       continue;
-     }
-@@ -1384,8 +1420,10 @@ module.exports = {
-   bookedPolySizeKeys,
-   bookedReconcileKeys,
-   bookedActivityKeys,
-+  bookedAnyPolyKeys,
-   alreadyBookedSameSize,
-   activityAlreadyReconciled,
-+  findPolyEconomicTwin,
-   lockHasPolyContractsForCaoc,
-   selectDuplicatePolyFillsToDrop,
-   slugMakerSizeAllowed,
-diff --git a/polymarket-fill-reconcile.test.js b/polymarket-fill-reconcile.test.js
-index dd2fb22..9a61f6b 100644
---- a/polymarket-fill-reconcile.test.js
-+++ b/polymarket-fill-reconcile.test.js
-@@ -14,6 +14,8 @@ const {
-   bookedReconcileKeys,
-   bookedActivityKeys,
-   alreadyBookedSameSize,
-+  bookedAnyPolyKeys,
-+  findPolyEconomicTwin,
-   lockHasPolyContractsForCaoc,
-   selectDuplicatePolyFillsToDrop,
-   quotedSizesByLock,
-@@ -307,6 +309,57 @@ function emptyTitleCaocTrade(id, cost, { aggressor = true } = {}) {
-     ravensLock,
-     bookedReconcileKeys({ bookedFills: reconBooked })
-   ));
-+  const slugCacheRecon = [{
-+    ticker: ravensSlug,
-+    market_ticker: ravensSlug,
-+    parlay_id: ravensLock.id,
-+    contracts: 629.82,
-+    fill_id: 'poly-recon:DP9qb_kO-3EK-RNRaoBRybVoRsPoOOBWGANmHeGzBrw:629.82',
-+    source: 'poly-reconcile',
-+  }];
-+  assert.strictEqual(
-+    matchActivitiesToLocks([junkTrade], [ravensLock], {
-+      slugMap: ravensMap,
-+      bookedFills: slugCacheRecon,
-+    }).length,
-+    0,
-+    '06:41-style activity must not re-book when slug-cache recon already has 629.82'
-+  );
-+  assert.ok(findPolyEconomicTwin(
-+    { qty: 629.82, marketSlug: ravensSlug, fill_id: 'poly-act:CJDEG0BFCVAY' },
-+    ravensLock,
-+    slugCacheRecon
-+  ));
-+  const priorAct = [{
-+    parlay_id: ravensLock.id,
-+    ticker: ravensSlug,
-+    count: 629.82,
-+    fill_id: 'poly-act:CJDEG0BFCVAY',
-+    source: 'poly-activity',
-+  }];
-+  assert.strictEqual(
-+    matchActivitiesToLocks([{
-+      type: 'ACTIVITY_TYPE_TRADE',
-+      trade: {
-+        id: 'poly-act-second',
-+        marketSlug: ravensSlug,
-+        qtyDecimal: '629.82',
-+        isAggressor: false,
-+        state: 'TRADE_STATE_CLEARED',
-+        marketMetadata: { title: '', slug: ravensSlug },
-+      },
-+    }], [ravensLock], {
-+      slugMap: ravensMap,
-+      bookedFills: priorAct,
-+    }).length,
-+    0,
-+    'prior activity of the same economic size blocks a second activity insert'
-+  );
-+  assert.ok(alreadyBookedSameSize(
-+    { qty: 629.82, marketSlug: ravensSlug },
-+    ravensLock,
-+    bookedAnyPolyKeys({ bookedFills: priorAct })
-+  ));
-   assert.strictEqual(
-     matchActivitiesToLocks([junkTrade], [ravensLock], {
-       slugMap: ravensMap,
-@@ -659,6 +712,43 @@ function comboTrade(id, qty, { aggressor = false, payout } = {}) {
-   assert.ok(!dropIds.has('poly-act:CJAADJR8RVAY'));
-   assert.ok(!dropIds.has('poly-recon:q-rav:629.82'));
-   assert.strictEqual(drop.length, 7, 'keep activity/reconcile trades; drop duplicate recon + every position snapshot');
-+
-+  const liveTwins = [
++{
++  const ravens = "86917686-1ed3-4d3a-9d30-499c9f433b94";
++  const cubs = "cae9b7ae-4cb8-4d8f-9aab-086af8c5c770";
++  const twins = [
 +    {
-+      fill_id: 'poly-recon:DP9qb_kO-3EK-RNRaoBRybVoRsPoOOBWGANmHeGzBrw:629.82',
++      fill_id: "poly-recon:DP9qb_kO-3EK-RNRaoBRybVoRsPoOOBWGANmHeGzBrw:629.82",
 +      parlay_id: ravens,
-+      ticker: 'caoc-23f1fca1ea3441ed',
++      ticker: "caoc-23f1fca1ea3441ed",
 +      count: 629.82,
-+      source: 'poly-reconcile',
++      raw: { source: "poly-reconcile", venue: "polymarket" },
 +    },
 +    {
-+      fill_id: 'poly-act:CJDEG0BFCVAY',
++      fill_id: "poly-act:CJDEG0BFCVAY",
 +      parlay_id: ravens,
-+      ticker: 'caoc-23f1fca1ea3441ed',
++      ticker: "caoc-23f1fca1ea3441ed",
 +      count: 629.82,
-+      source: 'poly-activity',
++      raw: { source: "poly-activity", venue: "polymarket" },
 +    },
 +    {
-+      fill_id: 'poly-recon:GNESocXBvU9SGBMM3IS-n4O5rkSxza-dBdA5-bSsE2Y:83.57',
-+      parlay_id: 'cae9b7ae-4cb8-4d8f-9aab-086af8c5c770',
-+      ticker: 'caoc-480e44754843a011',
++      fill_id: "poly-recon:GNESocXBvU9SGBMM3IS-n4O5rkSxza-dBdA5-bSsE2Y:83.57",
++      parlay_id: cubs,
++      ticker: "caoc-480e44754843a011",
 +      count: 83.57,
-+      source: 'poly-reconcile',
++      raw: { source: "poly-reconcile", venue: "polymarket" },
 +    },
 +    {
-+      fill_id: 'poly-act:CKHWA67BPW1E',
-+      parlay_id: 'cae9b7ae-4cb8-4d8f-9aab-086af8c5c770',
-+      ticker: 'caoc-480e44754843a011',
++      fill_id: "poly-act:CKHWA67BPW1E",
++      parlay_id: cubs,
++      ticker: "caoc-480e44754843a011",
 +      count: 83.57,
-+      source: 'poly-activity',
++      raw: { source: "poly-activity", venue: "polymarket" },
 +    },
 +  ];
-+  const liveDrop = selectDuplicatePolyFillsToDrop(liveTwins);
-+  const liveDropIds = new Set(liveDrop.map((row) => row.fill_id));
-+  assert.ok(liveDropIds.has('poly-recon:DP9qb_kO-3EK-RNRaoBRybVoRsPoOOBWGANmHeGzBrw:629.82'));
-+  assert.ok(liveDropIds.has('poly-recon:GNESocXBvU9SGBMM3IS-n4O5rkSxza-dBdA5-bSsE2Y:83.57'));
-+  assert.ok(!liveDropIds.has('poly-act:CJDEG0BFCVAY'));
-+  assert.ok(!liveDropIds.has('poly-act:CKHWA67BPW1E'));
- }
- 
++  const kept = dedupePolyFillsBySize(twins);
++  assert.equal(kept.length, 2);
++  assert.equal(kept.find((f) => f.parlay_id === ravens).fill_id, "poly-act:CJDEG0BFCVAY");
++  assert.equal(kept.find((f) => f.parlay_id === cubs).fill_id, "poly-act:CKHWA67BPW1E");
++  const desk = deskFillCounts(twins, []);
++  assert.equal(Math.round(desk.byParlay[ravens] * 100) / 100, 629.82);
++  assert.equal(Math.round(desk.byParlay[cubs] * 100) / 100, 83.57);
++  const tape = buildLockTape({
++    parlay: { id: ravens, active: false, max_contracts: 700, archived_at: "2026-09-21T00:00:00Z" },
++    fills: twins.filter((f) => f.parlay_id === ravens),
++  });
++  assert.equal(tape.rows.filter((r) => r.bucket === "filled").length, 1);
++  assert.equal(Math.round(tape.fill.filled * 100) / 100, 629.82);
++  assert.equal(dedupeFillsForDesk(twins).length, 2);
++}
++
  {
-diff --git a/scripts/cleanup-combo-fill-twins.js b/scripts/cleanup-combo-fill-twins.js
-new file mode 100644
-index 0000000..2718b69
---- /dev/null
-+++ b/scripts/cleanup-combo-fill-twins.js
-@@ -0,0 +1,106 @@
-+#!/usr/bin/env node
-+// One-shot cleanup of Combo Lock fill twins in combo_fills.
-+//
-+// 1) Kalshi: delete live-runner order stubs (fill_id === order_id /
-+//    raw.source=live-runner) when a real portfolio trade exists for
-+//    that order_id (trade_id / count_fp / fill_id ≠ order_id).
-+// 2) Polymarket: same-size activity + reconcile on one lock+caoc —
-+//    keep poly-activity (trade id), drop poly-reconcile / poly-position.
-+//
-+// Env: SUPABASE_URL, SUPABASE_SERVICE_KEY
-+// Optional: CLEANUP_LOOKBACK_DAYS (default 21)
-+// Optional: CLEANUP_DRY_RUN=1
-+// Does not deploy.
-+'use strict';
-+const { createClient } = require('@supabase/supabase-js');
-+const { selectLiveRunnerStubsToDrop } = require('../fills-attr');
-+const { selectDuplicatePolyFillsToDrop } = require('../polymarket-fill-reconcile');
-+
-+const DAYS = parseInt(process.env.CLEANUP_LOOKBACK_DAYS || '21', 10);
-+const LOOKBACK_MS = (Number.isFinite(DAYS) && DAYS > 0 ? DAYS : 21) * 24 * 3600 * 1000;
-+const DRY = /^(1|true|yes|on)$/i.test(String(process.env.CLEANUP_DRY_RUN || ''));
-+
-+const POLY_TWINS = [
-+  'poly-recon:DP9qb_kO-3EK-RNRaoBRybVoRsPoOOBWGANmHeGzBrw:629.82',
-+  'poly-recon:GNESocXBvU9SGBMM3IS-n4O5rkSxza-dBdA5-bSsE2Y:83.57',
-+];
-+
-+function uniqueByFillId(rows) {
-+  const out = [];
-+  const seen = new Set();
-+  for (const row of rows || []) {
-+    const id = row && row.fill_id;
-+    if (!id || seen.has(id)) continue;
-+    seen.add(id);
-+    out.push(row);
-+  }
-+  return out;
-+}
-+
-+async function main() {
-+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
-+    console.error('need SUPABASE_URL and SUPABASE_SERVICE_KEY');
-+    process.exit(1);
-+  }
-+  const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-+  const cutoff = new Date(Date.now() - LOOKBACK_MS).toISOString();
-+  const { data, error } = await supabase
-+    .from('combo_fills')
-+    .select('fill_id,parlay_id,ticker,count,order_id,recorded_at,raw')
-+    .eq('is_combo', true)
-+    .gte('recorded_at', cutoff)
-+    .limit(8000);
-+  if (error) throw new Error(error.message);
-+
-+  const rows = data || [];
-+  const drop = uniqueByFillId([
-+    ...selectLiveRunnerStubsToDrop(rows),
-+    ...selectDuplicatePolyFillsToDrop(rows),
-+  ]);
-+
-+  console.log(
-+    `[CLEANUP] lookback_d=${LOOKBACK_MS / 86400000} dry=${DRY} ` +
-+    `rows=${rows.length} drop=${drop.length}`
-+  );
-+  console.log('[CLEANUP] Kalshi: drop live-runner stubs when a real trade exists for order_id');
-+  console.log('[CLEANUP] Poly: keep poly-activity, drop same-size reconcile/position');
-+
-+  for (const row of drop) {
-+    const src = row.raw && row.raw.source;
-+    console.log(
-+      `[CLEANUP] ${DRY ? 'would drop' : 'dropping'} fill_id=${row.fill_id} ` +
-+      `ticker=${row.ticker || '—'} count=${row.count} src=${src || '—'} ` +
-+      `order=${row.order_id || '—'} parlay=${row.parlay_id || '—'}`
-+    );
-+  }
-+
-+  const dropIds = new Set(drop.map((row) => row.fill_id));
-+  for (const id of POLY_TWINS) {
-+    console.log(`[CLEANUP] expected live twin ${id}: ${dropIds.has(id) ? 'queued' : 'already gone'}`);
-+  }
-+
-+  if (DRY || !drop.length) {
-+    console.log(`[CLEANUP] ${DRY ? 'dry-run done' : 'nothing to drop'}`);
-+    return;
-+  }
-+
-+  let deleted = 0;
-+  for (const row of drop) {
-+    if (!row.fill_id) continue;
-+    const { error: delErr } = await supabase
-+      .from('combo_fills')
-+      .delete()
-+      .eq('fill_id', row.fill_id);
-+    if (delErr) {
-+      console.error('[CLEANUP] delete failed', row.fill_id, delErr.message);
-+      continue;
-+    }
-+    deleted += 1;
-+  }
-+  console.log(`[CLEANUP] deleted=${deleted}`);
-+}
-+
-+main().catch((e) => {
-+  console.error(e);
-+  process.exit(1);
-+});
-diff --git a/sql/cleanup_combo_fill_twins.sql b/sql/cleanup_combo_fill_twins.sql
-new file mode 100644
-index 0000000..1fe9ea9
---- /dev/null
-+++ b/sql/cleanup_combo_fill_twins.sql
-@@ -0,0 +1,64 @@
-+-- Combo Locks fill-twin cleanup. Preview first, then run the DELETEs.
-+-- Do not run until combo-worker with persist/activity guards is deployed,
-+-- or the old process can re-insert the dropped rows.
-+-- Prefer keeping real Kalshi trades and poly-activity trade ids.
-+
-+-- 1) Preview Kalshi live-runner stubs that share order_id with a real trade.
-+SELECT s.fill_id AS stub_fill_id, s.order_id, s.count AS stub_count,
-+       r.fill_id AS real_fill_id, r.count AS real_count, s.parlay_id, s.ticker
-+FROM combo_fills s
-+JOIN combo_fills r
-+  ON r.order_id = s.order_id
-+ AND r.fill_id IS DISTINCT FROM s.fill_id
-+WHERE (
-+        s.raw->>'source' = 'live-runner'
-+        OR (s.fill_id = s.order_id AND COALESCE(s.raw->>'source','') NOT LIKE 'poly-%')
-+      )
-+  AND COALESCE(s.raw->>'source','') NOT LIKE 'poly-%'
-+  AND s.raw->>'trade_id' IS NULL
-+  AND (
-+        r.raw ? 'trade_id'
-+        OR r.raw ? 'count_fp'
-+        OR (r.fill_id IS DISTINCT FROM r.order_id
-+            AND COALESCE(r.raw->>'source','') NOT IN ('live-runner')
-+            AND COALESCE(r.raw->>'source','') NOT LIKE 'poly-%')
-+      );
-+
-+-- 2) Delete those Kalshi stubs (209 rows as of 2026-09-21).
-+DELETE FROM combo_fills s
-+WHERE (
-+        s.raw->>'source' = 'live-runner'
-+        OR (s.fill_id = s.order_id AND COALESCE(s.raw->>'source','') NOT LIKE 'poly-%')
-+      )
-+  AND COALESCE(s.raw->>'source','') NOT LIKE 'poly-%'
-+  AND s.raw->>'trade_id' IS NULL
-+  AND EXISTS (
-+    SELECT 1 FROM combo_fills r
-+    WHERE r.order_id = s.order_id
-+      AND r.fill_id IS DISTINCT FROM s.fill_id
-+      AND (
-+            r.raw ? 'trade_id'
-+            OR r.raw ? 'count_fp'
-+            OR (r.fill_id IS DISTINCT FROM r.order_id
-+                AND COALESCE(r.raw->>'source','') NOT IN ('live-runner')
-+                AND COALESCE(r.raw->>'source','') NOT LIKE 'poly-%')
-+          )
-+  );
-+
-+-- 3) Preview the two remaining Poly same-size twins (keep poly-act, drop recon).
-+SELECT fill_id, parlay_id, ticker, count, recorded_at, raw->>'source' AS source
-+FROM combo_fills
-+WHERE fill_id IN (
-+  'poly-recon:DP9qb_kO-3EK-RNRaoBRybVoRsPoOOBWGANmHeGzBrw:629.82',
-+  'poly-act:CJDEG0BFCVAY',
-+  'poly-recon:GNESocXBvU9SGBMM3IS-n4O5rkSxza-dBdA5-bSsE2Y:83.57',
-+  'poly-act:CKHWA67BPW1E'
-+)
-+ORDER BY ticker, fill_id;
-+
-+-- 4) Drop the two poly-reconcile twins. Keep the poly-act trade ids.
-+DELETE FROM combo_fills
-+WHERE fill_id IN (
-+  'poly-recon:DP9qb_kO-3EK-RNRaoBRybVoRsPoOOBWGANmHeGzBrw:629.82',
-+  'poly-recon:GNESocXBvU9SGBMM3IS-n4O5rkSxza-dBdA5-bSsE2Y:83.57'
-+);
+   const scoped = buildLockTape({
+     parlay: { id: "p-a", active: true, max_contracts: 50 },
+@@ -830,6 +881,9 @@ assert.equal(isLiveRunnerTwin({ raw: { source: "live-runner" }, fill_id: "f1", o
+   assert.match(locks, /buildParlayDesk/);
+   assert.match(locks, /deskFillCounts/);
+   assert.doesNotMatch(locks, /fillRows\.forEach\(\(f\) => \{ const c = Number\(f\.count \|\| 0\)/);
++  const profile = fs.readFileSync(path.join(dir, "UserProfile.jsx"), "utf8");
++  assert.match(profile, /deskFillCounts/);
++  assert.doesNotMatch(profile, /fillsById\[f\.parlay_id\] = \(fillsById\[f\.parlay_id\] \|\| 0\) \+ Number\(f\.count/);
+   const app = fs.readFileSync(path.join(dir, "App.jsx"), "utf8");
+   assert.match(app, /Miss tape/);
+   assert.match(app, /<ComboTape /);
+diff --git a/src/userProfile.test.js b/src/userProfile.test.js
+index d39dc51..ba0ce72 100644
+--- a/src/userProfile.test.js
++++ b/src/userProfile.test.js
+@@ -210,6 +210,8 @@ assert.equal(PROFILE_PREFS_KEY, "aibetbuilder.profilePrefs");
+   assert.match(ui, /canSeeOwnerTools\(user\)/);
+   assert.match(ui, /WhatsNewComposer/);
+   assert.match(ui, /buildComboStatement/);
++  assert.match(ui, /deskFillCounts/);
++  assert.match(ui, /fill_id,order_id,ticker,raw/);
+   assert.match(ui, /StatementBoard/);
+   assert.match(ui, /useStatementView/);
+   assert.match(ui, /downloadStatementCsv/);
 -- 
 2.43.0
 
