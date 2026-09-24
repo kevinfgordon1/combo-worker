@@ -72,6 +72,77 @@ Optional: `SUPABASE_FETCH_IPV4=1` forces IPv4 if Railway DNS/IPv6 to `*.supabase
 
 The Unhedged job uses a dedicated undici Agent + bounded retries + rate-limited error logs. Combo Locks quoting is unchanged.
 
+## Adverse Protect (Kevin's Live Trading Desk)
+
+Combo Locks can poll aibetbuilder so an **armed** Polymarket US desk rest is not left as a stale gift. This worker does not call Polymarket, does not quote RFQs, and does not read combo user tables. Cancel / re-rest math stays in aibetbuilder.
+
+The poller starts only on the Combo Locks service (`npm start` / `start-live.js`), and only when both env vars below are set. The Unhedged job does not start it. With the URL unset it logs one line and makes no request.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `DESK_PROTECT_SWEEP_URL` | unset | HTTPS URL, `POST /api/desk-protect-sweep` on aibetbuilder. Unset → poller is not started. |
+| `DESK_PROTECT_SWEEP_SECRET` | unset | Shared secret, request header `X-Desk-Protect-Secret`. At least 16 characters, one line. Not a Supabase user JWT. Do not prefix with `VITE_`. Do not put it in the URL. |
+| `DESK_PROTECT_POLL_MS` | `1500` | Clamped to 1000–10000. |
+| `DESK_PROTECT_THROUGH_CENTS` | `3` | X. Cents through mid that count as picked off. Sent as `defaults.throughCents`. |
+| `DESK_PROTECT_REST_OFFSET_CENTS` | `1` | Y. Re-rest a buy at mid − Y and a sell at mid + Y. `0` re-rests at mid. |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALERT_CHAT_ID` | optional | One ping per adverse event. If unset, the same text is logged once. |
+
+Point Combo Locks at the sweep after aibetbuilder is serving it (same secret on that server only):
+
+```
+DESK_PROTECT_SWEEP_URL=https://<your-aibetbuilder-host>/api/desk-protect-sweep
+DESK_PROTECT_SWEEP_SECRET=<long random>
+```
+
+Live Trading Desk PR #210 places and cancels for the owner. It does not ship this sweep. Until that route exists, leave `DESK_PROTECT_SWEEP_URL` unset. A URL that 404s only logs on this worker; it still does not cancel or replace orders.
+
+### Sweep contract
+
+`POST` JSON:
+
+```json
+{
+  "op": "sweep",
+  "mode": "adverse-only",
+  "defaults": { "throughCents": 3, "restOffsetCents": 1 },
+  "ackedIds": []
+}
+```
+
+Wrong or missing `X-Desk-Protect-Secret` → `401` and no orders touched. This is not the Desk route that takes a user JWT. Owner / Desk only.
+
+Act only on rests that have **Protect armed** on that order. Unarmed orders stay put. Use the order’s own X and Y when it was armed; otherwise use `defaults`.
+
+**Adverse only.** If the resting outcome price is at least X¢ through the current mid, cancel it and re-rest better (buy lower, sell higher). If the market runs away from the rest, do nothing. Never move a buy up or a sell down to follow the market.
+
+Idempotent. Repeating the sweep must not cancel the replacement unless that new rest is itself ≥ X¢ through mid. `ackedIds` were already announced — do not return them. Do not return chase or follow events. Each event needs a stable `id`.
+
+```json
+{
+  "ok": true,
+  "events": [
+    {
+      "id": "prot_…",
+      "kind": "adverse-reprice",
+      "adverse": true,
+      "orderId": "canceled",
+      "newOrderId": "replacement",
+      "marketSlug": "aec-…",
+      "label": "Titans",
+      "action": "buy",
+      "outcome": "short",
+      "fromCents": 43,
+      "toCents": 40,
+      "midCents": 46,
+      "throughCents": 6,
+      "restOffsetCents": 1
+    }
+  ]
+}
+```
+
+This worker pings Telegram once per adverse id (`kind` `adverse-reprice`, or `adverse: true` with no chase kind). A restart can repeat a ping only if the sweep returns that same id again. It will not place a second order. Keep Combo Locks at replica count **1** so two processes do not sweep the same rests.
+
 ## Local
 
 ```bash

@@ -38,7 +38,10 @@ assert.strictEqual(shouldRunUnhedged({ WORKER_MODE: 'all' }), true);
 
   assert.ok(startLive.includes("run('live-runner.js')"));
   assert.ok(startLive.includes("run('fills-reader.js')"));
+  assert.ok(/if \(protectCfg\.enabled\) \{\s*run\('desk-protect\.js'\)/.test(startLive));
+  assert.ok(startLive.includes('deskProtectDisabledMessage'));
   assert.ok(!startLive.includes('unhedged-runner'));
+  assert.ok(!startUnhedged.includes('desk-protect'));
   assert.ok(/WORKER_MODE=unhedged/.test(startLive), 'start-live must refuse the Unhedged mode');
 
   assert.ok(startUnhedged.includes("require('./unhedged-runner')"));
