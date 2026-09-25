@@ -1,4 +1,4 @@
-# Railway: two services from this repo
+# Railway: services from this repo
 
 Combo Locks and Unhedged RFQs are **separate processes**. They share the same GitHub repo, Supabase project, and Kalshi / Polymarket credentials. They must **not** share a Node event loop or the Combo Locks Kalshi quote HTTP pool.
 
@@ -10,6 +10,7 @@ Do **not** Railway-deploy from this PR unless asked. Create / wire the second se
 |---|---|---|---|
 | **Combo Locks** (existing worker) | `npm start` → `start-live.js` (`live-runner.js` + `fills-reader.js`) | Kalshi WS + Poly Retail RFQ **locks**: exact-lock quoting, confirm, fills, Miss tape (`combo_submissions`), reserves/caps, skip-tape, `combo_fills` | Unhedged `/markets` refresh, unhedged fill ticks, shadow-miss persist to `unhedged_rfqs` |
 | **Unhedged RFQs** (new worker) | `npm run start:unhedged` → `start-unhedged.js` (`unhedged-runner.js`) | Own Kalshi WS + REST, own Poly listen, own MLB/NFL price cache, paper tape + fill tracking on `unhedged_rfqs` | Combo Lock quote POST / confirm. `UNHEDGED_RFQ_LIVE` stays off (paper/shadow only) |
+| **Odds relay** (board fanout) | `npm run start:odds-relay` → `start-odds-relay.js` | Polymarket US markets websocket, international CLOB fallback, Kalshi public REST (and a market-data websocket only with its own key). SSE for the New Odds Board | Combo Locks, Unhedged, `WORKER_MODE`, Kalshi `communications`. Do not copy Combo Locks `KALSHI_KEY_ID` |
 
 `WORKER_MODE` (default **`combo`**):
 
@@ -143,12 +144,32 @@ Idempotent. Repeating the sweep must not cancel the replacement unless that new 
 
 This worker pings Telegram once per adverse id (`kind` `adverse-reprice`, or `adverse: true` with no chase kind). A restart can repeat a ping only if the sweep returns that same id again. It will not place a second order. Keep Combo Locks at replica count **1** so two processes do not sweep the same rests.
 
+## Odds relay (third service)
+
+The New Odds Board reads this process directly from the browser (`VITE_ODDS_RELAY_URL` on aibetbuilder). Vercel functions cannot hold the venue sockets for a whole game. This service does.
+
+Do **not** attach it to Combo Locks or Unhedged. Do **not** Railway-deploy it from a PR unless asked. Add a third service when you are ready.
+
+- **Name:** e.g. `odds-relay`
+- **Start command:** `npm run start:odds-relay`
+- **Replica count:** 1
+- **WORKER_MODE:** leave unset. `start-odds-relay.js` does not start the combo event loop.
+- **PORT:** Railway sets this. Local default is `8787`.
+- Copy `POLYMARKET_KEY_ID` and `POLYMARKET_SECRET_KEY` (same Retail Ed25519 pair as Combo Locks). That key signs `GET /v1/ws/markets`. Combo Locks uses it for REST, not this markets socket.
+- **Do not copy** Combo Locks `KALSHI_KEY_ID` / `Kalshi_combo_key`. A second socket on that key unsubscribes communications and Combo Lock quoting dies.
+- Kalshi ticks: set `ODDS_RELAY_KALSHI_KEY_ID` and `ODDS_RELAY_KALSHI_KEY` (or `ODDS_RELAY_KALSHI_PRIVATE_KEY`) only when that key is a **different** Kalshi API key. The relay subscribes to `ticker` and `orderbook_delta` only. Without it, the relay polls public REST and still applies the ESPN kickoff overlay.
+- No Supabase. No Telegram.
+- Public URL (no trailing slash) becomes `VITE_ODDS_RELAY_URL` on the Vercel project. The browser connects to `GET /stream?league=NFL&venue=polymarket` and `venue=kalshi`. CORS is `*`.
+
+`GET /health` returns `{ ok, status, counts }` and no key material. `status.us` is `no-key` until the Polymarket pair is set; international CLOB is the book until the US socket is up. `status.kalshi` is `rest` until the dedicated key connects.
+
 ## Local
 
 ```bash
 npm start                 # Combo Locks + fills-reader (WORKER_MODE=combo)
 npm run start:unhedged    # Unhedged paper tape only
 npm run start:all         # both in one process (escape hatch)
+npm run start:odds-relay  # board relay only (port 8787 or $PORT)
 npm test
 ```
 
