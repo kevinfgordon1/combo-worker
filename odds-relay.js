@@ -847,38 +847,155 @@ function kalshiLevelPrice(msg) {
   return null;
 }
 
-function quotesFromKalshiOrderbook(message, books, metaByTicker) {
+function kalshiNoRows(msg) {
+  if (!msg || typeof msg !== 'object') return [];
+  if (Array.isArray(msg.no_dollars_fp)) return msg.no_dollars_fp;
+  if (Array.isArray(msg.no_dollars)) return msg.no_dollars;
+  if (Array.isArray(msg.no)) return msg.no;
+  return [];
+}
+
+function loadKalshiNoLevels(rows) {
+  const no = new Map();
+  for (const row of rows || []) {
+    const price = Array.isArray(row) ? Number(row[0]) : kalshiLevelPrice(row);
+    const size = Array.isArray(row) ? Number(row[1]) : Number(row && (row.size || row.count));
+    const px = price > 1 && price < 100 ? price / 100 : price;
+    if (!Number.isFinite(px) || px <= 0 || px >= 1) continue;
+    if (Number.isFinite(size) && size > 0) no.set(px.toFixed(4), size);
+  }
+  return no;
+}
+
+function createKalshiOrderbook() {
+  return {
+    levels: new Map(),
+    built: new Set(),
+    sourced: new Set(),
+    seqBySid: new Map(),
+    tickersBySid: new Map(),
+  };
+}
+
+function classifyKalshiSeq(state, sid, seq) {
+  if (sid == null || sid === '' || !Number.isFinite(Number(seq))) return 'unsequenced';
+  const key = Number(sid);
+  const n = Number(seq);
+  if (!state.seqBySid.has(key) || state.seqBySid.get(key) == null) return 'baseline';
+  const last = state.seqBySid.get(key);
+  if (n === last + 1) return 'next';
+  if (n <= last) return 'dup';
+  return 'gap';
+}
+
+function rememberKalshiTicker(state, sid, ticker) {
+  if (sid == null || !Number.isFinite(Number(sid)) || !ticker) return;
+  const key = Number(sid);
+  let set = state.tickersBySid.get(key);
+  if (!set) {
+    set = new Set();
+    state.tickersBySid.set(key, set);
+  }
+  set.add(ticker);
+}
+
+function invalidateKalshiSid(state, sid, ticker) {
+  const key = Number(sid);
+  const tickers = [...(state.tickersBySid.get(key) || [])];
+  if (ticker && !tickers.includes(ticker)) tickers.push(ticker);
+  for (const item of tickers) {
+    state.built.delete(item);
+    state.levels.delete(item);
+  }
+  state.seqBySid.set(key, null);
+  return tickers;
+}
+
+function applyKalshiOrderbookFrame(state, message, metaByTicker) {
+  const empty = { quotes: [], resnapshot: null };
   const msg = message && message.msg && typeof message.msg === 'object' ? message.msg : message;
   const type = String((message && message.type) || '');
-  if (type !== 'orderbook_snapshot' && type !== 'orderbook_delta') return [];
+  if (type !== 'orderbook_snapshot' && type !== 'orderbook_delta') return empty;
   const ticker = msg && (msg.market_ticker || msg.ticker);
   const meta = metaByTicker && metaByTicker.get(ticker);
-  if (!meta || !ticker) return [];
-  let no = books.get(ticker);
+  if (!meta || !ticker || !state) return empty;
+  const sid = message && message.sid != null && message.sid !== '' ? Number(message.sid) : null;
+  const seq = message && message.seq != null && message.seq !== '' ? Number(message.seq) : null;
+  const kind = classifyKalshiSeq(state, sid, seq);
+  const ts = (msg && (msg.ts_ms || msg.ts)) || (message && message.ts);
+  if (kind === 'dup') return empty;
   if (type === 'orderbook_snapshot') {
-    no = new Map();
-    for (const row of msg.no_dollars || msg.no || []) {
-      const price = Array.isArray(row) ? Number(row[0]) : kalshiLevelPrice(row);
-      const size = Array.isArray(row) ? Number(row[1]) : Number(row && (row.size || row.count));
-      const px = price > 1 && price < 100 ? price / 100 : price;
-      if (!Number.isFinite(px) || px <= 0 || px >= 1) continue;
-      if (Number.isFinite(size) && size > 0) no.set(px.toFixed(4), size);
-    }
-    books.set(ticker, no);
-  } else {
-    if (!no) return [];
-    if (String(msg.side || '').toLowerCase() !== 'no') return [];
+    const levels = loadKalshiNoLevels(kalshiNoRows(msg));
+    state.levels.set(ticker, levels);
+    state.built.add(ticker);
+    state.sourced.add(ticker);
+    rememberKalshiTicker(state, sid, ticker);
+    if (kind !== 'unsequenced') state.seqBySid.set(sid, seq);
+    const ask = asProb(kalshiYesAskFromNoBids([...levels.entries()].map(([price, size]) => [price, size])));
+    if (ask == null) return { quotes: [], resnapshot: null };
+    return { quotes: [{ ...meta, odds: ask, updated_at: isoFromMs(ts), ticker }], resnapshot: null };
+  }
+  if (kind === 'gap') {
+    const tickers = invalidateKalshiSid(state, sid, ticker);
+    return { quotes: [], resnapshot: { sid, market_tickers: tickers } };
+  }
+  if (kind === 'baseline') {
+    rememberKalshiTicker(state, sid, ticker);
+    return { quotes: [], resnapshot: { sid, market_tickers: [ticker] } };
+  }
+  if (kind === 'next') state.seqBySid.set(sid, seq);
+  if (!state.built.has(ticker)) {
+    rememberKalshiTicker(state, sid, ticker);
+    if (sid != null && Number.isFinite(sid)) return { quotes: [], resnapshot: { sid, market_tickers: [ticker] } };
+    return empty;
+  }
+  const side = String(msg.side || '').toLowerCase();
+  if (side === 'no') {
+    const no = state.levels.get(ticker);
     const px = kalshiLevelPrice(msg);
     const delta = msg.delta_fp != null && msg.delta_fp !== '' ? Number(msg.delta_fp) : Number(msg.delta);
-    if (px == null || !Number.isFinite(delta)) return [];
-    const key = px.toFixed(4);
-    const next = (no.get(key) || 0) + delta;
-    if (next <= 0) no.delete(key);
-    else no.set(key, next);
+    if (no && px != null && Number.isFinite(delta)) {
+      const key = px.toFixed(4);
+      const next = (no.get(key) || 0) + delta;
+      if (next <= 0) no.delete(key);
+      else no.set(key, next);
+    }
+  } else if (side !== 'yes') {
+    return empty;
   }
-  const ask = asProb(kalshiYesAskFromNoBids([...no.entries()].map(([price, size]) => [price, size])));
-  if (ask == null) return [];
-  return [{ ...meta, odds: ask, updated_at: isoFromMs(msg.ts || message.ts), ticker }];
+  const levels = state.levels.get(ticker) || new Map();
+  const ask = asProb(kalshiYesAskFromNoBids([...levels.entries()].map(([price, size]) => [price, size])));
+  if (ask == null) return empty;
+  return { quotes: [{ ...meta, odds: ask, updated_at: isoFromMs(ts), ticker }], resnapshot: null };
+}
+
+const kalshiBookStates = new WeakMap();
+
+function kalshiBookState(books) {
+  if (books && books.levels && books.seqBySid) return books;
+  if (!(books instanceof Map)) return createKalshiOrderbook();
+  let state = kalshiBookStates.get(books);
+  if (!state) {
+    state = createKalshiOrderbook();
+    kalshiBookStates.set(books, state);
+  }
+  return state;
+}
+
+function quotesFromKalshiOrderbook(message, books, metaByTicker) {
+  return applyKalshiOrderbookFrame(kalshiBookState(books), message, metaByTicker).quotes;
+}
+
+function kalshiSnapshotRequest(sid, tickers, id) {
+  return {
+    id,
+    cmd: 'update_subscription',
+    params: {
+      sids: [Number(sid)],
+      market_tickers: tickers,
+      action: 'get_snapshot',
+    },
+  };
 }
 
 function quotesFromKalshiTicker(message, metaByTicker) {
@@ -1252,7 +1369,9 @@ function startKalshi(state, deps) {
   let ping = null;
   let backoff = 1000;
   const metaByTicker = new Map();
-  const noBooks = new Map();
+  const ob = createKalshiOrderbook();
+  let cmdId = 1000;
+  const pendingSnap = new Set();
   state.status.kalshi = creds ? 'connecting' : 'rest';
   if (!creds) {
     console.log('[odds-relay] kalshi market-data websocket off (no ODDS_RELAY_KALSHI_KEY_ID). Public REST only. Combo Locks KALSHI_KEY_ID is not read.');
@@ -1315,6 +1434,11 @@ function startKalshi(state, deps) {
       backoff = 1000;
       state.kalshiWsUp = true;
       state.status.kalshi = 'ws';
+      ob.seqBySid.clear();
+      ob.built.clear();
+      ob.levels.clear();
+      ob.tickersBySid.clear();
+      pendingSnap.clear();
       const tickers = [...metaByTicker.keys()];
       if (tickers.length) ws.send(JSON.stringify(kalshiSubscribeMessage(tickers)));
       if (ping) clearInterval(ping);
@@ -1327,9 +1451,24 @@ function startKalshi(state, deps) {
       try { parsed = JSON.parse(String(data)); } catch (_) { return; }
       const type = String(parsed && parsed.type || '');
       let quotes = [];
-      if (type === 'ticker') quotes = quotesFromKalshiTicker(parsed, metaByTicker);
-      else if (type === 'orderbook_snapshot' || type === 'orderbook_delta') {
-        quotes = quotesFromKalshiOrderbook(parsed, noBooks, metaByTicker);
+      if (type === 'orderbook_snapshot' || type === 'orderbook_delta') {
+        const applied = applyKalshiOrderbookFrame(ob, parsed, metaByTicker);
+        if (type === 'orderbook_snapshot' && parsed.sid != null) pendingSnap.delete(Number(parsed.sid));
+        if (applied.resnapshot && applied.resnapshot.sid != null && !pendingSnap.has(Number(applied.resnapshot.sid))) {
+          const sid = Number(applied.resnapshot.sid);
+          const tickers = [...new Set((applied.resnapshot.market_tickers || []).filter(Boolean))];
+          if (tickers.length) {
+            pendingSnap.add(sid);
+            try {
+              ws.send(JSON.stringify(kalshiSnapshotRequest(sid, tickers, cmdId)));
+              cmdId += 1;
+            } catch (_) { pendingSnap.delete(sid); }
+          }
+        }
+        quotes = applied.quotes;
+      } else if (type === 'ticker') {
+        quotes = quotesFromKalshiTicker(parsed, metaByTicker)
+          .filter((quote) => quote && !ob.sourced.has(quote.ticker));
       }
       if (!quotes.length) return;
       for (const [league, group] of groupByLeague(quotes)) {
@@ -1542,5 +1681,8 @@ module.exports = {
   kalshiYesAskFromNoBids,
   pairFromTicker,
   quotesFromKalshiOrderbook,
+  createKalshiOrderbook,
+  applyKalshiOrderbookFrame,
+  kalshiSnapshotRequest,
   startOddsRelay,
 };

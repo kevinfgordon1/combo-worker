@@ -19,6 +19,9 @@ const {
   kalshiYesAskFromNoBids,
   pairFromTicker,
   quotesFromKalshiOrderbook,
+  createKalshiOrderbook,
+  applyKalshiOrderbookFrame,
+  kalshiSnapshotRequest,
 } = require('./odds-relay');
 
 {
@@ -217,6 +220,32 @@ function offersWorstFirst() {
     msg: { market_ticker: 'T', side: 'no', price_dollars: '0.40', delta_fp: '2', ts: 2000 },
   }, books, meta);
   assert.strictEqual(delta[0].odds, 0.6);
+}
+
+{
+  const ticker = 'KXNFLGAME-26SEP24ATLGB-GB';
+  const meta = new Map([[ticker, {
+    book: 'kalshi', book_id: 194, league: 'NFL', away: 'Atlanta Falcons', home: 'Green Bay Packers',
+    side: 'Green Bay', bet_type: 'moneyline', is_live: true, odds: 0.09, ticker,
+  }]]);
+  const state = createKalshiOrderbook();
+  const recorded = [
+    { type: 'orderbook_snapshot', sid: 4, seq: 20, msg: { market_ticker: ticker, no_dollars_fp: [['0.8000', '20.00'], ['0.9100', '100.00']] } },
+    { type: 'orderbook_delta', sid: 4, seq: 21, msg: { market_ticker: ticker, side: 'no', price_dollars: '0.9000', delta_fp: '15.00' } },
+    { type: 'orderbook_delta', sid: 4, seq: 23, msg: { market_ticker: ticker, side: 'no', price_dollars: '0.9100', delta_fp: '-100.00' } },
+  ];
+  const emitted = [];
+  let resnap = null;
+  for (const frame of recorded) {
+    const applied = applyKalshiOrderbookFrame(state, frame, meta);
+    if (applied.resnapshot) resnap = applied.resnapshot;
+    for (const quote of applied.quotes) emitted.push(quote.odds);
+  }
+  assert.deepEqual(emitted, [0.09, 0.09]);
+  assert.equal(resnap.sid, 4);
+  const req = kalshiSnapshotRequest(4, resnap.market_tickers, 3);
+  assert.equal(req.params.action, 'get_snapshot');
+  assert.equal(state.sourced.has(ticker), true);
 }
 
 (async () => {
