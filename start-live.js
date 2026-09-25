@@ -3,6 +3,7 @@
 'use strict';
 const { spawn } = require('child_process');
 const { resolveWorkerMode } = require('./worker-mode');
+const { readDeskProtectConfig, deskProtectDisabledMessage } = require('./desk-protect');
 
 function run(script) {
   const child = spawn(process.execPath, [script], { stdio: 'inherit' });
@@ -21,3 +22,12 @@ if (mode === 'unhedged') {
 
 run('live-runner.js');
 run('fills-reader.js');
+
+// Kevin's Desk Adverse Protect. No-op unless the aibetbuilder sweep URL and
+// shared secret are both set. Never started for the Unhedged job.
+const protectCfg = readDeskProtectConfig(process.env);
+if (protectCfg.enabled) {
+  run('desk-protect.js');
+} else {
+  console.log(deskProtectDisabledMessage(protectCfg));
+}
