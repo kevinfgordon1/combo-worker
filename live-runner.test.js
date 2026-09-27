@@ -125,7 +125,18 @@ assert.ok(
 );
 assert.ok(
   /require\('\.\/fills-attr'\)/.test(liveSrc) && /liveRunnerFillRow/.test(liveSrc),
-  'quote_executed must persist combo_fills via liveRunnerFillRow (parlay_id for Combo Locks)'
+  'Polymarket ORDER FILL still persists combo_fills via liveRunnerFillRow'
+);
+assert.ok(
+  /bookFromQuoteExecution/.test(liveSrc)
+    && /quote_executed no portfolio fill/.test(liveSrc)
+    && /countsTowardCap/.test(liveSrc)
+    && /fetchKalshiFillsForOrder/.test(liveSrc),
+  'Kalshi quote_executed must confirm portfolio fills and must not count quote stubs toward the cap'
+);
+assert.ok(
+  /if \(venue !== 'polymarket'\) \{[\s\S]*?quote_executed no portfolio fill[\s\S]*?return;[\s\S]*?\} else \{[\s\S]*?persistExecutedFill/.test(liveSrc),
+  'an executed Kalshi quote with no portfolio fill returns before any fill is booked'
 );
 assert.ok(
   /async function persistExecutedFill/.test(liveSrc)
