@@ -32,7 +32,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const {
   attributeComboFill,
-  sumAttributedFillCounts,
+  sumConfirmedFillCounts,
   formatRealFillAlert,
   existingFillNeedsParlay,
   submissionFilledPatch,
@@ -41,6 +41,7 @@ const {
   selectLiveRunnerStubsToDrop,
   QUOTE_WINDOW_BEFORE_MS,
 } = require('./fills-attr');
+const { normalizeKalshiFill } = require('./kalshi-fill-confirm');
 
 const MODE = 'FILLS';
 const KEY_ID = process.env.KALSHI_KEY_ID;
@@ -63,7 +64,6 @@ async function sendAlert(text) {
   } catch (e) { console.error(`[${MODE}] telegram error`, e.message); }
 }
 
-const isComboTicker = (t) => !!t && /MVE/i.test(t);
 let activeParlays = [];
 
 async function loadParlays() {
@@ -85,7 +85,7 @@ async function filledSumForParlay(parlayId) {
     console.error(`[${MODE}] fill sum failed`, error.message);
     return null;
   }
-  return sumAttributedFillCounts(data || []);
+  return sumConfirmedFillCounts(data || []);
 }
 
 async function loadRecentSubmissions() {
@@ -176,27 +176,7 @@ async function fetchFills(minTs) {
 }
 
 function normalizeFill(f) {
-  const fillId = f.fill_id || f.trade_id;
-  const ticker = f.ticker || f.market_ticker || null;
-  const count = Number(f.count != null ? f.count : (f.count_fp != null ? f.count_fp : 0));
-  const created = f.created_time || (f.ts ? new Date(f.ts * 1000).toISOString() : null);
-  const yesP = f.yes_price_dollars ?? f.yes_price_fixed ?? (f.yes_price != null ? f.yes_price / 100 : null);
-  const noP = f.no_price_dollars ?? f.no_price_fixed ?? (f.no_price != null ? f.no_price / 100 : null);
-  return {
-    fill_id: fillId,
-    order_id: f.order_id || null,
-    ticker,
-    is_combo: isComboTicker(ticker),
-    outcome_side: f.outcome_side || f.side || null,
-    action: f.action || null,
-    count,
-    is_taker: !!f.is_taker,
-    yes_price: yesP != null ? Number(yesP) : null,
-    no_price: noP != null ? Number(noP) : null,
-    fee: f.fee_cost != null ? Number(f.fee_cost) : (f.fee != null ? Number(f.fee) : null),
-    kalshi_created_time: created,
-    raw: f,
-  };
+  return normalizeKalshiFill(f);
 }
 
 let lastTs = 0;

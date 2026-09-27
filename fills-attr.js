@@ -266,6 +266,30 @@ function isLiveRunnerTwin(row) {
   return !!(row.fill_id && row.order_id && row.fill_id === row.order_id);
 }
 
+// quote_executed books the quoted size under source=live-runner (or
+// fill_id === order_id) before Kalshi has a portfolio fill. That row is not
+// a fill. A real trade payload (trade_id / count_fp) that happens to share
+// the order id is not a stub.
+function isQuoteExecutionStub(row) {
+  if (!row || isPolyishFill(row)) return false;
+  const raw = row.raw || {};
+  if (raw.venue === 'polymarket' || row.venue === 'polymarket') return false;
+  if (raw.source === 'live-runner') return true;
+  if (row.fill_id && row.order_id && row.fill_id === row.order_id && !raw.trade_id && raw.count_fp == null) {
+    return true;
+  }
+  return false;
+}
+
+// Cap / filled-so-far. Polymarket order fills count. Kalshi quote-execution
+// stubs do not — only rows Kalshi's fills API confirmed (or any other
+// non-stub combo row already stored from that API).
+function countsTowardCap(row) {
+  if (!row) return false;
+  if (isQuoteExecutionStub(row)) return false;
+  return true;
+}
+
 function isPolyishFill(row) {
   if (!row) return false;
   const id = String(row.fill_id || '');
@@ -318,6 +342,13 @@ function pickFillForSum(rows) {
 
 function sumAttributedFillCounts(rows) {
   return sumFillCounts(pickFillForSum(rows));
+}
+
+// Every confirmed row counts, including partial fills that share an order_id.
+// Quote-execution stubs are omitted even when no real trade has arrived.
+function sumConfirmedFillCounts(rows) {
+  if (!Array.isArray(rows)) return null;
+  return sumFillCounts(rows.filter(countsTowardCap));
 }
 
 function sumFillCounts(rows) {
@@ -382,11 +413,14 @@ module.exports = {
   submissionAlreadyFilled,
   existingFillNeedsParlay,
   isLiveRunnerTwin,
+  isQuoteExecutionStub,
+  countsTowardCap,
   isPolyishFill,
   isKalshiTradeFill,
   selectLiveRunnerStubsToDrop,
   pickFillForSum,
   sumAttributedFillCounts,
+  sumConfirmedFillCounts,
   contractsCoverFill,
   isQuoteCandidate,
   sumFillCounts,

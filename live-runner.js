@@ -1,8 +1,11 @@
 // ─────────────────────────────────────────────────────────────────────────
 // live-runner.js — LIVE worker (latency-optimized)
 //
-// ACCOUNTING: POST → 'quoted'. Filled advances on quote_executed (Kalshi)
-//   or Polymarket orderExecution FILL / PARTIAL_FILL (same persist).
+// ACCOUNTING: POST → 'quoted'. Kalshi quote_executed means orders were
+//   placed, not that a trade filled — do not book the quoted size.
+//   combo_fills / max_contracts advance only from GET /portfolio/fills
+//   (count_fp, one row per fill_id, partials add). Polymarket orderExecution
+//   FILL / PARTIAL_FILL still persists on the same path.
 //   Persist combo_fills (parlay_id) FIRST, then stamp combo_submissions
 //   status=filled + order_id. UI Filled tab is combo_fills; History needs
 //   both fields. Restart recovery reads combo_submissions by quote_id
@@ -131,7 +134,8 @@ const {
   applyRefreshKillByUser,
   applyRefreshFilledByParlay,
 } = require('./refresh-state');
-const { liveRunnerFillRow, resolveFillLookup, findPendingFill, submissionAlreadyFilled, claimFillKey, isKalshiTradeFill } = require('./fills-attr');
+const { liveRunnerFillRow, resolveFillLookup, findPendingFill, submissionAlreadyFilled, claimFillKey, isKalshiTradeFill, countsTowardCap } = require('./fills-attr');
+const { bookFromQuoteExecution, fillsQuery, fillReferencesOrder } = require('./kalshi-fill-confirm');
 const { findPolyEconomicTwin } = require('./polymarket-fill-reconcile');
 const {
   fingerprintRfq,
@@ -268,9 +272,10 @@ async function refresh() {
     const [parlaysQ, settingsQ, fillsQ] = await Promise.all([
       supabase.from('combo_parlays').select('*').eq('active', true),
       supabase.from('combo_settings').select('user_id,kill_switch'),
-      // Ground truth contracts from Kalshi account fills (not our optimistic submission math).
+      // Confirmed contracts only. Quote-execution stubs (source=live-runner)
+      // are not Kalshi fills and must not consume max_contracts.
       supabase.from('combo_fills')
-        .select('parlay_id,count')
+        .select('parlay_id,count,fill_id,order_id,raw')
         .eq('is_combo', true)
         .eq('is_taker', false)
         .not('parlay_id', 'is', null),
@@ -280,7 +285,10 @@ async function refresh() {
     const parlaysFailed = querySoftFailed(parlaysQ);
     parlays = applyRefreshParlays(parlays, parlaysQ, refreshLog);
     killByUser = applyRefreshKillByUser(killByUser, settingsQ, refreshLog);
-    filledByParlay = applyRefreshFilledByParlay(filledByParlay, fillsQ, 'count', refreshLog);
+    const fillsForCap = querySoftFailed(fillsQ)
+      ? fillsQ
+      : { data: (fillsQ.data || []).filter(countsTowardCap), error: null };
+    filledByParlay = applyRefreshFilledByParlay(filledByParlay, fillsForCap, 'count', refreshLog);
 
     // Pre-stage prices (Step 3). Soft-fail keeps previous staged with the locks.
     if (!parlaysFailed) {
@@ -1396,6 +1404,102 @@ function persistQuoteOrder(quoteId, orderId) {
     .catch((e) => console.error(`[${MODE}] stamp order_id failed`, e && e.message));
 }
 
+async function findComboFill(fillId) {
+  if (!fillId) return null;
+  try {
+    const { data, error } = await supabase
+      .from('combo_fills')
+      .select('fill_id,count')
+      .eq('fill_id', fillId)
+      .maybeSingle();
+    if (error) {
+      console.error(`[${MODE}] confirmed fill lookup`, error.message);
+      return { fill_id: fillId, uncertain: true };
+    }
+    return data || null;
+  } catch (e) {
+    console.error(`[${MODE}] confirmed fill lookup`, e.message);
+    return { fill_id: fillId, uncertain: true };
+  }
+}
+
+// quote_executed places orders. Count only fills Kalshi already lists for
+// that order_id, at count_fp. An empty fills response books nothing.
+async function fetchKalshiFillsForOrder(orderId) {
+  if (!orderId) return [];
+  const signPath = '/trade-api/v2/portfolio/fills';
+  const out = [];
+  let cursor = '';
+  for (let page = 0; page < 10; page++) {
+    const qs = fillsQuery({ orderId, limit: 200, cursor });
+    const res = await kalshiSigned('GET', signPath, { path: `${signPath}?${qs}` });
+    if (!res || res.statusCode !== 200) {
+      throw new Error(`fills read ${res && res.statusCode}: ${res && res.text}`);
+    }
+    const body = JSON.parse(res.text || '{}');
+    const fills = (body.fills || []).filter((fill) => fillReferencesOrder(fill, orderId));
+    out.push(...fills);
+    if (!body.cursor || !(body.fills || []).length) break;
+    cursor = body.cursor;
+  }
+  return out;
+}
+
+async function bookConfirmedKalshiFills(pending, evt) {
+  const quoteId = evt.quoteId || null;
+  const orderId = evt.orderId || null;
+  if (quoteId && orderId) persistQuoteOrder(quoteId, orderId);
+  let apiFills = [];
+  try {
+    apiFills = await fetchKalshiFillsForOrder(orderId);
+  } catch (e) {
+    console.error(`[${MODE}] quote_executed fill confirm failed`, e.message);
+    return { contracts: 0, newContracts: 0, reason: 'confirm-failed', partial: false };
+  }
+  const booked = bookFromQuoteExecution({ orderId, fills: apiFills });
+  if (booked.reason !== 'confirmed') {
+    return { contracts: 0, newContracts: 0, reason: booked.reason, partial: false };
+  }
+  let added = 0;
+  for (const row of booked.book) {
+    seenFillIds.add(row.fill_id);
+    const existing = await findComboFill(row.fill_id);
+    const stored = {
+      ...row,
+      parlay_id: (pending && pending.parlayId) || null,
+      is_combo: true,
+    };
+    try {
+      const { error } = await supabase.from('combo_fills').upsert(stored, { onConflict: 'fill_id' });
+      if (error) {
+        console.error(`[${MODE}] confirmed fill upsert failed`, error.message);
+        continue;
+      }
+    } catch (e) {
+      console.error(`[${MODE}] confirmed fill upsert failed`, e.message);
+      continue;
+    }
+    // Already stored (or the lookup failed): refresh owns the cap. Only a
+    // newly inserted portfolio fill moves max_contracts in this process.
+    if (existing) continue;
+    const n = Number(row.count);
+    if (Number.isFinite(n)) added += n;
+  }
+  const quoted = evt.contracts != null ? Number(evt.contracts) : Number(pending && pending.contracts);
+  const partial = Number.isFinite(quoted) && quoted > 0 && booked.contracts + 1e-9 < quoted;
+  if (quoteId && booked.contracts > 0) {
+    try {
+      const patch = { status: 'filled', order_id: orderId, is_live: true };
+      if (evt.marketTicker) patch.market_ticker = evt.marketTicker;
+      const { error } = await supabase.from('combo_submissions').update(patch).eq('quote_id', quoteId);
+      if (error) console.error(`[${MODE}] stamp confirmed fill failed`, error.message);
+    } catch (e) {
+      console.error(`[${MODE}] stamp confirmed fill failed`, e.message);
+    }
+  }
+  return { contracts: booked.contracts, newContracts: added, reason: 'confirmed', partial };
+}
+
 async function onQuoteExecuted(evt) {
   if (!evt) return;
   const looked = resolveFillLookup(evt);
@@ -1435,20 +1539,40 @@ async function onQuoteExecuted(evt) {
     return;
   }
 
-  const contracts = evt.contracts != null ? evt.contracts : pending.contracts;
   const venue = fillVenueOf(evt);
-  await persistExecutedFill(pending, { ...evt, quoteId, orderId, venue });
-  // Restart replay of the same full fill: persist is idempotent; do not
-  // re-count or re-Telegram. Partials keep a distinct fill_id so they add.
-  if (!fromMemory && pending.alreadyFilled && !evt.isPartial) {
+  let contracts = evt.contracts != null ? evt.contracts : pending.contracts;
+  let partial = !!evt.isPartial;
+  if (venue !== 'polymarket') {
+    // Orders are on the book. The quote is no longer outstanding, whether
+    // or not any of it has traded.
     pendingQuotes.delete(quoteId);
-    polyPendingQuotes.delete(quoteId);
-    return;
+    const confirmed = await bookConfirmedKalshiFills(pending, { ...evt, quoteId, orderId });
+    if (!(confirmed.newContracts > 0)) {
+      console.log(
+        `[${MODE}] quote_executed no portfolio fill quote_id=${quoteId} order_id=${orderId || '?'} ` +
+        `quoted=${evt.contracts != null ? evt.contracts : pending.contracts} reason=${confirmed.reason}`
+      );
+      return;
+    }
+    contracts = confirmed.newContracts;
+    partial = confirmed.partial;
+  } else {
+    await persistExecutedFill(pending, { ...evt, quoteId, orderId, venue });
+    // Restart replay of the same full fill: persist is idempotent; do not
+    // re-count or re-Telegram. Partials keep a distinct fill_id so they add.
+    if (!fromMemory && pending.alreadyFilled && !evt.isPartial) {
+      pendingQuotes.delete(quoteId);
+      polyPendingQuotes.delete(quoteId);
+      return;
+    }
   }
 
   sessionFilledByParlay[pending.parlayId] =
     (sessionFilledByParlay[pending.parlayId] || 0) + contracts;
-  if (!evt.isPartial) {
+  if (venue !== 'polymarket' && pending.parlayId) {
+    filledByParlay[pending.parlayId] = (filledByParlay[pending.parlayId] || 0) + contracts;
+  }
+  if (!partial) {
     pendingQuotes.delete(quoteId);
     polyPendingQuotes.delete(quoteId);
   }
@@ -1488,7 +1612,7 @@ async function onQuoteExecuted(evt) {
     `[${MODE}] FILL CONFIRMED${venueTag} ${pending.label} quote_id=${quoteId} order_id=${orderId} ` +
     `contracts=${contracts} sessionTotal=${sessionTotal}` +
     (fullyFilled ? ' FULL' : '') +
-    (evt.isPartial ? ' PARTIAL' : '')
+    (partial ? ' PARTIAL' : '')
   );
   sendAlert(
     `${formatAlertStatus('✅ FILL CONFIRMED', venue)} — ${pending.label}\n` +

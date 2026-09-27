@@ -312,7 +312,9 @@ function createKalshiWs({
         } catch (e) { console.error('onQuoteAccepted', e); }
       }
 
-      // Quote executed (orders placed — real position)
+      // Quote executed: orders placed on the book. Not a portfolio fill.
+      // Live runner confirms order_id against GET /portfolio/fills before
+      // any contract count hits the cap.
       if (env.type === 'quote_executed' && onQuoteExecuted) {
         try {
           const m = env.msg || {};
