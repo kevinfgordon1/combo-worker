@@ -5,12 +5,17 @@ const {
   formatWsAlert,
   isHandshakeOrAuth,
   isSubscriptionLost,
+  isFailedReconnect,
   DEFAULT_COOLDOWN_MS,
   DEFAULT_BURST_COUNT,
+  DEFAULT_DOWN_MS,
 } = require('./ws-status-alert');
 
 assert.strictEqual(DEFAULT_COOLDOWN_MS, 5 * 60_000);
 assert.strictEqual(DEFAULT_BURST_COUNT, 3);
+assert.strictEqual(DEFAULT_DOWN_MS, 10_000);
+assert.strictEqual(isFailedReconnect('reconnecting', { reason: 'channel_error' }), false);
+assert.strictEqual(isFailedReconnect('reconnecting', { reason: 'close_1006' }), true);
 
 assert.strictEqual(isHandshakeOrAuth('error', { message: 'handshake 401: header_timestamp_expired' }), true);
 assert.strictEqual(isHandshakeOrAuth('reconnecting', { reason: 'auth_timestamp' }), true);
@@ -96,28 +101,73 @@ assert.strictEqual(isSubscriptionLost('error', { message: 'Unable to process mes
 
 {
   let t = 5_000_000;
-  const alerter = createWsStatusAlerter({ now: () => t, cooldownMs: 60_000, burstCount: 3, burstWindowMs: 120_000 });
+  const alerter = createWsStatusAlerter({ now: () => t, cooldownMs: 60_000, burstCount: 3, burstWindowMs: 120_000, downMs: 10_000 });
   assert.strictEqual(
     alerter.shouldAlert('unsubscribed', { message: 'unsubscribed', type: 'unsubscribed' }),
-    true,
-    'communications unsubscribed must page immediately'
+    false,
+    'a 1s unsubscribed reconnect must not page'
   );
   t += 1_000;
-  assert.strictEqual(
-    alerter.shouldAlert('reconnecting', { wait: 1000, reason: 'unsubscribed' }),
-    false,
-    'unsubscribed reconnect honors cooldown'
-  );
+  assert.strictEqual(alerter.shouldAlert('subscribed', {}), false);
+  t += 20_000;
+  assert.strictEqual(alerter.poll(), null, 'recovery before 10s must not page');
 }
 
 {
   let t = 6_000_000;
-  const alerter = createWsStatusAlerter({ now: () => t, cooldownMs: 60_000, burstCount: 3, burstWindowMs: 120_000 });
+  const alerter = createWsStatusAlerter({ now: () => t, cooldownMs: 60_000, burstCount: 3, burstWindowMs: 120_000, downMs: 10_000 });
   assert.strictEqual(
     alerter.shouldAlert('error', { message: 'unsubscribed', type: 'unsubscribed' }),
-    true,
-    'legacy quiet error { type: unsubscribed } must page'
+    false,
+    'legacy quiet error { type: unsubscribed } must not page on the blip'
   );
+  t += 11_000;
+  const hit = alerter.poll();
+  assert.ok(hit && hit.s === 'down', 'still down after 10s must page');
+  assert.strictEqual(alerter.poll(), null, 'cooldown suppresses a second sustained page');
+}
+
+{
+  let t = 7_000_000;
+  const alerter = createWsStatusAlerter({ now: () => t, cooldownMs: 60_000, burstCount: 3, burstWindowMs: 120_000, downMs: 10_000 });
+  const overflow = { message: 'Subscription buffer overflow', type: 'error', code: 25, shardKey: 3 };
+  assert.strictEqual(alerter.shouldAlert('error', overflow), false, 'code 25 must not page immediately');
+  t += 500;
+  assert.strictEqual(
+    alerter.shouldAlert('reconnecting', { wait: 1000, reason: 'channel_error', shardKey: 3 }),
+    false
+  );
+  t += 9_000;
+  assert.strictEqual(alerter.poll({ shardFactor: 8, shardsUp: 7 }), null, '9s is under the 10s bar');
+  t += 1_000;
+  const hit = alerter.poll({ shardFactor: 8, shardsUp: 7 });
+  assert.ok(hit, 'code 25 socket still down at 10s must page');
+  const text = formatWsAlert(hit.s, hit.info);
+  assert.match(text, /Shard 3 still down/);
+  assert.match(text, /quoting continues on 7\/8 sockets/);
+  assert.ok(!/quoting is paused until communications resume/.test(text));
+}
+
+{
+  let t = 8_000_000;
+  const alerter = createWsStatusAlerter({ now: () => t, cooldownMs: 60_000, downMs: 10_000 });
+  alerter.shouldAlert('error', { message: 'Subscription buffer overflow', code: 25 });
+  t += 11_000;
+  const hit = alerter.poll({ shardFactor: 1, shardsUp: 0 });
+  assert.ok(hit);
+  const text = formatWsAlert(hit.s, hit.info);
+  assert.match(text, /quoting is paused until communications resume/);
+}
+
+{
+  let t = 9_000_000;
+  const alerter = createWsStatusAlerter({ now: () => t, cooldownMs: 60_000, downMs: 10_000 });
+  alerter.shouldAlert('reconnecting', { reason: 'channel_error', shardKey: 1 });
+  t += 400;
+  assert.strictEqual(alerter.shouldAlert('subscribed', { shardKey: 1 }), false);
+  t += 30_000;
+  assert.strictEqual(alerter.poll(), null, 'shard that resubscribed must not page');
+  alerter.shouldAlert('shard-retired', { shardKey: 2 });
 }
 
 {

@@ -205,6 +205,11 @@ async function main() {
     if (!wsAlerter.shouldAlert(s, info)) return;
     console.error(`[${MODE}] ${formatWsAlert(s, info).replace(/\n/g, ' — ')}`);
   }
+  setInterval(() => {
+    const hit = wsAlerter.poll();
+    if (!hit) return;
+    console.error(`[${MODE}] ${formatWsAlert(hit.s, hit.info).replace(/\n/g, ' — ')}`);
+  }, 1000);
 
   const client = createKalshiWs({
     keyId: KEY_ID,

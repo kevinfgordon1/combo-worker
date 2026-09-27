@@ -2,7 +2,9 @@
 const assert = require('assert');
 const { EventEmitter } = require('events');
 const { generateKeyPairSync } = require('crypto');
-const { createKalshiWs, DEFAULT_STALL_MS, PING_MS, INITIAL_BACKOFF_MS, readStallMs, deadChannelReason, shouldOpenQuoteWatcherWs } = require('./kalshi-ws');
+const { createKalshiWs, createKalshiFirehose, DEFAULT_STALL_MS, DEFAULT_LIVE_SHARD_FACTOR, PING_MS, INITIAL_BACKOFF_MS, readStallMs, readShardFactor, shardsLookUnsplit, summarizeThroughput, deadChannelReason, shouldOpenQuoteWatcherWs } = require('./kalshi-ws');
+const { normalizeRfq, matchParlay } = require('./rfq');
+const { createQuoteHot, lockNeedlePlan } = require('./quote-hot');
 const { applyServerDate, resetClockOffset, signedNow, authHeaders } = require('./kalshi-auth');
 
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -105,6 +107,15 @@ function startClient(extra = {}) {
   assert.strictEqual(shouldOpenQuoteWatcherWs({ KALSHI_WS_OWNER: 'quote-watcher' }), true);
   assert.strictEqual(shouldOpenQuoteWatcherWs({ KALSHI_WS_OWNER: 'watcher' }), true);
   assert.strictEqual(shouldOpenQuoteWatcherWs({ KALSHI_WS_OWNER: 'quote-watcher', QUOTE_WATCHER_WS: '0' }), false);
+  assert.strictEqual(DEFAULT_LIVE_SHARD_FACTOR, 8);
+  assert.strictEqual(readShardFactor(undefined, {}, 8), 8);
+  assert.strictEqual(readShardFactor(undefined, { KALSHI_WS_SHARD_FACTOR: '1' }, 8), 1);
+  assert.strictEqual(readShardFactor('4', { KALSHI_WS_SHARD_FACTOR: '1' }, 8), 4);
+  assert.strictEqual(readShardFactor('0', {}, 8), 1);
+  assert.strictEqual(readShardFactor('500', {}, 1), 100);
+  assert.strictEqual(shardsLookUnsplit([2100, 2200, 2300], 3), true);
+  assert.strictEqual(shardsLookUnsplit([300, 300, 300], 3), false);
+  assert.strictEqual(shardsLookUnsplit([5000], 1), false);
 }
 
 {
@@ -364,6 +375,237 @@ async function runAsync() {
     assert.strictEqual(executed[0].contracts, 98);
     assert.match(executed[0].marketTicker, /CROSSCATEGORY/);
     client.stop();
+  }
+
+  {
+    FakeWs.instances = [];
+    const hot = createQuoteHot();
+    hot.setPlan(lockNeedlePlan([{
+      id: 'sea',
+      leg_keys: ['KXNFLGAME-26SEP13NESEA-SEA:yes', 'KXNFLGAME-26SEP13WASPHI-PHI:yes'],
+    }]));
+    const created = [];
+    const deleted = [];
+    const accepted = [];
+    const executed = [];
+    const client = createKalshiFirehose({
+      keyId: 'test-key',
+      pem: PEM,
+      WebSocket: FakeWs,
+      stallMs: 60_000,
+      shardFactor: 4,
+      shouldDropCreated: (raw) => hot.shouldDropCreated(raw),
+      onRfqCreated: (rfq) => created.push(rfq.rfqId),
+      onRfqDeleted: (evt) => deleted.push(evt.rfqId),
+      onQuoteAccepted: (evt) => accepted.push(evt.quoteId),
+      onQuoteExecuted: (evt) => executed.push(evt.orderId),
+    });
+    client.start();
+    await wait(30);
+    assert.strictEqual(FakeWs.instances.length, 4, 'one socket per shard');
+    const keys = FakeWs.instances.map((sock) => {
+      const body = JSON.parse(sock.sent[0]);
+      assert.deepStrictEqual(body.params.channels, ['communications']);
+      return body.params.shard_key;
+    });
+    assert.deepStrictEqual(keys.sort((a, b) => a - b), [0, 1, 2, 3]);
+    assert.ok(FakeWs.instances.every((sock) => JSON.parse(sock.sent[0]).params.shard_factor === 4));
+
+    const noise = Buffer.from(JSON.stringify({
+      type: 'rfq_created',
+      msg: {
+        id: 'rfq-noise',
+        contracts_fp: '10.00',
+        mve_collection_ticker: 'KXMVECROSSCATEGORY-R',
+        mve_selected_legs: [
+          { market_ticker: 'KXNFLGAME-26SEP271330BUFKC-BUF', side: 'yes' },
+          { market_ticker: 'KXNFLGAME-26SEP271330DALNYG-DAL', side: 'yes' },
+        ],
+      },
+    }));
+    FakeWs.instances[0].emit('message', noise);
+    assert.strictEqual(created.length, 0, 'non-lock rfq_created must not be parsed into onRfq');
+    assert.ok(client.health().drop >= 1);
+
+    FakeWs.instances[1].emit('message', JSON.stringify({
+      type: 'rfq_created',
+      msg: {
+        id: 'rfq-hit',
+        contracts_fp: '10.00',
+        mve_collection_ticker: 'KXMVECROSSCATEGORY-R',
+        mve_selected_legs: [
+          { market_ticker: 'KXNFLGAME-26SEP271330NESEA-SEA', side: 'yes' },
+          { market_ticker: 'KXNFLGAME-26SEP271330WASPHI-PHI', side: 'yes' },
+        ],
+      },
+    }));
+    assert.ok(created.includes('rfq-hit'), 'needle hit stays on the receive path');
+    FakeWs.instances[2].emit('message', JSON.stringify({
+      type: 'rfq_created',
+      msg: {
+        id: 'rfq-hit',
+        contracts_fp: '10.00',
+        mve_selected_legs: [
+          { market_ticker: 'KXNFLGAME-26SEP271330NESEA-SEA', side: 'yes' },
+        ],
+      },
+    }));
+    assert.strictEqual(created.filter((id) => id === 'rfq-hit').length, 1, 'duplicate shard delivery must not double-quote');
+
+    FakeWs.instances[0].emit('message', JSON.stringify({
+      type: 'rfq_deleted',
+      msg: { id: 'rfq-hit', deleted_ts: '2026-09-27T18:00:00Z' },
+    }));
+    assert.deepStrictEqual(deleted, ['rfq-hit'], 'rfq_deleted is not needle-filtered');
+
+    const quote = {
+      type: 'quote_accepted',
+      msg: { quote_id: 'q-1', rfq_id: 'rfq-hit', accepted_side: 'no' },
+    };
+    FakeWs.instances[2].emit('message', JSON.stringify(quote));
+    FakeWs.instances[3].emit('message', JSON.stringify(quote));
+    assert.deepStrictEqual(accepted, ['q-1'], 'quote_accepted from two shards confirms once');
+
+    const executedMsg = {
+      type: 'quote_executed',
+      msg: {
+        quote_id: 'q-1',
+        rfq_id: 'rfq-hit',
+        order_id: 'ord-1',
+        market_ticker: 'KXMVECROSSCATEGORY-R',
+        contracts_fp: '10.00',
+      },
+    };
+    FakeWs.instances[0].emit('message', JSON.stringify(executedMsg));
+    FakeWs.instances[1].emit('message', JSON.stringify(executedMsg));
+    assert.deepStrictEqual(executed, ['ord-1']);
+    await wait(300);
+    FakeWs.instances[1].emit('message', JSON.stringify(executedMsg));
+    assert.strictEqual(executed.length, 2, 'a later quote_executed still reaches the fill path');
+
+    const before = FakeWs.instances.length;
+    const victim = FakeWs.instances[1];
+    victim.emit('message', JSON.stringify({
+      type: 'error',
+      msg: { code: 25, msg: 'Subscription buffer overflow' },
+    }));
+    assert.ok(victim.terminated, 'code 25 drops that shard socket');
+    assert.ok(FakeWs.instances[0].readyState === FakeWs.OPEN && !FakeWs.instances[0].terminated, 'other shards stay up');
+    assert.strictEqual(client.health().shardFactor, 4, 'code 25 must not collapse sharding');
+    await wait(1100);
+    assert.ok(FakeWs.instances.length > before, 'the overflowed shard reconnects on its own');
+    client.stop();
+  }
+
+  {
+    FakeWs.instances = [];
+    const statuses = [];
+    const client = createKalshiFirehose({
+      keyId: 'test-key',
+      pem: PEM,
+      WebSocket: FakeWs,
+      stallMs: 60_000,
+      shardFactor: 3,
+      onStatus: (s, info) => statuses.push({ s, info }),
+    });
+    client.start();
+    await wait(20);
+    FakeWs.instances[0].emit('message', JSON.stringify({ type: 'unsubscribed', msg: { channel: 'communications' } }));
+    FakeWs.instances[1].emit('message', JSON.stringify({ type: 'unsubscribed', msg: { channel: 'communications' } }));
+    await wait(30);
+    assert.ok(statuses.some((x) => x.s === 'fallback'), 'two unsubscribed shards collapse to one socket');
+    assert.strictEqual(client.health().shardFactor, 1);
+    const live = FakeWs.instances.filter((sock) => !sock.terminated);
+    assert.ok(live.length >= 1);
+    const solo = live[live.length - 1];
+    const params = JSON.parse(solo.sent[0]).params;
+    assert.ok(!('shard_factor' in params), 'fallback socket is the full unsharded subscription');
+    client.stop();
+  }
+
+  {
+    const hot = createQuoteHot();
+    hot.setPlan(lockNeedlePlan([{
+      id: 'sea',
+      leg_keys: ['KXNFLGAME-26SEP13NESEA-SEA:yes'],
+    }]));
+    const legs = [];
+    for (let i = 0; i < 8; i++) {
+      legs.push({
+        market_ticker: `KXNFLGAME-26SEP271330BUFKC-BUF${i}`,
+        side: 'yes',
+        event_ticker: 'KXNFLGAME-26SEP27',
+        yes_settlement_value_dollars: '1.0000',
+      });
+    }
+    const noise = Buffer.from(JSON.stringify({
+      type: 'rfq_created',
+      sid: 1,
+      msg: {
+        id: 'rfq-bench',
+        creator_id: '',
+        market_ticker: 'KXMVECROSSCATEGORY-R',
+        contracts_fp: '100.00',
+        target_cost_dollars: '25.00',
+        mve_collection_ticker: 'KXMVECROSSCATEGORY-R',
+        mve_selected_legs: legs,
+      },
+    }));
+    assert.ok(noise.length > 800, `bench frame should look like a combo RFQ, got ${noise.length}b`);
+    const N = 20000;
+    const t0 = process.hrtime.bigint();
+    let dropped = 0;
+    for (let i = 0; i < N; i++) if (hot.shouldDropCreated(noise)) dropped++;
+    const sec = Number(process.hrtime.bigint() - t0) / 1e9;
+    const rate = N / sec;
+    assert.strictEqual(dropped, N);
+    const parlays = [{ id: 'sea', leg_keys: ['KXNFLGAME-26SEP13NESEA-SEA:yes'] }];
+    const M = 2000;
+    const t1 = process.hrtime.bigint();
+    for (let i = 0; i < M; i++) {
+      matchParlay(normalizeRfq(JSON.parse(noise.toString())), parlays);
+    }
+    const parseSec = Number(process.hrtime.bigint() - t1) / 1e9;
+    const parseRate = M / parseSec;
+    FakeWs.instances = [];
+    const benchClient = createKalshiWs({
+      keyId: 'test-key',
+      pem: PEM,
+      WebSocket: FakeWs,
+      stallMs: 60_000,
+      shouldDropCreated: (raw) => hot.shouldDropCreated(raw),
+      onRfqCreated: () => { throw new Error('fast-drop leaked a non-lock rfq_created'); },
+    });
+    benchClient.start();
+    await wait(20);
+    const benchSock = FakeWs.instances[FakeWs.instances.length - 1];
+    const H = 10000;
+    const t2 = process.hrtime.bigint();
+    for (let i = 0; i < H; i++) benchSock.emit('message', noise);
+    const handlerRate = H / (Number(process.hrtime.bigint() - t2) / 1e9);
+    benchClient.stop();
+    console.log(
+      `[bench] fast-drop ${Math.round(rate)} frames/s; receive handler ${Math.round(handlerRate)} frames/s ` +
+      `(${noise.length}b); full normalize+match ${Math.round(parseRate)} frames/s`
+    );
+    assert.ok(handlerRate >= 6000, `receive handler ${Math.round(handlerRate)} frames/s cannot cover a 2.7k peak`);
+    assert.ok(rate >= 6000, `fast-drop ${Math.round(rate)} frames/s is under the 2.7k peak with headroom`);
+    const snap = summarizeThroughput({
+      windowMs: 30_000,
+      recv: 81000,
+      drop: 80000,
+      parse: 1000,
+      quotes: 2,
+      backlog: 0,
+      maxHandlerMs: 0.4,
+      loopLagMs: 12,
+      shardsUp: 8,
+      shardFactor: 8,
+      perShard: [{ shardKey: 0, recv: 10000, recvPerSec: 333, up: true }],
+    });
+    assert.strictEqual(snap.recvPerSec, 2700);
+    assert.strictEqual(snap.backlog, 0);
+    assert.strictEqual(snap.shardsUp, 8);
   }
 
   console.log('kalshi-ws.test.js ok');

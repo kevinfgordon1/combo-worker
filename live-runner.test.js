@@ -510,12 +510,22 @@ assert.ok(
 assert.ok(
   /require\('\.\/quote-hot'\)/.test(liveSrc) &&
     /createQuoteHot/.test(liveSrc) &&
-    /lockNeedlesFromParlays/.test(liveSrc),
+    /lockNeedlePlan/.test(liveSrc),
   'quote-hot needles + in-flight tracker must be wired'
 );
 assert.ok(
   /shouldDeferCreated:\s*\(raw\) => quoteHot\.shouldDeferCreated\(raw\)/.test(liveSrc),
   'Kalshi WS must defer unmatched firehose frames while a quote POST is in flight'
+);
+assert.ok(
+  /shouldDropCreated:\s*\(raw\) => quoteHot\.shouldDropCreated\(raw\)/.test(liveSrc) &&
+    /createKalshiFirehose/.test(liveSrc) &&
+    /DEFAULT_LIVE_SHARD_FACTOR/.test(liveSrc),
+  'live runner must shard the communications firehose and fast-drop non-lock rfq_created'
+);
+assert.ok(
+  /ws-throughput/.test(liveSrc) && /wsBacklog/.test(liveSrc) && /wsAlerter\.poll/.test(liveSrc),
+  'throughput, backlog, and sustained-down alerts must be logged'
 );
 assert.ok(
   /function withQuoteHot\(/.test(liveSrc) &&
@@ -537,7 +547,8 @@ assert.ok(
   'quote pool warm must use QUOTE_WARM_MS (15s), not a 45s idle gap'
 );
 assert.ok(
-  /quoteHot\.setNeedles\(lockNeedlesFromParlays\(parlays\)\)/.test(liveSrc),
+  /quoteHot\.setPlan\(needlePlan\)/.test(liveSrc) &&
+    /lockNeedlePlan\(parlays\)/.test(liveSrc),
   'refresh must restage lock needles after parlays apply'
 );
 assert.ok(

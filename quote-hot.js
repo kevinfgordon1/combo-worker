@@ -60,23 +60,111 @@ function needlesFromTicker(ticker) {
   return [...out];
 }
 
-function lockNeedlesFromParlays(parlays) {
-  const out = new Set();
-  for (const p of parlays || []) {
-    const keys = (p && (p.leg_keys || p.legKeys)) || [];
-    if (Array.isArray(keys)) {
-      for (const key of keys) {
-        for (const n of needlesFromTicker(key)) out.add(n);
-      }
-    }
-    if (Array.isArray(p && p.legs)) {
-      for (const leg of p.legs) {
-        const t = (leg && (leg.market_ticker || leg.marketTicker || leg.ticker)) || '';
-        for (const n of needlesFromTicker(t)) out.add(n);
-      }
+function legKeysOfParlay(p) {
+  const out = [];
+  const keys = p && (p.leg_keys || p.legKeys);
+  if (Array.isArray(keys)) {
+    for (const key of keys) if (key) out.push(key);
+  }
+  if (Array.isArray(p && p.legs)) {
+    for (const leg of p.legs) {
+      const t = leg && (leg.market_ticker || leg.marketTicker || leg.ticker);
+      if (t) out.push(t);
     }
   }
-  return [...out];
+  return out;
+}
+
+// Legs that are not NFL/NBA-style team-pair tickers still need a substring
+// that survives a Kalshi HHMM insert. Prefer that token over the full ticker
+// (the full date-only string is absent from the timed RFQ).
+function fallbackNeedle(ticker) {
+  const core = tickerCore(ticker);
+  const parts = core.split('-');
+  let best = '';
+  for (let i = 1; i < parts.length; i++) {
+    const stripped = parts[i].replace(
+      /^\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{2}\d{0,4}/i,
+      ''
+    );
+    if (stripped.length >= 4 && /[A-Z]/i.test(stripped) && stripped.length > best.length) {
+      best = stripped.toUpperCase();
+    }
+  }
+  if (best) return best;
+  if (core.length >= 8) return core;
+  return null;
+}
+
+function needlesForLeg(ticker) {
+  const pairs = needlesFromTicker(ticker);
+  if (pairs.length) return pairs;
+  const one = fallbackNeedle(ticker);
+  return one ? [one] : [];
+}
+
+// enabled=false when any matchable lock has no needle — dropping those RFQs
+// would miss quotes. Zero locks is enabled with an empty needle list (drop
+// every rfq_created; nothing can match).
+function lockNeedlePlan(parlays) {
+  const needles = new Set();
+  let uncovered = 0;
+  for (const p of parlays || []) {
+    const keys = legKeysOfParlay(p);
+    if (!keys.length) continue;
+    const found = [];
+    for (const key of keys) {
+      for (const n of needlesForLeg(key)) found.push(n);
+    }
+    if (!found.length) {
+      uncovered += 1;
+      continue;
+    }
+    for (const n of found) needles.add(n);
+  }
+  return {
+    needles: [...needles],
+    uncovered,
+    enabled: uncovered === 0,
+  };
+}
+
+function lockNeedlesFromParlays(parlays) {
+  return lockNeedlePlan(parlays).needles;
+}
+
+function escapeRe(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function compileNeedleMatcher(needles) {
+  const list = [];
+  const bufs = [];
+  for (const n of needles || []) {
+    if (!n) continue;
+    const s = String(n);
+    list.push(s);
+    bufs.push(Buffer.from(s));
+  }
+  if (!list.length) return null;
+  const re = new RegExp(list.map(escapeRe).join('|'));
+  return function matches(raw) {
+    if (raw == null) return false;
+    if (typeof raw === 'string') return re.test(raw);
+    if (Buffer.isBuffer(raw)) {
+      for (let i = 0; i < bufs.length; i++) {
+        if (raw.indexOf(bufs[i]) !== -1) return true;
+      }
+      return false;
+    }
+    return re.test(String(raw));
+  };
+}
+
+function fastDropDisabled(env = process.env) {
+  const raw = env && env.KALSHI_WS_FAST_DROP;
+  if (raw == null || raw === '') return false;
+  return /^(0|false|off|no)$/i.test(String(raw).trim());
 }
 
 function rawLooksLikeLock(raw, needles) {
@@ -93,18 +181,48 @@ function rawLooksLikeLock(raw, needles) {
 function createQuoteHot() {
   let n = 0;
   let needles = [];
+  let dropEnabled = false;
+  let uncovered = 0;
+  let matcher = null;
+
+  function setPlan(plan) {
+    const next = plan || {};
+    needles = Array.isArray(next.needles) ? next.needles.filter(Boolean) : [];
+    uncovered = Number(next.uncovered) || 0;
+    dropEnabled = !!next.enabled && uncovered === 0;
+    matcher = compileNeedleMatcher(needles);
+  }
+
+  function matches(raw) {
+    if (!matcher) return false;
+    return matcher(raw);
+  }
+
   return {
     begin() { n += 1; },
     end() { n = n > 0 ? n - 1 : 0; },
     get inFlight() { return n; },
-    setNeedles(next) { needles = Array.isArray(next) ? next.filter(Boolean) : []; },
+    setNeedles(next) {
+      const list = Array.isArray(next) ? next.filter(Boolean) : [];
+      setPlan({ needles: list, uncovered: 0, enabled: list.length > 0 });
+    },
+    setPlan,
     getNeedles() { return needles; },
+    uncovered() { return uncovered; },
+    fastDropEnabled() { return dropEnabled; },
     // Empty needles → cannot tell a lock from the book; do not defer
     // (would hide the matching RFQ behind a setImmediate pile-up).
     shouldDeferCreated(raw) {
       if (n <= 0) return false;
       if (!needles.length) return false;
-      return !rawLooksLikeLock(raw, needles);
+      return !matches(raw);
+    },
+    // True → rfq_created is not a configured lock. Caller must not use this
+    // for quote_* or rfq close frames.
+    shouldDropCreated(raw) {
+      if (!dropEnabled) return false;
+      if (!needles.length) return true;
+      return !matches(raw);
     },
   };
 }
@@ -114,6 +232,9 @@ module.exports = {
   aliasTeamPairs,
   needlesFromTicker,
   lockNeedlesFromParlays,
+  lockNeedlePlan,
+  fallbackNeedle,
   rawLooksLikeLock,
+  fastDropDisabled,
   createQuoteHot,
 };
