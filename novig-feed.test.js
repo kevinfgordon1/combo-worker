@@ -20,7 +20,7 @@ const {
   quotesForMarket,
   pickMain,
   startNovigWs,
-} = require('./novig-feed');
+} = require('./odds-relay').novigFeed;
 const { createState, publishNovig, startOddsRelay } = require('./odds-relay');
 
 // NOVIG-V3 string-to-sign and Ed25519 signatures match Novig's vectors.
@@ -127,7 +127,7 @@ assert.deepStrictEqual(askFor(mlBook, ml, 'ari'), { odds: 0.52, size: 1 });
 
 // Limiter: weighted round robin keeps searches moving under hot load.
 (async () => {
-  const { createLimiter } = require('./novig-feed');
+  const { createLimiter } = require('./odds-relay').novigFeed;
   const lim = createLimiter({ rps: 1000, concurrency: 1 });
   const order = [];
   const jobs = [];
