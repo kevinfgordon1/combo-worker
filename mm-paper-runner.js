@@ -7,7 +7,8 @@ const { createClient } = require('@supabase/supabase-js');
 const { readConfig, flagOn } = require('./mm-paper-config');
 const { createPaperSession } = require('./mm-paper-engine');
 const { createPaperLog } = require('./mm-paper-log');
-const { groupKalshiMarkets, attachOdds } = require('./mm-paper-games');
+const { groupKalshiMarkets, attachOdds, polyKickoffMs } = require('./mm-paper-games');
+const { loadPaperHistory } = require('./mm-paper-state');
 const { sportsForLeagues } = require('./mm-paper-odds');
 const { invertBook } = require('./mm-paper-books');
 const { roundCent } = require('./mm-paper-math');
@@ -113,6 +114,8 @@ function createRunner(env = process.env, deps = {}) {
         try {
           const resolved = await resolvePolyBooks(poly, g);
           if (!resolved) continue;
+          const kick = polyKickoffMs(resolved.market);
+          if (kick != null) session.setKickoff(g.gameId, { polymarket: kick });
           const sides = polySides(g, resolved.slug, resolved.market, resolved.book);
           if (!sides) continue;
           next.set(g.gameId, { slug: resolved.slug, sides });
@@ -209,6 +212,16 @@ function createRunner(env = process.env, deps = {}) {
     return events;
   }
 
+  async function restore(now = nowFn()) {
+    const history = await loadPaperHistory({ supabase, filePath: cfg.logPath });
+    const stats = session.restoreFromEvents(history.events, now);
+    console.log(
+      `[MM-PAPER] restored open=${stats.openQty} locked=${stats.lockedPnl} `
+      + `from ${history.source} (${history.events.length} events)`
+    );
+    return { ...stats, source: history.source, events: history.events.length };
+  }
+
   async function once(now = nowFn()) {
     if (busy) return [];
     busy = true;
@@ -234,6 +247,7 @@ function createRunner(env = process.env, deps = {}) {
     session,
     log,
     refreshMarkets,
+    restore,
     once,
     startWs() { if (ws) ws.start(); },
     stop() {
@@ -273,6 +287,7 @@ async function main(env = process.env) {
     + `kalshiMaker=${cfg.kalshiMakerCoeff} polyRebate=${cfg.polyMakerRebate} `
     + `polyTaker=${cfg.polyTakerFee} adverse=${cfg.adverseCents}c `
     + `cap=${cfg.positionCap} size=${cfg.orderSize} `
+    + `kickoffBuffer=${cfg.kickoffBufferSec}s `
     + `oddsMaxAgeMs=${cfg.oddsMaxAgeMs} log=${cfg.logPath} `
     + `supabase=${cfg.supabase ? 'on' : 'off'}`
   );
@@ -286,6 +301,11 @@ async function main(env = process.env) {
   };
   process.on('SIGINT', () => { stop(); process.exit(0); });
   process.on('SIGTERM', () => { stop(); process.exit(0); });
+  try {
+    await runner.restore();
+  } catch (err) {
+    console.warn(`[MM-PAPER] restore failed: ${err && err.message ? err.message : err}`);
+  }
   try {
     const n = await runner.refreshMarkets();
     console.log(`[MM-PAPER] watching ${n} games`);

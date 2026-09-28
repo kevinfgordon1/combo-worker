@@ -63,6 +63,9 @@ function readConfig(env = process.env) {
     oddsPollMs: num(env && env.MM_ODDS_POLL_MS, 30000, { min: 1000, max: 30 * 60 * 1000 }),
     marketRefreshMs: num(env && env.MM_MARKET_REFRESH_MS, 60000, { min: 5000, max: 30 * 60 * 1000 }),
     maxGames: num(env && env.MM_MAX_GAMES, 40, { min: 1, max: 200 }),
+    // Stop quoting this many seconds before scheduled kickoff. 0 quotes until
+    // the kickoff instant, then stops. Unknown kickoff never quotes.
+    kickoffBufferSec: num(env && env.MM_PAPER_KICKOFF_BUFFER_SEC, 60, { min: 0, max: 24 * 3600 }),
     // Supabase tape is optional. Default on only when the project URL + service
     // key are already set. MM_SUPABASE=0 disables even then. A missing table
     // must not stop the JSONL log (see mm-paper-log.js).

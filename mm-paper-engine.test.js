@@ -29,6 +29,7 @@ function sessionWithGame(overrides = {}) {
     kc: { prob: impliedProb(-150), american: -150, book: 'pinnacle' },
     phi: { prob: impliedProb(130), american: 130, book: 'pinnacle' },
   });
+  session.setKickoff(gameId, { polymarket: Date.parse('2026-09-14T00:00:00Z') });
   for (const venue of ['kalshi', 'polymarket']) {
     session.setBook(gameId, venue, 'kc', book(0.54, 0.56, 100));
     session.setBook(gameId, venue, 'phi', book(0.38, 0.42, 20));
@@ -98,6 +99,7 @@ const held = createPaperSession(readConfig({ MM_PAPER: '1', MM_ORDER_SIZE: '10' 
 held.upsertGame({
   gameId, league: 'nfl', date: '2026-09-13', teams: ['kc', 'phi'], labels: {},
 });
+held.setKickoff(gameId, { polymarket: Date.parse('2026-09-14T00:00:00Z') });
 held.setOdds(gameId, {
   kc: { prob: 0.35, american: -186, book: 'pinnacle' },
   phi: { prob: 0.35, american: -186, book: 'pinnacle' },
