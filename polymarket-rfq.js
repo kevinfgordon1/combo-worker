@@ -35,6 +35,12 @@
 // Kalshi cancelStartedQuotes works. Date-only Polymarket slugs are not starts —
 // findStartedEvent still uses combo_parlays.starts_at, per-leg start fields,
 // and Kalshi ticker HHMM in leg_keys.
+// CONFIRM: rfqClosed often beats quoteAccepted by ~10ms. The quote's lock,
+// cap, and kickoff stay in a 60s context map so the late accept still checks
+// both. No context → do not confirm. Cap uses the largest size the accept
+// could fill (RFQ qty / cash / accept qty), not only the posted qty. A fill
+// bigger than the quote is a warning plus Telegram. COMBO_CAP_AT_CONFIRM
+// (default off) is what stops open quotes from reserving; these checks stay on.
 'use strict';
 const { matchParlay } = require('./rfq');
 const { decideAtFill, quoteFailureSkipReason } = require('./engine');
@@ -42,12 +48,25 @@ const { findStartedEvent } = require('./started');
 const {
   RESERVE_TTL_MS,
   sumOutstanding,
-  wouldExceedCap,
   dropPendingForRfq,
   listStaleUnaccepted,
   isReserveKey,
   isExecutedPending,
 } = require('./reserve');
+const {
+  CLOSED_CONTEXT_TTL_MS,
+  capAtConfirmEnabled,
+  createCapBook,
+  createClosedContext,
+  confirmAgainstCap,
+  releaseConfirmedFill,
+  maxPolymarketFillSize,
+  overfillOf,
+  formatOverfillLog,
+  formatOverfillAlert,
+  formatCapSkip,
+  formatMissingContext,
+} = require('./cap-confirm');
 const {
   buildPolymarketQuote,
   shouldPostPolymarketQuote,
@@ -1261,6 +1280,15 @@ function startPolymarketRfqLoop(ctx = {}) {
   const creds = inspectPolymarketCreds({ keyId, secretKey }, env);
   const pendingQuotes = ctx.pendingQuotes || new Map();
   const confirmingQuotes = ctx.confirmingQuotes || new Set();
+  const clock = typeof ctx.now === 'function' ? ctx.now : () => Date.now();
+  const capBook = ctx.capBook || createCapBook({
+    enabled: capAtConfirmEnabled(env),
+    now: clock,
+  });
+  const closedContext = createClosedContext({
+    ttlMs: ctx.quoteContextTtlMs > 0 ? ctx.quoteContextTtlMs : CLOSED_CONTEXT_TTL_MS,
+    now: clock,
+  });
   const seenRfqs = new Map();
   let reserveSeq = 0;
   let stopped = false;
@@ -1276,7 +1304,8 @@ function startPolymarketRfqLoop(ctx = {}) {
     `unhedged=${enableUnhedged ? 'on' : 'off'}. ` +
     (enableLocks
       ? 'POST create-quote / confirm only when POLYMARKET_RFQ_LIVE is truthy. ' +
-        'Kalshi quoting keeps running. Remaining is shared via reserve.js. '
+        'Kalshi quoting keeps running. Remaining is shared via reserve.js. ' +
+        `COMBO_CAP_AT_CONFIRM=${capBook.enabled ? 'on' : 'off'}. `
       : 'Combo Lock quote POST/confirm disabled (Unhedged job). ') +
     (enableUnhedged
       ? `Unhedged RFQ shadow (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(env) ? 'on' : 'off'}, ` +
@@ -1355,7 +1384,45 @@ function startPolymarketRfqLoop(ctx = {}) {
     const other = ctx.kalshiPendingQuotes
       ? sumOutstanding(ctx.kalshiPendingQuotes, parlayId, excludeQuoteId)
       : 0;
-    return self + other;
+    return capBook.exposure(self + other, parlayId, excludeQuoteId);
+  }
+
+  function exposureBit(n) {
+    return capBook.enabled ? `inFlight=${n}` : `reserved=${n}`;
+  }
+
+  function quoteSizeMeta(rfq, evaluation) {
+    const q = evaluation && evaluation.quote;
+    return {
+      rfqQty: parsePositiveShares(rfq && rfq.qtyDecimal) || null,
+      cashOrderQty: parsePositiveShares(rfq && rfq.cashOrderQty) || null,
+      buyPrice: q && q.buyPrice,
+      estimatedContracts: q && q.estimatedContracts,
+    };
+  }
+
+  function flagOverfill(evt, pending, contracts, quoteId) {
+    const over = overfillOf(pending && pending.contracts, contracts);
+    if (!over) return null;
+    if (evt) evt.overfillFlagged = true;
+    const info = {
+      ...over,
+      label: (pending && pending.label) || (evt && evt.label) || '(unknown)',
+      quoteId: quoteId || (evt && evt.quoteId) || '?',
+      venue: 'polymarket',
+      quoteShort: shortId(quoteId || (evt && evt.quoteId)),
+    };
+    console.warn(formatOverfillLog(MODE, info));
+    if (typeof ctx.sendAlert === 'function') {
+      Promise.resolve(ctx.sendAlert(formatOverfillAlert(info))).catch(() => {});
+    }
+    return info;
+  }
+
+  function forgetQuote(quoteId, pending) {
+    const row = pending || (quoteId && pendingQuotes.get(quoteId));
+    if (row) capBook.release(row.parlayId, quoteId);
+    closedContext.drop(quoteId);
   }
 
   function filledSoFarFor(id) {
@@ -1471,26 +1538,27 @@ function startPolymarketRfqLoop(ctx = {}) {
       console.log(
         `[${MODE}] WOULD-QUOTE ${p.label} rfq=${rfq.rfqId} ` +
         `buy=${q.buyPrice} sell=${q.sellPrice} contracts=${q.estimatedContracts} ` +
-        `reserved=${outstandingFor(p.id)}/${d.totalLimit} reason=${gate.reason}`
+        `${exposureBit(outstandingFor(p.id))}/${d.totalLimit} reason=${gate.reason}`
       );
       persistLockTape(evaluation, 'shadow');
       return { ...evaluation, post: false, reason: gate.reason };
     }
 
     const reserveKey = `reserve:pm:${++reserveSeq}`;
-    pendingQuotes.set(reserveKey, pendingEntry(p, rfq, d.contracts));
+    const sizeMeta = quoteSizeMeta(rfq, evaluation);
+    pendingQuotes.set(reserveKey, pendingEntry(p, rfq, d.contracts, sizeMeta));
     try {
       const posted = await http.createQuote(quoteBodyFromEval(evaluation));
       const quoteId = posted && (posted.quoteId || posted.id);
       pendingQuotes.delete(reserveKey);
       if (quoteId) {
-        pendingQuotes.set(quoteId, pendingEntry(p, rfq, d.contracts));
+        pendingQuotes.set(quoteId, pendingEntry(p, rfq, d.contracts, sizeMeta));
       }
       bump('polyPosted');
       console.log(
         `[${MODE}] QUOTED ${p.label} rfq=${rfq.rfqId} quote_id=${quoteId || '?'} ` +
         `buy=${q.buyPrice} sell=${q.sellPrice} contracts=${d.contracts} ` +
-        `reserved=${outstandingFor(p.id)}/${d.totalLimit}`
+        `${exposureBit(outstandingFor(p.id))}/${d.totalLimit}`
       );
       persistLockTape(evaluation, 'quoted', {
         quote_id: quoteId, is_live: true, contracts: d.contracts,
@@ -1541,6 +1609,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         e.message
       );
     }
+    forgetQuote(quoteId, pending);
     pendingQuotes.delete(quoteId);
     if (reason && reason.started) {
       console.log(
@@ -1573,7 +1642,18 @@ function startPolymarketRfqLoop(ctx = {}) {
   async function handleQuoteAccepted(evt) {
     const acc = acceptedFromEvent(evt);
     const { quoteId, rfqId, acceptedSide } = acc;
-    const pending = quoteId ? pendingQuotes.get(quoteId) : null;
+    let pending = quoteId ? pendingQuotes.get(quoteId) : null;
+    if (!pending && quoteId) {
+      const kept = closedContext.take(quoteId);
+      if (kept) {
+        pending = kept;
+        pendingQuotes.set(quoteId, pending);
+        console.log(
+          `[${MODE}] quote context restored after close quote_id=${quoteId} ` +
+          `rfq_id=${rfqId || pending.rfqId || '?'} label=${pending.label || '(unknown)'}`
+        );
+      }
+    }
     if (pending) {
       pending.accepted = true;
       if (acc.creatorOrderId) pending.creatorOrderId = acc.creatorOrderId;
@@ -1601,6 +1681,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         try { await http.deleteQuote(rfqId, quoteId); } catch (e) {
           console.error(`[${MODE}] decline delete failed`, e.message);
         }
+        forgetQuote(quoteId, pending);
         pendingQuotes.delete(quoteId);
       }
       return { confirmed: false, reason: gate.reason, started: gate.reason === 'game_started' ? started : undefined };
@@ -1609,30 +1690,49 @@ function startPolymarketRfqLoop(ctx = {}) {
       console.error(`[${MODE}] quoteAccepted missing ids`);
       return { confirmed: false, reason: 'missing_ids' };
     }
+    if (!pending) {
+      console.warn(formatMissingContext(MODE, quoteId, rfqId));
+      return { confirmed: false, reason: 'missing_context' };
+    }
     if (confirmingQuotes.has(quoteId)) return { confirmed: false, reason: 'in_flight' };
     confirmingQuotes.add(quoteId);
     try {
-      if (pending) {
-        const maxContracts = pending.maxContracts;
-        const filledSoFar = filledSoFarFor(pending.parlayId);
-        const outstandingOthers = outstandingFor(pending.parlayId, quoteId);
-        if (wouldExceedCap(maxContracts, filledSoFar, outstandingOthers, pending.contracts)) {
-          console.log(
-            `[${MODE}] CONFIRM SKIPPED cap exceeded quote_id=${quoteId} ` +
-            `filled=${filledSoFar} reserved=${outstandingOthers} want=${pending.contracts} max=${maxContracts}`
-          );
+      const want = maxPolymarketFillSize(pending, evt);
+      const decision = await confirmAgainstCap(capBook, {
+        parlayId: pending.parlayId,
+        quoteId,
+        maxContracts: pending.maxContracts,
+        size: want,
+        getFilled: () => filledSoFarFor(pending.parlayId),
+        getOpenHeld: () => outstandingFor(pending.parlayId, quoteId),
+        confirm: () => http.confirmQuote(rfqId, quoteId),
+        onExceed: async (info) => {
+          console.log(formatCapSkip({
+            mode: MODE,
+            quoteId,
+            rfqId,
+            label: pending.label,
+            quoted: pending.contracts,
+            enabled: capBook.enabled,
+            filled: info.filled,
+            held: info.held,
+            size: info.size,
+            maxContracts: info.maxContracts,
+          }));
           try { await http.deleteQuote(rfqId, quoteId); } catch (_) {}
+          forgetQuote(quoteId, pending);
           pendingQuotes.delete(quoteId);
-          return { confirmed: false, reason: 'cap_exceeded' };
-        }
+        },
+      });
+      if (!decision.ok) {
+        return { confirmed: false, reason: 'cap_exceeded', want: decision.size };
       }
-      await http.confirmQuote(rfqId, quoteId);
-      if (pending) pending.confirmed = true;
+      pending.confirmed = true;
       console.log(
         `[${MODE}] CONFIRMED quote_id=${quoteId} rfq_id=${rfqId} side=${acceptedSide} ` +
-        `label=${pending ? pending.label : '(unknown)'}`
+        `label=${pending.label || '(unknown)'} want=${want}`
       );
-      return { confirmed: true };
+      return { confirmed: true, want };
     } catch (e) {
       console.error(`[${MODE}] CONFIRM FAILED quote_id=${quoteId} rfq_id=${rfqId}`, e.message);
       const skipReason = quoteFailureSkipReason(e.message);
@@ -1655,6 +1755,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         }
       }
       try { if (live) await http.deleteQuote(rfqId, quoteId); } catch (_) {}
+      forgetQuote(quoteId, pending);
       pendingQuotes.delete(quoteId);
       return { confirmed: false, reason: skipReason || 'confirm_failed', error: e.message };
     } finally {
@@ -1672,6 +1773,9 @@ function startPolymarketRfqLoop(ctx = {}) {
       console.log(
         `[${MODE}] RESERVE RELEASED closed ${quote.label || ''} quote_id=${id} rfq=${rfqId}`
       );
+      // Accept often lands a few milliseconds after close. Keep lock/cap/kickoff
+      // long enough for that confirm; do not keep pre-POST reserve keys.
+      if (!isReserveKey(id) && quote) closedContext.put(id, quote);
     }
     if (enableUnhedged && unhedgedFills) {
       unhedgedFills.onClosed({
@@ -1837,22 +1941,36 @@ function startPolymarketRfqLoop(ctx = {}) {
   }
 
   function emitOrderFill(evt) {
+    const remembered = (evt && evt.pending)
+      || (evt && evt.quoteId && pendingQuotes.get(evt.quoteId))
+      || null;
+    if (evt && !evt.overfillFlagged) {
+      flagOverfill(evt, remembered, evt.contracts, evt.quoteId);
+    }
     if (typeof ctx.onQuoteExecuted === 'function') {
       Promise.resolve()
         .then(() => ctx.onQuoteExecuted(evt))
         .catch((e) => console.error(`[${MODE}] onQuoteExecuted`, e && e.message));
       return 'persist';
     }
+    let booked = null;
     if (typeof ctx.onFill === 'function') {
       ctx.onFill(evt.parlayId, evt.contracts);
-      return 'onFill';
-    }
-    if (ctx.sessionFilledByParlay && evt.parlayId) {
+      booked = 'onFill';
+    } else if (ctx.sessionFilledByParlay && evt.parlayId) {
       ctx.sessionFilledByParlay[evt.parlayId] =
         (ctx.sessionFilledByParlay[evt.parlayId] || 0) + evt.contracts;
-      return 'session';
+      booked = 'session';
     }
-    return null;
+    if (booked) {
+      releaseConfirmedFill(capBook, {
+        parlayId: evt.parlayId,
+        quoteId: evt.quoteId,
+        partial: !!(evt && evt.isPartial),
+        contracts: evt.contracts,
+      });
+    }
+    return booked;
   }
 
   function handleOrderExecution(ex) {
@@ -1886,6 +2004,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
     if (!matched) return null;
     if (isOrderCancelExecution(typ)) {
+      forgetQuote(pendingId, pending);
       pendingQuotes.delete(pendingId);
       console.log(`[${MODE}] RESERVE RELEASED order ${typ} quote_id=${pendingId}`);
       return { canceled: true, pendingId, type: typ };
@@ -1989,9 +2108,13 @@ function startPolymarketRfqLoop(ctx = {}) {
     } else if (evt.type === 'quoteDeleted') {
       const q = evt.quote || {};
       const id = q.id || q.quoteId;
-      if (id && pendingQuotes.has(id)) {
+      const pending = id && pendingQuotes.get(id);
+      if (id && pending) {
+        forgetQuote(id, pending);
         pendingQuotes.delete(id);
         console.log(`[${MODE}] RESERVE RELEASED deleted quote_id=${id}`);
+      } else if (id) {
+        closedContext.drop(id);
       }
     } else if (evt.type === 'orderExecution') {
       const list = Array.isArray(evt.executions) && evt.executions.length
@@ -2046,6 +2169,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     reconcileLockFills().catch((e) => console.error(`[${MODE}] fill reconcile`, e.message));
   }, fillReconcileMs);
   const ttlTimer = setInterval(() => {
+    closedContext.sweep();
     cancelUnaccepted().catch((e) => console.error(`[${MODE}] ttl`, e.message));
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start`, e.message));
   }, 2000);
