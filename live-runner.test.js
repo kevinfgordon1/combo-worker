@@ -568,5 +568,18 @@ assert.ok(
     !/enableUnhedged:\s*true/.test(liveSrc),
   'Combo Locks Poly path keeps lock quoting; unhedged is env-gated not hard-on'
 );
+assert.ok(
+  /COMBO_CAP_AT_CONFIRM/.test(liveSrc) &&
+    /confirmAgainstCap\(capBook/.test(liveSrc) &&
+    /capBook,/.test(liveSrc) &&
+    /formatMissingContext\(MODE, quoteId, rfqId\)/.test(liveSrc) &&
+    /releaseConfirmedFill\(capBook/.test(liveSrc),
+  'Kalshi confirm must share the cap book, fail closed without context when the flag is on, and release the hold on fill'
+);
+assert.ok(
+  /CONFIRM SKIPPED game started/.test(liveSrc) &&
+    liveSrc.indexOf('CONFIRM SKIPPED game started') < liveSrc.indexOf('confirmAgainstCap(capBook'),
+  'kickoff check stays before the Kalshi confirm'
+);
 
 console.log('live-runner.test.js ok');

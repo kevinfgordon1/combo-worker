@@ -1,5 +1,8 @@
 // Outstanding-quote reservation against a parlay's max_contracts ceiling.
 //
+// COMBO_CAP_AT_CONFIRM=1 (see cap-confirm.js) does not pass this sum into
+// quote or confirm. Default off: callers still reserve open quotes here.
+//
 // remaining = max - filled - outstanding.
 // A new quote (or a confirm) must fit in remaining. "Outstanding" is live
 // unfilled quoted size we already posted — pendingQuotes (plus a brief

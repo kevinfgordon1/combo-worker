@@ -2986,6 +2986,321 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   assert.strictEqual(parsed.type, 'rfqCreated');
   assert.strictEqual(parsed.rfq.id, 'rfq_ws');
 
+  // Cap-at-confirm + Polymarket close/accept safety.
+  function polyHttp(extra = {}) {
+    const confirms = [];
+    const deletes = [];
+    return {
+      confirms,
+      deletes,
+      http: {
+        async getUserId() { return { rfqUserId: 'rfquser_cap' }; },
+        async listRfqs() { return { rfqs: [] }; },
+        async listQuotes() { return { quotes: [] }; },
+        async getCombo() { return { combos: [] }; },
+        async createQuote(body) {
+          return { quoteId: 'quote-' + (body && body.rfqId) };
+        },
+        async confirmQuote(rfqId, quoteId) {
+          if (extra.confirmQuote) return extra.confirmQuote(rfqId, quoteId);
+          confirms.push({ rfqId, quoteId });
+          return {};
+        },
+        async deleteQuote(rfqId, quoteId) {
+          deletes.push({ rfqId, quoteId });
+          return { statusCode: 200 };
+        },
+        close() {},
+      },
+    };
+  }
+
+  const capParlay = { ...pmParlay, id: 'cap-lock', label: 'MIA+IND+TEN', max_contracts: 100 };
+
+  // Flag off: the open quote still reserves, so a second 60 is clipped to the leftover.
+  {
+    const off = polyHttp();
+    const offPending = new Map();
+    const offLoop = startPolymarketRfqLoop({
+      env: {
+        POLYMARKET_KEY_ID: 'key-id-fixture',
+        POLYMARKET_SECRET_KEY: SEED_B64,
+        POLYMARKET_RFQ_LIVE: 'true',
+      },
+      http: off.http,
+      startWs: false,
+      getParlays: () => [capParlay],
+      startedFor: () => ({ started: false }),
+      filledSoFarFor: () => 0,
+      pendingQuotes: offPending,
+      reconcileMs: 60 * 60 * 1000,
+    });
+    try {
+      const first = await offLoop.handleRfq({ ...pmRfq, id: 'rfq_off_1', qtyDecimal: '60' });
+      assert.strictEqual(first.post, true);
+      assert.strictEqual(first.decision.contracts, 60);
+      const second = await offLoop.handleRfq({ ...pmRfq, id: 'rfq_off_2', qtyDecimal: '60' });
+      assert.strictEqual(second.post, true);
+      assert.strictEqual(second.decision.partial, true);
+      assert.strictEqual(second.decision.contracts, 40, 'flag off: open quote still reserves');
+      assert.strictEqual(sumOutstanding(offPending, 'cap-lock'), 100);
+    } finally {
+      offLoop.stop();
+    }
+  }
+
+  // Flag on: open quotes do not reserve. Two 60s both post. Concurrent accepts
+  // on that lock cannot both confirm against a 100 cap.
+  {
+    const on = polyHttp({
+      confirmQuote: async (rfqId, quoteId) => {
+        on.confirms.push({ rfqId, quoteId });
+        await new Promise((r) => setTimeout(r, 30));
+        return {};
+      },
+    });
+    const onPending = new Map();
+    const onLoop = startPolymarketRfqLoop({
+      env: {
+        POLYMARKET_KEY_ID: 'key-id-fixture',
+        POLYMARKET_SECRET_KEY: SEED_B64,
+        POLYMARKET_RFQ_LIVE: 'true',
+        COMBO_CAP_AT_CONFIRM: '1',
+      },
+      http: on.http,
+      startWs: false,
+      getParlays: () => [capParlay],
+      startedFor: () => ({ started: false }),
+      filledSoFarFor: () => 0,
+      pendingQuotes: onPending,
+      reconcileMs: 60 * 60 * 1000,
+    });
+    try {
+      const a = await onLoop.handleRfq({ ...pmRfq, id: 'rfq_on_a', qtyDecimal: '60' });
+      const b = await onLoop.handleRfq({ ...pmRfq, id: 'rfq_on_b', qtyDecimal: '60' });
+      assert.strictEqual(a.post, true);
+      assert.strictEqual(b.post, true);
+      assert.strictEqual(a.decision.contracts, 60);
+      assert.strictEqual(b.decision.contracts, 60, 'flag on: open quote does not shrink the next quote');
+      const [accA, accB] = await Promise.all([
+        onLoop.handleQuoteAccepted({
+          quote: { id: a.quoteId, rfqId: 'rfq_on_a', acceptedSide: 'SIDE_BUY' },
+        }),
+        onLoop.handleQuoteAccepted({
+          quote: { id: b.quoteId, rfqId: 'rfq_on_b', acceptedSide: 'SIDE_BUY' },
+        }),
+      ]);
+      const oks = [accA, accB].filter((row) => row.confirmed);
+      const nos = [accA, accB].filter((row) => !row.confirmed);
+      assert.strictEqual(oks.length, 1);
+      assert.strictEqual(nos.length, 1);
+      assert.strictEqual(nos[0].reason, 'cap_exceeded');
+      assert.strictEqual(on.confirms.length, 1);
+    } finally {
+      onLoop.stop();
+    }
+  }
+
+  // Close-before-accept still checks kickoff and cap. Missing or expired
+  // context does not confirm. A fill above the quote is flagged and counted.
+  {
+    const race = polyHttp();
+    const racePending = new Map();
+    let filled = 0;
+    const started = { on: false };
+    const alerts = [];
+    const session = {};
+    const warns = [];
+    const origWarn = console.warn;
+    console.warn = (...args) => {
+      warns.push(args.join(' '));
+      origWarn(...args);
+    };
+    const raceLoop = startPolymarketRfqLoop({
+      env: {
+        POLYMARKET_KEY_ID: 'key-id-fixture',
+        POLYMARKET_SECRET_KEY: SEED_B64,
+        POLYMARKET_RFQ_LIVE: 'true',
+      },
+      http: race.http,
+      startWs: false,
+      getParlays: () => [capParlay],
+      startedFor: () => (started.on
+        ? { started: true, source: 'kickoff', at: '2026-09-01T00:00:00Z' }
+        : { started: false }),
+      filledSoFarFor: () => filled,
+      pendingQuotes: racePending,
+      reconcileMs: 60 * 60 * 1000,
+      sendAlert: async (text) => { alerts.push(text); },
+      sessionFilledByParlay: session,
+    });
+    try {
+      racePending.set('q-kick', {
+        parlayId: 'cap-lock',
+        contracts: 40,
+        maxContracts: 100,
+        rfqId: 'rfq-kick',
+        label: 'MIA+IND+TEN',
+        starts_at: capParlay.starts_at,
+        legs: capParlay.legs,
+        leg_keys: capParlay.leg_keys,
+      });
+      raceLoop.handleRfqClosed({ rfq: { id: 'rfq-kick' } });
+      assert.ok(!racePending.has('q-kick'), 'close drops the live reserve');
+      started.on = true;
+      const kicked = await raceLoop.handleQuoteAccepted({
+        quote: { id: 'q-kick', rfqId: 'rfq-kick', acceptedSide: 'SIDE_BUY' },
+      });
+      assert.strictEqual(kicked.confirmed, false);
+      assert.strictEqual(kicked.reason, 'game_started');
+      assert.strictEqual(race.confirms.length, 0);
+      assert.ok(race.deletes.some((d) => d.quoteId === 'q-kick'));
+
+      started.on = false;
+      racePending.set('q-cap', {
+        parlayId: 'cap-lock',
+        contracts: 80,
+        maxContracts: 100,
+        rfqId: 'rfq-cap',
+        label: 'MIA+IND+TEN',
+      });
+      raceLoop.handleRfqClosed({ rfq: { id: 'rfq-cap' } });
+      filled = 50;
+      const capped = await raceLoop.handleQuoteAccepted({
+        quote: { id: 'q-cap', rfqId: 'rfq-cap', acceptedSide: 'SIDE_BUY' },
+      });
+      assert.strictEqual(capped.confirmed, false);
+      assert.strictEqual(capped.reason, 'cap_exceeded');
+      assert.strictEqual(race.confirms.length, 0);
+
+      filled = 0;
+      racePending.set('q-ok', {
+        parlayId: 'cap-lock',
+        contracts: 10,
+        maxContracts: 100,
+        rfqId: 'rfq-ok',
+        label: 'MIA+IND+TEN',
+      });
+      raceLoop.handleRfqClosed({ rfq: { id: 'rfq-ok' } });
+      const logs = [];
+      const origLog = console.log;
+      console.log = (...args) => {
+        logs.push(args.join(' '));
+        origLog(...args);
+      };
+      let okAccept;
+      try {
+        okAccept = await raceLoop.handleQuoteAccepted({
+          quote: { id: 'q-ok', rfqId: 'rfq-ok', acceptedSide: 'SIDE_BUY' },
+        });
+      } finally {
+        console.log = origLog;
+      }
+      assert.strictEqual(okAccept.confirmed, true);
+      assert.ok(logs.some((line) => line.includes('label=MIA+IND+TEN') && line.includes('CONFIRMED')));
+      assert.ok(!logs.some((line) => line.includes('label=(unknown)') && line.includes('q-ok')));
+      assert.strictEqual(race.confirms.length, 1);
+
+      const missing = await raceLoop.handleQuoteAccepted({
+        quote: { id: 'q-missing', rfqId: 'rfq-missing', acceptedSide: 'SIDE_BUY' },
+      });
+      assert.strictEqual(missing.confirmed, false);
+      assert.strictEqual(missing.reason, 'missing_context');
+      assert.strictEqual(race.confirms.length, 1);
+
+      racePending.set('q-big', {
+        parlayId: 'cap-lock',
+        contracts: 209,
+        estimatedContracts: 377.5,
+        maxContracts: 300,
+        rfqId: 'rfq-big',
+        label: 'MIA+IND+TEN',
+      });
+      const big = await raceLoop.handleQuoteAccepted({
+        quote: { id: 'q-big', rfqId: 'rfq-big', acceptedSide: 'SIDE_BUY' },
+      });
+      assert.strictEqual(big.confirmed, false);
+      assert.strictEqual(big.reason, 'cap_exceeded');
+      assert.strictEqual(big.want, 377.5);
+      assert.strictEqual(race.confirms.length, 1, 'oversized Polymarket accept is not confirmed');
+
+      racePending.set('q-over', {
+        parlayId: 'cap-lock',
+        contracts: 209,
+        label: 'MIA+IND+TEN',
+        rfqId: 'rfq-over',
+      });
+      const overEvt = raceLoop.handleOrderExecution({
+        type: 'EXECUTION_TYPE_FILL',
+        lastShares: '377.5',
+        order: { id: 'ord-over', quoteId: 'q-over' },
+      });
+      assert.strictEqual(overEvt.contracts, 377.5);
+      assert.strictEqual(session['cap-lock'], 377.5, 'cap counts the actual fill, not the quote');
+      assert.ok(warns.some((line) => line.includes('OVERFILL') && line.includes('quoted=209') && line.includes('filled=377.5')));
+      assert.ok(alerts.some((text) => text.includes('OVERFILL') && text.includes('Polymarket') && text.includes('377.5')));
+
+      const underWarns = warns.length;
+      racePending.set('q-under', {
+        parlayId: 'cap-lock',
+        contracts: 209,
+        label: 'MIA+IND+TEN',
+        rfqId: 'rfq-under',
+      });
+      const underEvt = raceLoop.handleOrderExecution({
+        type: 'EXECUTION_TYPE_FILL',
+        lastShares: '192',
+        order: { id: 'ord-under', quoteId: 'q-under' },
+      });
+      assert.strictEqual(underEvt.contracts, 192);
+      assert.strictEqual(warns.length, underWarns, 'a smaller fill is not an overfill');
+    } finally {
+      console.warn = origWarn;
+      raceLoop.stop();
+    }
+  }
+
+  {
+    let now = 8_000_000;
+    const ttlPending = new Map();
+    const ttl = polyHttp();
+    const ttlLoop = startPolymarketRfqLoop({
+      env: {
+        POLYMARKET_KEY_ID: 'key-id-fixture',
+        POLYMARKET_SECRET_KEY: SEED_B64,
+        POLYMARKET_RFQ_LIVE: 'true',
+      },
+      http: ttl.http,
+      startWs: false,
+      getParlays: () => [capParlay],
+      startedFor: () => ({ started: false }),
+      filledSoFarFor: () => 0,
+      pendingQuotes: ttlPending,
+      now: () => now,
+      quoteContextTtlMs: 60_000,
+      reconcileMs: 60 * 60 * 1000,
+    });
+    try {
+      ttlPending.set('q-ttl', {
+        parlayId: 'cap-lock',
+        contracts: 10,
+        maxContracts: 100,
+        rfqId: 'rfq-ttl',
+        label: 'MIA+IND+TEN',
+      });
+      ttlLoop.handleRfqClosed({ rfq: { id: 'rfq-ttl' } });
+      now += 60_000;
+      const late = await ttlLoop.handleQuoteAccepted({
+        quote: { id: 'q-ttl', rfqId: 'rfq-ttl', acceptedSide: 'SIDE_BUY' },
+      });
+      assert.strictEqual(late.confirmed, false);
+      assert.strictEqual(late.reason, 'missing_context');
+      assert.strictEqual(ttl.confirms.length, 0);
+    } finally {
+      ttlLoop.stop();
+    }
+  }
+
   console.log('polymarket-rfq.test.js ok');
 }).catch((e) => {
   console.error(e);

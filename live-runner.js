@@ -17,9 +17,13 @@
 //   still dark, portfolio activities/positions matched to a unique lock).
 //   Poly activity / reconcile / position share one economic size per
 //   lock+caoc — distinct fill_ids must not stack on the Combo Lock card.
-// RESERVE: outstanding live quotes (pendingQuotes + in-flight POST) count against
-//   remaining so parallel RFQs cannot all clear the same ceiling.
+// RESERVE: default outstanding live quotes (pendingQuotes + in-flight POST)
+//   count against remaining so parallel RFQs cannot all clear the same ceiling.
 //   remaining = max - filled - outstanding.
+//   COMBO_CAP_AT_CONFIRM=1 stops open quotes from reserving. Quote time still
+//   skips an RFQ bigger than max - confirmed fills - confirms in flight.
+//   Confirm (Kalshi and Polymarket) then checks that sum plus this accept,
+//   one lock at a time. Default off keeps the outstanding-quote reserve.
 //   Polymarket Retail RFQ (polymarket-rfq.js) shares this ceiling via
 //   polyPendingQuotes + outstandingFor — Kalshi yes_bid / dollar RFQ math is unchanged.
 //   Kalshi still declines the full RFQ when rfqContracts > remaining (no allowPartial).
@@ -103,6 +107,9 @@
 //      RFQ_REPEAT_MAX_QUOTES (optional; default 8)
 //      RFQ_REPEAT_COOLDOWN_MS (optional; default 300000; 0 disables)
 //      WORKER_MODE=combo|unhedged|all (default combo)
+//      COMBO_CAP_AT_CONFIRM=1 (optional; default off) — enforce cap at confirm,
+//        not by reserving every open quote. Polymarket close/overfill guards
+//        stay on either way.
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
@@ -114,12 +121,22 @@ const { findStartedEvent } = require('./started');
 const {
   RESERVE_TTL_MS,
   sumOutstanding,
-  wouldExceedCap,
   isCapExhausted,
   isReserveKey,
   dropPendingForRfq,
   listStaleUnaccepted,
 } = require('./reserve');
+const {
+  capAtConfirmEnabled,
+  createCapBook,
+  confirmAgainstCap,
+  releaseConfirmedFill,
+  overfillOf,
+  formatOverfillLog,
+  formatOverfillAlert,
+  formatCapSkip,
+  formatMissingContext,
+} = require('./cap-confirm');
 const { startHeartbeat } = require('./heartbeat');
 const { startPolymarketRfqLoop } = require('./polymarket-rfq');
 const { shortId } = require('./short-id');
@@ -200,6 +217,7 @@ async function kalshiSigned(method, signPath, opts = {}) {
 const cancelingQuotes = new Set();
 const cancelledQuotes = new Set();
 const confirmingQuotes = new Set(); // de-dupe accept + skip 20s TTL during confirm
+const capBook = createCapBook({ enabled: capAtConfirmEnabled(process.env) });
 let reserveSeq = 0;
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -236,9 +254,17 @@ let polyLoop = null;
 let polyUnhedgedHttp = null;
 let unhedgedPrices = null;
 
-function outstandingFor(parlayId, excludeQuoteId) {
+function openOutstanding(parlayId, excludeQuoteId) {
   return sumOutstanding(pendingQuotes, parlayId, excludeQuoteId)
     + sumOutstanding(polyPendingQuotes, parlayId, excludeQuoteId);
+}
+
+function outstandingFor(parlayId, excludeQuoteId) {
+  return capBook.exposure(openOutstanding(parlayId, excludeQuoteId), parlayId, excludeQuoteId);
+}
+
+function exposureBit(n) {
+  return capBook.enabled ? `inFlight=${n}` : `reserved=${n}`;
 }
 
 // Step 3 — pre-staged quote pieces per parlay (rebuilt on successful parlays refresh)
@@ -658,10 +684,11 @@ function cancelLogLine(quoteId, pending, reason) {
     );
   }
   if (reason && reason.kind === 'cap_exceeded') {
+    const heldWord = reason.inFlight ? 'inFlight' : 'reserved';
     return (
       `[${MODE}] CANCEL cap exceeded ${label} quote_id=${quoteId}` +
       rfqBit +
-      ` filled=${reason.filled} reserved=${reason.reserved} want=${reason.want} max=${reason.max}`
+      ` filled=${reason.filled} ${heldWord}=${reason.reserved} want=${reason.want} max=${reason.max}`
     );
   }
   if (reason && reason.kind === 'yes_accept') {
@@ -1054,33 +1081,59 @@ async function onQuoteAccepted(evt) {
       cancelQuoteAndDrop(quoteId, pending, started).catch(() => {});
       return;
     }
-    const maxContracts = (parlay && parlay.max_contracts) || (pending && pending.maxContracts);
-    const filledSoFar = pending ? filledSoFarFor(pending.parlayId) : 0;
-    const outstandingOthers = pending
-      ? outstandingFor(pending.parlayId, quoteId)
-      : 0;
-    const want = pending && pending.contracts;
-    if (pending && wouldExceedCap(maxContracts, filledSoFar, outstandingOthers, want)) {
-      console.log(
-        `[${MODE}] CONFIRM SKIPPED cap exceeded quote_id=${quoteId} rfq_id=${rfqId} ` +
-        `label=${pending.label} filled=${filledSoFar} reserved=${outstandingOthers} ` +
-        `want=${want} max=${maxContracts}`
-      );
-      await cancelQuoteAndDrop(quoteId, pending, {
-        kind: 'cap_exceeded',
-        filled: filledSoFar,
-        reserved: outstandingOthers,
-        want,
-        max: maxContracts,
-      });
+    // Flag on: no quote context means we cannot check the cap. Do not confirm.
+    // Flag off keeps today's confirm-without-pending path.
+    if (!pending && capBook.enabled) {
+      console.warn(formatMissingContext(MODE, quoteId, rfqId));
       return;
     }
-    // Confirm FIRST — HVM confirmation window is ~3s. Log/Telegram after.
-    await confirmQuote(rfqId, quoteId);
+    if (!pending) {
+      await confirmQuote(rfqId, quoteId);
+      const ms = (performance.now() - t0).toFixed(1);
+      console.log(
+        `[${MODE}] CONFIRMED quote_id=${quoteId} rfq_id=${rfqId} in ${ms}ms ` +
+        `side=${evt.acceptedSide || '?'} label=(unknown)`
+      );
+      return;
+    }
+    const maxContracts = (parlay && parlay.max_contracts) || pending.maxContracts;
+    const decision = await confirmAgainstCap(capBook, {
+      parlayId: pending.parlayId,
+      quoteId,
+      maxContracts,
+      size: pending.contracts,
+      getFilled: () => filledSoFarFor(pending.parlayId),
+      getOpenHeld: () => openOutstanding(pending.parlayId, quoteId),
+      confirm: () => confirmQuote(rfqId, quoteId),
+      onExceed: async (info) => {
+        console.log(formatCapSkip({
+          mode: MODE,
+          quoteId,
+          rfqId,
+          label: pending.label,
+          quoted: pending.contracts,
+          enabled: capBook.enabled,
+          filled: info.filled,
+          held: info.held,
+          size: info.size,
+          maxContracts: info.maxContracts,
+        }));
+        await cancelQuoteAndDrop(quoteId, pending, {
+          kind: 'cap_exceeded',
+          filled: info.filled,
+          reserved: info.held,
+          want: info.size,
+          max: info.maxContracts,
+          inFlight: capBook.enabled,
+        });
+      },
+    });
+    if (!decision.ok) return;
+    // Confirm already returned — HVM window is ~3s. Log/Telegram after.
     const ms = (performance.now() - t0).toFixed(1);
     console.log(
       `[${MODE}] CONFIRMED quote_id=${quoteId} rfq_id=${rfqId} in ${ms}ms ` +
-      `side=${evt.acceptedSide || '?'} label=${pending ? pending.label : '(unknown)'}`
+      `side=${evt.acceptedSide || '?'} label=${pending.label}`
     );
   } catch (e) {
     console.error(`[${MODE}] CONFIRM FAILED quote_id=${quoteId} rfq_id=${rfqId}`, e.message);
@@ -1585,6 +1638,26 @@ async function onQuoteExecuted(evt) {
   if (venue !== 'polymarket' && pending.parlayId) {
     filledByParlay[pending.parlayId] = (filledByParlay[pending.parlayId] || 0) + contracts;
   }
+  // Actual size is already in the cap. Drop the confirm hold in the same turn
+  // so the next accept cannot see neither number.
+  releaseConfirmedFill(capBook, {
+    parlayId: pending.parlayId,
+    quoteId,
+    partial,
+    contracts,
+  });
+  if (!evt.overfillFlagged) {
+    const over = overfillOf(pending.contracts, contracts);
+    if (over) {
+      console.warn(formatOverfillLog(MODE, { ...over, label: pending.label, quoteId }));
+      sendAlert(formatOverfillAlert({
+        ...over,
+        venue,
+        label: pending.label,
+        quoteShort: shortId(quoteId),
+      })).catch(() => {});
+    }
+  }
   if (!partial) {
     pendingQuotes.delete(quoteId);
     polyPendingQuotes.delete(quoteId);
@@ -1779,7 +1852,7 @@ async function onRfq(rfq, env) {
       counts.limitReached++;
       console.log(
         `[${MODE}] LIMIT REACHED ${p.label} rfq=${rfq.rfqId} — ` +
-        `filled=${filledSoFar} reserved=${outstanding} ${filledSoFar + outstanding}/${d.totalLimit}`
+        `filled=${filledSoFar} ${exposureBit(outstanding)} ${filledSoFar + outstanding}/${d.totalLimit}`
       );
       logSkip(p, rfq, d, 'limitreached', size);
       // No Telegram — every post-ceiling RFQ would spam. Console above is enough.
@@ -1795,7 +1868,7 @@ async function onRfq(rfq, env) {
       console.log(
         `[${MODE}] SKIP oversized RFQ ${p.label} rfq=${rfq.rfqId} ` +
         `want=${size.contracts} remaining=${d.remaining}/${d.totalLimit} ` +
-        `filled=${filledSoFar} reserved=${outstanding}`
+        `filled=${filledSoFar} ${exposureBit(outstanding)}`
       );
       logSkip(p, rfq, d, 'declined', size);
       return;
@@ -1882,7 +1955,7 @@ async function onRfq(rfq, env) {
       console.log(
         `[${MODE}] QUOTED ${p.label} rfq=${rfq.rfqId} quote_id=${result.id} ` +
         `contracts=${reservedContracts} yes_bid=${yesBid} no_bid=${noBid} ` +
-        `reserved=${outstanding + reservedContracts}/${d.totalLimit} locks=${d.locks}`
+        `${exposureBit(capBook.enabled ? outstanding : outstanding + reservedContracts)}/${d.totalLimit} locks=${d.locks}`
       );
 
       // REST may return rfq_creator_id after we already posted. Persist it
@@ -1981,7 +2054,8 @@ async function main() {
     `Kalshi communications shard_factor=${readShardFactor(undefined, process.env, DEFAULT_LIVE_SHARD_FACTOR)} ` +
     `(KALSHI_WS_SHARD_FACTOR, 1 = one unsharded socket). ` +
     `Non-lock rfq_created frames drop before JSON.parse when every lock has a needle. ` +
-    `Remaining = max - filled - outstanding quotes (Kalshi + Polymarket). ` +
+    `Remaining = max - filled - ${capBook.enabled ? 'in-flight confirms' : 'outstanding quotes'} (Kalshi + Polymarket). ` +
+    `COMBO_CAP_AT_CONFIRM=${capBook.enabled ? 'on' : 'off'}. ` +
     `Unaccepted quotes are DELETE'd after ${RESERVE_TTL_MS / 1000}s. ` +
     `rfq_deleted releases immediately. ` +
     `Skipped oversized/cap RFQs get a targeted tape lookup after close. ` +
@@ -2025,6 +2099,7 @@ async function main() {
   const poly = startPolymarketRfqLoop({
     pendingQuotes: polyPendingQuotes,
     kalshiPendingQuotes: pendingQuotes,
+    capBook,
     getOutstanding: outstandingFor,
     getParlays: () => parlays,
     filledSoFarFor,
