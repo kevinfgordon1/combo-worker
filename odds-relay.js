@@ -2018,8 +2018,8 @@ const novigFeed = (() => {
     let rate = rps;
     let slowUntil = 0;
     const queues = { high: [], mid: [], low: [] };
-    // Weighted round robin: hot polls, main-line searches, then everything else.
-    const pattern = ['high', 'mid', 'high', 'mid', 'low'];
+    // Weighted round robin 4:2:1: hot polls, main-line searches, then everything else.
+    const pattern = ['high', 'high', 'mid', 'high', 'low', 'high', 'mid'];
     let timer = null;
     let served = 0;
     const refill = () => {
@@ -2089,7 +2089,7 @@ const novigFeed = (() => {
     if (!ev) return opts.coldMs;
     if (ev.status === 'OPEN_INGAME') return opts.hotMs;
     const start = ev.startsTs || 0;
-    if (start && start - at < 6 * 3600 * 1000) return opts.hotMs;
+    if (start && start - at < 6 * 3600 * 1000) return opts.nearMs || opts.hotMs;
     if (start && start - at < 48 * 3600 * 1000) return opts.warmMs;
     return opts.coldMs;
   }
@@ -2103,6 +2103,8 @@ const novigFeed = (() => {
     const log = opts.log || ((...a) => console.log('[novig]', ...a));
     const cfg = {
       hotMs: Number(env.NOVIG_HOT_POLL_MS) || opts.hotMs || 2000,
+      // Pregame within 6h: the book moves slowly, so leave the budget to live games.
+      nearMs: Number(env.NOVIG_NEAR_POLL_MS) || opts.nearMs || 6000,
       warmMs: Number(env.NOVIG_WARM_POLL_MS) || opts.warmMs || 20000,
       coldMs: Number(env.NOVIG_COLD_POLL_MS) || opts.coldMs || 600000,
       wsOwnedMs: opts.wsOwnedMs || 60000,
@@ -2392,13 +2394,13 @@ const novigFeed = (() => {
           const before = books.get(m.id);
           const beforeSeq = before ? before.seq : -2;
           // First load of a market jumps the slow rotation so a restart fills the board fast.
-          const priority = row.pollMs <= cfg.hotMs ? 'high' : (before ? 'low' : 'mid');
+          const priority = row.pollMs <= cfg.nearMs ? 'high' : (before ? 'low' : 'mid');
           fetchBook(m, priority).then((book) => {
             if (book && book.seq !== beforeSeq) schedulePublish(cat.league);
           }).catch(() => {});
         }
         if (m.type !== 'MONEY' && row.pollMs < cfg.coldMs) {
-          const walkEvery = row.pollMs <= cfg.hotMs ? cfg.walkMs : cfg.walkMs * 4;
+          const walkEvery = row.pollMs <= cfg.nearMs ? cfg.walkMs : cfg.walkMs * 4;
           if (at - (lastWalk.get(key) || 0) > walkEvery) {
             lastWalk.set(key, at);
             walkMain(cat, key, cat.groups.get(key)).then(() => schedulePublish(cat.league)).catch(() => {});
