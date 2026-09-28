@@ -2391,7 +2391,9 @@ const novigFeed = (() => {
           due.set(m.id, at + every);
           const before = books.get(m.id);
           const beforeSeq = before ? before.seq : -2;
-          fetchBook(m, row.pollMs <= cfg.hotMs ? 'high' : 'low').then((book) => {
+          // First load of a market jumps the slow rotation so a restart fills the board fast.
+          const priority = row.pollMs <= cfg.hotMs ? 'high' : (before ? 'low' : 'mid');
+          fetchBook(m, priority).then((book) => {
             if (book && book.seq !== beforeSeq) schedulePublish(cat.league);
           }).catch(() => {});
         }
