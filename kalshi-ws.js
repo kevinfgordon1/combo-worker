@@ -21,12 +21,22 @@
 //      can keep ponging after Kalshi drops the only channel we quote on.
 //      Stall watchdog will not fire. Close + resubscribe immediately.
 //
-// SINGLE-SUBSCRIBER: Kalshi keeps ONE communications subscription per API
-// key. A second createKalshiWs on the same KALSHI_KEY_ID (quote-watcher,
-// a second replica, unhedged on a copied key) gets `unsubscribed` ~30–40s
-// later while TCP/pongs stay up. Combo Locks (live-runner) owns the
-// production socket. Do not multiplex. quote-watcher must stay parked or
-// set QUOTE_WATCHER_WS=0 / KALSHI_WS_OWNER=combo.
+// FIREHOSE: peak NFL volume is ~2–2.7k communications frames/s. Parsing
+// and matching every rfq_created on this callback fills Kalshi's
+// per-subscription buffer (error code 25). createKalshiFirehose opens one
+// socket per shard_key (default 8 on the live runner) and drops
+// rfq_created frames that miss lock needles before JSON.parse. quote_*
+// and rfq close frames are never dropped. A shard reconnect pauses only
+// that socket.
+//
+// SINGLE-SUBSCRIBER: Kalshi keeps ONE full communications subscription per
+// API key. A second process on the same KALSHI_KEY_ID (quote-watcher, a
+// second replica, unhedged on a copied key) gets `unsubscribed` ~30–40s
+// later while TCP/pongs stay up. Sharded sockets inside this process are
+// one subscriber split by shard_key, not a second process. If Kalshi
+// rejects that split, the firehose collapses to one unsharded socket.
+// quote-watcher must stay parked or set QUOTE_WATCHER_WS=0 /
+// KALSHI_WS_OWNER=combo.
 'use strict';
 const WebSocket = require('ws');
 const { authHeaders, applyServerDate, isTimestampExpired } = require('./kalshi-auth');
@@ -42,6 +52,66 @@ const STALL_TICK_MS = 5_000;
 const PING_MS = 10_000;
 const INITIAL_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 30_000;
+const MAX_SHARD_FACTOR = 100;
+// Combo Locks default. Other callers pass 1 (a single unsharded socket).
+const DEFAULT_LIVE_SHARD_FACTOR = 8;
+// Each shard above this rate is seeing an unsplit firehose, not 1/N.
+const UNSLIT_SHARD_PER_SEC = 2000;
+const RFQ_DEDUPE_MS = 2000;
+const QUOTE_ACCEPT_DEDUPE_MS = 5000;
+const QUOTE_EXEC_DEDUPE_MS = 250;
+
+function readShardFactor(explicit, env = process.env, fallback = 1) {
+  const fromEnv = env && Object.prototype.hasOwnProperty.call(env, 'KALSHI_WS_SHARD_FACTOR')
+    ? env.KALSHI_WS_SHARD_FACTOR
+    : undefined;
+  const raw = explicit != null ? explicit : fromEnv;
+  const chosen = (raw == null || raw === '') ? fallback : raw;
+  const n = Number(chosen);
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.max(1, Math.min(MAX_SHARD_FACTOR, Math.floor(n)));
+}
+
+function shardsLookUnsplit(rates, factor) {
+  if (!(factor > 1) || !rates || rates.length < factor) return false;
+  return rates.every((r) => r > UNSLIT_SHARD_PER_SEC);
+}
+
+function headString(data, n) {
+  if (typeof data === 'string') return data.length > n ? data.slice(0, n) : data;
+  if (Buffer.isBuffer(data)) return data.toString('utf8', 0, Math.min(data.length, n));
+  return String(data == null ? '' : data).slice(0, n);
+}
+
+// Type sits at the front of Kalshi frames. Unknown → caller must not drop.
+function peekTypeFast(data) {
+  const head = headString(data, 160);
+  const m = /"type"\s*:\s*"([a-z0-9_]+)"/i.exec(head);
+  return m ? m[1] : null;
+}
+
+function toRawString(data) {
+  if (typeof data === 'string') return data;
+  if (Buffer.isBuffer(data)) return data.toString();
+  if (Array.isArray(data)) return Buffer.concat(data).toString();
+  return String(data);
+}
+
+function createStats() {
+  return {
+    recv: 0,
+    drop: 0,
+    parse: 0,
+    quotes: 0,
+    backlog: 0,
+    maxHandlerNs: 0,
+    windowRecv: 0,
+    windowDrop: 0,
+    windowParse: 0,
+    windowQuotes: 0,
+    windowStarted: Date.now(),
+  };
+}
 
 function readStallMs(explicit, env = process.env) {
   if (explicit != null && Number.isFinite(Number(explicit))) return Number(explicit);
@@ -113,16 +183,31 @@ function createKalshiWs({
   onEvent,
   stallMs,
   shouldDeferCreated,
+  shouldDropCreated,
+  shardFactor,
+  shardKey,
   captureRfq: captureFn,
   WebSocket: WsImpl,
 } = {}) {
   const Ws = WsImpl || WebSocket;
   const capture = captureFn || captureRfq;
   const stallAfter = readStallMs(stallMs);
+  const shardN = shardFactor != null ? Number(shardFactor) : null;
+  const useShard = shardN > 1 && shardKey != null && shardKey !== '';
   let ws = null, subId = 1, pingTimer = null, stallTimer = null;
   let backoff = INITIAL_BACKOFF_MS, closedByUs = false, reconnectTimer = null;
   let lastCommAt = 0;
-  const status = (s, i) => { try { onStatus && onStatus(s, i); } catch (_) {} };
+  const stats = createStats();
+  const status = (s, i) => {
+    let payload = i;
+    if (useShard) payload = Object.assign({ shardKey: Number(shardKey), shardFactor: shardN }, i || {});
+    try { onStatus && onStatus(s, payload); } catch (_) {}
+  };
+
+  function noteHandler(started) {
+    const dt = Number(process.hrtime.bigint() - started);
+    if (dt > stats.maxHandlerNs) stats.maxHandlerNs = dt;
+  }
 
   function touchAlive() {
     lastCommAt = Date.now();
@@ -228,14 +313,23 @@ function createKalshiWs({
 
     const headers = authHeaders({ keyId, pem, method: 'GET', signPath: WS_SIGN_PATH });
     status('connecting', { url: WS_URL });
-    ws = new Ws(WS_URL, { headers });
+    ws = new Ws(WS_URL, {
+      headers,
+      perMessageDeflate: false,
+      skipUTF8Validation: true,
+    });
 
     ws.on('open', () => {
       // Grace period only — do not reset backoff or treat open as proven live.
       // A stall→open→quiet loop used to snap backoff to 1s forever.
       touchAlive();
       try {
-        ws.send(JSON.stringify({ id: subId++, cmd: 'subscribe', params: { channels: ['communications'] } }));
+        const params = { channels: ['communications'] };
+        if (useShard) {
+          params.shard_factor = shardN;
+          params.shard_key = Number(shardKey);
+        }
+        ws.send(JSON.stringify({ id: subId++, cmd: 'subscribe', params }));
       } catch (e) {
         status('error', { message: e && e.message });
         forceReconnect('subscribe_send');
@@ -261,8 +355,14 @@ function createKalshiWs({
     });
 
     function handleRaw(raw) {
+      stats.parse++;
+      stats.windowParse++;
       const env = parseEnvelope(raw);
       if (!env) return;
+      if (env.type && String(env.type).indexOf('quote_') === 0) {
+        stats.quotes++;
+        stats.windowQuotes++;
+      }
 
       try { onEvent && onEvent(env); } catch (_) {}
 
@@ -339,21 +439,42 @@ function createKalshiWs({
     }
 
     ws.on('message', (d) => {
-      const raw = d.toString();
+      const started = process.hrtime.bigint();
+      stats.recv++;
+      stats.windowRecv++;
       touchComm();
+      let kind = null;
+      try { kind = peekTypeFast(d); } catch (_) { kind = null; }
+      // Only rfq_created is eligible to drop. quote_accepted / quote_executed
+      // (confirm + PR #93 fill confirm) and rfq close frames always parse.
+      if (kind === 'rfq_created' && shouldDropCreated) {
+        let drop = false;
+        try { drop = !!shouldDropCreated(d); } catch (_) { drop = false; }
+        if (drop) {
+          stats.drop++;
+          stats.windowDrop++;
+          noteHandler(started);
+          return;
+        }
+      }
+      const raw = toRawString(d);
       // While a quote POST/confirm is in flight, unmatched rfq_created
       // frames are deferred (setImmediate) so the HTTP callback is not
       // stuck behind JSON.parse of the communications book. Lock-needle
-      // hits and quote_accepted/executed stay on this tick.
-      if (
-        shouldDeferCreated
-        && peekEnvelopeType(raw) === 'rfq_created'
-        && shouldDeferCreated(raw)
-      ) {
-        setImmediate(() => handleRaw(raw));
+      // hits and quote_accepted/executed stay on this tick. Fast-drop
+      // already removed the non-lock bulk; this still covers fast-drop off.
+      const created = kind === 'rfq_created' || peekEnvelopeType(raw) === 'rfq_created';
+      if (created && shouldDeferCreated && shouldDeferCreated(raw)) {
+        stats.backlog++;
+        setImmediate(() => {
+          stats.backlog = Math.max(0, stats.backlog - 1);
+          handleRaw(raw);
+        });
+        noteHandler(started);
         return;
       }
       handleRaw(raw);
+      noteHandler(started);
     });
 
     ws.on('close', (c) => {
@@ -384,18 +505,323 @@ function createKalshiWs({
         readyState: ws ? ws.readyState : null,
         reconnectPending: !!reconnectTimer,
         backoff,
+        shardKey: useShard ? Number(shardKey) : null,
+        shardFactor: useShard ? shardN : 1,
+        backlog: stats.backlog,
+        recv: stats.recv,
+        drop: stats.drop,
+        parse: stats.parse,
+        quotes: stats.quotes,
       };
     },
+    takeThroughput() {
+      const now = Date.now();
+      const windowMs = Math.max(0, now - stats.windowStarted);
+      const h = this.health();
+      const snap = {
+        windowMs,
+        recv: stats.windowRecv,
+        drop: stats.windowDrop,
+        parse: stats.windowParse,
+        quotes: stats.windowQuotes,
+        maxHandlerNs: stats.maxHandlerNs,
+        backlog: stats.backlog,
+        shardKey: h.shardKey,
+        up: h.readyState === 1 && !h.reconnectPending,
+      };
+      stats.windowRecv = 0;
+      stats.windowDrop = 0;
+      stats.windowParse = 0;
+      stats.windowQuotes = 0;
+      stats.windowStarted = now;
+      stats.maxHandlerNs = 0;
+      return snap;
+    },
+  };
+}
+
+function rememberRecent(map, key, now, ttl) {
+  const prev = map.get(key);
+  if (prev != null && now - prev < ttl) return true;
+  map.set(key, now);
+  if (map.size > 4000) {
+    for (const [k, t] of map) {
+      if (now - t >= ttl) map.delete(k);
+      if (map.size <= 2000) break;
+    }
+  }
+  return false;
+}
+
+// One socket per shard_key. Handlers are shared and deduped so a quote or
+// RFQ delivered twice (shard fanout overlap) cannot double-confirm or
+// double-POST. rfq_deleted is not deduped: release is idempotent and a
+// missed close pins a reserve until the 20s TTL.
+function createKalshiFirehose(opts = {}) {
+  const factor = readShardFactor(opts.shardFactor, opts.env, 1);
+  const seenRfq = new Map();
+  const seenAccept = new Map();
+  const seenExec = new Map();
+
+  const onRfqCreated = opts.onRfqCreated
+    ? (rfq, env) => {
+      const id = rfq && rfq.rfqId;
+      if (id && rememberRecent(seenRfq, String(id), Date.now(), RFQ_DEDUPE_MS)) return;
+      opts.onRfqCreated(rfq, env);
+    }
+    : undefined;
+  const onQuoteAccepted = opts.onQuoteAccepted
+    ? (evt) => {
+      const key = `${evt && evt.quoteId || ''}|${evt && evt.rfqId || ''}`;
+      if (key !== '|' && rememberRecent(seenAccept, key, Date.now(), QUOTE_ACCEPT_DEDUPE_MS)) return;
+      opts.onQuoteAccepted(evt);
+    }
+    : undefined;
+  const onQuoteExecuted = opts.onQuoteExecuted
+    ? (evt) => {
+      // Collapse same-millisecond shard copies. A later execution (partial
+      // fill) has a new timestamp outside QUOTE_EXEC_DEDUPE_MS and still
+      // runs bookFromQuoteExecution / the portfolio-fills confirm path.
+      const key = `${evt && evt.quoteId || ''}|${evt && evt.orderId || ''}|${evt && evt.contracts || ''}`;
+      if (key !== '||' && rememberRecent(seenExec, key, Date.now(), QUOTE_EXEC_DEDUPE_MS)) return;
+      opts.onQuoteExecuted(evt);
+    }
+    : undefined;
+
+  let sockets = [];
+  let collapsed = false;
+  let loopLagMs = 0;
+  let lagExpected = 0;
+  let lagTimer = null;
+  const unsubShards = new Set();
+
+  function socketOpts(shardKey) {
+    const sharded = factor > 1 && shardKey != null;
+    return {
+      keyId: opts.keyId,
+      pem: opts.pem,
+      WebSocket: opts.WebSocket,
+      stallMs: opts.stallMs,
+      shouldDropCreated: opts.shouldDropCreated,
+      shouldDeferCreated: opts.shouldDeferCreated,
+      onRfqCreated,
+      onRfqDeleted: opts.onRfqDeleted,
+      onQuoteAccepted,
+      onQuoteExecuted,
+      onEvent: opts.onEvent,
+      captureRfq: opts.captureRfq,
+      shardFactor: sharded ? factor : null,
+      shardKey: sharded ? shardKey : null,
+      onStatus: (s, info) => onShardStatus(s, info),
+    };
+  }
+
+  function startLagTimer() {
+    if (lagTimer) return;
+    lagExpected = Date.now() + 1000;
+    lagTimer = setInterval(() => {
+      const t = Date.now();
+      loopLagMs = Math.max(0, t - lagExpected);
+      lagExpected = t + 1000;
+    }, 1000);
+    if (lagTimer.unref) lagTimer.unref();
+  }
+
+  function stopLagTimer() {
+    if (lagTimer) clearInterval(lagTimer);
+    lagTimer = null;
+  }
+
+  function onShardStatus(s, info) {
+    if (collapsed && info && info.shardKey != null) return;
+    try { opts.onStatus && opts.onStatus(s, info); } catch (_) {}
+    if (collapsed || factor <= 1) return;
+    if (s === 'unsubscribed') {
+      unsubShards.add(info && info.shardKey);
+      if (unsubShards.size >= 2) collapse('two shard sockets received unsubscribed');
+      return;
+    }
+    if (s === 'error') {
+      const code = Number(info && info.code);
+      if (code === 6 || (code >= 19 && code <= 22)) {
+        collapse(`communications subscribe rejected (code ${code})`);
+      }
+    }
+  }
+
+  function collapse(reason) {
+    if (collapsed) return;
+    collapsed = true;
+    const dying = sockets;
+    sockets = [];
+    for (const s of dying) {
+      let key = null;
+      try { key = s.health().shardKey; } catch (_) {}
+      try { opts.onStatus && opts.onStatus('shard-retired', { shardKey: key, shardFactor: factor, reason }); } catch (_) {}
+      try { s.stop(); } catch (_) {}
+    }
+    console.error(`[kalshi-ws] ${reason}; collapsing to one unsharded communications socket`);
+    try { opts.onStatus && opts.onStatus('fallback', { reason, shardFactor: 1 }); } catch (_) {}
+    const solo = createKalshiWs(socketOpts(null));
+    sockets = [solo];
+    solo.start();
+  }
+
+  function health() {
+    const rows = sockets.map((s) => s.health());
+    const up = rows.filter((r) => r.readyState === 1 && !r.reconnectPending).length;
+    let stalest = null;
+    let lastCommAt = 0;
+    let backlog = 0;
+    let recv = 0;
+    let drop = 0;
+    let parse = 0;
+    let quotes = 0;
+    for (const r of rows) {
+      if (r.lastCommAt) {
+        lastCommAt = Math.max(lastCommAt, r.lastCommAt);
+        const age = Date.now() - r.lastCommAt;
+        if (stalest == null || age > stalest) stalest = age;
+      }
+      backlog += r.backlog || 0;
+      recv += r.recv || 0;
+      drop += r.drop || 0;
+      parse += r.parse || 0;
+      quotes += r.quotes || 0;
+    }
+    return {
+      shardFactor: collapsed ? 1 : factor,
+      collapsed,
+      shardsUp: up,
+      shardsDown: Math.max(0, rows.length - up),
+      lastCommAt,
+      stalestAgeMs: stalest,
+      stallMs: rows[0] ? rows[0].stallMs : readStallMs(opts.stallMs),
+      reconnectPending: rows.some((r) => r.reconnectPending),
+      readyState: rows.length === 1 ? rows[0].readyState : null,
+      backlog,
+      loopLagMs,
+      recv,
+      drop,
+      parse,
+      quotes,
+      shards: rows,
+    };
+  }
+
+  return {
+    start() {
+      if (sockets.length) return;
+      collapsed = false;
+      const n = factor > 1 ? factor : 1;
+      sockets = [];
+      for (let k = 0; k < n; k++) sockets.push(createKalshiWs(socketOpts(factor > 1 ? k : null)));
+      for (const s of sockets) s.start();
+      startLagTimer();
+    },
+    stop() {
+      stopLagTimer();
+      const dying = sockets;
+      sockets = [];
+      for (const s of dying) {
+        try { s.stop(); } catch (_) {}
+      }
+    },
+    health,
+    takeThroughput() {
+      const parts = sockets.map((s) => s.takeThroughput());
+      const windowMs = parts.reduce((m, p) => Math.max(m, p.windowMs || 0), 0);
+      const sec = Math.max(0.001, windowMs / 1000);
+      let recv = 0;
+      let drop = 0;
+      let parse = 0;
+      let quotes = 0;
+      let maxHandlerNs = 0;
+      let backlog = 0;
+      const perShard = [];
+      for (const p of parts) {
+        recv += p.recv;
+        drop += p.drop;
+        parse += p.parse;
+        quotes += p.quotes;
+        backlog += p.backlog || 0;
+        if (p.maxHandlerNs > maxHandlerNs) maxHandlerNs = p.maxHandlerNs;
+        perShard.push({
+          shardKey: p.shardKey,
+          recv: p.recv,
+          drop: p.drop,
+          recvPerSec: p.recv / sec,
+          up: !!p.up,
+        });
+      }
+      const activeFactor = collapsed ? 1 : factor;
+      const snap = {
+        windowMs,
+        recv,
+        drop,
+        parse,
+        quotes,
+        backlog,
+        maxHandlerMs: maxHandlerNs / 1e6,
+        loopLagMs,
+        shardsUp: health().shardsUp,
+        shardFactor: activeFactor,
+        perShard,
+      };
+      if (
+        !collapsed
+        && factor > 1
+        && windowMs >= 20_000
+        && shardsLookUnsplit(perShard.map((p) => p.recvPerSec), factor)
+      ) {
+        collapse('each shard is receiving an unsharded firehose');
+      }
+      return snap;
+    },
+  };
+}
+
+function summarizeThroughput(snap) {
+  const sec = Math.max(0.001, (snap && snap.windowMs ? snap.windowMs : 0) / 1000);
+  const recv = snap && snap.recv || 0;
+  const drop = snap && snap.drop || 0;
+  const parse = snap && snap.parse || 0;
+  return {
+    windowSec: Math.round(sec),
+    recv,
+    recvPerSec: Math.round(recv / sec),
+    drop,
+    dropPerSec: Math.round(drop / sec),
+    parse,
+    parsePerSec: Math.round(parse / sec),
+    quotes: snap && snap.quotes || 0,
+    backlog: snap && snap.backlog || 0,
+    maxHandlerMs: snap && snap.maxHandlerMs != null ? Math.round(snap.maxHandlerMs * 100) / 100 : 0,
+    loopLagMs: snap && snap.loopLagMs || 0,
+    shardsUp: snap && snap.shardsUp,
+    shardFactor: snap && snap.shardFactor,
+    perShard: (snap && snap.perShard || []).map((p) => ({
+      shardKey: p.shardKey,
+      recv: p.recv,
+      recvPerSec: Math.round(p.recvPerSec || 0),
+      up: p.up,
+    })),
   };
 }
 
 module.exports = {
   createKalshiWs,
+  createKalshiFirehose,
   DEFAULT_STALL_MS,
+  DEFAULT_LIVE_SHARD_FACTOR,
   PING_MS,
   INITIAL_BACKOFF_MS,
   MAX_BACKOFF_MS,
   readStallMs,
+  readShardFactor,
+  shardsLookUnsplit,
+  peekTypeFast,
+  summarizeThroughput,
   deadChannelReason,
   shouldOpenQuoteWatcherWs,
 };

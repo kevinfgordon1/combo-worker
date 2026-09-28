@@ -54,8 +54,16 @@
 //   nor pongs. Keepalive pong is liveness; a quiet Saturday book must
 //   not reconnect. Communications `unsubscribed` / channel-dead error
 //   frames force close + resubscribe (pongs must not hide a dropped
-//   sub). Telegram on handshake/auth, subscription loss, or a
-//   stall/reconnect burst — not every quiet-book watchdog tick.
+//   sub). Telegram on handshake/auth, or a stall/reconnect burst — not
+//   every quiet-book watchdog tick. Code 25 (subscription buffer
+//   overflow) reconnects that shard only; Telegram fires when a socket
+//   is still down after ~10s, not on every overflow.
+// FIREHOSE: one socket per communications shard_key (KALSHI_WS_SHARD_FACTOR,
+//   default 8; 1 = single unsharded socket). rfq_created frames that miss
+//   lock needles are dropped before JSON.parse. quote_accepted /
+//   quote_executed and rfq close frames are never dropped. counts.rfqs is
+//   needle hits; ws-throughput.recv is the raw firehose. A shard reconnect
+//   does not pause the other sockets.
 // REST CLOCK: quote POST/confirm/cancel/GET share signedRequest so the
 //   timestamp is minted at send, Date-header offset ignores 1s Date
 //   truncation (PR #61 expired otherwise-good quotes), and a 401
@@ -98,7 +106,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
-const { createKalshiWs } = require('./kalshi-ws');
+const { createKalshiFirehose, readShardFactor, DEFAULT_LIVE_SHARD_FACTOR, summarizeThroughput } = require('./kalshi-ws');
 const { normalizePem, clockOffset, signedRequest } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
 const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, isRfqClosedFailure, quotePostFailReason, formatQuoteLatency, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
@@ -148,7 +156,7 @@ const {
   REPEAT_SKIP_REASON,
 } = require('./rfq-repeat');
 const { createKalshiRestPair, QUOTE_WARM_MS } = require('./kalshi-http');
-const { createQuoteHot, lockNeedlesFromParlays } = require('./quote-hot');
+const { createQuoteHot, lockNeedlePlan, fastDropDisabled } = require('./quote-hot');
 const { resolveWorkerMode, shouldRunUnhedged } = require('./worker-mode');
 const { startUnhedgedSide } = require('./unhedged-boot');
 const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
@@ -305,16 +313,21 @@ async function refresh() {
       }
       staged = next;
     }
-    quoteHot.setNeedles(lockNeedlesFromParlays(parlays));
+    const needlePlan = lockNeedlePlan(parlays);
+    if (fastDropDisabled(process.env)) needlePlan.enabled = false;
+    quoteHot.setPlan(needlePlan);
+    const fastDropBit = `fastDrop=${needlePlan.enabled ? 'on' : 'off'} needles=${needlePlan.needles.length} uncovered=${needlePlan.uncovered}`;
 
     if (parlaysFailed) {
       const kept = parlays.map((row) => row.label || row.id).join(', ') || 'none';
       console.log(
         `[${MODE}] refreshed — ${parlays.length} active parlay(s) RETAINED after soft-fail, ` +
-        `staged=${Object.keys(staged).length} — ${kept}`
+        `staged=${Object.keys(staged).length} ${fastDropBit} — ${kept}`
       );
     } else {
-      console.log(`[${MODE}] refreshed — ${parlays.length} active parlay(s), staged=${Object.keys(staged).length}`);
+      console.log(
+        `[${MODE}] refreshed — ${parlays.length} active parlay(s), staged=${Object.keys(staged).length} ${fastDropBit}`
+      );
     }
     const lockBits = parlays.map((row) => {
       const keys = row.leg_keys || row.legKeys || [];
@@ -1965,6 +1978,9 @@ async function main() {
     `[${MODE}] starting — latency-optimized. POST first, dedicated quote HTTP, ` +
     `firehose yield while quote-hot, quote warm ${QUOTE_WARM_MS}ms, pre-staged prices. ` +
     `Auto-confirms quote_accepted (HVM ~3s window). ` +
+    `Kalshi communications shard_factor=${readShardFactor(undefined, process.env, DEFAULT_LIVE_SHARD_FACTOR)} ` +
+    `(KALSHI_WS_SHARD_FACTOR, 1 = one unsharded socket). ` +
+    `Non-lock rfq_created frames drop before JSON.parse when every lock has a needle. ` +
     `Remaining = max - filled - outstanding quotes (Kalshi + Polymarket). ` +
     `Unaccepted quotes are DELETE'd after ${RESERVE_TTL_MS / 1000}s. ` +
     `rfq_deleted releases immediately. ` +
@@ -2043,27 +2059,67 @@ async function main() {
   polyLoop = poly;
 
   const wsAlerter = createWsStatusAlerter();
-  function noteWsStatus(s, info) {
-    console.log(`[${MODE}] ws:${s}`, info || '');
-    if (!wsAlerter.shouldAlert(s, info)) return;
-    sendAlert(formatWsAlert(s, info)).catch(() => {});
-  }
+  const shardFactor = readShardFactor(undefined, process.env, DEFAULT_LIVE_SHARD_FACTOR);
 
-  const client = createKalshiWs({
+  const client = createKalshiFirehose({
     keyId: KEY_ID,
     pem: PEM,
+    shardFactor,
     onStatus: noteWsStatus,
     shouldDeferCreated: (raw) => quoteHot.shouldDeferCreated(raw),
+    shouldDropCreated: (raw) => quoteHot.shouldDropCreated(raw),
     onRfqCreated: (rfq, env) => onRfq(rfq, env).catch((e) => console.error('onRfq', e)),
     onRfqDeleted: (evt, env) => { try { onRfqDeleted(evt, env); } catch (e) { console.error('onRfqDeleted', e); } },
     onQuoteAccepted: (evt) => onQuoteAccepted(evt).catch((e) => console.error('onQuoteAccepted', e)),
     onQuoteExecuted: (evt) => onQuoteExecuted(evt).catch((e) => console.error('onQuoteExecuted', e)),
   });
 
+  function noteWsStatus(s, info) {
+    const h = client.health ? client.health() : null;
+    const enriched = Object.assign({}, info || {}, {
+      shardFactor: h && h.shardFactor,
+      shardsUp: h && h.shardsUp,
+      shardsDown: h && h.shardsDown,
+    });
+    console.log(`[${MODE}] ws:${s}`, enriched);
+    if (!wsAlerter.shouldAlert(s, enriched)) return;
+    sendAlert(formatWsAlert(s, enriched)).catch(() => {});
+  }
+
+  setInterval(() => {
+    const snap = client.takeThroughput ? client.takeThroughput() : null;
+    if (!snap) return;
+    console.log(`[${MODE}] ws-throughput`, Object.assign(summarizeThroughput(snap), {
+      fastDrop: quoteHot.fastDropEnabled(),
+      needles: quoteHot.getNeedles().length,
+    }));
+  }, 30_000);
   setInterval(() => {
     const h = client.health ? client.health() : null;
-    const age = h && h.lastCommAt ? Date.now() - h.lastCommAt : null;
-    console.log(`[${MODE}] tallies`, { ...counts, kalshiWsAgeMs: age, kalshiWsStallMs: h && h.stallMs });
+    const hit = wsAlerter.poll(h ? {
+      shardFactor: h.shardFactor,
+      shardsUp: h.shardsUp,
+      shardsDown: h.shardsDown,
+    } : null);
+    if (!hit) return;
+    sendAlert(formatWsAlert(hit.s, hit.info)).catch(() => {});
+  }, 1000);
+  setInterval(() => {
+    const h = client.health ? client.health() : null;
+    const age = h && h.stalestAgeMs != null
+      ? h.stalestAgeMs
+      : (h && h.lastCommAt ? Date.now() - h.lastCommAt : null);
+    console.log(`[${MODE}] tallies`, {
+      ...counts,
+      kalshiWsAgeMs: age,
+      kalshiWsStallMs: h && h.stallMs,
+      shardsUp: h && h.shardsUp,
+      shardFactor: h && h.shardFactor,
+      wsBacklog: h && h.backlog,
+      wsLoopLagMs: h && h.loopLagMs,
+      wsRecv: h && h.recv,
+      wsDrop: h && h.drop,
+    });
   }, 60000);
   process.on('SIGINT', () => {
     client.stop();

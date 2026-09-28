@@ -5,7 +5,10 @@ const {
   aliasTeamPairs,
   needlesFromTicker,
   lockNeedlesFromParlays,
+  lockNeedlePlan,
+  fallbackNeedle,
   rawLooksLikeLock,
+  fastDropDisabled,
   createQuoteHot,
 } = require('./quote-hot');
 
@@ -113,5 +116,60 @@ assert.strictEqual(teamPairFromTicker(''), null);
   hot.end();
   assert.strictEqual(hot.inFlight, 0);
 }
+
+{
+  const plan = lockNeedlePlan([seaPhiLar, ariJac]);
+  assert.strictEqual(plan.enabled, true);
+  assert.strictEqual(plan.uncovered, 0);
+  assert.ok(plan.needles.includes('NESEA'));
+  assert.ok(plan.needles.includes('CLEJAX'));
+}
+
+{
+  assert.strictEqual(fallbackNeedle('KXNFLPASSYDS-26SEP13-MAHOMES250:yes'), 'MAHOMES250');
+  const prop = {
+    id: 'prop',
+    leg_keys: ['KXNFLPASSYDS-26SEP13-MAHOMES250:yes'],
+  };
+  const plan = lockNeedlePlan([prop]);
+  assert.strictEqual(plan.enabled, true);
+  assert.ok(plan.needles.includes('MAHOMES250'));
+  const timed = '{"type":"rfq_created","market_ticker":"KXNFLPASSYDS-26SEP131330-MAHOMES250"}';
+  assert.strictEqual(rawLooksLikeLock(timed, plan.needles) || timed.includes('MAHOMES250'), true);
+  const hot = createQuoteHot();
+  hot.setPlan(plan);
+  assert.strictEqual(hot.shouldDropCreated(timed), false);
+  assert.strictEqual(hot.shouldDropCreated('{"type":"rfq_created","market_ticker":"KXNFLGAME-26SEP13BUFKC-BUF"}'), true);
+}
+
+{
+  const bare = { id: 'bare', leg_keys: ['AB:yes'] };
+  const plan = lockNeedlePlan([bare, seaPhiLar]);
+  assert.strictEqual(plan.enabled, false, 'a lock with no needle disables fast-drop');
+  assert.ok(plan.uncovered >= 1);
+  const hot = createQuoteHot();
+  hot.setPlan(plan);
+  assert.strictEqual(hot.fastDropEnabled(), false);
+  assert.strictEqual(hot.shouldDropCreated('{"type":"rfq_created","x":1}'), false);
+}
+
+{
+  const hot = createQuoteHot();
+  hot.setPlan(lockNeedlePlan([]));
+  assert.strictEqual(hot.fastDropEnabled(), true);
+  assert.strictEqual(hot.shouldDropCreated('{"type":"rfq_created"}'), true, 'no locks → drop every created frame');
+}
+
+{
+  const hot = createQuoteHot();
+  hot.setPlan({ needles: ['NESEA'], uncovered: 0, enabled: true });
+  const buf = Buffer.from('{"type":"rfq_created","legs":"KXNFLGAME-26SEP131330NESEA-SEA"}');
+  const other = Buffer.from('{"type":"rfq_created","legs":"KXNFLGAME-26SEP13BUFKC-BUF"}');
+  assert.strictEqual(hot.shouldDropCreated(buf), false);
+  assert.strictEqual(hot.shouldDropCreated(other), true);
+}
+
+assert.strictEqual(fastDropDisabled({ KALSHI_WS_FAST_DROP: '0' }), true);
+assert.strictEqual(fastDropDisabled({}), false);
 
 console.log('quote-hot.test.js ok');

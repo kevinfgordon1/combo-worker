@@ -22,16 +22,16 @@ Quote-watcher stays parked on both jobs (`sleep infinity`, or `QUOTE_WATCHER_WS=
 
 ## Kalshi communications WS — one subscriber per API key
 
-Kalshi keeps **one** `communications` subscription per `KALSHI_KEY_ID`. A second `createKalshiWs` on that key receives `unsubscribed` after ~30–40s. The TCP socket stays up and pongs, so `kalshiWsAgeMs` looks healthy while Combo Lock quoting is dead (`rfq_created` stops).
+Kalshi keeps **one full `communications` subscription per `KALSHI_KEY_ID`**. A second process on that key (`quote-watcher`, a second Combo Locks replica, Unhedged using the copied key) receives `unsubscribed` after ~30–40s. The TCP socket stays up and pongs, so `kalshiWsAgeMs` looks healthy while Combo Lock quoting is dead (`rfq_created` stops).
 
 **Production owner:** Combo Locks (`npm start` / `start-live.js`) — replica count **1**.
 
-Do **not** multiplex two WS clients on one key. Reconnect-on-unsubscribe recovers a lone client if Kalshi drops the sub; it cannot make two processes share one subscription.
+Combo Locks itself opens **one socket per `shard_key`** on that same key (`KALSHI_WS_SHARD_FACTOR`, default 8) so the RFQ firehose is split across Kalshi subscription buffers. That is one subscriber, not a second process. Do not point another process at this key. If those sockets get `unsubscribed` or `already subscribed`, the worker collapses to a single unsharded socket and keeps running. Set `KALSHI_WS_SHARD_FACTOR=1` to skip sharding. `KALSHI_WS_FAST_DROP=0` parses every `rfq_created` again (quote and fill events are never dropped either way).
 
 | Process | What to do |
 |---|---|
 | **quote-watcher** | Park on Railway (`sleep infinity`), or start with `QUOTE_WATCHER_WS=0` / `KALSHI_WS_OWNER=combo` (REST-only; no WS). |
-| **Combo Locks replicas** | Never scale above 1. |
+| **Combo Locks replicas** | Never scale above 1. Several shard sockets inside that one process are expected. |
 | **Unhedged** | Needs its **own** Kalshi API key if it opens `createKalshiWs`. Copying Combo Locks `KALSHI_KEY_ID` will unsubscribe the quoter. |
 
 ## Deploy two services (same repo)
