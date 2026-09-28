@@ -13,6 +13,28 @@ const {
   identityFromPolymarketSlug,
 } = require('./leg-identity');
 const { teamCode, etDate, etMinutes, SPORT_LEAGUE, bestTeamPrice } = require('./mm-paper-odds');
+const { parseKalshiTickerStart } = require('./started');
+
+// Kickoff clock for the paper cutoff.
+//
+// Checked against live markets on 2026-09-28:
+//   Polymarket US `gameStartTime` on aec-nfl-lar-den-2026-09-27 is
+//   2026-09-28T00:20:00Z (Sun Sep 27, 8:20 PM ET) — the scheduled kickoff.
+//   `startDate` on that market is 2026-09-13, when the market was listed.
+//   It is not kickoff.
+//   Kalshi NFL tickers are date-only (KXNFLGAME-26SEP27LARDEN). The ticker
+//   clock below is null for them. MLB tickers do embed HHMM ET.
+//   Kalshi open_time is listing time. close_time, expected_expiration_time,
+//   and occurrence_datetime sit hours after kickoff (LAR/DEN occurrence
+//   2026-09-28T03:20:00Z, expected expiration 06:20Z, close Sep 30). None of
+//   those are kickoff, so they are not read.
+//   odds_cache commence_time is The Odds API scheduled start, already matched
+//   onto the game. It cross-checks Polymarket.
+//
+// chooseKickoff prefers Polymarket gameStartTime, then Odds API commence_time,
+// then a Kalshi ticker clock when the ticker has one. Sources more than 10
+// minutes apart: use the earlier time so quoting stops before the first
+// claimed kickoff. No source at all means the game is not quotable.
 
 const SERIES_LEAGUE = {
   KXNFLGAME: 'nfl',
@@ -26,6 +48,9 @@ function gameIdOf(league, date, teams) {
   return `${league}|${date}|${uniq.join('+')}`;
 }
 
+// Minutes-of-day from a Kalshi ticker clock. Used only to sort the watch
+// list and to reject an odds_cache row whose commence_time is hours away.
+// NFL tickers have no clock, so this is null. It is not a kickoff cutoff.
 function tickerStartMinutes(ticker) {
   const m = /-(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})/i.exec(String(ticker || ''));
   if (!m) return null;
@@ -33,6 +58,92 @@ function tickerStartMinutes(ticker) {
   const mm = Number(m[5]);
   if (hh > 23 || mm > 59) return null;
   return hh * 60 + mm;
+}
+
+const KICKOFF_AGREE_MS = 10 * 60 * 1000;
+
+function finiteMs(v) {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  const n = Date.parse(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Full kickoff instant from a ticker that encodes HHMM America/New_York.
+// Date-only NFL tickers return null. Market close/expiration fields are ignored.
+function kalshiTickerKickoffMs(marketOrTicker) {
+  const ticker = typeof marketOrTicker === 'string'
+    ? marketOrTicker
+    : (marketOrTicker && (marketOrTicker.ticker || marketOrTicker.event_ticker));
+  return parseKalshiTickerStart(ticker);
+}
+
+// Polymarket US game start. gameStartTime is kickoff. startDate is listing time.
+function polyKickoffMs(market) {
+  if (!market || typeof market !== 'object') return null;
+  return finiteMs(market.gameStartTime || market.game_start_time || null);
+}
+
+function formatKickoffEt(ms) {
+  const t = finiteMs(ms);
+  if (t == null) return null;
+  const d = new Date(t);
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(d);
+  const get = (type) => {
+    const hit = parts.find((p) => p.type === type);
+    return hit ? hit.value : '';
+  };
+  const date = `${get('year')}-${get('month')}-${get('day')}`;
+  const time = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  }).format(d);
+  return `${date} ${time} ET`;
+}
+
+// sources: { polymarket, odds, kalshiTicker, restored } as ms or ISO.
+function chooseKickoff(sources) {
+  const specs = [
+    ['polymarket', 'polymarket'],
+    ['odds', 'odds'],
+    ['kalshiTicker', 'kalshi_ticker'],
+    ['restored', 'restored'],
+  ];
+  const rows = [];
+  for (const [key, source] of specs) {
+    const at = finiteMs(sources && sources[key]);
+    if (at != null) rows.push({ source, at });
+  }
+  if (!rows.length) return null;
+  const primary = rows[0];
+  let chosen = primary;
+  const disagreements = [];
+  for (const row of rows) {
+    if (row === primary) continue;
+    if (Math.abs(row.at - primary.at) <= KICKOFF_AGREE_MS) continue;
+    const deltaMin = Math.round((row.at - primary.at) / 60000);
+    disagreements.push(`${row.source} ${deltaMin > 0 ? '+' : ''}${deltaMin}m`);
+    if (row.at < chosen.at) chosen = row;
+  }
+  let note = null;
+  if (disagreements.length) {
+    note = chosen === primary
+      ? `cross-check ${disagreements.join(', ')}`
+      : `using earlier ${chosen.source}; cross-check ${disagreements.join(', ')}`;
+  }
+  return {
+    kickoffMs: chosen.at,
+    source: chosen.source,
+    note,
+    agreed: disagreements.length === 0,
+  };
 }
 
 function splitBySelection(blob, selection) {
@@ -148,6 +259,7 @@ function groupKalshiMarkets(markets, leagues) {
         date: leg.date,
         teams: leg.teams.slice(),
         startMinutes: leg.startMinutes,
+        kickoffMs: null,
         labels: {},
         rawTeams: leg.rawTeams.slice(),
         kalshi: {},
@@ -155,6 +267,8 @@ function groupKalshiMarkets(markets, leagues) {
       byGame.set(gameId, g);
     }
     if (g.startMinutes == null && leg.startMinutes != null) g.startMinutes = leg.startMinutes;
+    const kick = kalshiTickerKickoffMs(leg.ticker);
+    if (kick != null && (g.kickoffMs == null || kick < g.kickoffMs)) g.kickoffMs = kick;
     const team = normTeam(leg.league, leg.selection);
     if (!team) continue;
     g.kalshi[team] = {
@@ -261,12 +375,13 @@ function matchOddsToGame(oddsGame, game, { fetchedAt, now, maxAgeMs, pinnacleMax
   const odds = {};
   if (homePx) odds[homeTeam] = homePx;
   if (awayPx) odds[awayTeam] = awayPx;
-  return { gameId: game.gameId, odds };
+  const commenceMs = finiteMs(oddsGame.commence_time);
+  return { gameId: game.gameId, odds, commenceMs };
 }
 
 function attachOdds(games, cacheRows, opts) {
   const byId = new Map();
-  for (const g of games || []) byId.set(g.gameId, { ...g, odds: {} });
+  for (const g of games || []) byId.set(g.gameId, { ...g, odds: {}, commenceMs: null });
   for (const row of cacheRows || []) {
     const league = SPORT_LEAGUE[row && row.sport];
     if (!league) continue;
@@ -294,6 +409,9 @@ function attachOdds(games, cacheRows, opts) {
       if (!best) continue;
       const g = byId.get(best.gameId);
       g.odds = { ...g.odds, ...best.odds };
+      if (best.commenceMs != null && (g.commenceMs == null || best.commenceMs < g.commenceMs)) {
+        g.commenceMs = best.commenceMs;
+      }
     }
   }
   return [...byId.values()];
@@ -311,4 +429,10 @@ module.exports = {
   matchOddsToGame,
   attachOdds,
   tokenOverlap,
+  kalshiTickerKickoffMs,
+  polyKickoffMs,
+  chooseKickoff,
+  formatKickoffEt,
+  finiteMs,
+  KICKOFF_AGREE_MS,
 };

@@ -2,9 +2,19 @@
 // Summarize a paper market-making JSONL log.
 //   node scripts/mm-paper-summary.js [path]
 //   MM_LOG_PATH=mm-paper.jsonl node scripts/mm-paper-summary.js
+//
+// Fills and pairs are split pregame / ingame using the event phase, or the
+// kickoff stamped on the tape (cutoff = kickoff - buffer). Unpaired lots are
+// rebuilt from fills and pairs. When Kalshi has a final `result`, leftover
+// contracts are settled into net P&L. Prices are American odds.
+//   MM_PAPER_SETTLE=0 skips the Kalshi result lookup.
 'use strict';
 
 const fs = require('fs');
+const { priceView } = require('../mm-paper-math');
+const { paperEventKey, replayPaperEvents } = require('../mm-paper-state');
+
+const KALSHI_ORIGIN = 'https://api.elections.kalshi.com';
 
 function readEvents(filePath) {
   if (!filePath || !fs.existsSync(filePath)) return [];
@@ -18,8 +28,60 @@ function readEvents(filePath) {
   return events;
 }
 
+function emptyPhase() {
+  return { fills: 0, pairs: 0, locked: 0 };
+}
+
+function kickoffIndex(events) {
+  const out = new Map();
+  for (const ev of events || []) {
+    if (!ev || !ev.gameId || ev.kickoffMs == null) continue;
+    const ms = Number(ev.kickoffMs);
+    if (!Number.isFinite(ms)) continue;
+    if (!out.has(ev.gameId)) {
+      out.set(ev.gameId, {
+        kickoffMs: ms,
+        bufferSec: ev.bufferSec != null ? Number(ev.bufferSec) : 60,
+      });
+    }
+  }
+  return out;
+}
+
+function phaseOf(ev, kickoffs) {
+  if (!ev) return 'unknown';
+  if (ev.phase === 'pregame' || ev.phase === 'ingame' || ev.phase === 'unknown') return ev.phase;
+  const info = kickoffs.get(ev.gameId);
+  const kick = ev.kickoffMs != null ? Number(ev.kickoffMs) : (info && info.kickoffMs);
+  const bufferSec = ev.bufferSec != null
+    ? Number(ev.bufferSec)
+    : (info && info.bufferSec != null ? info.bufferSec : 60);
+  const ts = ev.tradeTs != null ? Number(ev.tradeTs) : (ev.ts != null ? Number(ev.ts) : null);
+  if (kick == null || ts == null || !Number.isFinite(kick) || !Number.isFinite(ts) || !Number.isFinite(bufferSec)) {
+    return 'unknown';
+  }
+  return ts >= kick - bufferSec * 1000 ? 'ingame' : 'pregame';
+}
+
+function lotView(lot) {
+  const view = priceView(lot.net);
+  return {
+    team: lot.team,
+    venue: lot.venue,
+    qty: lot.qty,
+    net: lot.net,
+    cents: view.cents,
+    american: view.american,
+    americanText: view.americanText,
+    kalshiTicker: lot.kalshiTicker || null,
+  };
+}
+
 function summarize(events) {
+  const kickoffs = kickoffIndex(events);
+  const replay = replayPaperEvents(events);
   const games = new Map();
+  const seen = new Set();
   function game(id) {
     const key = id || '(no game)';
     let g = games.get(key);
@@ -33,10 +95,15 @@ function summarize(events) {
         fills: 0,
         pairs: 0,
         lockedProfit: 0,
+        phases: { pregame: emptyPhase(), ingame: emptyPhase(), unknown: emptyPhase() },
         openPositions: [],
+        lots: [],
         lockedPnl: 0,
         openPnl: null,
         hedges: 0,
+        settledLeftover: null,
+        openQty: 0,
+        net: null,
       };
       games.set(key, g);
     }
@@ -44,23 +111,126 @@ function summarize(events) {
   }
   for (const ev of events || []) {
     if (!ev || typeof ev !== 'object') continue;
+    if (ev.kind === 'fill' || ev.kind === 'pair') {
+      const key = paperEventKey(ev);
+      if (key && seen.has(key)) continue;
+      if (key) seen.add(key);
+    }
     const g = game(ev.gameId);
     if (ev.league) g.league = ev.league;
+    const phase = phaseOf(ev, kickoffs);
     if (ev.kind === 'quote') g.quotes += 1;
     else if (ev.kind === 'reprice') g.reprices += 1;
     else if (ev.kind === 'pull') g.pulls += 1;
-    else if (ev.kind === 'fill') g.fills += 1;
-    else if (ev.kind === 'pair') {
+    else if (ev.kind === 'fill') {
+      g.fills += 1;
+      g.phases[phase].fills += 1;
+    } else if (ev.kind === 'pair') {
       g.pairs += 1;
-      g.lockedProfit += Number(ev.lockedProfit) || 0;
+      const profit = Number(ev.lockedProfit) || 0;
+      g.lockedProfit += profit;
+      g.phases[phase].pairs += 1;
+      g.phases[phase].locked += profit;
     } else if (ev.kind === 'hedge') g.hedges += 1;
-    if (ev.openPositions) g.openPositions = ev.openPositions;
     if (ev.lockedPnl != null && Number.isFinite(Number(ev.lockedPnl))) g.lockedPnl = Number(ev.lockedPnl);
     if (ev.kind === 'pair' || ev.kind === 'fill' || ev.kind === 'quote' || ev.kind === 'reprice' || ev.kind === 'pull') {
       g.openPnl = ev.openPnl == null ? g.openPnl : ev.openPnl;
     }
   }
+  for (const g of games.values()) {
+    const replayed = replay.get(g.gameId);
+    const lots = [];
+    if (replayed) {
+      for (const lot of replayed.lots) {
+        if (!(lot.qty > 1e-9)) continue;
+        lots.push(lot);
+      }
+    }
+    g.lots = lots;
+    g.openPositions = lots.map(lotView);
+    g.openQty = lots.reduce((sum, lot) => sum + lot.qty, 0);
+  }
   return [...games.values()];
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+async function fetchKalshiMarket(ticker, fetchFn = fetch) {
+  if (!ticker) return null;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const res = await fetchFn(
+      `${KALSHI_ORIGIN}/trade-api/v2/markets/${encodeURIComponent(ticker)}`,
+      { signal: ctrl.signal, headers: { accept: 'application/json' } }
+    );
+    if (!res || !res.ok) return null;
+    const body = await res.json();
+    return (body && body.market) || body;
+  } catch (_) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function resultOf(market) {
+  const raw = market && (market.result != null ? market.result : market.market && market.market.result);
+  const result = String(raw || '').trim().toLowerCase();
+  if (result === 'yes' || result === 'no') return result;
+  return null;
+}
+
+// Settle unpaired lots against Kalshi YES/NO. `fetchMarket(ticker)` returns
+// a market object or { result }. Lots without a final result stay open.
+async function settleRows(rows, fetchMarket) {
+  const fetchOne = fetchMarket || ((ticker) => fetchKalshiMarket(ticker));
+  const cache = new Map();
+  async function lookup(ticker) {
+    if (!ticker) return null;
+    if (cache.has(ticker)) return cache.get(ticker);
+    let result = null;
+    try {
+      result = resultOf(await fetchOne(ticker));
+    } catch (_) {
+      result = null;
+    }
+    cache.set(ticker, result);
+    return result;
+  }
+  for (const row of rows || []) {
+    let settled = 0;
+    let openQty = 0;
+    const open = [];
+    const settledLots = [];
+    for (const lot of row.lots || []) {
+      if (!(lot.qty > 1e-9) || !Number.isFinite(Number(lot.net))) continue;
+      const result = await lookup(lot.kalshiTicker);
+      if (result === 'yes' || result === 'no') {
+        const payout = result === 'yes' ? 1 : 0;
+        settled += lot.qty * (payout - Number(lot.net));
+        const view = priceView(Number(lot.net));
+        settledLots.push({
+          team: lot.team,
+          qty: lot.qty,
+          venue: lot.venue,
+          result,
+          americanText: view.americanText,
+        });
+      } else {
+        openQty += lot.qty;
+        open.push(lot);
+      }
+    }
+    row.settledLots = settledLots;
+    row.settledLeftover = round2(settled);
+    row.openQty = openQty;
+    row.openPositions = open.map(lotView);
+    row.net = round2((Number(row.lockedProfit) || 0) + settled);
+  }
+  return rows;
 }
 
 function money(n) {
@@ -70,6 +240,10 @@ function money(n) {
   return v < 0 ? `-${body}` : body;
 }
 
+function phaseText(label, phase) {
+  return `${label} fills=${phase.fills} pairs=${phase.pairs} locked=${money(phase.locked)}`;
+}
+
 function formatReport(rows) {
   if (!rows.length) return 'mm-paper: no events';
   const lines = [];
@@ -77,32 +251,82 @@ function formatReport(rows) {
   let fills = 0;
   let pairs = 0;
   let locked = 0;
+  let settled = 0;
+  let settledKnown = true;
+  let openQty = 0;
+  let net = 0;
+  let netKnown = true;
+  const pre = emptyPhase();
+  const ingame = emptyPhase();
   for (const g of rows) {
     quotes += g.quotes + g.reprices;
     fills += g.fills;
     pairs += g.pairs;
     locked += g.lockedProfit;
+    pre.fills += g.phases.pregame.fills;
+    pre.pairs += g.phases.pregame.pairs;
+    pre.locked += g.phases.pregame.locked;
+    ingame.fills += g.phases.ingame.fills;
+    ingame.pairs += g.phases.ingame.pairs;
+    ingame.locked += g.phases.ingame.locked;
+    if (g.settledLeftover == null || g.net == null) {
+      settledKnown = false;
+      netKnown = false;
+    } else {
+      settled += g.settledLeftover;
+      net += g.net;
+    }
+    openQty += Number(g.openQty) || 0;
     const open = (g.openPositions || []).map((p) => {
-      const am = p.americanText || (p.american > 0 ? `+${p.american}` : p.american);
-      return `${p.team} ${p.qty} @ ${p.cents}c ${am || ''} net ${p.venue}`.trim();
+      const am = p.americanText || (p.american > 0 ? `+${p.american}` : (p.american != null ? String(p.american) : 'n/a'));
+      return `${p.team} ${p.qty} @ ${am} ${p.venue || ''}`.trim();
     }).join('; ') || 'flat';
+    const unknown = g.phases.unknown;
+    const unknownText = (unknown.fills || unknown.pairs)
+      ? ` ${phaseText('unknown', unknown)}`
+      : '';
+    const settledLots = (g.settledLots || []).map((p) => `${p.team} ${p.qty} @ ${p.americanText}`).join('; ');
+    const settledText = settledLots ? ` settledLots=${settledLots}` : '';
     lines.push(
       `${g.gameId}  quotes=${g.quotes} reprices=${g.reprices} pulls=${g.pulls} `
-      + `fills=${g.fills} pairs=${g.pairs} locked=${money(g.lockedProfit)} `
-      + `openPnl=${money(g.openPnl)} hedges=${g.hedges} open=${open}`
+      + `fills=${g.fills} pairs=${g.pairs} hedges=${g.hedges} `
+      + `${phaseText('pregame', g.phases.pregame)} ${phaseText('ingame', g.phases.ingame)}${unknownText} `
+      + `locked=${money(g.lockedProfit)} settledLeftover=${money(g.settledLeftover)} `
+      + `open=${g.openQty} net=${money(g.net)}${settledText} openLots=${open}`
     );
   }
-  lines.push(`TOTAL quotes=${quotes} fills=${fills} pairs=${pairs} locked=${money(locked)}`);
+  lines.push(
+    `TOTAL quotes=${quotes} fills=${fills} pairs=${pairs} `
+    + `${phaseText('pregame', pre)} ${phaseText('ingame', ingame)} `
+    + `locked=${money(locked)} settledLeftover=${settledKnown ? money(settled) : 'n/a'} `
+    + `open=${openQty} net=${netKnown ? money(net) : 'n/a'}`
+  );
   return lines.join('\n');
 }
 
-function main(argv, env = process.env) {
+async function main(argv, env = process.env, deps = {}) {
   const filePath = argv[2] || env.MM_LOG_PATH || 'mm-paper.jsonl';
   const rows = summarize(readEvents(filePath));
-  console.log(formatReport(rows));
+  const settleOff = /^(0|false|no|off)$/i.test(String(env.MM_PAPER_SETTLE || '').trim());
+  if (!settleOff) await settleRows(rows, deps.fetchMarket);
+  const text = formatReport(rows);
+  console.log(text);
   return rows;
 }
 
-if (require.main === module) main(process.argv);
+if (require.main === module) {
+  main(process.argv).catch((err) => {
+    console.error(err && err.stack ? err.stack : err);
+    process.exit(1);
+  });
+}
 
-module.exports = { summarize, formatReport, readEvents, main };
+module.exports = {
+  summarize,
+  formatReport,
+  readEvents,
+  settleRows,
+  fetchKalshiMarket,
+  phaseOf,
+  main,
+};

@@ -17,6 +17,43 @@ const {
   pairNetsOk,
 } = require('./mm-paper-math');
 const { bookTop, sizeAtBid } = require('./mm-paper-books');
+const { chooseKickoff, formatKickoffEt } = require('./mm-paper-games');
+const {
+  metaFromGameId,
+  paperEventKey,
+  sortPaperEvents,
+  applyFill,
+  applyPair,
+} = require('./mm-paper-state');
+
+function bufferMs(cfg) {
+  const sec = cfg && Number.isFinite(Number(cfg.kickoffBufferSec)) ? Number(cfg.kickoffBufferSec) : 60;
+  return sec * 1000;
+}
+
+function formatCutoffLine({ gameId, kickoffEt, bufferSec, pulled }) {
+  const n = Number.isFinite(Number(bufferSec)) ? String(Number(bufferSec)) : '60';
+  return `[MM-PAPER] cutoff ${gameId} kickoff=${kickoffEt} buffer=${n}s — pulled ${pulled} bids, no more quotes`;
+}
+
+function formatNoKickoffLine(gameId) {
+  return `[MM-PAPER] no kickoff ${gameId} — not quoting`;
+}
+
+function formatKickoffLine({ gameId, source, kickoffEt, note }) {
+  const extra = note ? ` (${note})` : '';
+  return `[MM-PAPER] kickoff ${gameId} source=${source} kickoff=${kickoffEt}${extra}`;
+}
+
+function normalizePrintTs(ts, fallback) {
+  if (ts == null || ts === '') return fallback;
+  if (typeof ts === 'number') {
+    if (!Number.isFinite(ts)) return fallback;
+    return ts > 0 && ts < 1e12 ? ts * 1000 : ts;
+  }
+  const parsed = Date.parse(ts);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
 
 function etDay(now) {
   const parts = new Intl.DateTimeFormat('en-US', {
@@ -39,6 +76,7 @@ function otherTeam(game, team) {
 function createPaperSession(cfg) {
   const games = new Map();
   const seenTrades = new Set();
+  const restoredKeys = new Set();
   let halted = false;
   let dailyDay = null;
   let dailyLocked = 0;
@@ -69,6 +107,13 @@ function createPaperSession(cfg) {
         lots: [],
         lockedPnl: 0,
         pairedQty: 0,
+        kickoffMs: null,
+        kickoffSource: null,
+        kickoffNote: null,
+        kickoffSources: {},
+        kickoffLoggedKey: null,
+        closed: false,
+        noKickoffLogged: false,
       };
       games.set(meta.gameId, g);
     }
@@ -82,7 +127,120 @@ function createPaperSession(cfg) {
     g.teams = meta.teams.slice();
     g.labels = { ...g.labels, ...(meta.labels || {}) };
     g.kalshiTickers = meta.kalshi || g.kalshiTickers || {};
+    if (meta.kickoffMs != null) setKickoff(g.gameId, { kalshiTicker: meta.kickoffMs });
+    if (meta.commenceMs != null) setKickoff(g.gameId, { odds: meta.commenceMs });
     return g;
+  }
+
+  function cutoffMsOf(g) {
+    if (!g || g.kickoffMs == null || !Number.isFinite(g.kickoffMs)) return null;
+    return g.kickoffMs - bufferMs(cfg);
+  }
+
+  function phaseAt(g, ts) {
+    const cut = cutoffMsOf(g);
+    if (cut == null || ts == null || !Number.isFinite(Number(ts))) return 'unknown';
+    return Number(ts) >= cut ? 'ingame' : 'pregame';
+  }
+
+  function setKickoff(gameId, partial) {
+    const g = games.get(gameId);
+    if (!g || !partial) return null;
+    g.kickoffSources = { ...(g.kickoffSources || {}) };
+    for (const [key, value] of Object.entries(partial)) {
+      if (value == null || value === '') continue;
+      const ms = typeof value === 'number' ? value : Date.parse(value);
+      if (!Number.isFinite(ms)) continue;
+      g.kickoffSources[key] = ms;
+    }
+    const chosen = chooseKickoff(g.kickoffSources);
+    if (!chosen) return null;
+    g.kickoffMs = chosen.kickoffMs;
+    g.kickoffSource = chosen.source;
+    g.kickoffNote = chosen.note || null;
+    if (!g.closed) {
+      const logKey = `${chosen.source}|${chosen.kickoffMs}|${chosen.note || ''}`;
+      if (g.kickoffLoggedKey !== logKey) {
+        g.kickoffLoggedKey = logKey;
+        console.log(formatKickoffLine({
+          gameId: g.gameId,
+          source: g.kickoffSource,
+          kickoffEt: formatKickoffEt(g.kickoffMs),
+          note: g.kickoffNote,
+        }));
+      }
+    }
+    return chosen;
+  }
+
+  function rememberKickoff(g, ev) {
+    if (!g || !ev || ev.kickoffMs == null) return;
+    const source = ev.kickoffSource;
+    if (source === 'polymarket') setKickoff(g.gameId, { polymarket: ev.kickoffMs });
+    else if (source === 'odds') setKickoff(g.gameId, { odds: ev.kickoffMs });
+    else if (source === 'kalshi_ticker' || source === 'kalshiTicker') {
+      setKickoff(g.gameId, { kalshiTicker: ev.kickoffMs });
+    } else if (g.kickoffMs == null) {
+      setKickoff(g.gameId, { restored: ev.kickoffMs });
+    }
+  }
+
+  function ensureFromEvent(ev) {
+    const meta = metaFromGameId(ev && ev.gameId, ev && ev.league);
+    if (!meta) return null;
+    return upsertGame({
+      gameId: meta.gameId,
+      league: meta.league,
+      date: meta.date,
+      teams: meta.teams,
+      labels: {},
+    });
+  }
+
+  function tradeSeenKey(ev) {
+    if (ev && ev.tradeKey) return ev.tradeKey;
+    if (ev && ev.tradeId) return `${ev.venue}|${ev.team}|${ev.tradeId}`;
+    return null;
+  }
+
+  function restoreFromEvents(events, now = Date.now()) {
+    rollDay(now);
+    let applied = 0;
+    for (const ev of sortPaperEvents(events)) {
+      if (!ev) continue;
+      if (ev.kind !== 'fill' && ev.kind !== 'pair' && ev.kind !== 'cutoff') continue;
+      const g = ensureFromEvent(ev);
+      if (g) rememberKickoff(g, ev);
+      if (ev.kind !== 'fill' && ev.kind !== 'pair') continue;
+      const key = paperEventKey(ev);
+      if (!key || restoredKeys.has(key)) continue;
+      restoredKeys.add(key);
+      if (!g) continue;
+      if (ev.kind === 'fill') {
+        const lot = applyFill(g, ev);
+        if (!lot) continue;
+        const seen = tradeSeenKey(ev);
+        if (seen) seenTrades.add(seen);
+        applied += 1;
+      } else {
+        const paired = applyPair(g, ev);
+        if (!paired) continue;
+        if (ev.ts != null && etDay(ev.ts) === dailyDay) dailyLocked += paired.profit;
+        applied += 1;
+      }
+    }
+    let openQty = 0;
+    let lockedPnl = 0;
+    for (const g of games.values()) {
+      lockedPnl += g.lockedPnl;
+      for (const lot of g.lots) if (lot.qty > 1e-9) openQty += lot.qty;
+    }
+    return {
+      applied,
+      openQty,
+      lockedPnl: round2(lockedPnl),
+      dailyLocked: round2(dailyLocked),
+    };
   }
 
   function setBook(gameId, venue, team, book) {
@@ -112,6 +270,8 @@ function createPaperSession(cfg) {
       g.kalshiTickers = row.kalshi || {};
       g.odds = row.odds || {};
       g.rawTeams = row.rawTeams;
+      if (row.commenceMs != null) setKickoff(row.gameId, { odds: row.commenceMs });
+      if (row.kickoffMs != null) setKickoff(row.gameId, { kalshiTicker: row.kickoffMs });
     }
     for (const [id, g] of games) {
       if (!live.has(id)) g.odds = {};
@@ -170,19 +330,31 @@ function createPaperSession(cfg) {
   }
 
   function baseEvent(g, kind, extra) {
+    const extraFields = { ...(extra || {}) };
+    const ts = extraFields.ts || Date.now();
+    const phaseTs = extraFields.phaseTs != null ? extraFields.phaseTs : ts;
+    const phase = extraFields.phase || phaseAt(g, phaseTs);
+    delete extraFields.phaseTs;
+    delete extraFields.phase;
+    delete extraFields.ts;
     return {
       kind,
-      ts: extra && extra.ts ? extra.ts : Date.now(),
+      ts,
       gameId: g.gameId,
       league: g.league,
       paper: true,
       orders: 'none',
+      kickoffMs: g.kickoffMs,
+      kickoffSource: g.kickoffSource || null,
+      cutoffMs: cutoffMsOf(g),
+      bufferSec: bufferMs(cfg) / 1000,
+      phase,
       ...pnlFields(g),
-      ...extra,
+      ...extraFields,
     };
   }
 
-  function tryPair(g, ts) {
+  function tryPair(g, ts, phaseTs) {
     const events = [];
     const [aTeam, bTeam] = g.teams;
     for (;;) {
@@ -193,6 +365,7 @@ function createPaperSession(cfg) {
       if (!done.ok) {
         events.push(baseEvent(g, 'pair_blocked', {
           ts,
+          phaseTs: phaseTs != null ? phaseTs : ts,
           reason: done.reason,
           combinedNet: done.combinedNet,
           teams: {
@@ -209,6 +382,7 @@ function createPaperSession(cfg) {
       dailyLocked += done.lockedProfit;
       events.push(baseEvent(g, 'pair', {
         ts,
+        phaseTs: phaseTs != null ? phaseTs : ts,
         qty: done.qty,
         combinedNet: done.combinedNet,
         combinedCents: Math.round(done.combinedNet * 100),
@@ -227,9 +401,17 @@ function createPaperSession(cfg) {
     return events;
   }
 
+  function kalshiTickerFor(g, team) {
+    const row = g.kalshiTickers && g.kalshiTickers[team];
+    return row && row.ticker ? row.ticker : null;
+  }
+
   function applyTrade(gameId, venue, team, trade, now) {
     const g = games.get(gameId);
     if (!g || !trade) return [];
+    const printTs = normalizePrintTs(trade.ts, now);
+    const cut = cutoffMsOf(g);
+    if (cut == null || printTs >= cut) return [];
     const key = `${venue}|${team}|${trade.id || `${trade.ts}|${trade.price}|${trade.qty}`}`;
     if (seenTrades.has(key)) return [];
     seenTrades.add(key);
@@ -271,8 +453,12 @@ function createPaperSession(cfg) {
       tradeAmericanText: priceView(trade.price).americanText,
       queueReason: sim.reason,
       tradeId: trade.id || null,
+      tradeKey: key,
+      tradeTs: printTs,
+      kalshiTicker: kalshiTickerFor(g, team),
+      phaseTs: printTs,
     })];
-    events.push(...tryPair(g, now));
+    events.push(...tryPair(g, now, printTs));
     return events;
   }
 
@@ -487,6 +673,50 @@ function createPaperSession(cfg) {
       }
     }
     for (const g of games.values()) {
+      const cut = cutoffMsOf(g);
+      if (g.closed || (cut != null && now >= cut)) {
+        const pulls = [];
+        for (const team of g.teams) {
+          const pulled = pullQuote(g, team, 'kickoff_cutoff', now);
+          if (pulled) pulls.push(pulled);
+        }
+        if (!g.closed) {
+          g.closed = true;
+          const line = formatCutoffLine({
+            gameId: g.gameId,
+            kickoffEt: formatKickoffEt(g.kickoffMs),
+            bufferSec: bufferMs(cfg) / 1000,
+            pulled: pulls.length,
+          });
+          console.log(line);
+          events.push(baseEvent(g, 'cutoff', {
+            ts: now,
+            reason: 'kickoff_cutoff',
+            pulled: pulls.length,
+            logLine: line,
+            kickoffEt: formatKickoffEt(g.kickoffMs),
+          }));
+        }
+        events.push(...pulls);
+        continue;
+      }
+      if (cut == null) {
+        for (const team of g.teams) {
+          const pulled = pullQuote(g, team, 'no_kickoff', now);
+          if (pulled) events.push(pulled);
+        }
+        if (!g.noKickoffLogged) {
+          g.noKickoffLogged = true;
+          const line = formatNoKickoffLine(g.gameId);
+          console.log(line);
+          events.push(baseEvent(g, 'no_kickoff', {
+            ts: now,
+            reason: 'unknown_kickoff',
+            logLine: line,
+          }));
+        }
+        continue;
+      }
       if (halted) {
         for (const team of g.teams) {
           const pulled = pullQuote(g, team, 'daily_loss_limit', now);
@@ -566,6 +796,7 @@ function createPaperSession(cfg) {
   function instruments() {
     const out = [];
     for (const g of games.values()) {
+      if (g.closed || g.kickoffMs == null) continue;
       for (const team of g.teams) {
         const k = g.kalshiTickers && g.kalshiTickers[team];
         if (k && k.ticker) {
@@ -595,6 +826,8 @@ function createPaperSession(cfg) {
     setOdds,
     setPolyMarket,
     replaceOdds,
+    setKickoff,
+    restoreFromEvents,
     applyTrade,
     tick,
     instruments,
@@ -611,4 +844,7 @@ function round2(n) {
 module.exports = {
   createPaperSession,
   etDay,
+  formatCutoffLine,
+  formatNoKickoffLine,
+  formatKickoffLine,
 };
