@@ -1,7 +1,9 @@
 'use strict';
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 const {
-  decideAtFill, fillView, buildQuoteBody, yesBidForQuote, shouldPostQuote, isSilentQuoteFailure,
+  decideAtFill, hedgeCap, fillView, buildQuoteBody, yesBidForQuote, shouldPostQuote, isSilentQuoteFailure,
   isInsufficientFundsFailure, quoteFailureSkipReason,
   isRfqClosedFailure, quotePostFailReason, formatQuoteLatency,
   YES_DECLINE, impliedYesBid, quoteYesBid, isRealYesBid, shouldConfirmAccept, contractsFromQuoteResponse,
@@ -272,5 +274,158 @@ assert.strictEqual(contractsFromQuoteResponse({ id: 'q1', yes_contracts_fp: '50.
 assert.strictEqual(contractsFromQuoteResponse({ id: 'q1', contracts_fp: '41.00' }, 40), 41);
 assert.strictEqual(contractsFromQuoteResponse({ quote: { no_contracts_fp: '42.00' } }, 40), 42);
 assert.strictEqual(contractsFromQuoteResponse(null, 43), 43);
+
+// riskfree_open: $100 at +2000, fill +1200. y = 1/13, W = 2000.
+// 1× = 2100. Open cap = floor(2000 / (12/13)) = 2166. Win side stays ≥ $0.
+{
+  const stake = 100;
+  const boost = 2000;
+  const fill = 1200;
+  const y = 1 / 13;
+  const W = 2000;
+  assert.strictEqual(hedgeCap({ stake, boostAmerican: boost, fillAmerican: fill, mode: '1x' }), 2100);
+  assert.strictEqual(hedgeCap({ stake, boostAmerican: boost, fillAmerican: fill, mode: 'riskfree' }), 1300);
+  assert.strictEqual(hedgeCap({ stake, boostAmerican: boost, fillAmerican: fill, mode: '2x' }), 4200);
+  assert.strictEqual(hedgeCap({ stake, boostAmerican: boost, fillAmerican: fill, mode: '3x' }), 6300);
+  assert.strictEqual(hedgeCap({ stake, boostAmerican: boost, fillAmerican: fill, mode: 'nope' }), 2100);
+  const openCap = hedgeCap({ stake, boostAmerican: boost, fillAmerican: fill, mode: 'riskfree_open' });
+  assert.strictEqual(openCap, 2166);
+  assert.strictEqual(openCap, Math.floor(W / (1 - y)));
+  const open = decideAtFill({
+    parlayStake: stake,
+    parlayAmerican: boost,
+    fillAmerican: fill,
+    rfqContracts: openCap,
+    hedgeMode: 'riskfree_open',
+    maxContracts: openCap,
+  });
+  assert.strictEqual(open.ok, true);
+  assert.strictEqual(open.cap, 2166);
+  assert.strictEqual(open.contracts, 2166);
+  assert.strictEqual(open.hit, 0.62);
+  assert.strictEqual(open.miss, 66.62);
+  assert.ok(open.hit >= 0);
+  const tooBig = decideAtFill({
+    parlayStake: stake,
+    parlayAmerican: boost,
+    fillAmerican: fill,
+    rfqContracts: 2167,
+    hedgeMode: 'riskfree_open',
+    maxContracts: openCap,
+  });
+  assert.strictEqual(tooBig.ok, false);
+  assert.strictEqual(tooBig.reason, 'rfq_too_large');
+  const between = decideAtFill({
+    parlayStake: stake,
+    parlayAmerican: boost,
+    fillAmerican: fill,
+    rfqContracts: 2166,
+    hedgeMode: '1x',
+    maxContracts: openCap,
+  });
+  assert.strictEqual(between.ok, false, '1× still declines an RFQ between 2100 and the open cap');
+  assert.strictEqual(between.reason, 'rfq_too_large');
+  assert.strictEqual(between.cap, 2100);
+}
+
+// Free bet: cash at risk is $0, profit is still face × (decimal − 1).
+// A $100 free bet at +2000 has W = 2000, so the open cap is 2166, not 0.
+{
+  const face = 100;
+  const profit = face * (2000 / 100);
+  assert.strictEqual(profit, 2000);
+  const free = hedgeCap({
+    stake: face, boostAmerican: 2000, fillAmerican: 1200, mode: 'riskfree_open',
+  });
+  assert.strictEqual(free, 2166);
+  assert.strictEqual(free, Math.floor(profit / (12 / 13)));
+  const exact = hedgeCap({
+    stake: 50, boostAmerican: 500, fillAmerican: 200, mode: 'riskfree_open',
+  });
+  assert.strictEqual(exact, 375, 'free-bet profit that divides evenly stays on the integer');
+  const filled = decideAtFill({
+    parlayStake: 50,
+    parlayAmerican: 500,
+    fillAmerican: 200,
+    rfqContracts: exact,
+    hedgeMode: 'riskfree_open',
+    maxContracts: exact,
+  });
+  assert.strictEqual(filled.ok, true);
+  assert.ok(filled.hit >= 0);
+  assert.strictEqual(filled.hit, 0);
+}
+
+// Short parlay odds, and a short fill that is larger than the legacy 3× cap.
+{
+  const short = hedgeCap({
+    stake: 100, boostAmerican: -200, fillAmerican: 150, mode: 'riskfree_open',
+  });
+  assert.strictEqual(hedgeCap({
+    stake: 100, boostAmerican: -200, fillAmerican: 150, mode: '1x',
+  }), 150);
+  assert.strictEqual(short, 83);
+  const shortFill = decideAtFill({
+    parlayStake: 100,
+    parlayAmerican: -200,
+    fillAmerican: 150,
+    rfqContracts: short,
+    hedgeMode: 'riskfree_open',
+  });
+  assert.strictEqual(shortFill.ok, true);
+  assert.ok(shortFill.hit >= 0);
+  assert.strictEqual(shortFill.hit, 0.2);
+  const past3x = hedgeCap({
+    stake: 100, boostAmerican: 2000, fillAmerican: -400, mode: 'riskfree_open',
+  });
+  assert.strictEqual(past3x, 10000);
+  assert.ok(past3x > hedgeCap({
+    stake: 100, boostAmerican: 2000, fillAmerican: -400, mode: '3x',
+  }));
+}
+
+// Merged cash: $40 at +1500 and $60 at +2500 → S = 100, W = 2100, odds +2100.
+{
+  const merged = hedgeCap({
+    stake: 100, boostAmerican: 2100, fillAmerican: 1200, mode: 'riskfree_open',
+  });
+  assert.strictEqual(merged, 2275);
+  assert.strictEqual(hedgeCap({
+    stake: 100, boostAmerican: 2100, fillAmerican: 1200, mode: '1x',
+  }), 2200);
+  assert.strictEqual(hedgeCap({
+    stake: 100, boostAmerican: 2100, fillAmerican: 1200, mode: '3x',
+  }), 6600);
+}
+
+// Bad inputs stay finite. y outside (0, 1) and a non-positive profit return 0.
+{
+  assert.strictEqual(hedgeCap({
+    stake: 0, boostAmerican: 2000, fillAmerican: 1200, mode: 'riskfree_open',
+  }), 0);
+  assert.strictEqual(hedgeCap({
+    stake: 100, boostAmerican: 2000, fillAmerican: null, mode: 'riskfree_open',
+  }), 0);
+  assert.strictEqual(hedgeCap({
+    stake: 100, boostAmerican: 2000, fillAmerican: 0, mode: 'riskfree_open',
+  }), 0);
+  assert.strictEqual(hedgeCap({
+    stake: NaN, boostAmerican: 2000, fillAmerican: 1200, mode: 'riskfree_open',
+  }), 0);
+  const infiniteFill = hedgeCap({
+    stake: 100, boostAmerican: 2000, fillAmerican: Number.POSITIVE_INFINITY, mode: 'riskfree_open',
+  });
+  assert.strictEqual(infiniteFill, 0);
+  assert.ok(Number.isFinite(infiniteFill));
+}
+
+for (const file of ['live-runner.js', 'shadow-runner.js', 'polymarket-rfq.js']) {
+  const src = fs.readFileSync(path.join(__dirname, file), 'utf8');
+  assert.match(
+    src,
+    /hedgeMode:\s*(?:p|parlay)\.hedge_mode\s*\|\|\s*'1x'/,
+    `${file} must pass hedge_mode into decideAtFill`
+  );
+}
 
 console.log('engine.test.js ok');
