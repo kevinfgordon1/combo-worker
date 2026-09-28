@@ -2270,14 +2270,21 @@ const novigFeed = (() => {
       }
     }
 
-    // Main-line searches run two at a time, soonest game first, so a slow
+    // Main-line searches run two at a time, tonight's games and NFL first, so a slow
     // public budget finishes tonight's lines before next week's.
     const searchQueue = [];
     let searchWorkers = 0;
     function enqueueSearch(job) {
       if (searching.has(job.key) || searchQueue.some((j) => j.key === job.key)) return;
       searchQueue.push(job);
-      searchQueue.sort((a, b) => a.startsAt - b.startsAt);
+      // Live or within 6h first, then NFL before MLB before NCAAF, then soonest.
+      const soon = Date.now() + 6 * 3600 * 1000;
+      const rank = (j) => [j.startsAt <= soon ? 0 : 1, Math.max(0, LEAGUES.indexOf(j.cat.league)), j.startsAt];
+      searchQueue.sort((a, b) => {
+        const ra = rank(a);
+        const rb = rank(b);
+        return ra[0] - rb[0] || ra[1] - rb[1] || ra[2] - rb[2];
+      });
       while (searchWorkers < 2 && searchQueue.length) {
         searchWorkers += 1;
         (async () => {
