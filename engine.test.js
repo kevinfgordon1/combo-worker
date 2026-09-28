@@ -428,4 +428,42 @@ for (const file of ['live-runner.js', 'shadow-runner.js', 'polymarket-rfq.js']) 
   );
 }
 
+{
+  // Original riskfree mode on a FREE BET with max_contracts 0/null must not quote.
+  // The fallback would size it like cash (ceil(stake / y)) with no persisted
+  // ceiling, which confirm-time / reserve checks treat as unlimited.
+  const { isFreeBetRow, freeBetRiskfreeMissingCap } = require('./engine');
+  const base = {
+    parlayStake: 100, parlayAmerican: 650, fillAmerican: 610, rfqContracts: 50,
+    hedgeMode: 'riskfree', isFreeBet: true,
+  };
+  for (const maxContracts of [0, null, undefined, '', '0', -5, NaN]) {
+    const d = decideAtFill({ ...base, maxContracts });
+    assert.strictEqual(d.ok, false, `max=${maxContracts}`);
+    assert.strictEqual(d.reason, 'no_cap', `max=${maxContracts}`);
+  }
+  // Correct saved cap (ceil(face / y) = 710) quotes and is the ceiling.
+  const ok = decideAtFill({ ...base, maxContracts: 710 });
+  assert.strictEqual(ok.ok, true);
+  assert.strictEqual(ok.totalLimit, 710);
+  const capped = decideAtFill({ ...base, maxContracts: 710, filledSoFar: 700, rfqContracts: 50, allowPartial: true });
+  assert.strictEqual(capped.ok, true);
+  assert.strictEqual(capped.contracts, 10);
+  // Cash riskfree and other free-bet modes keep the old fallback (unchanged behavior).
+  assert.strictEqual(decideAtFill({ ...base, isFreeBet: false, maxContracts: 0 }).ok, true);
+  assert.strictEqual(decideAtFill({ ...base, hedgeMode: '1x', maxContracts: 0 }).ok, true);
+  assert.strictEqual(decideAtFill({ ...base, hedgeMode: 'riskfree_open', maxContracts: 0 }).ok, true);
+  assert.strictEqual(freeBetRiskfreeMissingCap({ hedgeMode: 'riskfree', maxContracts: 0, isFreeBet: false }), false);
+  assert.strictEqual(isFreeBetRow({ is_free_bet: true }), true);
+  assert.strictEqual(isFreeBetRow({ bet_type: 'free' }), true);
+  assert.strictEqual(isFreeBetRow({ is_free_bet: false, bet_type: 'cash' }), false);
+  assert.strictEqual(isFreeBetRow(null), false);
+  // Every live quoting path must pass isFreeBet so the guard can fire.
+  for (const file of ['live-runner.js', 'polymarket-rfq.js', 'shadow-runner.js']) {
+    const src = fs.readFileSync(path.join(__dirname, file), 'utf8');
+    assert.ok(/isFreeBet:\s*isFreeBetRow\(/.test(src), `${file} must pass isFreeBet into decideAtFill`);
+  }
+}
+
 console.log('engine.test.js ok');
+

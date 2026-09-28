@@ -209,8 +209,29 @@ function hedgeCap({ stake, boostAmerican, fillAmerican, mode = '1x' }) {
 // Polymarket can size the maker quote (qtyDecimal). Pass allowPartial: true so a
 // leftover remaining > 0 still quotes min(rfq, remaining, per-fill cap) instead
 // of rfq_too_large. Kalshi live-runner must leave allowPartial off.
-function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican = null, rfqContracts, hedgeMode = '1x', maxContracts = null, filledSoFar = 0, outstanding = 0, allowPartial = false }) {
+//
+// isFreeBet   : the row is a free bet (combo_parlays.is_free_bet / bet_type 'free').
+//               Original 'riskfree' mode on a free bet MUST carry a saved max_contracts.
+//               Older aibetbuilder builds saved 0 there ("0 contracts, no hedge"), and the
+//               fallback below would then size it as cash (ceil(stake / y)) with NO
+//               persisted ceiling, so confirm-time and reservation cap checks (which
+//               treat max ≤ 0 as unlimited) could not stop an overfill. Decline instead.
+function isFreeBetRow(p) {
+  if (!p) return false;
+  return p.is_free_bet === true || String(p.bet_type || '').toLowerCase() === 'free';
+}
+
+function freeBetRiskfreeMissingCap({ hedgeMode, maxContracts, isFreeBet }) {
+  if (!isFreeBet || String(hedgeMode) !== 'riskfree') return false;
+  const max = Number(maxContracts);
+  return !(maxContracts != null && maxContracts !== '' && Number.isFinite(max) && max > 0);
+}
+
+function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican = null, rfqContracts, hedgeMode = '1x', maxContracts = null, filledSoFar = 0, outstanding = 0, allowPartial = false, isFreeBet = false }) {
   if (!(parlayStake > 0) || !parlayAmerican || !fillAmerican || !(rfqContracts > 0)) return { ok: false, reason: 'bad_inputs' };
+  if (freeBetRiskfreeMissingCap({ hedgeMode, maxContracts, isFreeBet })) {
+    return { ok: false, reason: 'no_cap', cap: 0, totalLimit: 0, filledSoFar: filledSoFar > 0 ? filledSoFar : 0, outstanding: outstanding > 0 ? outstanding : 0, remaining: 0 };
+  }
   const dec = aToDec(parlayAmerican), winReturn = parlayStake * dec, bookHit = winReturn - parlayStake, bookMiss = -parlayStake;
   const cap = hedgeCap({ stake: parlayStake, boostAmerican: parlayAmerican, fillAmerican, mode: hedgeMode }); // per-fill hedge shape
   // Total ceiling: the persisted limit if set, else fall back to the mode's hedge size.
@@ -248,6 +269,7 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
 }
 module.exports = {
   decideAtFill, impliedProb, hedgeCap, fillView, americanFromProb,
+  isFreeBetRow, freeBetRiskfreeMissingCap,
   YES_DECLINE, yesBidForQuote, impliedYesBid, quoteYesBid, isRealYesBid,
   shouldConfirmAccept, contractsFromQuoteResponse,
   buildQuoteBody, shouldPostQuote, isSilentQuoteFailure,
