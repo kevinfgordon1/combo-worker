@@ -285,3 +285,6 @@ function offersWorstFirst() {
   console.error(err);
   process.exit(1);
 });
+
+// Novig feed tests live in their own file; run them with the relay tests.
+require('./novig-feed.test.js');
