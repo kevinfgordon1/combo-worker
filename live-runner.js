@@ -120,7 +120,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { createKalshiFirehose, readShardFactor, DEFAULT_LIVE_SHARD_FACTOR, summarizeThroughput } = require('./kalshi-ws');
 const { normalizePem, clockOffset, signedRequest } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
-const { decideAtFill, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, isRfqClosedFailure, quotePostFailReason, formatQuoteLatency, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
+const { decideAtFill, isFreeBetRow, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, isRfqClosedFailure, quotePostFailReason, formatQuoteLatency, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
 const { findStartedEvent } = require('./started');
 const {
   RESERVE_TTL_MS,
@@ -1863,9 +1863,18 @@ async function onRfq(rfq, env) {
     maxContracts: p.max_contracts,
     filledSoFar,
     outstanding,
+    isFreeBet: isFreeBetRow(p),
   });
 
   if (!d.ok) {
+    if (d.reason === 'no_cap') {
+      counts.declined++;
+      console.log(
+        `[${MODE}] SKIP no cap ${p.label} rfq=${rfq.rfqId} — free bet riskfree with max_contracts=${p.max_contracts}; not quoting`
+      );
+      logAsync(p, rfq, null, 'declined');
+      return;
+    }
     if (d.reason === 'limit_reached') {
       counts.limitReached++;
       console.log(

@@ -19,7 +19,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { createKalshiWs } = require('./kalshi-ws');
 const { normalizePem } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
-const { decideAtFill } = require('./engine');
+const { decideAtFill, isFreeBetRow } = require('./engine');
 const { shortId } = require('./short-id');
 const {
   querySoftFailed,
@@ -130,6 +130,7 @@ async function onRfq(rfq) {
     parlayStake: p.parlay_stake, parlayAmerican: p.parlay_american, fillAmerican: p.fill_american,
     fairAmerican: p.fair_american, rfqContracts: rfq.contracts, hedgeMode: p.hedge_mode || '1x',
     maxContracts: p.max_contracts, filledSoFar, // cumulative ceiling — stop once total is reached
+    isFreeBet: isFreeBetRow(p),
   });
   if (!d.ok) {
     // Ceiling hit: this parlay has already filled its full max_contracts — decline everything further.

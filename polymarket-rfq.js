@@ -43,7 +43,7 @@
 // (default off) is what stops open quotes from reserving; these checks stay on.
 'use strict';
 const { matchParlay } = require('./rfq');
-const { decideAtFill, quoteFailureSkipReason } = require('./engine');
+const { decideAtFill, isFreeBetRow, quoteFailureSkipReason } = require('./engine');
 const { findStartedEvent } = require('./started');
 const {
   RESERVE_TTL_MS,
@@ -655,6 +655,7 @@ function evaluatePolymarketRfq({
     filledSoFar,
     outstanding,
     allowPartial: true,
+    isFreeBet: isFreeBetRow(parlay),
   });
   if (!decision.ok) {
     return {
