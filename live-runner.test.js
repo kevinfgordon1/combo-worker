@@ -220,8 +220,13 @@ assert.ok(
   'underfunded confirm stays off Telegram; other confirm fails still alert'
 );
 assert.ok(
-  /persistQuoteSkip:\s*\(quoteId, skipReason, fallback\) =>\s*persistQuoteSkip\(quoteId, skipReason, fallback\)/.test(liveSrc),
+  /persistQuoteSkip:\s*\(quoteId, skipReason, fallback\) =>\s*persistQuoteSkip\(quoteId, skipReason, fallback, 'polymarket'\)/.test(liveSrc),
   'Poly loop must receive persistQuoteSkip so confirm can update the attempt'
+);
+assert.ok(
+  /require\('\.\/bucket-manager'\)/.test(liveSrc) &&
+    /noteInsufficientBalance\(venueExtra\.venue/.test(liveSrc),
+  'insufficient_balance notifies the bucket manager with the submission venue'
 );
 
 {

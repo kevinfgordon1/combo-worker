@@ -78,7 +78,9 @@
 //   Poly Combo Locks reconcile SKIP/QUOTE also insert here (venue=polymarket)
 //   via persistLockTape — not Railway-only. no_lock_overlap* is not taped.
 //   Underfunded quote create/confirm (insufficient_balance) also persist a
-//   declined combo_submissions row for the lock card. Telegram stays silent.
+//   declined combo_submissions row for the lock card. The generic QUOTE
+//   FAILED Telegram stays silent. bucket-manager.js sends a loud alert
+//   (1 per 10 min per venue) and checks the combo bucket immediately.
 //   No public-tape lookup. Precision rejects stay console + unfilled.
 //   Quote-watcher stays parked (same KALSHI_KEY_ID unsubscribes this WS).
 //   We do not write combo_matches or watcher_debug.
@@ -110,6 +112,8 @@
 //      COMBO_CAP_AT_CONFIRM=1 (optional; default off) — enforce cap at confirm,
 //        not by reserving every open quote. Polymarket close/overfill guards
 //        stay on either way.
+//      Combo bucket (shard 1) preallocation: bucket-manager.js.
+//        KALSHI_BUCKET_AUTO=0 (default) logs the dry run and does not transfer.
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
@@ -178,8 +182,17 @@ const { resolveWorkerMode, shouldRunUnhedged } = require('./worker-mode');
 const { startUnhedgedSide } = require('./unhedged-boot');
 const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
 const { formatAlertStatus } = require('./venue-alert');
+const { createBucketManager } = require('./bucket-manager');
 
 const MODE = 'LIVE';
+let bucketManager = null;
+
+function noteInsufficientBalance(venue) {
+  if (!bucketManager) return;
+  Promise.resolve(bucketManager.onInsufficientBalance(venue)).catch((e) => {
+    console.error(`[${MODE}] bucket notify`, e && e.message);
+  });
+}
 const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -411,6 +424,10 @@ function logAsync(p, rfq, d, status, extra = {}) {
     extra.contracts != null ? extra.contracts
       : d && d.contracts != null ? d.contracts
         : rfq.contracts != null ? rfq.contracts : null;
+  const venueExtra = withVenue(extra);
+  if (venueExtra.skip_reason === 'insufficient_balance') {
+    noteInsufficientBalance(venueExtra.venue || 'kalshi');
+  }
   const body = stripUnknown({
     user_id: p.user_id,
     parlay_id: p.id,
@@ -486,7 +503,8 @@ function logFundingSkip(p, rfq, d, extra = {}) {
 
 // Confirm already inserted a quoted row — stamp skip_reason on that attempt.
 // If the insert never landed, insert a declined funding row.
-function persistQuoteSkip(quoteId, skipReason, fallback) {
+function persistQuoteSkip(quoteId, skipReason, fallback, venue) {
+  if (skipReason === 'insufficient_balance') noteInsufficientBalance(venue || 'kalshi');
   if (!skipReason) return Promise.resolve(null);
   const body = stripUnknown({
     skip_reason: skipReason,
@@ -2047,6 +2065,13 @@ async function main() {
     );
     process.exit(1);
   }
+  bucketManager = createBucketManager({
+    env: process.env,
+    alert: (text) => sendAlert(text),
+    signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
+  });
+  bucketManager.start();
+
   console.log(
     `[${MODE}] starting — latency-optimized. POST first, dedicated quote HTTP, ` +
     `firehose yield while quote-hot, quote warm ${QUOTE_WARM_MS}ms, pre-staged prices. ` +
@@ -2108,7 +2133,7 @@ async function main() {
     logAsync: (p, rfq, d, status, extra = {}) =>
       logAsync(p, rfq, d, status, withVenue(extra, 'polymarket')),
     persistQuoteSkip: (quoteId, skipReason, fallback) =>
-      persistQuoteSkip(quoteId, skipReason, fallback),
+      persistQuoteSkip(quoteId, skipReason, fallback, 'polymarket'),
     persistQuoteOrder,
     loadUnfilledPolyQuotes,
     getFilledForQuote,
