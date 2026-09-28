@@ -18,7 +18,10 @@ const { createRunner } = require('./mm-paper-runner');
 const { summarize, formatReport, settleRows, phaseOf } = require('./scripts/mm-paper-summary');
 
 const KICK = Date.parse('2026-09-13T17:00:00Z');
+// Later the same ET day as the game id, so the kickoff log stays on 2026-09-13.
+const SAME_DAY_KICK = Date.parse('2026-09-13T23:00:00Z');
 const GAME = 'nfl|2026-09-13|kc+phi';
+assert.strictEqual(formatKickoffEt(SAME_DAY_KICK).slice(0, 10), GAME.split('|')[1]);
 
 function book(bid, ask, bidSize) {
   return {
@@ -252,7 +255,7 @@ assert.strictEqual(formatKickoffEt(KICK), '2026-09-13 1:00 PM ET');
 
 // Open lots and a locked pair survive a restart, and the same print does not fill twice.
 {
-  const first = makeSession({ kickoff: KICK + 86400_000 });
+  const first = makeSession({ kickoff: SAME_DAY_KICK });
   const placed = quiet(() => first.session.tick(KICK));
   const byTeam = Object.fromEntries(placed.value.filter((e) => e.kind === 'quote').map((e) => [e.team, e]));
   assert.ok(byTeam.phi && byTeam.kc);
@@ -269,8 +272,8 @@ assert.strictEqual(formatKickoffEt(KICK), '2026-09-13 1:00 PM ET');
   const openBefore = before.positions.reduce((s, p) => s + p.qty, 0);
 
   const second = makeSession({ kickoff: false });
-  const once = second.session.restoreFromEvents(tape, KICK + 5000);
-  const twice = second.session.restoreFromEvents(tape, KICK + 5000);
+  const once = quiet(() => second.session.restoreFromEvents(tape, KICK + 5000)).value;
+  const twice = quiet(() => second.session.restoreFromEvents(tape, KICK + 5000)).value;
   const afterSnap = second.session.snapshot()[0];
   const openAfter = afterSnap.positions.reduce((s, p) => s + p.qty, 0);
   assert.strictEqual(openAfter, openBefore);
@@ -278,7 +281,7 @@ assert.strictEqual(formatKickoffEt(KICK), '2026-09-13 1:00 PM ET');
   assert.strictEqual(roundCents(afterSnap.lockedPnl), roundCents(before.lockedPnl));
   assert.ok(afterSnap.lockedPnl > 0);
 
-  quiet(() => second.session.setKickoff(GAME, { polymarket: KICK + 86400_000 }));
+  quiet(() => second.session.setKickoff(GAME, { polymarket: SAME_DAY_KICK }));
   for (const venue of ['kalshi', 'polymarket']) {
     second.session.setBook(GAME, venue, 'kc', book(0.54, 0.56, 0));
     second.session.setBook(GAME, venue, 'phi', book(0.38, 0.42, 0));
@@ -309,9 +312,10 @@ async function quietAsync(fn) {
 }
 
 async function main() {
-// Supabase down falls back to JSONL. The same fill in both stores counts once.
+// Supabase down falls back to JSONL. A successful Supabase read is the only
+// source, so the same fill in both stores counts once.
 {
-  const seeded = makeSession({ kickoff: KICK + 86400_000 });
+  const seeded = makeSession({ kickoff: SAME_DAY_KICK });
   const placed = quiet(() => seeded.session.tick(KICK));
   const phi = placed.value.find((e) => e.kind === 'quote' && e.team === 'phi');
   const filled = seeded.session.applyTrade(GAME, phi.venue, 'phi', {
@@ -362,10 +366,10 @@ async function main() {
       },
     },
   });
-  assert.strictEqual(duped.source, 'supabase+jsonl');
+  assert.strictEqual(duped.source, 'supabase');
   assert.strictEqual(duped.events.filter((e) => e.kind === 'fill').length, 1);
   const merged = createPaperSession(readConfig({ MM_PAPER: '1' }));
-  const stats = merged.restoreFromEvents(duped.events, KICK + 5000);
+  const stats = quiet(() => merged.restoreFromEvents(duped.events, KICK + 5000)).value;
   assert.strictEqual(stats.openQty, fill.qty);
 }
 
