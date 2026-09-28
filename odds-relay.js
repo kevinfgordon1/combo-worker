@@ -553,9 +553,11 @@ function publish(state, venue, league, quotes, mode, feed) {
 // Novig hands over the full set of board quotes for a league each time.
 // Quotes that left (a main spread moved to a new line, a market closed) are
 // dropped, and the packet is then a complete snapshot so the board drops
-// them too. Otherwise only quotes whose price or live flag moved are sent.
+// them too. Otherwise only quotes whose book moved (new seq, price, size or
+// live flag) are sent, so the board's "updated Xs ago" tracks the book and a
+// quiet but live Novig price is not shown as stale.
 function novigSig(quote) {
-  return `${quote.odds}|${quote.line == null ? '' : quote.line}|${quote.is_live ? 1 : 0}`;
+  return `${quote.odds}|${quote.size}|${quote.seq == null ? '' : quote.seq}|${quote.line == null ? '' : quote.line}|${quote.is_live ? 1 : 0}`;
 }
 
 function publishNovig(state, league, quotes, mode) {
