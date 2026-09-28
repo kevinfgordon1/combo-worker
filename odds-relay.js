@@ -13,6 +13,7 @@
 const http = require('http');
 const { authHeaders: polymarketAuthHeaders } = require('./polymarket-auth');
 const { authHeaders: kalshiAuthHeaders, normalizePem } = require('./kalshi-auth');
+const { createNovigFeed } = require('./novig-feed');
 
 const US_WS_URL = 'wss://api.polymarket.us/v1/ws/markets';
 const US_WS_PATH = '/v1/ws/markets';
@@ -24,7 +25,8 @@ const KALSHI_REST = 'https://api.elections.kalshi.com/trade-api/v2';
 const KALSHI_WS_URL = 'wss://external-api-ws.kalshi.com/trade-api/ws/v2';
 const KALSHI_WS_SIGN_PATH = '/trade-api/ws/v2';
 
-const BOOK_IDS = Object.freeze({ polymarket: 193, kalshi: 194 });
+const BOOK_IDS = Object.freeze({ polymarket: 193, kalshi: 194, novig: 195 });
+const VENUES = ['polymarket', 'kalshi', 'novig'];
 const LEAGUES = ['NFL', 'NCAAF', 'MLB'];
 const US_LEAGUE_PATH = Object.freeze({ NFL: 'nfl', MLB: 'mlb', NCAAF: 'cfb' });
 const WINNER_TYPES = new Set([
@@ -438,14 +440,16 @@ function createChannel() {
 }
 
 function createState() {
-  const books = { polymarket: {}, kalshi: {} };
-  const channels = { polymarket: {}, kalshi: {} };
+  const books = { polymarket: {}, kalshi: {}, novig: {} };
+  const channels = { polymarket: {}, kalshi: {}, novig: {} };
   const emitters = { polymarket: {}, kalshi: {} };
   for (const league of LEAGUES) {
     books.polymarket[league] = new Map();
     books.kalshi[league] = new Map();
+    books.novig[league] = new Map();
     channels.polymarket[league] = createChannel();
     channels.kalshi[league] = createChannel();
+    channels.novig[league] = createChannel();
     emitters.polymarket[league] = createQuoteEmitter(
       books.polymarket[league],
       (q) => q.token_id,
@@ -465,7 +469,8 @@ function createState() {
     usSocketUp: false,
     usLastFrameAt: 0,
     kalshiWsUp: false,
-    status: { us: 'starting', clob: 'starting', kalshi: 'starting' },
+    status: { us: 'starting', clob: 'starting', kalshi: 'starting', novig: 'off' },
+    novigFeed: null,
   };
 }
 
@@ -544,6 +549,43 @@ function publish(state, venue, league, quotes, mode, feed) {
   }
   if (replaced) emitter.forceSnapshot();
   else emitter.push(mode);
+}
+
+// Novig hands over the full set of board quotes for a league each time.
+// Quotes that left (a main spread moved to a new line, a market closed) are
+// dropped, and the packet is then a complete snapshot so the board drops
+// them too. Otherwise only quotes whose price or live flag moved are sent.
+function novigSig(quote) {
+  return `${quote.odds}|${quote.line == null ? '' : quote.line}|${quote.is_live ? 1 : 0}`;
+}
+
+function publishNovig(state, league, quotes, mode) {
+  const book = state.books.novig && state.books.novig[league];
+  const channel = state.channels.novig && state.channels.novig[league];
+  if (!book || !channel) return;
+  const next = new Map();
+  for (const quote of quotes || []) {
+    if (quote && quote.token_id) next.set(quote.token_id, quote);
+  }
+  let removed = false;
+  for (const key of book.keys()) {
+    if (!next.has(key)) removed = true;
+  }
+  const changed = [];
+  for (const [key, quote] of next) {
+    const prev = book.get(key);
+    if (!prev || novigSig(prev) !== novigSig(quote)) changed.push(quote);
+  }
+  book.clear();
+  for (const [key, quote] of next) book.set(key, quote);
+  if (!removed && !changed.length) return;
+  if (removed || !state.novigSnapshotted || !state.novigSnapshotted[league]) {
+    state.novigSnapshotted = state.novigSnapshotted || {};
+    state.novigSnapshotted[league] = true;
+    channel.push({ quotes: [...next.values()], complete: true, mode: 'snapshot' });
+    return;
+  }
+  channel.push({ quotes: changed, complete: false, mode: mode || 'rest' });
 }
 
 function levelPriceSize(row) {
@@ -1526,6 +1568,25 @@ function startKalshi(state, deps) {
   };
 }
 
+function startNovig(state, opts, env) {
+  if (opts.novig === false || String(env.NOVIG_RELAY || '') === '0') {
+    state.status.novig = 'off';
+    return () => {};
+  }
+  const feed = (opts.createNovigFeed || createNovigFeed)({
+    env,
+    fetchFn: opts.fetchFn,
+    WebSocket: opts.novigWebSocket,
+    onQuotes: (league, quotes, mode) => {
+      state.status.novig = feed && feed.status ? `rest:${feed.status.rest} ws:${feed.status.ws}` : 'up';
+      publishNovig(state, league, quotes, mode);
+    },
+  });
+  state.novigFeed = feed;
+  state.status.novig = 'starting';
+  return () => feed.stop();
+}
+
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -1553,12 +1614,13 @@ function handleRequest(req, res, state) {
   }
   if (url.pathname === '/health') {
     const counts = {};
-    for (const venue of ['polymarket', 'kalshi']) {
+    for (const venue of VENUES) {
       counts[venue] = {};
       for (const league of LEAGUES) counts[venue][league] = state.books[venue][league].size;
     }
+    const novig = state.novigFeed ? state.novigFeed.health() : null;
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-    res.end(JSON.stringify({ ok: true, status: state.status, counts }));
+    res.end(JSON.stringify({ ok: true, status: state.status, counts, novig }));
     return;
   }
   if (url.pathname !== '/stream' && url.pathname !== '/board') {
@@ -1568,7 +1630,7 @@ function handleRequest(req, res, state) {
   }
   const venue = String(url.searchParams.get('venue') || '');
   const league = parseLeague(url.searchParams.get('league') || 'NFL');
-  if ((venue !== 'polymarket' && venue !== 'kalshi') || !league) {
+  if (!VENUES.includes(venue) || !league) {
     res.writeHead(400, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: false, error: 'venue and league required' }));
     return;
@@ -1615,8 +1677,9 @@ function startOddsRelay(opts = {}) {
     stops.push(startPolymarketUs(state, opts));
     stops.push(startClob(state, opts));
     stops.push(startKalshi(state, opts));
+    stops.push(startNovig(state, opts, env));
   } else {
-    state.status = { us: 'off', clob: 'off', kalshi: 'off' };
+    state.status = { us: 'off', clob: 'off', kalshi: 'off', novig: 'off' };
   }
   const server = http.createServer((req, res) => {
     try {
@@ -1676,6 +1739,7 @@ module.exports = {
   replaySnapshot,
   createState,
   publish,
+  publishNovig,
   applyPolymarketStreamMessage,
   bestAskFromLevels,
   kalshiYesAskFromNoBids,
