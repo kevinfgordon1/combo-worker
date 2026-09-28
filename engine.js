@@ -156,9 +156,14 @@ function fillView(fillAfterFeeAmerican) {
 }
 
 // Contracts cap for a hedge mode. Fill odds already include your maker fee, so no fee term here.
-//   riskfree : fewest contracts so the losing (miss) side breaks even (~$0 floor), keeps hit upside
-//   1x       : pure hedge — equal payoff whether the combo hits or misses (= stake × decimal boost)
-//   2x / 3x  : multiples of the pure hedge — directional short past the hedge (big loss on hit)
+// y = implied fill price as a fraction. W = profit if the parlay wins.
+//   riskfree      : fewest contracts so the losing (miss) side breaks even (~$0 floor), keeps hit upside
+//   1x            : pure hedge — equal payoff whether the combo hits or misses (= stake × decimal boost)
+//   riskfree_open : largest whole-contract size whose win side stays ≥ $0. N = floor(W / (1 − y)).
+//                   Merged rows store total profit as stake × (decimal − 1). A free bet uses that
+//                   same profit; cash at risk is $0 and is not in this formula.
+//   2x / 3x       : multiples of the pure hedge — directional short past the hedge (big loss on hit).
+//                   3× stays for rows already saved that way.
 function hedgeCap({ stake, boostAmerican, fillAmerican, mode = '1x' }) {
   if (!(stake > 0) || !boostAmerican || !fillAmerican) return 0;
   const winReturn = stake * aToDec(boostAmerican);
@@ -166,6 +171,19 @@ function hedgeCap({ stake, boostAmerican, fillAmerican, mode = '1x' }) {
   const riskfree = s > 0 ? Math.ceil(stake / s) : 0;
   switch (String(mode)) {
     case 'riskfree': return riskfree;
+    case 'riskfree_open': {
+      // Profit if the parlay wins. Same number for cash (stake × (decimal − 1))
+      // and for a free bet. Merged rows store stake = total at risk and
+      // american = total profit / that stake, so bookHit is total profit.
+      const bookHit = winReturn - stake;
+      if (!(s > 0 && s < 1) || !(bookHit > 0) || !Number.isFinite(bookHit)) return 0;
+      const exact = bookHit / (1 - s);
+      if (!Number.isFinite(exact) || !(exact > 0)) return 0;
+      const nearest = Math.round(exact);
+      const n = Math.abs(exact - nearest) < 1e-6 ? nearest : exact;
+      const floored = Math.floor(n + 1e-9); // whole contract, win side stays ≥ $0
+      return Number.isFinite(floored) && floored > 0 ? floored : 0;
+    }
     case '2x': return Math.round(2 * winReturn);
     case '3x': return Math.round(3 * winReturn);
     case '1x':

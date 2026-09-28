@@ -546,6 +546,42 @@ async function main() {
     assert.strictEqual(h.alerts.filter((t) => /INSUFFICIENT BALANCE \(Kalshi\)/.test(t)).length, 2);
   }
 
+  // Top-up blocked: at most once per 60 minutes per reason. A new reason alerts now.
+  {
+    const book = fakeBook({ main: cents(2_000), bucket: 0 });
+    const h = harness(LIVE, book);
+    const started = h.now().getTime();
+    const floorAlerts = () => h.alerts.filter((t) => /blocked \(floor\)/.test(t)).length;
+    const ceilingAlerts = () => h.alerts.filter((t) => /blocked \(ceiling\)/.test(t)).length;
+    const first = await h.mgr.check('interval');
+    assert.strictEqual(first.decision.block, 'floor');
+    assert.strictEqual(floorAlerts(), 1);
+    h.setNow(new Date(started + 5 * 60 * 1000));
+    const again = await h.mgr.check('interval');
+    assert.strictEqual(again.decision.block, 'floor');
+    assert.strictEqual(floorAlerts(), 1, 'the 5-minute check does not resend the same block');
+    assert.ok(h.logs.some((line) => /blocked/.test(line)));
+    book.state.main.availableCents = cents(50_000);
+    book.state.bucket.availableCents = cents(1_000);
+    book.state.bucket.portfolioCents = cents(14_500);
+    h.setNow(new Date(started + 10 * 60 * 1000));
+    const ceiling = await h.mgr.check('interval');
+    assert.strictEqual(ceiling.decision.block, 'ceiling');
+    assert.strictEqual(ceilingAlerts(), 1, 'a changed block reason alerts immediately');
+    assert.strictEqual(floorAlerts(), 1);
+    book.state.main.availableCents = cents(2_000);
+    book.state.bucket.availableCents = 0;
+    book.state.bucket.portfolioCents = 0;
+    h.setNow(new Date(started + 15 * 60 * 1000));
+    const back = await h.mgr.check('interval');
+    assert.strictEqual(back.decision.block, 'floor');
+    assert.strictEqual(floorAlerts(), 1, 'returning to a reason inside the hour stays quiet');
+    h.setNow(new Date(started + 60 * 60 * 1000));
+    const later = await h.mgr.check('interval');
+    assert.strictEqual(later.decision.block, 'floor');
+    assert.strictEqual(floorAlerts(), 2, 'the same reason alerts again after 60 minutes');
+  }
+
   // Low-balance alerts repeat hourly, and Polymarket cash is alert-only.
   {
     const book = fakeBook({ main: cents(20_000), bucket: cents(1_000) });

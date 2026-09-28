@@ -1,6 +1,6 @@
 'use strict';
 const assert = require('assert');
-const { decideAtFill } = require('./engine');
+const { decideAtFill, hedgeCap } = require('./engine');
 const {
   CLOSED_CONTEXT_TTL_MS,
   capAtConfirmEnabled,
@@ -69,6 +69,46 @@ assert.strictEqual(CLOSED_CONTEXT_TTL_MS, 60_000);
   assert.strictEqual(blocked.ok, false);
   assert.strictEqual(blocked.reason, 'rfq_too_large');
   assert.strictEqual(decide(116, book.exposure(0, P)).reason, 'limit_reached');
+}
+
+// Flag on: open quotes do not reserve, so an RFQ up to riskfree_open is accepted.
+// The same hedgeCap is the per-fill ceiling. 1× would still decline it.
+{
+  const book = createCapBook({ enabled: true });
+  const stake = 100;
+  const boost = 2000;
+  const fill = 1200;
+  const openCap = hedgeCap({
+    stake, boostAmerican: boost, fillAmerican: fill, mode: 'riskfree_open',
+  });
+  assert.strictEqual(openCap, 2166);
+  const openQuotes = 2100;
+  assert.strictEqual(book.exposure(openQuotes, P), 0);
+  const accepted = decideAtFill({
+    parlayStake: stake,
+    parlayAmerican: boost,
+    fillAmerican: fill,
+    rfqContracts: openCap,
+    hedgeMode: 'riskfree_open',
+    maxContracts: openCap,
+    filledSoFar: 0,
+    outstanding: book.exposure(openQuotes, P),
+  });
+  assert.strictEqual(accepted.ok, true);
+  assert.strictEqual(accepted.contracts, 2166);
+  assert.strictEqual(accepted.cap, 2166);
+  const oneX = decideAtFill({
+    parlayStake: stake,
+    parlayAmerican: boost,
+    fillAmerican: fill,
+    rfqContracts: openCap,
+    hedgeMode: '1x',
+    maxContracts: openCap,
+    outstanding: book.exposure(openQuotes, P),
+  });
+  assert.strictEqual(oneX.ok, false);
+  assert.strictEqual(oneX.reason, 'rfq_too_large');
+  assert.strictEqual(oneX.cap, 2100);
 }
 
 // Polymarket can fill more than we quoted. Cap against the larger number.

@@ -41,6 +41,9 @@ const MAIN_SHARD = 0;
 const BUCKET_SHARD = 1;
 const VENUE_ALERT_MS = 10 * 60 * 1000;
 const LOW_REPEAT_MS = 60 * 60 * 1000;
+// Top-up blocked (main floor, daily cap, or ceiling): at most once per hour
+// per block reason. A different reason alerts on the next check.
+const BLOCKED_ALERT_MS = 60 * 60 * 1000;
 const CHECK_COALESCE_MS = 15_000;
 const DEFAULT_SETTLE_MS = 180_000;
 const DEFAULT_ERROR_COOLDOWN_MS = 60_000;
@@ -567,6 +570,7 @@ function createBucketManager({
   let balanceErrorAt = 0;
   let polyErrorAt = 0;
   let loggedPolySkip = false;
+  const blockedAlertAt = new Map();
 
   if (config.scheduleError) {
     log(`[BUCKET] ${config.scheduleError} — using the default game-day list`);
@@ -761,18 +765,23 @@ function createBucketManager({
     );
 
     if (decision.action === 'blocked' && decision.block) {
-      await emit(
-        `Kalshi bucket top-up blocked (${decision.block})\n` +
-        `shard 1 available ${formatDollarsFromCents(shards.bucket.availableCents)}, ` +
-        `target ${formatDollarsFromCents(decision.targetCents)}, ` +
-        `need ${formatDollarsFromCents(Math.max(0, decision.gapCents))}\n` +
-        `shard 1 total ${formatDollarsFromCents(decision.totalCents)}, ` +
-        `ceiling ${formatDollarsFromCents(config.ceilingCents)}\n` +
-        `shard 0 available ${formatDollarsFromCents(shards.main.availableCents)}, ` +
-        `floor ${formatDollarsFromCents(config.floorCents)}\n` +
-        `daily auto-transferred ${formatDollarsFromCents(dailySpent(date))} ` +
-        `of ${formatDollarsFromCents(config.dailyCapCents)}`
-      );
+      const reason = String(decision.block);
+      const lastBlocked = blockedAlertAt.get(reason) || 0;
+      if (!lastBlocked || t - lastBlocked >= BLOCKED_ALERT_MS) {
+        blockedAlertAt.set(reason, t);
+        await emit(
+          `Kalshi bucket top-up blocked (${decision.block})\n` +
+          `shard 1 available ${formatDollarsFromCents(shards.bucket.availableCents)}, ` +
+          `target ${formatDollarsFromCents(decision.targetCents)}, ` +
+          `need ${formatDollarsFromCents(Math.max(0, decision.gapCents))}\n` +
+          `shard 1 total ${formatDollarsFromCents(decision.totalCents)}, ` +
+          `ceiling ${formatDollarsFromCents(config.ceilingCents)}\n` +
+          `shard 0 available ${formatDollarsFromCents(shards.main.availableCents)}, ` +
+          `floor ${formatDollarsFromCents(config.floorCents)}\n` +
+          `daily auto-transferred ${formatDollarsFromCents(dailySpent(date))} ` +
+          `of ${formatDollarsFromCents(config.dailyCapCents)}`
+        );
+      }
       return { decision, dryRun: !config.auto };
     }
 
@@ -940,6 +949,7 @@ module.exports = {
   BUCKET_SHARD,
   VENUE_ALERT_MS,
   LOW_REPEAT_MS,
+  BLOCKED_ALERT_MS,
   DEFAULT_GAMEDAY_WINDOWS,
   floorCents,
   dollarsToCenticents,
