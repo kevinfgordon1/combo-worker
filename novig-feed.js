@@ -445,7 +445,9 @@ function createLimiter({ rps = 1.8, concurrency = 2, now = () => Date.now() } = 
   let pausedUntil = 0;
   let rate = rps;
   let slowUntil = 0;
-  const queues = { high: [], low: [] };
+  const queues = { high: [], mid: [], low: [] };
+  // Weighted round robin: hot polls, main-line searches, then everything else.
+  const pattern = ['high', 'mid', 'high', 'mid', 'low'];
   let timer = null;
   let served = 0;
   const refill = () => {
@@ -458,19 +460,22 @@ function createLimiter({ rps = 1.8, concurrency = 2, now = () => Date.now() } = 
     timer = null;
     refill();
     const t = now();
-    while ((queues.high.length || queues.low.length) && active < concurrency && tokens >= 1 && t >= pausedUntil) {
-      // Hot polls get most slots, but main-line searches still move.
-      let q = queues.high.length ? queues.high : queues.low;
-      if (queues.high.length && queues.low.length) {
-        served += 1;
-        q = served % 4 === 0 ? queues.low : queues.high;
+    const waiting = () => queues.high.length + queues.mid.length + queues.low.length;
+    while (waiting() && active < concurrency && tokens >= 1 && t >= pausedUntil) {
+      let q = null;
+      for (let i = 0; i < pattern.length && !q; i += 1) {
+        const name = pattern[(served + i) % pattern.length];
+        if (queues[name].length) {
+          q = queues[name];
+          served = (served + i + 1) % pattern.length;
+        }
       }
       const next = q.shift();
       tokens -= 1;
       active += 1;
       next();
     }
-    if ((queues.high.length || queues.low.length) && !timer) {
+    if (waiting() && !timer) {
       const wait = t < pausedUntil ? pausedUntil - t : 50;
       timer = setTimeout(pump, wait);
       if (timer.unref) timer.unref();
@@ -479,7 +484,7 @@ function createLimiter({ rps = 1.8, concurrency = 2, now = () => Date.now() } = 
   return {
     run(fn, priority = 'low') {
       return new Promise((resolve, reject) => {
-        (priority === 'high' ? queues.high : queues.low).push(() => {
+        (queues[priority] || queues.low).push(() => {
           Promise.resolve().then(fn).then(resolve, reject).finally(() => {
             active -= 1;
             pump();
@@ -494,10 +499,11 @@ function createLimiter({ rps = 1.8, concurrency = 2, now = () => Date.now() } = 
       slowUntil = t + 120_000;
     },
     stats() {
-      return { rps: rate, queued: queues.high.length + queues.low.length, active, pausedUntil };
+      return { rps: rate, queued: { high: queues.high.length, mid: queues.mid.length, low: queues.low.length }, active, pausedUntil };
     },
     clear() {
       queues.high.length = 0;
+      queues.mid.length = 0;
       queues.low.length = 0;
       if (timer) clearTimeout(timer);
       timer = null;
@@ -660,7 +666,7 @@ function createNovigFeed(opts = {}) {
         const m = list[i];
         if (!m) return null;
         probed.add(i);
-        const book = await fetchBook(m, 'low');
+        const book = await fetchBook(m, 'mid');
         return book ? fairProb0(book, m) : null;
       };
       let lo = 0;
@@ -679,7 +685,7 @@ function createNovigFeed(opts = {}) {
         else hi = mid - 1;
       }
       // Neighbours of the crossing point.
-      for (const i of [lo - 2, lo - 1, lo, lo + 1]) {
+      for (const i of [lo - 1, lo]) {
         if (i >= 0 && i < list.length && !probed.has(i) && !stopped) await probe(i);
       }
       const main = pickMain(list, books);

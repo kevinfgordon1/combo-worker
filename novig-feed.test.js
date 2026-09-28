@@ -125,6 +125,19 @@ assert.deepStrictEqual(askFor(mlBook, ml, 'ari'), { odds: 0.52, size: 1 });
   assert.deepStrictEqual(tq.map((q) => [q.side, q.side_type, q.line, q.odds]), [['Over', 'Over', 43.5, 0.5], ['Under', 'Under', 43.5, 0.54]]);
 }
 
+// Limiter: weighted round robin keeps searches moving under hot load.
+(async () => {
+  const { createLimiter } = require('./novig-feed');
+  const lim = createLimiter({ rps: 1000, concurrency: 1 });
+  const order = [];
+  const jobs = [];
+  for (let i = 0; i < 4; i += 1) jobs.push(lim.run(() => order.push('h'), 'high'));
+  for (let i = 0; i < 4; i += 1) jobs.push(lim.run(() => order.push('m'), 'mid'));
+  for (let i = 0; i < 2; i += 1) jobs.push(lim.run(() => order.push('l'), 'low'));
+  await Promise.all(jobs);
+  assert.ok(order.slice(0, 5).includes('m') && order.slice(0, 5).includes('l'), order.join(''));
+})().catch((err) => { console.error(err); process.exit(1); });
+
 // Relay: first publish is a complete snapshot; a moved line re-snapshots.
 {
   const state = createState();
