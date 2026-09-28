@@ -20,8 +20,8 @@ const { bookTop, sizeAtBid } = require('./mm-paper-books');
 const { chooseKickoff, formatKickoffEt } = require('./mm-paper-games');
 const {
   metaFromGameId,
-  paperEventKey,
-  sortPaperEvents,
+  orderPaperEvents,
+  restoreIdentity,
   applyFill,
   applyPair,
 } = require('./mm-paper-state');
@@ -77,6 +77,7 @@ function createPaperSession(cfg) {
   const games = new Map();
   const seenTrades = new Set();
   const restoredKeys = new Set();
+  let eventSeq = 0;
   let halted = false;
   let dailyDay = null;
   let dailyLocked = 0;
@@ -206,13 +207,15 @@ function createPaperSession(cfg) {
   function restoreFromEvents(events, now = Date.now()) {
     rollDay(now);
     let applied = 0;
-    for (const ev of sortPaperEvents(events)) {
+    const passCounts = new Map();
+    for (const ev of orderPaperEvents(events)) {
       if (!ev) continue;
       if (ev.kind !== 'fill' && ev.kind !== 'pair' && ev.kind !== 'cutoff') continue;
+      if (ev.seq != null && Number(ev.seq) > eventSeq) eventSeq = Number(ev.seq);
       const g = ensureFromEvent(ev);
       if (g) rememberKickoff(g, ev);
       if (ev.kind !== 'fill' && ev.kind !== 'pair') continue;
-      const key = paperEventKey(ev);
+      const key = restoreIdentity(ev, passCounts);
       if (!key || restoredKeys.has(key)) continue;
       restoredKeys.add(key);
       if (!g) continue;
@@ -235,11 +238,13 @@ function createPaperSession(cfg) {
       lockedPnl += g.lockedPnl;
       for (const lot of g.lots) if (lot.qty > 1e-9) openQty += lot.qty;
     }
+    const lots = openLots();
     return {
       applied,
       openQty,
       lockedPnl: round2(lockedPnl),
       dailyLocked: round2(dailyLocked),
+      lots,
     };
   }
 
@@ -337,7 +342,9 @@ function createPaperSession(cfg) {
     delete extraFields.phaseTs;
     delete extraFields.phase;
     delete extraFields.ts;
+    eventSeq += 1;
     return {
+      seq: eventSeq,
       kind,
       ts,
       gameId: g.gameId,
@@ -809,6 +816,26 @@ function createPaperSession(cfg) {
     return out;
   }
 
+  function openLots() {
+    const out = [];
+    for (const g of games.values()) {
+      for (const lot of g.lots) {
+        if (!(lot.qty > 1e-9)) continue;
+        const view = priceView(lot.net);
+        out.push({
+          gameId: g.gameId,
+          team: lot.team,
+          venue: lot.venue || null,
+          qty: lot.qty,
+          net: lot.net,
+          price: lot.price,
+          americanText: view.americanText,
+        });
+      }
+    }
+    return out;
+  }
+
   function snapshot() {
     return [...games.values()].map((g) => ({
       gameId: g.gameId,
@@ -828,6 +855,7 @@ function createPaperSession(cfg) {
     replaceOdds,
     setKickoff,
     restoreFromEvents,
+    openLots,
     applyTrade,
     tick,
     instruments,

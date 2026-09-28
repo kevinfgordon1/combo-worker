@@ -8,7 +8,7 @@ const { readConfig, flagOn } = require('./mm-paper-config');
 const { createPaperSession } = require('./mm-paper-engine');
 const { createPaperLog } = require('./mm-paper-log');
 const { groupKalshiMarkets, attachOdds, polyKickoffMs } = require('./mm-paper-games');
-const { loadPaperHistory } = require('./mm-paper-state');
+const { loadPaperHistory, formatRestoreLog } = require('./mm-paper-state');
 const { sportsForLeagues } = require('./mm-paper-odds');
 const { invertBook } = require('./mm-paper-books');
 const { roundCent } = require('./mm-paper-math');
@@ -215,11 +215,17 @@ function createRunner(env = process.env, deps = {}) {
   async function restore(now = nowFn()) {
     const history = await loadPaperHistory({ supabase, filePath: cfg.logPath });
     const stats = session.restoreFromEvents(history.events, now);
-    console.log(
-      `[MM-PAPER] restored open=${stats.openQty} locked=${stats.lockedPnl} `
-      + `from ${history.source} (${history.events.length} events)`
-    );
-    return { ...stats, source: history.source, events: history.events.length };
+    const lines = formatRestoreLog({
+      openQty: stats.openQty,
+      lockedPnl: stats.lockedPnl,
+      source: history.source,
+      events: history.events.length,
+      rowsRead: history.rowsRead,
+      pages: history.pages,
+      lots: stats.lots,
+    });
+    for (const line of lines) console.log(line);
+    return { ...stats, source: history.source, events: history.events.length, rowsRead: history.rowsRead, pages: history.pages };
   }
 
   async function once(now = nowFn()) {

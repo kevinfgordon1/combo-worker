@@ -8,11 +8,21 @@
 // rebuilt from fills and pairs. When Kalshi has a final `result`, leftover
 // contracts are settled into net P&L. Prices are American odds.
 //   MM_PAPER_SETTLE=0 skips the Kalshi result lookup.
+//   node scripts/mm-paper-summary.js --compare [path]
+//     Rebuilds open lots from every fill and pair and prints them next to the
+//     openPositions the live engine stamped on the latest event. Read-only.
+//     When SUPABASE_URL and SUPABASE_SERVICE_KEY are set, the tape is read
+//     from mm_paper_events (no writes). Otherwise the JSONL file is used.
 'use strict';
 
 const fs = require('fs');
 const { priceView } = require('../mm-paper-math');
-const { paperEventKey, replayPaperEvents } = require('../mm-paper-state');
+const {
+  replayPaperEvents,
+  countHistoryEvent,
+  compareReplayToSnapshots,
+  loadPaperHistory,
+} = require('../mm-paper-state');
 
 const KALSHI_ORIGIN = 'https://api.elections.kalshi.com';
 
@@ -81,7 +91,7 @@ function summarize(events) {
   const kickoffs = kickoffIndex(events);
   const replay = replayPaperEvents(events);
   const games = new Map();
-  const seen = new Set();
+  const counted = { ids: new Set(), fills: new Set() };
   function game(id) {
     const key = id || '(no game)';
     let g = games.get(key);
@@ -111,11 +121,7 @@ function summarize(events) {
   }
   for (const ev of events || []) {
     if (!ev || typeof ev !== 'object') continue;
-    if (ev.kind === 'fill' || ev.kind === 'pair') {
-      const key = paperEventKey(ev);
-      if (key && seen.has(key)) continue;
-      if (key) seen.add(key);
-    }
+    if ((ev.kind === 'fill' || ev.kind === 'pair') && !countHistoryEvent(ev, counted)) continue;
     const g = game(ev.gameId);
     if (ev.league) g.league = ev.league;
     const phase = phaseOf(ev, kickoffs);
@@ -304,14 +310,68 @@ function formatReport(rows) {
   return lines.join('\n');
 }
 
+function formatCompare(result, source) {
+  const where = source ? ` source=${source}` : '';
+  if (!result || result.ok) {
+    return `[MM-PAPER] compare ok — restore matches live openPositions${where}`;
+  }
+  const lines = [`[MM-PAPER] compare mismatch${where}`];
+  for (const diff of result.diffs || []) {
+    const live = diff.live
+      ? `${diff.live.team} ${diff.live.qty} net=${diff.live.net}`
+      : 'none';
+    const restored = diff.restored
+      ? `${diff.restored.team} ${diff.restored.qty} net=${diff.restored.net}`
+      : 'none';
+    lines.push(`[MM-PAPER] compare ${diff.gameId} live=${live} restored=${restored}`);
+  }
+  return lines.join('\n');
+}
+
+function scriptArgs(argv) {
+  const args = (argv || []).slice(2);
+  const compare = args.includes('--compare');
+  const filePath = args.find((arg) => arg && !arg.startsWith('--')) || null;
+  return { compare, filePath };
+}
+
+async function loadCompareEvents(filePath, env) {
+  const local = readEvents(filePath);
+  const url = env && env.SUPABASE_URL;
+  const key = env && env.SUPABASE_SERVICE_KEY;
+  if (!url || !key) return { events: local, source: local.length ? 'jsonl' : 'none' };
+  try {
+    const { createClient } = require('@supabase/supabase-js');
+    const history = await loadPaperHistory({
+      supabase: createClient(url, key),
+      filePath,
+    });
+    if (history.remoteOk) return { events: history.events, source: history.source };
+  } catch (err) {
+    console.warn(`[MM-PAPER] compare supabase read failed — JSONL fallback: ${err && err.message ? err.message : err}`);
+  }
+  return { events: local, source: local.length ? 'jsonl' : 'none' };
+}
+
 async function main(argv, env = process.env, deps = {}) {
-  const filePath = argv[2] || env.MM_LOG_PATH || 'mm-paper.jsonl';
-  const rows = summarize(readEvents(filePath));
+  const parsed = scriptArgs(argv);
+  const filePath = parsed.filePath || (env && env.MM_LOG_PATH) || 'mm-paper.jsonl';
+  let compareResult = null;
+  let events = null;
+  if (parsed.compare) {
+    const loaded = deps.events
+      ? { events: deps.events, source: deps.source || 'events' }
+      : await loadCompareEvents(filePath, env);
+    events = loaded.events;
+    compareResult = compareReplayToSnapshots(events);
+    console.log(formatCompare(compareResult, loaded.source));
+  }
+  const rows = summarize(events || readEvents(filePath));
   const settleOff = /^(0|false|no|off)$/i.test(String(env.MM_PAPER_SETTLE || '').trim());
   if (!settleOff) await settleRows(rows, deps.fetchMarket);
   const text = formatReport(rows);
   console.log(text);
-  return rows;
+  return { rows, compare: compareResult };
 }
 
 if (require.main === module) {
@@ -324,9 +384,11 @@ if (require.main === module) {
 module.exports = {
   summarize,
   formatReport,
+  formatCompare,
   readEvents,
   settleRows,
   fetchKalshiMarket,
   phaseOf,
+  scriptArgs,
   main,
 };
