@@ -19,6 +19,13 @@
 // KALSHI_BUCKET_AUTO defaults to off: log the decision, do not POST.
 // KALSHI_BUCKET_SWEEP defaults to off.
 //
+// In-app alerts (app-alerts.js -> public.app_alerts, shown to Kevin on
+// aibetbuilder, not Telegram): every transfer performed / failed /
+// unconfirmed, every blocked top-up (floor, daily cap, ceiling), shard 1
+// cash below COMBO_LOW_CASH_ALERT_USD (default $1,000), and a Kalshi
+// insufficient-funds skip. Low cash and blocked alerts are de-duplicated:
+// one unresolved row per condition until it clears.
+//
 // Schedule (America/New_York, DST-aware). A window is { start, end }
 // with dow 0=Sunday .. 6=Saturday and time "HH:MM". The end minute is
 // included. A window that wraps the week (Saturday through Monday) has
@@ -44,6 +51,7 @@ const LOW_REPEAT_MS = 60 * 60 * 1000;
 // Top-up blocked (main floor, daily cap, or ceiling): at most once per hour
 // per block reason. A different reason alerts on the next check.
 const BLOCKED_ALERT_MS = 60 * 60 * 1000;
+const INSUFFICIENT_IN_APP_MS = 5 * 60 * 1000;
 const CHECK_COALESCE_MS = 15_000;
 const DEFAULT_SETTLE_MS = 180_000;
 const DEFAULT_ERROR_COOLDOWN_MS = 60_000;
@@ -173,6 +181,7 @@ function loadBucketConfig(env = process.env) {
     targetGamedayCents: envDollarsToCents(env, 'KALSHI_BUCKET_TARGET_GAMEDAY', 10_000),
     targetDefaultCents: envDollarsToCents(env, 'KALSHI_BUCKET_TARGET_DEFAULT', 5_000),
     lowAlertCents: envDollarsToCents(env, 'KALSHI_BUCKET_LOW_ALERT', 1_500),
+    comboLowCashCents: envDollarsToCents(env, 'COMBO_LOW_CASH_ALERT_USD', 1_000),
     polyLowAlertCents: envDollarsToCents(env, 'POLY_LOW_ALERT', 1_500),
     intervalMin: envPositiveInt(env, 'KALSHI_BUCKET_INTERVAL_MIN', 5, 1),
     settleMs: envPositiveInt(env, 'KALSHI_BUCKET_SETTLE_MS', DEFAULT_SETTLE_MS, 0),
@@ -551,6 +560,7 @@ function createBucketManager({
   client = null,
   signed = null,
   readPolyCash,
+  appAlerts = null,
   config: configOverride = null,
 } = {}) {
   const config = configOverride || loadBucketConfig(env);
@@ -571,6 +581,12 @@ function createBucketManager({
   let polyErrorAt = 0;
   let loggedPolySkip = false;
   const blockedAlertAt = new Map();
+  let lastBucketCents = null;
+  let seenBucketThisRun = null;
+  // null = unknown since start (resolve once on the first healthy read).
+  let comboLowOpen = null;
+  let blockedOpen = null;
+  let insufficientInAppAt = 0;
 
   if (config.scheduleError) {
     log(`[BUCKET] ${config.scheduleError} — using the default game-day list`);
@@ -600,6 +616,90 @@ function createBucketManager({
     }
   }
 
+  // Kevin asked for in-app alerts, not Telegram, for routine bucket activity:
+  // a completed transfer and a blocked top-up. With the in-app writer wired
+  // those are log-only on Telegram unless KALSHI_BUCKET_TELEGRAM=1. Failures,
+  // unconfirmed transfers, balance-read errors, low-cash and INSUFFICIENT
+  // BALANCE keep their existing Telegram alerts (plus an in-app row).
+  const bucketTelegram = !(appAlerts && appAlerts.enabled) || envOn(env, 'KALSHI_BUCKET_TELEGRAM');
+  async function emitBucket(text) {
+    if (bucketTelegram) return emit(text);
+    log(`[BUCKET] ALERT (in-app only): ${String(text).replace(/\n/g, ' | ')}`);
+    return undefined;
+  }
+
+  // In-app alert for Kevin (app_alerts). Never throws, never blocks trading.
+  async function inApp(spec) {
+    if (!appAlerts || typeof appAlerts.raise !== 'function') return false;
+    try {
+      return await appAlerts.raise(spec);
+    } catch (e) {
+      log(`[BUCKET] in-app alert failed ${e && e.message ? e.message : e}`);
+      return false;
+    }
+  }
+
+  async function inAppResolve(keys, opts) {
+    if (!appAlerts || typeof appAlerts.resolve !== 'function') return false;
+    try {
+      return await appAlerts.resolve(keys, opts);
+    } catch (e) {
+      log(`[BUCKET] in-app resolve failed ${e && e.message ? e.message : e}`);
+      return false;
+    }
+  }
+
+  function transferText(decision) {
+    return `${formatDollarsFromCents(decision.amountCents)} ` +
+      `${shardLabel(decision.fromShard)} → ${shardLabel(decision.toShard)}`;
+  }
+
+  async function inAppTransfer(decision, transferId, after, state) {
+    const balances = after ? formatBalances(after.main, after.bucket) : '';
+    await inApp({
+      kind: 'bucket_transfer',
+      severity: 'info',
+      title: `Kalshi bucket moved ${formatDollarsFromCents(decision.amountCents)}`,
+      body: `${transferText(decision)} (${decision.reason}${state === 'accepted' ? ', balance re-read pending' : ''}). ` +
+        (balances ? `${balances}. ` : '') + `transfer_id ${transferId || '?'}.`,
+      meta: {
+        transferId: transferId || null,
+        amountCents: decision.amountCents,
+        fromShard: decision.fromShard,
+        toShard: decision.toShard,
+        reason: decision.reason,
+        state,
+      },
+    });
+  }
+
+  // Shard 1 available cash vs COMBO_LOW_CASH_ALERT_USD. One unresolved alert
+  // until cash recovers (or is dismissed and still low: it stays quiet).
+  async function checkComboLowCash(availableCents) {
+    const threshold = config.comboLowCashCents;
+    if (!(threshold > 0) || availableCents == null) return;
+    if (availableCents < threshold) {
+      if (comboLowOpen === true) return;
+      const ok = await inApp({
+        kind: 'combo_low_cash',
+        severity: 'warn',
+        title: 'Kalshi combo cash is low',
+        body: `Shard 1 (combo) available cash is ${formatDollarsFromCents(availableCents)}, ` +
+          `below your ${formatDollarsFromCents(threshold)} alert level. ` +
+          `Combo Locks can skip RFQs with "insufficient funds" until it is topped up.`,
+        dedupeKey: 'combo_low_cash',
+        meta: { availableCents, thresholdCents: threshold },
+      });
+      if (ok) comboLowOpen = true;
+    } else if (comboLowOpen !== false) {
+      if (await inAppResolve(['combo_low_cash'])) comboLowOpen = false;
+    }
+    if (availableCents >= threshold) {
+      // A skip alert older than an hour clears once cash is healthy again.
+      await inAppResolve(['combo_insufficient_funds'], { olderThanMs: 60 * 60 * 1000 });
+    }
+  }
+
   function formatBalances(main, bucket) {
     const total = bucket.availableCents + (bucket.portfolioCents || 0);
     return `${shardLabel(MAIN_SHARD)} ${formatDollarsFromCents(main.availableCents)}, ` +
@@ -610,6 +710,8 @@ function createBucketManager({
   async function loadShards() {
     const main = await kalshi.getShard(MAIN_SHARD);
     const bucket = await kalshi.getShard(BUCKET_SHARD);
+    lastBucketCents = bucket.availableCents;
+    seenBucketThisRun = bucket.availableCents;
     return { main, bucket };
   }
 
@@ -648,6 +750,21 @@ function createBucketManager({
   }
 
   async function evaluate(reason) {
+    seenBucketThisRun = null;
+    let out;
+    try {
+      out = await evaluateInner(reason);
+    } finally {
+      // Latest shard 1 read from this run (post-transfer when one landed), so
+      // a top-up that fixes low cash does not raise a low-cash alert.
+      if (seenBucketThisRun != null) {
+        try { await checkComboLowCash(seenBucketThisRun); } catch (_) { /* alert only */ }
+      }
+    }
+    return out;
+  }
+
+  async function evaluateInner(reason) {
     const date = clock();
     const t = date.getTime();
     if (reason === 'insufficient_balance' && lastCheckAt && t - lastCheckAt < CHECK_COALESCE_MS) {
@@ -703,7 +820,7 @@ function createBucketManager({
         const done = pending;
         pending = null;
         log(`[BUCKET] transfer ${done.transferId || '?'} confirmed ${formatBalances(after.main, after.bucket)}`);
-        await emit(
+        await emitBucket(
           `Kalshi bucket transfer\n` +
           `${formatDollarsFromCents(done.decision.amountCents)} ` +
           `${shardLabel(done.decision.fromShard)} → ${shardLabel(done.decision.toShard)}\n` +
@@ -711,14 +828,25 @@ function createBucketManager({
           `transfer_id: ${done.transferId || '?'}\n` +
           formatBalances(after.main, after.bucket)
         );
+        // The in-app row was already written when the transfer was accepted.
         return { confirmed: true, late: true };
       } else if (t < pending.holdUntil) {
         log(`[BUCKET] holding — transfer ${pending.transferId || '?'} not visible on the re-read yet`);
         return { held: true };
       } else {
         const id = pending.transferId;
+        const unconfirmedDecision = pending.decision;
         pending = null;
         cooldownUntil = t + Math.max(config.errorCooldownMs, UNCONFIRMED_COOLDOWN_MS);
+        await inApp({
+          kind: 'bucket_transfer_unconfirmed',
+          severity: 'error',
+          title: 'Kalshi bucket transfer not confirmed',
+          body: `${transferText(unconfirmedDecision)} was accepted ` +
+            `(transfer_id ${id || '?'}) but the balance re-read never showed it. ` +
+            `No further automatic transfer for a few minutes. Check Kalshi balances.`,
+          meta: { transferId: id || null },
+        });
         await emit(
           `Kalshi bucket transfer not confirmed\n` +
           `transfer_id ${id || '?'}\n` +
@@ -764,12 +892,44 @@ function createBucketManager({
       ` trigger=${reason || 'check'}`
     );
 
+    // Close in-app "blocked" rows whose reason no longer applies. First run
+    // after a restart closes any stale ones (in-memory state is lost).
+    {
+      const nowBlocked = decision.action === 'blocked' && decision.block ? String(decision.block) : null;
+      const stale = ['floor', 'daily_cap', 'ceiling'].filter((r) => r !== nowBlocked && (blockedOpen === null || blockedOpen.has(r)));
+      const resolved = !stale.length || await inAppResolve(stale.map((r) => `bucket_blocked:${r}`));
+      if (blockedOpen === null && resolved) blockedOpen = new Set();
+      if (resolved) for (const r of stale) blockedOpen.delete(r);
+    }
+
     if (decision.action === 'blocked' && decision.block) {
       const reason = String(decision.block);
+      // In-app: one unresolved row per reason (dedupe_key), raised whenever the
+      // block starts. Telegram stays throttled to once per hour per reason.
+      if (!blockedOpen || !blockedOpen.has(reason)) {
+        const blockedWhy = {
+          floor: `Main (shard 0) is at or under the ${formatDollarsFromCents(config.floorCents)} floor`,
+          daily_cap: `Today's auto-transfers hit the ${formatDollarsFromCents(config.dailyCapCents)} daily cap`,
+          ceiling: `Shard 1 is at the ${formatDollarsFromCents(config.ceilingCents)} ceiling`,
+        }[reason] || reason;
+        const ok = await inApp({
+          kind: 'bucket_blocked',
+          severity: 'warn',
+          title: `Kalshi bucket top-up blocked (${reason})`,
+          body: `${blockedWhy}, so the combo bucket was not topped up. ` +
+            `Shard 1 available ${formatDollarsFromCents(shards.bucket.availableCents)}, ` +
+            `target ${formatDollarsFromCents(decision.targetCents)}, ` +
+            `need ${formatDollarsFromCents(Math.max(0, decision.gapCents))}. ` +
+            `Shard 0 available ${formatDollarsFromCents(shards.main.availableCents)}.`,
+          dedupeKey: `bucket_blocked:${reason}`,
+          meta: { block: reason, bucketCents: shards.bucket.availableCents, mainCents: shards.main.availableCents },
+        });
+        if (ok && blockedOpen) blockedOpen.add(reason);
+      }
       const lastBlocked = blockedAlertAt.get(reason) || 0;
       if (!lastBlocked || t - lastBlocked >= BLOCKED_ALERT_MS) {
         blockedAlertAt.set(reason, t);
-        await emit(
+        await emitBucket(
           `Kalshi bucket top-up blocked (${decision.block})\n` +
           `shard 1 available ${formatDollarsFromCents(shards.bucket.availableCents)}, ` +
           `target ${formatDollarsFromCents(decision.targetCents)}, ` +
@@ -822,6 +982,7 @@ function createBucketManager({
           beforeBucket: shards.bucket,
           holdUntil: t + config.settleMs,
         };
+        await inAppTransfer(decision, sent.transferId, null, 'accepted');
         await emit(
           `Kalshi bucket transfer accepted, balance re-read failed\n` +
           `${amountText} ${shardLabel(decision.fromShard)} → ${shardLabel(decision.toShard)}\n` +
@@ -840,6 +1001,7 @@ function createBucketManager({
           beforeBucket: shards.bucket,
           holdUntil: t + config.settleMs,
         };
+        await inAppTransfer(decision, sent.transferId, after, 'accepted');
         await emit(
           `Kalshi bucket transfer accepted\n` +
           `${amountText} ${shardLabel(decision.fromShard)} → ${shardLabel(decision.toShard)}\n` +
@@ -850,7 +1012,8 @@ function createBucketManager({
         );
         return { decision, transferId: sent.transferId, confirmed: false };
       }
-      await emit(
+      await inAppTransfer(decision, sent.transferId, after, 'confirmed');
+      await emitBucket(
         `Kalshi bucket transfer\n` +
         `${amountText} ${shardLabel(decision.fromShard)} → ${shardLabel(decision.toShard)}\n` +
         `reason: ${decision.reason}\n` +
@@ -861,6 +1024,14 @@ function createBucketManager({
     } catch (e) {
       cooldownUntil = clock().getTime() + config.errorCooldownMs;
       log(`[BUCKET] transfer failed ${e && e.message ? e.message : e}`);
+      await inApp({
+        kind: 'bucket_transfer_failed',
+        severity: 'error',
+        title: 'Kalshi bucket transfer failed',
+        body: `${transferText(decision)} failed: ${String(e && e.message ? e.message : e).slice(0, 300)}. ` +
+          `No automatic retry for ${Math.round(config.errorCooldownMs / 1000)}s.`,
+        meta: { amountCents: decision.amountCents, reason: decision.reason },
+      });
       await emit(
         `Kalshi bucket transfer failed\n` +
         `${amountText} ${shardLabel(decision.fromShard)} → ${shardLabel(decision.toShard)}\n` +
@@ -888,6 +1059,21 @@ function createBucketManager({
     const name = String(venue || '').toLowerCase() === 'polymarket' ? 'polymarket' : 'kalshi';
     const t = clock().getTime();
     const last = venueAlertAt.get(name) || 0;
+    if (name === 'kalshi' && t - insufficientInAppAt >= INSUFFICIENT_IN_APP_MS) {
+      insufficientInAppAt = t;
+      const cash = lastBucketCents != null
+        ? `Last read: shard 1 (combo) available ${formatDollarsFromCents(lastBucketCents)}. `
+        : '';
+      await inApp({
+        kind: 'combo_insufficient_funds',
+        severity: 'error',
+        title: 'Combo Locks skipped: Kalshi insufficient funds',
+        body: `A Kalshi combo quote was rejected for insufficient balance. ${cash}` +
+          `The bucket manager is re-checking both shards now.`,
+        dedupeKey: 'combo_insufficient_funds',
+        meta: { availableCents: lastBucketCents },
+      });
+    }
     if (t - last >= VENUE_ALERT_MS) {
       venueAlertAt.set(name, t);
       const label = name === 'polymarket' ? 'Polymarket' : 'Kalshi';
