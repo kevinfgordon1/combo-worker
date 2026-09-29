@@ -114,6 +114,9 @@
 //        stay on either way.
 //      Combo bucket (shard 1) preallocation: bucket-manager.js.
 //        KALSHI_BUCKET_AUTO=0 (default) logs the dry run and does not transfer.
+//        In-app alerts for Kevin (public.app_alerts, sql/app_alerts.sql):
+//        transfers, blocked top-ups, low shard 1 cash, insufficient funds.
+//        COMBO_LOW_CASH_ALERT_USD (default 1000) = shard 1 low-cash level.
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
@@ -183,6 +186,7 @@ const { startUnhedgedSide } = require('./unhedged-boot');
 const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
 const { formatAlertStatus } = require('./venue-alert');
 const { createBucketManager } = require('./bucket-manager');
+const { createAppAlerts } = require('./app-alerts');
 
 const MODE = 'LIVE';
 let bucketManager = null;
@@ -2077,6 +2081,7 @@ async function main() {
   bucketManager = createBucketManager({
     env: process.env,
     alert: (text) => sendAlert(text),
+    appAlerts: createAppAlerts({ client: supabase }),
     signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
   });
   bucketManager.start();

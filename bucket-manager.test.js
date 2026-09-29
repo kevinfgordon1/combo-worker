@@ -720,6 +720,156 @@ async function main() {
     assert.strictEqual(cash, 8);
   }
 
+  // --- in-app alerts (app_alerts) -------------------------------------------
+  function fakeAppAlerts() {
+    const rows = [];
+    return {
+      enabled: true,
+      rows,
+      async raise(spec) {
+        if (spec.dedupeKey && rows.some((r) => r.dedupeKey === spec.dedupeKey && !r.resolved)) return true;
+        rows.push({ ...spec, resolved: false });
+        return true;
+      },
+      async resolve(keys) {
+        for (const r of rows) if (keys.includes(r.dedupeKey)) r.resolved = true;
+        return true;
+      },
+    };
+  }
+  function harnessApp(env, book, when, appAlerts) {
+    let current = when || WED;
+    const alerts = [];
+    const mgr = createBucketManager({
+      env, now: () => current, alert(t) { alerts.push(t); }, log() {},
+      client: book.client, readPolyCash: null, appAlerts,
+    });
+    return { mgr, alerts, setNow(d) { current = d; }, now() { return current; } };
+  }
+
+  // A transfer writes one in-app row with dollars, and stays off Telegram.
+  {
+    const book = fakeBook({ main: cents(20_000), bucket: cents(2_000) });
+    const app = fakeAppAlerts();
+    const h = harnessApp(LIVE, book, WED, app);
+    await h.mgr.check('interval');
+    const rows = app.rows.filter((r) => r.kind === 'bucket_transfer');
+    assert.strictEqual(rows.length, 1);
+    assert.ok(rows[0].title.includes('$3,000.00'));
+    assert.ok(rows[0].body.includes('shard 0 (main)') && rows[0].body.includes('shard 1 (combo)'));
+    assert.ok(!h.alerts.some((t) => /bucket transfer/.test(t)), 'no Telegram for a completed transfer');
+    await h.mgr.check('interval');
+    assert.strictEqual(app.rows.filter((r) => r.kind === 'bucket_transfer').length, 1, 'hold writes nothing');
+    assert.ok(!app.rows.some((r) => r.kind === 'combo_low_cash'), 'top-up to $5,000 is not low cash');
+  }
+
+  // Dry run writes no transfer rows.
+  {
+    const book = fakeBook({ main: cents(20_000), bucket: cents(2_000) });
+    const app = fakeAppAlerts();
+    const h = harnessApp({ KALSHI_BUCKET_AUTO: '0' }, book, WED, app);
+    await h.mgr.check('interval');
+    assert.strictEqual(app.rows.filter((r) => r.kind === 'bucket_transfer').length, 0);
+  }
+
+  // Failed transfer writes an error row and still alerts Telegram.
+  {
+    const book = fakeBook({ main: cents(20_000), bucket: cents(2_000) });
+    book.state.transferError = 'Kalshi POST 500 boom';
+    const app = fakeAppAlerts();
+    const h = harnessApp(LIVE, book, WED, app);
+    await h.mgr.check('interval');
+    const rows = app.rows.filter((r) => r.kind === 'bucket_transfer_failed');
+    assert.strictEqual(rows.length, 1);
+    {
+      assert.strictEqual(rows[0].severity, 'error');
+      assert.ok(h.alerts.some((t) => /transfer failed/.test(t)));
+    }
+  }
+
+  // Blocked (floor): one deduped row, resolved when it clears, re-raised after.
+  {
+    const book = fakeBook({ main: cents(2_050), bucket: cents(1_000) });
+    const app = fakeAppAlerts();
+    const h = harnessApp({ ...LIVE }, book, WED, app);
+    await h.mgr.check('interval');
+    const blocked = () => app.rows.filter((r) => r.kind === 'bucket_blocked');
+    assert.strictEqual(blocked().length, 1);
+    assert.strictEqual(blocked()[0].dedupeKey, 'bucket_blocked:floor');
+    assert.ok(blocked()[0].body.includes('$2,000.00'));
+    h.setNow(new Date(h.now().getTime() + 5 * 60 * 1000));
+    await h.mgr.check('interval');
+    assert.strictEqual(blocked().length, 1, 'still blocked: no second row');
+    book.state.main.availableCents = cents(20_000);
+    h.setNow(new Date(h.now().getTime() + 5 * 60 * 1000));
+    await h.mgr.check('interval');
+    assert.ok(blocked()[0].resolved, 'top-up clears the blocked row');
+    book.state.main.availableCents = cents(2_050);
+    book.state.bucket.availableCents = cents(1_000);
+    h.setNow(new Date(h.now().getTime() + 5 * 60 * 1000));
+    await h.mgr.check('interval');
+    assert.strictEqual(blocked().length, 2, 'blocked again after recovery raises a new row');
+  }
+
+  // Combo low cash: default $1,000, configurable, dollars in message, de-duped.
+  {
+    assert.strictEqual(loadBucketConfig({}).comboLowCashCents, cents(1_000));
+    assert.strictEqual(loadBucketConfig({ COMBO_LOW_CASH_ALERT_USD: '2500' }).comboLowCashCents, cents(2_500));
+    const book = fakeBook({ main: cents(500), bucket: cents(800) });
+    const app = fakeAppAlerts();
+    const h = harnessApp({ KALSHI_BUCKET_AUTO: '0' }, book, WED, app);
+    await h.mgr.check('interval');
+    const low = () => app.rows.filter((r) => r.kind === 'combo_low_cash');
+    assert.strictEqual(low().length, 1);
+    assert.ok(low()[0].body.includes('$800.00') && low()[0].body.includes('$1,000.00'));
+    await h.mgr.check('interval');
+    await h.mgr.check('interval');
+    assert.strictEqual(low().length, 1, 'one open alert while cash stays low');
+    book.state.bucket.availableCents = cents(4_000);
+    await h.mgr.check('interval');
+    assert.ok(low()[0].resolved, 'recovery resolves the alert');
+    book.state.bucket.availableCents = cents(900.5);
+    await h.mgr.check('interval');
+    assert.strictEqual(low().length, 2, 're-alerts after recovering and dropping again');
+    assert.ok(low()[1].body.includes('$900.50'));
+  }
+
+  // Cash at/above the threshold never alerts; a live top-up that fixes low cash does not alert.
+  {
+    const book = fakeBook({ main: cents(20_000), bucket: cents(1_000) });
+    const app = fakeAppAlerts();
+    const h = harnessApp(LIVE, book, WED, app);
+    await h.mgr.check('interval');
+    assert.strictEqual(app.rows.filter((r) => r.kind === 'combo_low_cash').length, 0);
+    const book2 = fakeBook({ main: cents(20_000), bucket: cents(1_000) });
+    const app2 = fakeAppAlerts();
+    const h2 = harnessApp({ KALSHI_BUCKET_AUTO: '0', COMBO_LOW_CASH_ALERT_USD: '1000' }, book2, WED, app2);
+    await h2.mgr.check('interval');
+    assert.strictEqual(app2.rows.filter((r) => r.kind === 'combo_low_cash').length, 0, 'exactly $1,000 is not low');
+  }
+
+  // Insufficient-funds skip writes an in-app row with the last shard 1 balance.
+  {
+    const book = fakeBook({ main: cents(20_000), bucket: cents(2_000) });
+    const app = fakeAppAlerts();
+    const h = harnessApp(LIVE, book, WED, app);
+    await h.mgr.check('startup');
+    await h.mgr.onInsufficientBalance('kalshi');
+    await h.mgr.onInsufficientBalance('polymarket');
+    const rows = app.rows.filter((r) => r.kind === 'combo_insufficient_funds');
+    assert.strictEqual(rows.length, 1);
+    assert.ok(/\$\d/.test(rows[0].body));
+  }
+
+  // A broken in-app writer never breaks the bucket manager.
+  {
+    const book = fakeBook({ main: cents(20_000), bucket: cents(2_000) });
+    const bad = { enabled: true, async raise() { throw new Error('db down'); }, async resolve() { throw new Error('db down'); } };
+    const h = harnessApp(LIVE, book, WED, bad);
+    const out = await h.mgr.check('interval');
+    assert.strictEqual(out.confirmed, true);
+  }
+
   console.log('bucket-manager.test.js ok');
 }
 
