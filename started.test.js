@@ -151,4 +151,29 @@ const rfq = normalizeRfq({
   assert.strictEqual(hit.started, true);
 }
 
+// NHL: KXNHLGAME keys are date-only (26SEP30PITPHI) — no HHMM, so the ticker alone
+// never reads as "started". Combo Locks stamps the exact puck drop on parlay.starts_at
+// and each leg.starts_at; that is what gates quoting.
+{
+  assert.strictEqual(parseKalshiTickerStart('KXNHLGAME-26SEP30PITPHI-PHI'), null);
+  assert.strictEqual(parseKalshiTickerStart('KXNHLTOTAL-26OCT01TBNYR-7:no'), null);
+  assert.strictEqual(parseKalshiTickerStart('KXNHLSPREAD-26OCT01FLASJ-SJ2'), null);
+  const PUCK = '2026-09-30T23:30:00.000Z'; // 7:30 PM ET
+  const lock = {
+    starts_at: PUCK,
+    legs: [
+      { ticker: 'KXNHLGAME-26SEP30PITPHI-PHI', side: 'yes', gameKey: 'nhl:26SEP30PITPHI', starts_at: PUCK },
+      { ticker: 'KXNHLTOTAL-26SEP30LACOL-7', side: 'yes', gameKey: 'nhl:26SEP30LACOL', starts_at: '2026-10-01T02:00:00.000Z' },
+    ],
+  };
+  assert.strictEqual(findStartedEvent(null, lock, null, Date.parse('2026-09-30T23:29:00Z')).started, false);
+  const hit = findStartedEvent(null, lock, null, Date.parse('2026-09-30T23:31:00Z'));
+  assert.strictEqual(hit.started, true);
+  assert.strictEqual(hit.atMs, Date.parse(PUCK));
+  // Leg-level stamp alone (older lock without parlay.starts_at) still gates.
+  const legOnly = { legs: lock.legs };
+  assert.strictEqual(findStartedEvent(null, legOnly, null, Date.parse('2026-09-30T23:31:00Z')).started, true);
+  assert.strictEqual(findStartedEvent(null, legOnly, null, Date.parse('2026-09-30T20:00:00Z')).started, false);
+}
+
 console.log('started.test.js ok');

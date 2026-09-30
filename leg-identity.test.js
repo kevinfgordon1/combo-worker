@@ -395,6 +395,66 @@ const cache = createMarketCache({
   },
 });
 
+// ── NHL (KXNHLGAME): date-only keys, 2-letter clubs, Polymarket code aliases ──
+{
+  const cases = [
+    ['KXNHLGAME-26SEP30PITPHI-PHI:yes', ['phi', 'pit'], 'phi', '2026-09-30'],
+    ['KXNHLGAME-26SEP30LACOL-LA:yes', ['col', 'la'], 'la', '2026-09-30'],
+    ['KXNHLGAME-26OCT01TBNYR-TB:yes', ['nyr', 'tb'], 'tb', '2026-10-01'],
+    ['KXNHLGAME-26OCT03LASJ-SJ:yes', ['la', 'sj'], 'sj', '2026-10-03'],
+    ['KXNHLGAME-26OCT01PHINJ-NJ:yes', ['nj', 'phi'], 'nj', '2026-10-01'],
+    ['KXNHLGAME-26OCT03NJNYI-NYI:yes', ['nj', 'nyi'], 'nyi', '2026-10-03'],
+    ['KXNHLGAME-26OCT03WSHTB-WSH:yes', ['tb', 'wsh'], 'wsh', '2026-10-03'],
+    ['KXNHLGAME-26OCT01FLASJ-FLA:yes', ['fla', 'sj'], 'fla', '2026-10-01'],
+    ['KXNHLGAME-26OCT02ANAVGK-VGK:yes', ['ana', 'vgk'], 'vgk', '2026-10-02'],
+    ['KXNHLGAME-26OCT01MINNSH-NSH:yes', ['min', 'nsh'], 'nsh', '2026-10-01'],
+    ['KXNHLGAME-26OCT03CGYVAN-VAN:yes', ['cgy', 'van'], 'van', '2026-10-03'],
+  ];
+  for (const [ticker, teams, selection, date] of cases) {
+    const id = parseKalshiTicker(ticker);
+    assert.ok(id, ticker);
+    assert.strictEqual(id.league, 'nhl', ticker);
+    assert.strictEqual(id.date, date, ticker);
+    assert.deepStrictEqual(id.teams, teams, ticker);
+    assert.strictEqual(id.selection, selection, ticker);
+  }
+  // Every team on the live Kalshi NHL slate splits both ways round.
+  const kalshiCodes = 'ANA BOS BUF CAR CBJ CGY CHI COL DAL DET EDM FLA LA MIN MTL NJ NSH NYI NYR OTT PHI PIT SEA SJ STL TB TOR UTA VAN VGK WPG WSH'.split(' ');
+  for (const a of kalshiCodes) for (const b of kalshiCodes) {
+    if (a === b) continue;
+    const p = kalshiTickerPieces(`KXNHLGAME-26OCT01${a}${b}-${a}:yes`);
+    assert.ok(p, a + b);
+    assert.deepStrictEqual(p.teams, [a.toLowerCase(), b.toLowerCase()], a + b);
+  }
+  // TEAM:no canonicalizes to the opponent winning (2-way moneyline, same as MLB).
+  const no = parseKalshiTicker('KXNHLGAME-26SEP30PITPHI-PHI:no');
+  assert.strictEqual(no.selection, 'pit');
+  assert.strictEqual(no.side, 'yes');
+  // Polymarket US slug (mon/nas/veg/was) meets the Kalshi lock (MTL/NSH/VGK/WSH).
+  const lock = identitiesFromParlay({
+    label: 'Canadiens + Golden Knights',
+    leg_keys: ['KXNHLGAME-26OCT03MTLPIT-MTL:yes', 'KXNHLGAME-26OCT04VGKVAN-VGK:yes'],
+  });
+  assert.ok(lock.ok);
+  const poly = identitiesFromPolymarketSlugs([
+    { symbol: 'aec-nhl-mon-pit-2026-10-03', side: 'SIDE_BUY' },
+    { symbol: 'aec-nhl-veg-van-2026-10-04', side: 'SIDE_BUY' },
+  ]);
+  assert.ok(poly.ok, JSON.stringify(poly));
+  assert.ok(sameIdentitySet(lock.keys, poly.keys), `${lock.keys} vs ${poly.keys}`);
+  const lock2 = identitiesFromParlay({ leg_keys: ['KXNHLGAME-26OCT02WSHCAR-WSH:yes', 'KXNHLGAME-26OCT01MINNSH-NSH:yes'] });
+  const poly2 = identitiesFromPolymarketSlugs([
+    { symbol: 'aec-nhl-was-car-2026-10-02', side: 'SIDE_BUY' },
+    { symbol: 'aec-nhl-min-nas-2026-10-01', side: 'SELL' },
+  ]);
+  assert.ok(poly2.ok);
+  assert.ok(sameIdentitySet(lock2.keys, poly2.keys), `${lock2.keys} vs ${poly2.keys}`);
+  // Kalshi spread/total NHL legs are not GAME identities (same as MLB/NFL): matched by ticker set.
+  assert.strictEqual(parseKalshiTicker('KXNHLTOTAL-26SEP30PITPHI-7:no'), null);
+  assert.strictEqual(parseKalshiTicker('KXNHLSPREAD-26SEP30PITPHI-PHI2:yes'), null);
+  console.log('leg-identity NHL ok');
+}
+
 (async () => {
   assert.ok(await cache.get('aec-mlb-cws-det-2026-08-14-cws'));
   assert.ok(await cache.get('aec-mlb-cws-det-2026-08-14-cws'));
