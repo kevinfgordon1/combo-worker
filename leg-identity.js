@@ -23,7 +23,7 @@ const MONTHS = {
 const SERIES = {
   KXMLBGAME: { league: 'mlb', marketType: 'moneyline', period: 'full', teamLen: 3 },
   KXNBAGAME: { league: 'nba', marketType: 'moneyline', period: 'full', teamLen: 3 },
-  KXNHLGAME: { league: 'nhl', marketType: 'moneyline', period: 'full', teamLen: 3 },
+  KXNHLGAME: { league: 'nhl', marketType: 'moneyline', period: 'full', teamLen: null }, // LA/NJ/SJ/TB are 2 letters
   KXNFLGAME: { league: 'nfl', marketType: 'moneyline', period: 'full', teamLen: null },
 };
 
@@ -49,7 +49,8 @@ const TEAM_ALIASES = {
   },
   nfl: { gnb: 'gb', jac: 'jax', wsh: 'was' },
   nba: { uta: 'utah', pho: 'phx', gsw: 'gs', nyk: 'ny', nop: 'no' },
-  nhl: {},
+  // Polymarket US slugs use mon/nas/veg/was; Kalshi KXNHLGAME uses MTL/NSH/VGK/WSH.
+  nhl: { mon: 'mtl', nas: 'nsh', veg: 'vgk', was: 'wsh', utah: 'uta', lak: 'la', njd: 'nj', sjs: 'sj', tbl: 'tb', cal: 'cgy' },
 };
 
 const NFL_CODES = [
@@ -68,7 +69,15 @@ const MLB_CODES = [
   'tb', 'tbr', 'tex', 'tor', 'was', 'wsh',
 ].sort((a, b) => b.length - a.length);
 
-const LEAGUE_TEAM_CODES = { nfl: NFL_CODES, mlb: MLB_CODES };
+// Kalshi KXNHLGAME codes (2026-09-30 live slate) plus the Polymarket variants.
+// Two-letter clubs (LA, NJ, SJ, TB) make even-split parsing wrong: TBNYR, LASJ.
+const NHL_CODES = [
+  'ana', 'bos', 'buf', 'car', 'cbj', 'cgy', 'chi', 'col', 'dal', 'det', 'edm',
+  'fla', 'la', 'min', 'mtl', 'nj', 'nsh', 'nyi', 'nyr', 'ott', 'phi', 'pit',
+  'sea', 'sj', 'stl', 'tb', 'tor', 'uta', 'van', 'vgk', 'wpg', 'wsh',
+].sort((a, b) => b.length - a.length);
+
+const LEAGUE_TEAM_CODES = { nfl: NFL_CODES, mlb: MLB_CODES, nhl: NHL_CODES };
 
 const DT_TIME_RE = /^(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})(\d{4})(.*)$/i;
 // NFL GAME tickers are often date-only: 26SEP13ARILAC (no HHMM).
