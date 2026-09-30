@@ -141,6 +141,28 @@ async function listKalshiMarkets(reader, leagues) {
   return markets;
 }
 
+// Finalized single-game markets (with `result`) for settlement. Newest first.
+async function listKalshiSettled(reader, leagues, { sinceMs, maxPages = 8 } = {}) {
+  if (!reader) return [];
+  const markets = [];
+  for (const league of leagues || []) {
+    const series = SERIES[league];
+    if (!series) continue;
+    let cursor = '';
+    for (let page = 0; page < maxPages; page += 1) {
+      const qs = new URLSearchParams({ series_ticker: series, status: 'settled', limit: '200' });
+      if (sinceMs) qs.set('min_close_ts', String(Math.floor(Number(sinceMs) / 1000)));
+      if (cursor) qs.set('cursor', cursor);
+      const { json } = await reader.get('/trade-api/v2/markets', qs.toString());
+      const batch = (json && json.markets) || [];
+      markets.push(...batch);
+      cursor = (json && json.cursor) || '';
+      if (!cursor || !batch.length) break;
+    }
+  }
+  return markets;
+}
+
 async function kalshiBook(reader, ticker) {
   if (!reader || !ticker) return null;
   const path = `/trade-api/v2/markets/${encodeURIComponent(ticker)}/orderbook`;
@@ -291,6 +313,7 @@ module.exports = {
   assertPaperReadOnly,
   createKalshiReader,
   listKalshiMarkets,
+  listKalshiSettled,
   kalshiBook,
   kalshiTrades,
   createPolyReader,

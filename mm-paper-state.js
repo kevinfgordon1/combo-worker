@@ -13,9 +13,21 @@
 
 const fs = require('fs');
 
-const HISTORY_KINDS = new Set(['fill', 'pair', 'cutoff']);
+const HISTORY_KINDS = new Set(['fill', 'pair', 'cutoff', 'exit', 'settle']);
+const DB_HISTORY_KINDS = ['fill', 'pair', 'cutoff', 'exit', 'settle'];
 const DEFAULT_PAGE = 1000;
 const MAX_PAGES = 2000;
+
+// Rows written before the kickoff-cutoff logic shipped (deploy ~Sep 28) carry
+// no `phase`. They were quoted with no cutoff, so they can include in-game
+// fills and pairs. They still consume inventory (lots stay correct) but their
+// locked profit is suspect and stays out of headline totals.
+function isLegacyEvent(ev) {
+  if (!ev || (ev.kind !== 'fill' && ev.kind !== 'pair')) return false;
+  if (ev.legacy === true) return true;
+  if (ev.legacy === false) return false;
+  return ev.phase == null;
+}
 
 function metaFromGameId(gameId, leagueHint) {
   const parts = String(gameId || '').split('|');
@@ -107,21 +119,27 @@ function applyFill(game, ev) {
     net,
     qty,
     kalshiTicker: ev.kalshiTicker || null,
+    ts: Number.isFinite(Number(ev.tradeTs)) ? Number(ev.tradeTs) : (Number.isFinite(Number(ev.ts)) ? Number(ev.ts) : null),
+    legacy: isLegacyEvent(ev),
   };
   game.lots.push(lot);
   return lot;
 }
 
+// FIFO reduce. Returns true when any consumed lot was legacy.
 function reduceTeam(game, team, qty) {
   let left = Number(qty);
-  if (!team || !(left > 0)) return;
+  let legacy = false;
+  if (!team || !(left > 0)) return legacy;
   for (const lot of game.lots) {
     if (lot.team !== team || !(lot.qty > 0)) continue;
     const take = Math.min(lot.qty, left);
     lot.qty -= take;
     left -= take;
+    if (lot.legacy) legacy = true;
     if (!(left > 1e-9)) break;
   }
+  return legacy;
 }
 
 function applyPair(game, ev) {
@@ -132,17 +150,49 @@ function applyPair(game, ev) {
   for (const leg of legs) {
     if (leg && leg.team && !teams.includes(leg.team)) teams.push(leg.team);
   }
+  let usedLegacy = false;
   if (teams.length >= 2) {
-    reduceTeam(game, teams[0], qty);
-    reduceTeam(game, teams[1], qty);
+    usedLegacy = reduceTeam(game, teams[0], qty) || usedLegacy;
+    usedLegacy = reduceTeam(game, teams[1], qty) || usedLegacy;
   } else if ((game.teams || []).length >= 2) {
-    reduceTeam(game, game.teams[0], qty);
-    reduceTeam(game, game.teams[1], qty);
+    usedLegacy = reduceTeam(game, game.teams[0], qty) || usedLegacy;
+    usedLegacy = reduceTeam(game, game.teams[1], qty) || usedLegacy;
   }
   const profit = Number(ev.lockedProfit) || 0;
+  // A pair that consumed a legacy lot is as suspect as the lot.
+  const legacy = ev.legacy === false && !usedLegacy ? false : (isLegacyEvent(ev) || usedLegacy);
   game.pairedQty += qty;
-  game.lockedPnl += profit;
-  return { qty, profit };
+  if (legacy) {
+    game.legacyPairedQty = (game.legacyPairedQty || 0) + qty;
+    game.legacyLockedPnl = (game.legacyLockedPnl || 0) + profit;
+  } else {
+    game.lockedPnl += profit;
+  }
+  return { qty, profit, legacy };
+}
+
+// A simulated exit sells `qty` of one team at ev.price. FIFO, like a pair.
+function applyExit(game, ev) {
+  const qty = Number(ev && ev.qty);
+  if (!game || !ev || !ev.team || !(qty > 0)) return null;
+  const usedLegacy = reduceTeam(game, ev.team, qty);
+  const pnl = Number(ev.pnl) || 0;
+  const legacy = ev.legacy === true || usedLegacy;
+  if (legacy) game.legacyExitPnl = (game.legacyExitPnl || 0) + pnl;
+  else game.exitPnl = (game.exitPnl || 0) + pnl;
+  return { qty, pnl, legacy };
+}
+
+function applySettle(game, ev) {
+  if (!game || !ev) return null;
+  for (const lot of game.lots) lot.qty = 0;
+  game.settled = true;
+  game.settlement = {
+    winner: ev.winner || null,
+    realizedPnl: Number(ev.realizedPnl) || 0,
+    legacyPnl: Number(ev.legacyPnl) || 0,
+  };
+  return game.settlement;
 }
 
 function emptyReplayGame(meta) {
@@ -153,16 +203,24 @@ function emptyReplayGame(meta) {
     teams: meta.teams.slice(),
     lots: [],
     lockedPnl: 0,
+    legacyLockedPnl: 0,
     pairedQty: 0,
+    legacyPairedQty: 0,
+    exitPnl: 0,
+    legacyExitPnl: 0,
+    settled: false,
+    settlement: null,
   };
 }
+
+const REPLAY_KINDS = new Set(['fill', 'pair', 'exit', 'settle']);
 
 function replayPaperEvents(events) {
   const games = new Map();
   const seenIds = new Set();
   const seenFills = new Set();
   for (const ev of orderPaperEvents(events)) {
-    if (!ev || (ev.kind !== 'fill' && ev.kind !== 'pair')) continue;
+    if (!ev || !REPLAY_KINDS.has(ev.kind)) continue;
     if (ev.id) {
       if (seenIds.has(ev.id)) continue;
       seenIds.add(ev.id);
@@ -180,7 +238,9 @@ function replayPaperEvents(events) {
       games.set(meta.gameId, game);
     }
     if (ev.kind === 'fill') applyFill(game, ev);
-    else applyPair(game, ev);
+    else if (ev.kind === 'pair') applyPair(game, ev);
+    else if (ev.kind === 'exit') applyExit(game, ev);
+    else if (ev.kind === 'settle') applySettle(game, ev);
   }
   return games;
 }
@@ -282,7 +342,7 @@ function historyQuery(supabase) {
     throw new Error('mm_paper_events client has no select');
   }
   query = query.select('id,kind,game_id,venue,team,payload,created_at');
-  if (typeof query.in === 'function') query = query.in('kind', ['fill', 'pair', 'cutoff']);
+  if (typeof query.in === 'function') query = query.in('kind', DB_HISTORY_KINDS);
   if (typeof query.order === 'function') query = query.order('created_at', { ascending: true });
   if (typeof query.order === 'function') query = query.order('id', { ascending: true });
   if (typeof query.range !== 'function') throw new Error('mm_paper_events client has no range');
@@ -450,6 +510,9 @@ module.exports = {
   sortPaperEvents,
   applyFill,
   applyPair,
+  applyExit,
+  applySettle,
+  isLegacyEvent,
   replayPaperEvents,
   positionsFromLots,
   compareReplayToSnapshots,

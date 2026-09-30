@@ -8,10 +8,16 @@
 // No I/O. No orders.
 'use strict';
 
-const { POLY_MAKER_REBATE, POLY_TAKER_FEE } = require('./mm-paper-config');
+const {
+  POLY_MAKER_REBATE,
+  POLY_TAKER_FEE,
+  KALSHI_MAKER_COEFF,
+  KALSHI_TAKER_COEFF,
+} = require('./mm-paper-config');
 
 const DEFAULT_CFG = Object.freeze({
-  kalshiMakerCoeff: 0,
+  kalshiMakerCoeff: KALSHI_MAKER_COEFF,
+  kalshiTakerCoeff: KALSHI_TAKER_COEFF,
   polyMakerRebate: POLY_MAKER_REBATE,
   polyTakerFee: POLY_TAKER_FEE,
 });
@@ -75,6 +81,12 @@ function validPrice(p) {
   return p != null && p >= 0.01 && p <= 0.99;
 }
 
+// Kalshi rounds fees UP to the next cent.
+function ceilCents(amount) {
+  if (!Number.isFinite(amount) || amount <= 0) return 0;
+  return Math.ceil(amount * 100 - 1e-8) / 100;
+}
+
 // Signed fee dollars for `contracts` at `price`. Positive = we pay.
 // Kalshi single-game maker is coeff * C * p * (1-p), default coeff 0.
 // Polymarket US maker rebate is negative: -(rebate * C * p * (1-p)).
@@ -86,7 +98,9 @@ function exactFee(venue, price, contracts, cfg, role) {
   if (!validPrice(p) || !(n > 0)) return null;
   const curve = n * p * (1 - p);
   if (venue === 'kalshi') {
-    if (role === 'taker') return null;
+    if (role === 'taker') {
+      return (c.kalshiTakerCoeff != null ? c.kalshiTakerCoeff : KALSHI_TAKER_COEFF) * curve;
+    }
     return c.kalshiMakerCoeff * curve;
   }
   if (venue === 'polymarket') {
@@ -99,6 +113,7 @@ function exactFee(venue, price, contracts, cfg, role) {
 function roundedFee(venue, price, contracts, cfg, role) {
   const exact = exactFee(venue, price, contracts, cfg, role);
   if (exact == null) return null;
+  if (venue === 'kalshi') return ceilCents(exact);
   return bankersRoundCents(exact);
 }
 
@@ -113,6 +128,15 @@ function netPerContract(venue, price, contracts, cfg) {
   const total = totalNet(venue, price, n, cfg);
   if (total == null || !(n > 0)) return null;
   return Math.round((total / n) * 1e8) / 1e8;
+}
+
+// Per-contract proceeds from SELLING `contracts` at `price` as a taker,
+// net of the taker fee. Null when the price or size is invalid.
+function takerProceedsPerContract(venue, price, contracts, cfg) {
+  const n = Number(contracts);
+  const fee = roundedFee(venue, price, n, cfg, 'taker');
+  if (fee == null || !(n > 0)) return null;
+  return Math.round(((Number(price) * n - fee) / n) * 1e8) / 1e8;
 }
 
 function lockPriceFromOpponent(opponentProb) {
@@ -249,23 +273,43 @@ function adverseMove(prev, next, cents) {
   return (prev - next) >= thresh - 1e-9;
 }
 
-// Conservative queue. At our price, size already resting is filled first.
-// A trade strictly through our bid clears that queue, then fills us only
-// up to the printed size. Unknown queue (null) never fills at our price.
-function simulateFill(quote, trade) {
+// Conservative fill model.
+//   queue  (default): a print strictly below our bid fills us (price
+//          priority: our bid was hit first). A print AT our bid first eats
+//          the queue ahead, padded by opts.queuePad (0.5 = assume 50% more
+//          size than the book showed, for adds ahead of us); unknown queue
+//          never fills at our price.
+//   strict: only prints strictly below our bid fill us.
+//   legacy: same as queue with queuePad 0.
+// Prints flagged aggressor==='buy' lifted an offer, so they never hit a bid.
+function simulateFill(quote, trade, opts = {}) {
   if (!quote || !trade) return null;
   if (!(trade.qty > 0) || !(quote.size > 0)) return null;
+  if (trade.aggressor === 'buy') return null;
   if (!(Number(trade.price) <= Number(quote.price) + 1e-9)) return null;
+  const model = opts.model || 'queue';
+  const pad = model === 'legacy' ? 0 : Math.max(0, Number(opts.queuePad) || 0);
   const at = Math.abs(Number(trade.price) - Number(quote.price)) <= 0.0005 + 1e-9;
   let queue = quote.queueAhead;
   let qty = Number(trade.qty);
   if (at) {
+    if (model === 'strict') {
+      return { fillQty: 0, queueAhead: queue, sizeLeft: quote.size, reason: 'at_ignored' };
+    }
     if (queue == null) {
       return { fillQty: 0, queueAhead: null, sizeLeft: quote.size, reason: 'queue_unknown' };
     }
-    const eat = Math.min(queue, qty);
-    queue -= eat;
-    qty -= eat;
+    const eff = queue * (1 + pad);
+    if (qty <= eff) {
+      return {
+        fillQty: 0,
+        queueAhead: (eff - qty) / (1 + pad),
+        sizeLeft: quote.size,
+        reason: 'queued',
+      };
+    }
+    qty -= eff;
+    queue = 0;
   } else {
     queue = 0;
   }
@@ -291,6 +335,8 @@ module.exports = {
   roundedFee,
   totalNet,
   netPerContract,
+  takerProceedsPerContract,
+  ceilCents,
   lockPriceFromOpponent,
   capBid,
   pairNetsOk,

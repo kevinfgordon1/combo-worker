@@ -21,7 +21,10 @@ const {
   createPolyReader,
   createPolyMarketsWs,
   resolvePolyBooks,
+  listKalshiSettled,
 } = require('./mm-paper-feed');
+const { resultsByGame, polyResolution } = require('./mm-paper-settle');
+const { polySlugCandidates } = require('./mm-paper-games');
 
 function polySides(game, slug, market, book) {
   const got = identityFromMarket(market, 'yes');
@@ -59,6 +62,8 @@ function createRunner(env = process.env, deps = {}) {
   let polyByGame = new Map();
   let ws = null;
   let lastOddsAt = 0;
+  let lastSettleAt = 0;
+  let settleBusy = false;
   let busy = false;
 
   if (cfg.polyWs && env.POLYMARKET_KEY_ID && env.POLYMARKET_SECRET_KEY && deps.polyWs !== false) {
@@ -212,6 +217,57 @@ function createRunner(env = process.env, deps = {}) {
     return events;
   }
 
+  // Look up final results for games that traded and have started, then let
+  // the session settle their leftover lots. Read-only GETs. Safe to call
+  // often: throttled by MM_SETTLE_POLL_SEC and never overlaps itself.
+  async function settle(now = nowFn(), { force } = {}) {
+    if (!cfg.settleEnabled || settleBusy) return [];
+    if (!force && lastSettleAt && (now - lastSettleAt) < cfg.settlePollMs) return [];
+    const pending = session.unsettledGames(now).filter((g) => (
+      g.startedAgoMs == null
+        ? true
+        : g.startedAgoMs >= cfg.settleAfterKickoffSec * 1000
+    ));
+    if (!pending.length) { lastSettleAt = now; return []; }
+    settleBusy = true;
+    try {
+      lastSettleAt = now;
+      const results = new Map();
+      let kalshiMarkets = [];
+      if (kalshi) {
+        try {
+          kalshiMarkets = await listKalshiSettled(kalshi, cfg.leagues, {
+            sinceMs: now - cfg.settleLookbackDays * 86400_000,
+          });
+        } catch (err) {
+          console.warn(`[MM-PAPER] settle kalshi list failed: ${err && err.message ? err.message : err}`);
+        }
+      }
+      for (const [gameId, res] of resultsByGame(kalshiMarkets, cfg.leagues)) results.set(gameId, res);
+      if (poly) {
+        for (const g of pending) {
+          if (results.has(g.gameId)) continue;
+          for (const slug of polySlugCandidates(g)) {
+            try {
+              const market = await poly.market(slug);
+              const res = polyResolution(market, g);
+              if (res) { results.set(g.gameId, res); break; }
+            } catch (_) { /* try next slug */ }
+          }
+        }
+      }
+      const events = session.settleGames(results, now);
+      for (const ev of events) {
+        console.log(`[MM-PAPER] settled ${ev.gameId} winner=${ev.winner} source=${ev.source} realized=$${ev.realizedPnl}`
+          + (ev.legacyPnl ? ` legacy=$${ev.legacyPnl}` : ''));
+        await log.write(ev);
+      }
+      return events;
+    } finally {
+      settleBusy = false;
+    }
+  }
+
   async function restore(now = nowFn()) {
     const history = await loadPaperHistory({ supabase, filePath: cfg.logPath });
     const stats = session.restoreFromEvents(history.events, now);
@@ -242,6 +298,11 @@ function createRunner(env = process.env, deps = {}) {
       events.push(...await pollBooksAndTrades(now));
       events.push(...session.tick(now));
       for (const ev of events) await log.write(ev);
+      try {
+        events.push(...await settle(now));
+      } catch (err) {
+        console.warn(`[MM-PAPER] settle failed: ${err && err.message ? err.message : err}`);
+      }
       return events;
     } finally {
       busy = false;
@@ -254,6 +315,7 @@ function createRunner(env = process.env, deps = {}) {
     log,
     refreshMarkets,
     restore,
+    settle,
     once,
     startWs() { if (ws) ws.start(); },
     stop() {
@@ -294,6 +356,10 @@ async function main(env = process.env) {
     + `polyTaker=${cfg.polyTakerFee} adverse=${cfg.adverseCents}c `
     + `cap=${cfg.positionCap} size=${cfg.orderSize} `
     + `kickoffBuffer=${cfg.kickoffBufferSec}s `
+    + `fillModel=${cfg.fillModel} queuePad=${cfg.queuePad} kalshiMakerCoeff=${cfg.kalshiMakerCoeff} `
+    + `pairTimeout=${cfg.pairTimeoutSec}s exit=${cfg.exitEnabled ? cfg.exitMode : 'off'} `
+    + `unpairedCap=${cfg.maxUnpairedQty}c/$${cfg.maxUnpairedUsd} markoutSec=${cfg.markoutSec.join('/')} `
+    + `settle=${cfg.settleEnabled ? 'on' : 'off'} `
     + `oddsMaxAgeMs=${cfg.oddsMaxAgeMs} log=${cfg.logPath} `
     + `supabase=${cfg.supabase ? 'on' : 'off'}`
   );

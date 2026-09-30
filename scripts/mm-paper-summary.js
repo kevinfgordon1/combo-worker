@@ -22,6 +22,7 @@ const {
   countHistoryEvent,
   compareReplayToSnapshots,
   loadPaperHistory,
+  isLegacyEvent,
 } = require('../mm-paper-state');
 
 const KALSHI_ORIGIN = 'https://api.elections.kalshi.com';
@@ -105,6 +106,12 @@ function summarize(events) {
         fills: 0,
         pairs: 0,
         lockedProfit: 0,
+        legacyPairs: 0,
+        legacyLocked: 0,
+        exitPnl: 0,
+        exits: 0,
+        realized: null,
+        markouts: {},
         phases: { pregame: emptyPhase(), ingame: emptyPhase(), unknown: emptyPhase() },
         openPositions: [],
         lots: [],
@@ -132,11 +139,29 @@ function summarize(events) {
       g.fills += 1;
       g.phases[phase].fills += 1;
     } else if (ev.kind === 'pair') {
-      g.pairs += 1;
       const profit = Number(ev.lockedProfit) || 0;
-      g.lockedProfit += profit;
-      g.phases[phase].pairs += 1;
-      g.phases[phase].locked += profit;
+      if (isLegacyEvent(ev)) {
+        // Pre-cutoff-logic pairs are suspect. Counted apart, out of headline.
+        g.legacyPairs += 1;
+        g.legacyLocked += profit;
+      } else {
+        g.pairs += 1;
+        g.lockedProfit += profit;
+        g.phases[phase].pairs += 1;
+        g.phases[phase].locked += profit;
+      }
+    } else if (ev.kind === 'exit') {
+      g.exits += 1;
+      if (ev.legacy !== true) g.exitPnl += Number(ev.pnl) || 0;
+    } else if (ev.kind === 'settle') {
+      g.realized = Number(ev.realizedPnl);
+      g.legacyRealized = Number(ev.legacyPnl);
+      g.settledWinner = ev.winner || null;
+    } else if (ev.kind === 'markout' && ev.horizon && Number.isFinite(Number(ev.markoutUsd))) {
+      const m = g.markouts[ev.horizon] || (g.markouts[ev.horizon] = { n: 0, usd: 0, adverse: 0 });
+      m.n += 1;
+      m.usd += Number(ev.markoutUsd);
+      if (ev.adverse) m.adverse += 1;
     } else if (ev.kind === 'hedge') g.hedges += 1;
     if (ev.lockedPnl != null && Number.isFinite(Number(ev.lockedPnl))) g.lockedPnl = Number(ev.lockedPnl);
     if (ev.kind === 'pair' || ev.kind === 'fill' || ev.kind === 'quote' || ev.kind === 'reprice' || ev.kind === 'pull') {
@@ -302,7 +327,7 @@ function formatReport(rows) {
     );
   }
   lines.push(
-    `TOTAL quotes=${quotes} fills=${fills} pairs=${pairs} `
+    `TOTAL quotes=${quotes} fills=${fills} pairs=${pairs} legacyPairsExcluded=${rows.reduce((n, g) => n + (g.legacyPairs || 0), 0)} `
     + `${phaseText('pregame', pre)} ${phaseText('ingame', ingame)} `
     + `locked=${money(locked)} settledLeftover=${settledKnown ? money(settled) : 'n/a'} `
     + `open=${openQty} net=${netKnown ? money(net) : 'n/a'}`
