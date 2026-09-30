@@ -26,6 +26,12 @@ const {
 const { resultsByGame, polyResolution } = require('./mm-paper-settle');
 const { polySlugCandidates } = require('./mm-paper-games');
 
+// Newer supabase-js needs a WebSocket implementation on Node < 22 even when
+// realtime is unused. `ws` is already a dependency, so hand it over.
+function paperSupabase(url, key) {
+  return createClient(url, key, { realtime: { transport: require('ws') } });
+}
+
 function polySides(game, slug, market, book) {
   const got = identityFromMarket(market, 'yes');
   const longTeam = got && got.identity
@@ -52,7 +58,7 @@ function createRunner(env = process.env, deps = {}) {
   });
   const supabase = deps.supabase !== undefined ? deps.supabase : (
     cfg.supabase
-      ? createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY)
+      ? paperSupabase(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY)
       : null
   );
   const nowFn = deps.now || (() => Date.now());
@@ -338,7 +344,7 @@ async function main(env = process.env) {
   const log = createPaperLog({
     filePath: cfg.logPath,
     insertFn: cfg.supabase ? async (row) => {
-      const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
+      const supabase = paperSupabase(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
       return supabase.from('mm_paper_events').insert({
         kind: row.kind,
         game_id: row.gameId || null,
@@ -399,4 +405,4 @@ async function main(env = process.env) {
   return { runner, stop };
 }
 
-module.exports = { createRunner, main, polySides };
+module.exports = { createRunner, main, polySides, paperSupabase };

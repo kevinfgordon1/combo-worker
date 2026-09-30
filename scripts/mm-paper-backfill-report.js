@@ -9,6 +9,7 @@
 'use strict';
 
 const { createClient } = require('@supabase/supabase-js');
+const WS = require('ws');
 const { loadPaperHistory, replayPaperEvents } = require('../mm-paper-state');
 const { createKalshiReader, listKalshiSettled, createPolyReader } = require('../mm-paper-feed');
 const { resultsByGame, polyResolution, winnerOf } = require('../mm-paper-settle');
@@ -22,7 +23,7 @@ async function run(argv = process.argv, env = process.env, deps = {}) {
   const asJson = args.includes('--json');
   const supabase = deps.supabase !== undefined ? deps.supabase : (
     env.SUPABASE_URL && env.SUPABASE_SERVICE_KEY
-      ? createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY)
+      ? createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { realtime: { transport: WS } })
       : null
   );
   const history = await loadPaperHistory({ supabase, filePath: env.MM_LOG_PATH || 'mm-paper.jsonl' });

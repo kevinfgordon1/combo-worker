@@ -368,7 +368,7 @@ async function loadCompareEvents(filePath, env) {
   try {
     const { createClient } = require('@supabase/supabase-js');
     const history = await loadPaperHistory({
-      supabase: createClient(url, key),
+      supabase: createClient(url, key, { realtime: { transport: require('ws') } }),
       filePath,
     });
     if (history.remoteOk) return { events: history.events, source: history.source };
