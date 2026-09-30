@@ -1,4 +1,5 @@
 'use strict';
+const LEGACY_ENV = { MM_FILL_LATENCY_MS: '0', MM_MAX_UNPAIRED_QTY: '100000', MM_MAX_UNPAIRED_USD: '1000000', MM_EXIT: '0', MM_SETTLE: '0', MM_FILL_MODEL: 'legacy' };
 const assert = require('assert');
 const { createPaperSession } = require('./mm-paper-engine');
 const { impliedProb, pairNetsOk } = require('./mm-paper-math');
@@ -13,7 +14,7 @@ function book(bid, ask, bidSize) {
 
 function sessionWithGame(overrides = {}) {
   const cfg = {
-    ...readConfig({ MM_PAPER: '1', MM_ORDER_SIZE: '10', MM_POSITION_CAP: '100' }),
+    ...readConfig({ ...LEGACY_ENV, MM_PAPER: '1', MM_ORDER_SIZE: '10', MM_POSITION_CAP: '100' }),
     ...overrides,
   };
   const session = createPaperSession(cfg);
@@ -95,7 +96,7 @@ assert.ok(phiQuote.cents <= 40);
 assert.ok(phiQuote.net <= 0.4 + 1e-9);
 
 // One-sided 60¢ inventory: the other bid cannot be raised to a combined $1.
-const held = createPaperSession(readConfig({ MM_PAPER: '1', MM_ORDER_SIZE: '10' }));
+const held = createPaperSession(readConfig({ ...LEGACY_ENV, MM_PAPER: '1', MM_ORDER_SIZE: '10' }));
 held.upsertGame({
   gameId, league: 'nfl', date: '2026-09-13', teams: ['kc', 'phi'], labels: {},
 });

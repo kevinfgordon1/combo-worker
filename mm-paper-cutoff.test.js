@@ -1,4 +1,5 @@
 'use strict';
+const LEGACY_ENV = { MM_FILL_LATENCY_MS: '0', MM_MAX_UNPAIRED_QTY: '100000', MM_MAX_UNPAIRED_USD: '1000000', MM_EXIT: '0', MM_SETTLE: '0', MM_FILL_MODEL: 'legacy' };
 const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
@@ -44,7 +45,7 @@ function quiet(fn) {
 function makeSession({ bufferSec, kickoff } = {}) {
   const env = { MM_PAPER: '1', MM_ORDER_SIZE: '10', MM_POSITION_CAP: '100' };
   if (bufferSec != null) env.MM_PAPER_KICKOFF_BUFFER_SEC = String(bufferSec);
-  const cfg = readConfig(env);
+  const cfg = readConfig({ ...LEGACY_ENV, ...env });
   const session = createPaperSession(cfg);
   session.upsertGame({
     gameId: GAME,
@@ -75,10 +76,10 @@ function quotesOf(events) {
   return (events || []).filter((e) => e.kind === 'quote' || e.kind === 'reprice');
 }
 
-assert.strictEqual(readConfig({ MM_PAPER: '1' }).kickoffBufferSec, 60);
-assert.strictEqual(readConfig({ MM_PAPER: '1', MM_PAPER_KICKOFF_BUFFER_SEC: '120' }).kickoffBufferSec, 120);
-assert.strictEqual(readConfig({ MM_PAPER: '1', MM_PAPER_KICKOFF_BUFFER_SEC: '0' }).kickoffBufferSec, 0);
-assert.strictEqual(readConfig({ MM_PAPER: '1', MM_PAPER_KICKOFF_BUFFER_SEC: 'nope' }).kickoffBufferSec, 60);
+assert.strictEqual(readConfig({ ...LEGACY_ENV, MM_PAPER: '1' }).kickoffBufferSec, 60);
+assert.strictEqual(readConfig({ ...LEGACY_ENV, MM_PAPER: '1', MM_PAPER_KICKOFF_BUFFER_SEC: '120' }).kickoffBufferSec, 120);
+assert.strictEqual(readConfig({ ...LEGACY_ENV, MM_PAPER: '1', MM_PAPER_KICKOFF_BUFFER_SEC: '0' }).kickoffBufferSec, 0);
+assert.strictEqual(readConfig({ ...LEGACY_ENV, MM_PAPER: '1', MM_PAPER_KICKOFF_BUFFER_SEC: 'nope' }).kickoffBufferSec, 60);
 
 assert.strictEqual(polyKickoffMs({
   startDate: '2026-09-13T06:00:20Z',
@@ -335,7 +336,7 @@ async function main() {
       };
     },
   };
-  const fresh = createPaperSession(readConfig({ MM_PAPER: '1' }));
+  const fresh = createPaperSession(readConfig({ ...LEGACY_ENV, MM_PAPER: '1' }));
   const runner = createRunner({
     MM_PAPER: '1',
     MM_LOG_PATH: file,
@@ -368,7 +369,7 @@ async function main() {
   });
   assert.strictEqual(duped.source, 'supabase');
   assert.strictEqual(duped.events.filter((e) => e.kind === 'fill').length, 1);
-  const merged = createPaperSession(readConfig({ MM_PAPER: '1' }));
+  const merged = createPaperSession(readConfig({ ...LEGACY_ENV, MM_PAPER: '1' }));
   const stats = quiet(() => merged.restoreFromEvents(duped.events, KICK + 5000)).value;
   assert.strictEqual(stats.openQty, fill.qty);
 }

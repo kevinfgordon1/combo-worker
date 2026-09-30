@@ -5,6 +5,11 @@
 
 const POLY_MAKER_REBATE = 0.0125;
 const POLY_TAKER_FEE = 0.0695;
+// Kalshi KXNFLGAME (kalshi.com/fee-schedule, captured 2026-09-02, multiplier 1):
+// taker $0.07-$1.75 per 100 contracts => 0.07 * p * (1-p) per contract,
+// maker $0.02-$0.44 per 100 => 0.0175 * p * (1-p). Both round UP to the cent.
+const KALSHI_MAKER_COEFF = 0.0175;
+const KALSHI_TAKER_COEFF = 0.07;
 
 function flagOn(raw) {
   if (raw == null || String(raw).trim() === '') return false;
@@ -25,6 +30,19 @@ function num(raw, fallback, { min = -Infinity, max = Infinity } = {}) {
   const n = Number(raw);
   if (!Number.isFinite(n) || n < min || n > max) return fallback;
   return n;
+}
+
+function pick(raw, allowed, fallback) {
+  const v = raw == null ? '' : String(raw).trim().toLowerCase();
+  return allowed.includes(v) ? v : fallback;
+}
+
+function numList(raw, fallback) {
+  if (raw == null || String(raw).trim() === '') return fallback.slice();
+  const out = String(raw).split(',')
+    .map((x) => Number(String(x).trim()))
+    .filter((n) => Number.isFinite(n) && n > 0 && n <= 24 * 3600);
+  return out.length ? out : fallback.slice();
 }
 
 function enabledLeagues(env = process.env) {
@@ -48,7 +66,8 @@ function readConfig(env = process.env) {
   return {
     enabled: paperEnabled(env),
     leagues: enabledLeagues(env),
-    kalshiMakerCoeff: num(env && env.MM_KALSHI_MAKER_COEFF, 0, { min: 0, max: 1 }),
+    kalshiMakerCoeff: num(env && env.MM_KALSHI_MAKER_COEFF, KALSHI_MAKER_COEFF, { min: 0, max: 1 }),
+    kalshiTakerCoeff: num(env && env.MM_KALSHI_TAKER_COEFF, KALSHI_TAKER_COEFF, { min: 0, max: 1 }),
     polyMakerRebate: num(env && env.MM_POLY_MAKER_REBATE, POLY_MAKER_REBATE, { min: 0, max: 1 }),
     polyTakerFee: num(env && env.MM_POLY_TAKER_FEE, POLY_TAKER_FEE, { min: 0, max: 1 }),
     oddsMaxAgeMs: num(env && env.MM_ODDS_MAX_AGE_MS, 360000, { min: 1000, max: 24 * 3600 * 1000 }),
@@ -58,6 +77,29 @@ function readConfig(env = process.env) {
     positionCap: num(env && env.MM_POSITION_CAP, 100, { min: 1, max: 100000 }),
     orderSize: num(env && env.MM_ORDER_SIZE, 10, { min: 1, max: 100000 }),
     dailyLossLimit,
+    // Fill model. queue (default): a print strictly below our bid fills us;
+    // a print at our bid must first eat the queue ahead (padded by queuePad)
+    // and unknown queue never fills; only aggressor sells count. strict:
+    // only strictly-below prints fill. legacy: the pre-2026-09-30 model.
+    fillModel: pick(env && env.MM_FILL_MODEL, ['queue', 'strict', 'legacy'], 'queue'),
+    queuePad: num(env && env.MM_QUEUE_PAD, 0.5, { min: 0, max: 10 }),
+    fillLatencyMs: num(env && env.MM_FILL_LATENCY_MS, 1500, { min: 0, max: 600000 }),
+    // Pair-completion timeout and exit (paper taker exit with fees).
+    exitEnabled: !flagOff(env && env.MM_EXIT),
+    pairTimeoutSec: num(env && env.MM_PAIR_TIMEOUT_SEC, 7200, { min: 5, max: 24 * 3600 }),
+    exitBeforeKickoffSec: num(env && env.MM_EXIT_BEFORE_KICKOFF_SEC, 600, { min: 0, max: 24 * 3600 }),
+    exitMode: pick(env && env.MM_EXIT_MODE, ['bid', 'mid'], 'bid'),
+    exitCooldownSec: num(env && env.MM_EXIT_COOLDOWN_SEC, 600, { min: 0, max: 24 * 3600 }),
+    // Per-game cap on unpaired inventory.
+    maxUnpairedQty: num(env && env.MM_MAX_UNPAIRED_QTY, 20, { min: 1, max: 100000 }),
+    maxUnpairedUsd: num(env && env.MM_MAX_UNPAIRED_USD, 12, { min: 1, max: 1000000 }),
+    // Adverse-fill markout horizons (seconds) plus kickoff.
+    markoutSec: numList(env && env.MM_MARKOUT_SEC, [10, 60, 300]),
+    // Settlement from Kalshi market results.
+    settleEnabled: !flagOff(env && env.MM_SETTLE),
+    settlePollMs: num(env && env.MM_SETTLE_POLL_SEC, 300, { min: 10, max: 24 * 3600 }) * 1000,
+    settleLookbackDays: num(env && env.MM_SETTLE_LOOKBACK_DAYS, 21, { min: 1, max: 365 }),
+    settleAfterKickoffSec: num(env && env.MM_SETTLE_AFTER_KICKOFF_SEC, 7200, { min: 0, max: 7 * 24 * 3600 }),
     logPath: (env && env.MM_LOG_PATH && String(env.MM_LOG_PATH).trim()) || 'mm-paper.jsonl',
     pollMs: num(env && env.MM_POLL_MS, 4000, { min: 500, max: 120000 }),
     oddsPollMs: num(env && env.MM_ODDS_POLL_MS, 30000, { min: 1000, max: 30 * 60 * 1000 }),
@@ -83,6 +125,8 @@ function readConfig(env = process.env) {
 module.exports = {
   POLY_MAKER_REBATE,
   POLY_TAKER_FEE,
+  KALSHI_MAKER_COEFF,
+  KALSHI_TAKER_COEFF,
   paperEnabled,
   enabledLeagues,
   readConfig,

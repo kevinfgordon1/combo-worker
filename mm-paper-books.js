@@ -93,12 +93,16 @@ function parseKalshiTrade(trade) {
   if (price == null || qty == null) return null;
   const id = trade.trade_id || trade.tradeId || trade.id || null;
   const ts = Date.parse(trade.created_time || trade.createdTime || trade.ts || '') || null;
+  // taker_side 'no' sold YES into the bids (hit a bid). 'yes' lifted an offer.
+  const taker = String(trade.taker_side || trade.takerSide || '').toLowerCase();
+  const aggressor = taker === 'yes' ? 'buy' : (taker === 'no' ? 'sell' : null);
   return {
     id: id != null ? String(id) : null,
     price,
     qty,
     ts: Number.isFinite(ts) ? ts : null,
     ticker: trade.ticker ? String(trade.ticker).toUpperCase() : null,
+    aggressor,
   };
 }
 

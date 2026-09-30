@@ -15,6 +15,7 @@ const {
   completePair,
   priceView,
   pairNetsOk,
+  takerProceedsPerContract,
 } = require('./mm-paper-math');
 const { bookTop, sizeAtBid } = require('./mm-paper-books');
 const { chooseKickoff, formatKickoffEt } = require('./mm-paper-games');
@@ -24,6 +25,8 @@ const {
   restoreIdentity,
   applyFill,
   applyPair,
+  applyExit,
+  applySettle,
 } = require('./mm-paper-state');
 
 function bufferMs(cfg) {
@@ -82,6 +85,8 @@ function createPaperSession(cfg) {
   let dailyDay = null;
   let dailyLocked = 0;
   const recentHedge = new Map();
+  const pendingMarkouts = [];
+  const capLogged = new Map();
 
   function rollDay(now) {
     const day = etDay(now);
@@ -107,7 +112,16 @@ function createPaperSession(cfg) {
         quotes: {},
         lots: [],
         lockedPnl: 0,
+        legacyLockedPnl: 0,
         pairedQty: 0,
+        legacyPairedQty: 0,
+        exitPnl: 0,
+        legacyExitPnl: 0,
+        exits: 0,
+        cooldownUntil: 0,
+        lastExitTryAt: 0,
+        settled: false,
+        settlement: null,
         kickoffMs: null,
         kickoffSource: null,
         kickoffNote: null,
@@ -210,11 +224,11 @@ function createPaperSession(cfg) {
     const passCounts = new Map();
     for (const ev of orderPaperEvents(events)) {
       if (!ev) continue;
-      if (ev.kind !== 'fill' && ev.kind !== 'pair' && ev.kind !== 'cutoff') continue;
+      if (!['fill', 'pair', 'cutoff', 'exit', 'settle'].includes(ev.kind)) continue;
       if (ev.seq != null && Number(ev.seq) > eventSeq) eventSeq = Number(ev.seq);
       const g = ensureFromEvent(ev);
       if (g) rememberKickoff(g, ev);
-      if (ev.kind !== 'fill' && ev.kind !== 'pair') continue;
+      if (ev.kind === 'cutoff') continue;
       const key = restoreIdentity(ev, passCounts);
       if (!key || restoredKeys.has(key)) continue;
       restoredKeys.add(key);
@@ -225,12 +239,29 @@ function createPaperSession(cfg) {
         const seen = tradeSeenKey(ev);
         if (seen) seenTrades.add(seen);
         applied += 1;
-      } else {
+      } else if (ev.kind === 'pair') {
         const paired = applyPair(g, ev);
         if (!paired) continue;
-        if (ev.ts != null && etDay(ev.ts) === dailyDay) dailyLocked += paired.profit;
+        if (!paired.legacy && ev.ts != null && etDay(ev.ts) === dailyDay) dailyLocked += paired.profit;
         applied += 1;
+      } else if (ev.kind === 'exit') {
+        const exited = applyExit(g, ev);
+        if (!exited) continue;
+        g.exits += 1;
+        if (!exited.legacy && ev.ts != null && etDay(ev.ts) === dailyDay) dailyLocked += exited.pnl;
+        applied += 1;
+      } else if (ev.kind === 'settle') {
+        if (applySettle(g, ev)) {
+          g.closed = true;
+          applied += 1;
+        }
       }
+    }
+    // Restored lots restart their pair-timeout clock at boot, so a redeploy
+    // never dumps every stale lot in one burst.
+    const nowMs = Number(now);
+    for (const g of games.values()) {
+      for (const lot of g.lots) lot.ts = nowMs;
     }
     let openQty = 0;
     let lockedPnl = 0;
@@ -325,13 +356,53 @@ function createPaperSession(cfg) {
     return { locked: g.lockedPnl, open: known ? open : null, positions: positions(g) };
   }
 
+  function exposureOf(g) {
+    let qty = 0;
+    let usd = 0;
+    for (const lot of g.lots) {
+      if (!(lot.qty > 1e-9)) continue;
+      qty += lot.qty;
+      usd += lot.qty * lot.net;
+    }
+    return { qty, usd };
+  }
+
   function pnlFields(g) {
     const pnl = markPnl(g);
+    const exp = exposureOf(g);
     return {
       lockedPnl: round2(pnl.locked),
+      legacyLockedPnl: round2(g.legacyLockedPnl || 0),
+      exitPnl: round2(g.exitPnl || 0),
       openPnl: pnl.open == null ? null : round2(pnl.open),
       openPositions: pnl.positions,
+      unpairedQty: round2(exp.qty),
+      unpairedUsd: round2(exp.usd),
     };
+  }
+
+  // Largest fill (contracts) on `team` that keeps this game's unpaired
+  // inventory within MM_MAX_UNPAIRED_QTY and MM_MAX_UNPAIRED_USD. A fill that
+  // pairs off inventory on the other side is always allowed up to that
+  // inventory. `px` bounds the per-contract cost of the new fill.
+  function capRoom(g, team, px) {
+    const capQ = Number.isFinite(cfg.maxUnpairedQty) ? cfg.maxUnpairedQty : Infinity;
+    const capU = Number.isFinite(cfg.maxUnpairedUsd) ? cfg.maxUnpairedUsd : Infinity;
+    const opp = otherTeam(g, team);
+    const uT = unpairedQty(g, team);
+    const uO = opp ? unpairedQty(g, opp) : 0;
+    const price = px > 0 ? px : 1;
+    const byQty = capQ + uO - uT;
+    const byUsd = capU / price + uO - uT;
+    const room = Math.max(uO, Math.min(byQty, byUsd));
+    return Math.max(0, Math.floor(room * 100 + 1e-9) / 100);
+  }
+
+  function atCap(g) {
+    const exp = exposureOf(g);
+    const capQ = Number.isFinite(cfg.maxUnpairedQty) ? cfg.maxUnpairedQty : Infinity;
+    const capU = Number.isFinite(cfg.maxUnpairedUsd) ? cfg.maxUnpairedUsd : Infinity;
+    return exp.qty >= capQ - 1e-9 || exp.usd >= capU - 1e-9;
   }
 
   function baseEvent(g, kind, extra) {
@@ -361,7 +432,7 @@ function createPaperSession(cfg) {
     };
   }
 
-  function tryPair(g, ts, phaseTs) {
+  function tryPair(g, ts, phaseTs, { quiet } = {}) {
     const events = [];
     const [aTeam, bTeam] = g.teams;
     for (;;) {
@@ -370,6 +441,7 @@ function createPaperSession(cfg) {
       if (!a || !b) break;
       const done = completePair(a, b);
       if (!done.ok) {
+        if (quiet) break;
         events.push(baseEvent(g, 'pair_blocked', {
           ts,
           phaseTs: phaseTs != null ? phaseTs : ts,
@@ -384,11 +456,19 @@ function createPaperSession(cfg) {
       }
       a.qty -= done.qty;
       b.qty -= done.qty;
+      // A pair that consumes a legacy (pre-cutoff-logic) lot is suspect too.
+      const legacy = !!(a.legacy || b.legacy);
       g.pairedQty += done.qty;
-      g.lockedPnl += done.lockedProfit;
-      dailyLocked += done.lockedProfit;
+      if (legacy) {
+        g.legacyPairedQty += done.qty;
+        g.legacyLockedPnl += done.lockedProfit;
+      } else {
+        g.lockedPnl += done.lockedProfit;
+        dailyLocked += done.lockedProfit;
+      }
       events.push(baseEvent(g, 'pair', {
         ts,
+        legacy,
         phaseTs: phaseTs != null ? phaseTs : ts,
         qty: done.qty,
         combinedNet: done.combinedNet,
@@ -424,8 +504,10 @@ function createPaperSession(cfg) {
     seenTrades.add(key);
     const quote = g.quotes[team];
     if (!quote || quote.venue !== venue) return [];
-    if (trade.ts != null && quote.quotedAt != null && trade.ts + 1 < quote.quotedAt) return [];
-    const sim = simulateFill(quote, trade);
+    // Our order is not live until fillLatencyMs after we posted it.
+    const latency = cfg.fillModel === 'legacy' ? 0 : (Number(cfg.fillLatencyMs) || 0);
+    if (trade.ts != null && quote.quotedAt != null && trade.ts + 1 < quote.quotedAt + latency) return [];
+    const sim = simulateFill(quote, trade, { model: cfg.fillModel || 'queue', queuePad: cfg.queuePad });
     if (!sim) return [];
     quote.queueAhead = sim.queueAhead;
     if (!(sim.fillQty > 0)) return [];
@@ -439,7 +521,11 @@ function createPaperSession(cfg) {
       price: filledPrice,
       net,
       qty: sim.fillQty,
+      ts: now,
+      legacy: false,
+      kalshiTicker: kalshiTickerFor(g, team),
     });
+    scheduleMarkouts(g, { team, venue, price: filledPrice, net, qty: sim.fillQty, tradeKey: key, now });
     const view = priceView(filledPrice);
     const events = [baseEvent(g, 'fill', {
       ts: now,
@@ -459,6 +545,9 @@ function createPaperSession(cfg) {
       tradeAmerican: priceView(trade.price).american,
       tradeAmericanText: priceView(trade.price).americanText,
       queueReason: sim.reason,
+      fillModel: cfg.fillModel || 'queue',
+      aggressor: trade.aggressor || null,
+      legacy: false,
       tradeId: trade.id || null,
       tradeKey: key,
       tradeTs: printTs,
@@ -479,7 +568,7 @@ function createPaperSession(cfg) {
     return bookTop((g.books[venue] && g.books[venue][team]) || null);
   }
 
-  function quoteFor(g, team, { step } = {}) {
+  function quoteFor(g, team, { step, forceSize } = {}) {
     const opp = otherTeam(g, team);
     const oppPx = opp && g.odds[opp];
     if (!oppPx || oppPx.prob == null) return { skip: 'no_sportsbook' };
@@ -490,8 +579,13 @@ function createPaperSession(cfg) {
     const otherNet = oppFilledNet != null
       ? oppFilledNet
       : (oppQuote ? oppQuote.net : null);
-    const size = Math.min(cfg.orderSize, sideRoom(g, team) + (g.quotes[team] ? g.quotes[team].size : 0));
+    const size = Math.min(forceSize || Infinity, cfg.orderSize, sideRoom(g, team) + (g.quotes[team] ? g.quotes[team].size : 0));
     if (!(size >= 1)) return { skip: 'position_cap' };
+    if (!forceSize) {
+      const room = capRoom(g, team, lock);
+      if (!(room >= 1)) return { skip: 'unpaired_cap' };
+      if (room < size) return quoteFor(g, team, { step, forceSize: Math.floor(room) });
+    }
     const restingVenue = step && g.quotes[team] ? g.quotes[team].venue : null;
     const venues = restingVenue ? [restingVenue] : ['kalshi', 'polymarket'];
     const offers = [];
@@ -643,6 +737,286 @@ function createPaperSession(cfg) {
     return events;
   }
 
+  // ---- Adverse-fill markout -------------------------------------------
+  // After each simulated fill, record the venue mid for that team at each
+  // MM_MARKOUT_SEC horizon and at the kickoff cutoff (the last pregame book).
+  // markoutCents = mid - fill price; negative means the market moved against
+  // us (we were picked off). Pending markouts live in memory only.
+  function midFor(g, venue, team) {
+    const first = topOf(g, venue, team).mid;
+    if (first != null) return { mid: first, venue };
+    const other = venue === 'kalshi' ? 'polymarket' : 'kalshi';
+    const second = topOf(g, other, team).mid;
+    return second != null ? { mid: second, venue: other } : { mid: null, venue };
+  }
+
+  function scheduleMarkouts(g, fill) {
+    const start = midFor(g, fill.venue, fill.team).mid;
+    const horizons = (cfg.markoutSec || []).map((sec) => ({ label: `${sec >= 60 && sec % 60 === 0 ? `${sec / 60}m` : `${sec}s`}`, dueAt: fill.now + sec * 1000 }));
+    const cut = cutoffMsOf(g);
+    const items = horizons.slice();
+    if (cut != null) items.push({ label: 'kickoff', dueAt: cut });
+    for (const h of items) {
+      if (h.label !== 'kickoff' && cut != null && h.dueAt > cut) continue;
+      pendingMarkouts.push({
+        gameId: g.gameId,
+        team: fill.team,
+        venue: fill.venue,
+        price: fill.price,
+        net: fill.net,
+        qty: fill.qty,
+        fillKey: fill.tradeKey,
+        fillAt: fill.now,
+        midAtFill: start,
+        label: h.label,
+        dueAt: h.dueAt,
+      });
+    }
+  }
+
+  function dueMarkouts(now) {
+    const events = [];
+    for (let i = pendingMarkouts.length - 1; i >= 0; i -= 1) {
+      const m = pendingMarkouts[i];
+      if (now < m.dueAt) continue;
+      pendingMarkouts.splice(i, 1);
+      const g = games.get(m.gameId);
+      if (!g) continue;
+      const got = midFor(g, m.venue, m.team);
+      const mid = got.mid;
+      const view = priceView(mid);
+      const fillView = priceView(m.price);
+      events.push(baseEvent(g, 'markout', {
+        ts: now,
+        team: m.team,
+        venue: m.venue,
+        horizon: m.label,
+        horizonSec: Math.round((m.dueAt - m.fillAt) / 1000),
+        fillKey: m.fillKey,
+        qty: m.qty,
+        fillCents: fillView.cents,
+        fillAmerican: fillView.american,
+        fillAmericanText: fillView.americanText,
+        midVenue: got.venue,
+        midCents: mid == null ? null : Math.round(mid * 100),
+        midAmerican: view.american,
+        midAmericanText: view.americanText,
+        midAtFillCents: m.midAtFill == null ? null : Math.round(m.midAtFill * 100),
+        markoutCents: mid == null ? null : round2((mid - m.price) * 100),
+        markoutUsd: mid == null ? null : round2((mid - m.price) * m.qty),
+        adverse: mid == null ? null : (mid - m.price) <= -(cfg.adverseCents / 100) + 1e-9,
+      }));
+    }
+    events.sort((a, b) => a.seq - b.seq);
+    return events;
+  }
+
+  // ---- Pair-completion timeout / exit ----------------------------------
+  // Sell `qty` of `team` as a paper taker. bid mode walks the bids (VWAP);
+  // mid mode takes the mid. Fees: venue taker fee. Returns null when the
+  // book cannot take it (no bids).
+  function exitQuote(g, team, qty, venuePref) {
+    const venues = [venuePref, venuePref === 'kalshi' ? 'polymarket' : 'kalshi'].filter(Boolean);
+    let best = null;
+    for (const venue of venues) {
+      const book = (g.books[venue] && g.books[venue][team]) || null;
+      let fillQty;
+      let px;
+      if (cfg.exitMode === 'mid') {
+        const top = bookTop(book);
+        if (top.mid == null) continue;
+        fillQty = qty;
+        px = top.mid;
+      } else {
+        let left = qty;
+        let notional = 0;
+        for (const lvl of (book && book.bids) || []) {
+          const take = Math.min(left, lvl.size);
+          notional += take * lvl.price;
+          left -= take;
+          if (!(left > 1e-9)) break;
+        }
+        fillQty = qty - Math.max(0, left);
+        if (!(fillQty > 1e-9)) continue;
+        px = notional / fillQty;
+      }
+      const proceeds = takerProceedsPerContract(venue, Math.round(px * 10000) / 10000, fillQty, cfg);
+      if (proceeds == null) continue;
+      const cand = { venue, price: px, proceeds, qty: fillQty };
+      if (!best
+        || (cand.qty >= qty - 1e-9 && best.qty < qty - 1e-9)
+        || ((cand.qty >= qty - 1e-9) === (best.qty >= qty - 1e-9) && cand.proceeds * cand.qty > best.proceeds * best.qty)) {
+        best = cand;
+      }
+    }
+    return best;
+  }
+
+  function exitEvents(g, now, why) {
+    const events = [];
+    if (!cfg.exitEnabled) return events;
+    for (const team of g.teams) {
+      const opp = otherTeam(g, team);
+      // Only one-sided inventory is stuck. Anything the other side could pair
+      // with is left to tryPair.
+      if (opp && unpairedQty(g, opp) > 1e-9) continue;
+      const lots = unpairedLots(g, team);
+      if (!lots.length) continue;
+      const timeoutMs = cfg.pairTimeoutSec * 1000;
+      const due = lots.filter((lot) => why !== 'pair_timeout' || (lot.ts != null && now - lot.ts >= timeoutMs));
+      if (!due.length) continue;
+      if (now - (g.lastExitTryAt || 0) < 15000 && why === 'pair_timeout') continue;
+      let qty = 0;
+      for (const lot of due) qty += lot.qty;
+      const quote = exitQuote(g, team, qty, due[0].venue);
+      g.lastExitTryAt = now;
+      if (!quote) {
+        if (!g.exitBlockedAt || now - g.exitBlockedAt > 300000) {
+          g.exitBlockedAt = now;
+          events.push(baseEvent(g, 'exit_blocked', { ts: now, team, qty: round2(qty), reason: 'no_bid', why }));
+        }
+        continue;
+      }
+      let left = quote.qty;
+      const view = priceView(quote.price);
+      for (const lot of lots) {
+        if (!(left > 1e-9)) break;
+        if (!due.includes(lot)) break;
+        const take = Math.min(lot.qty, left);
+        left -= take;
+        lot.qty -= take;
+        const pnl = take * (quote.proceeds - lot.net);
+        const legacy = !!lot.legacy;
+        if (legacy) g.legacyExitPnl += pnl; else { g.exitPnl += pnl; dailyLocked += pnl; }
+        g.exits += 1;
+        events.push(baseEvent(g, 'exit', {
+          ts: now,
+          why,
+          reason: why,
+          legacy,
+          team,
+          venue: quote.venue,
+          entryVenue: lot.venue,
+          qty: take,
+          price: view.price,
+          cents: view.cents,
+          american: view.american,
+          americanText: view.americanText,
+          proceeds: quote.proceeds,
+          entryNet: lot.net,
+          entryNetCents: Math.round(lot.net * 100),
+          entryAmerican: priceView(lot.net).american,
+          entryAmericanText: priceView(lot.net).americanText,
+          exitMode: cfg.exitMode,
+          ageSec: lot.ts == null ? null : Math.round((now - lot.ts) / 1000),
+          pnl: round2(pnl),
+        }));
+      }
+      g.cooldownUntil = Math.max(g.cooldownUntil || 0, now + (cfg.exitCooldownSec || 0) * 1000);
+    }
+    return events;
+  }
+
+  // ---- Settlement -------------------------------------------------------
+  // results: Map gameId -> { payouts: {team: 0|1|push}, source }.
+  function settleGames(results, now = Date.now()) {
+    const events = [];
+    if (!cfg.settleEnabled) return events;
+    for (const g of games.values()) {
+      if (g.settled) continue;
+      const res = results && results.get(g.gameId);
+      if (!res || !res.payouts) continue;
+      const settledLots = [];
+      let settlePnl = 0;
+      let legacySettlePnl = 0;
+      for (const lot of g.lots) {
+        if (!(lot.qty > 1e-9)) continue;
+        const payout = res.payouts[lot.team];
+        if (payout == null) continue;
+        const pnl = lot.qty * (payout - lot.net);
+        if (lot.legacy) legacySettlePnl += pnl; else settlePnl += pnl;
+        const v = priceView(lot.net);
+        settledLots.push({
+          team: lot.team, venue: lot.venue, qty: round2(lot.qty), entryNet: lot.net,
+          entryAmericanText: v.americanText, payout, pnl: round2(pnl), legacy: !!lot.legacy,
+        });
+      }
+      const active = g.pairedQty > 0 || g.exits > 0 || g.lots.length > 0;
+      const haveAll = g.lots.every((lot) => !(lot.qty > 1e-9) || res.payouts[lot.team] != null);
+      if (!haveAll) continue;
+      const realized = g.lockedPnl + g.exitPnl + settlePnl;
+      const legacyPnl = g.legacyLockedPnl + g.legacyExitPnl + legacySettlePnl;
+      const winner = Object.keys(res.payouts).find((t) => res.payouts[t] === 1) || 'push';
+      for (const team of g.teams) pullQuote(g, team, 'settled', now);
+      for (const lot of g.lots) lot.qty = 0;
+      g.settled = true;
+      g.closed = true;
+      g.settlement = { winner, realizedPnl: realized, legacyPnl };
+      if (!active) continue; // never traded: settled silently, nothing to record
+      events.push(baseEvent(g, 'settle', {
+        ts: now,
+        source: res.source || null,
+        winner,
+        payouts: res.payouts,
+        settledLots,
+        lockedPnl: round2(g.lockedPnl),
+        exitPnl: round2(g.exitPnl),
+        settlePnl: round2(settlePnl),
+        realizedPnl: round2(realized),
+        legacyLockedPnl: round2(g.legacyLockedPnl),
+        legacyExitPnl: round2(g.legacyExitPnl),
+        legacySettlePnl: round2(legacySettlePnl),
+        legacyPnl: round2(legacyPnl),
+        pairedQty: round2(g.pairedQty),
+        openPositions: [],
+        unpairedQty: 0,
+        unpairedUsd: 0,
+        openPnl: 0,
+        phase: 'settled',
+      }));
+    }
+    return events;
+  }
+
+  // Games that traded, are not settled, and started long enough ago that a
+  // result should exist. The runner looks their results up.
+  function unsettledGames(now = Date.now()) {
+    const out = [];
+    for (const g of games.values()) {
+      if (g.settled) continue;
+      if (!(g.pairedQty > 0 || g.exits > 0 || g.lots.length > 0)) continue;
+      out.push({
+        gameId: g.gameId,
+        league: g.league,
+        date: g.date,
+        teams: g.teams.slice(),
+        rawTeams: g.rawTeams,
+        kickoffMs: g.kickoffMs,
+        startedAgoMs: g.kickoffMs == null ? null : now - g.kickoffMs,
+      });
+    }
+    return out;
+  }
+
+  function pnlTotals() {
+    const t = { locked: 0, exit: 0, settled: 0, open: 0, legacy: 0, games: 0, settledGames: 0, openQty: 0, openUsd: 0 };
+    for (const g of games.values()) {
+      t.locked += g.lockedPnl;
+      t.exit += g.exitPnl;
+      t.legacy += g.legacyLockedPnl + g.legacyExitPnl;
+      if (g.settlement) {
+        t.settledGames += 1;
+        t.settled += g.settlement.realizedPnl - g.lockedPnl - g.exitPnl;
+        t.legacy += g.settlement.legacyPnl - g.legacyLockedPnl - g.legacyExitPnl;
+      }
+      const e = exposureOf(g);
+      t.openQty += e.qty;
+      t.openUsd += e.usd;
+      t.games += 1;
+    }
+    return t;
+  }
+
   function dayPnl(now) {
     rollDay(now);
     let open = 0;
@@ -679,8 +1053,14 @@ function createPaperSession(cfg) {
         });
       }
     }
+    events.push(...dueMarkouts(now));
     for (const g of games.values()) {
       const cut = cutoffMsOf(g);
+      if (!g.closed && cut != null && now >= cut && g.kickoffMs != null && now < g.kickoffMs
+        && cfg.exitEnabled && g.lots.some((l) => l.qty > 1e-9)) {
+        // Last chance before the book goes stale: leftover one-sided lots exit.
+        events.push(...exitEvents(g, now, 'cutoff'));
+      }
       if (g.closed || (cut != null && now >= cut)) {
         const pulls = [];
         for (const team of g.teams) {
@@ -731,6 +1111,20 @@ function createPaperSession(cfg) {
         }
         continue;
       }
+      if (cfg.exitEnabled && g.lots.some((l) => l.qty > 1e-9)) {
+        const nearKickoff = g.kickoffMs != null
+          && now >= g.kickoffMs - (cfg.exitBeforeKickoffSec || 0) * 1000;
+        events.push(...exitEvents(g, now, nearKickoff ? 'pre_kickoff' : 'pair_timeout'));
+      }
+      if (cfg.exitEnabled && ((g.cooldownUntil || 0) > now
+        || (g.kickoffMs != null && now >= g.kickoffMs - (cfg.exitBeforeKickoffSec || 0) * 1000
+            && g.exits > 0))) {
+        for (const team of g.teams) {
+          const pulled = pullQuote(g, team, 'exit_cooldown', now);
+          if (pulled) events.push(pulled);
+        }
+        continue;
+      }
       for (const team of g.teams) {
         if (unpairedQty(g, team) > 0 && g.quotes[team]) {
           const pulled = pullQuote(g, team, 'hold_position', now);
@@ -752,6 +1146,22 @@ function createPaperSession(cfg) {
       }
 
       const oneSided = g.teams.filter((team) => unpairedQty(g, team) > 0);
+      if (oneSided.length && atCap(g)) {
+        // Unpaired cap hit: no more skew. The resting pair-completing bid
+        // stays where it is; nothing new is quoted on the filled side.
+        if (!capLogged.get(g.gameId)) {
+          capLogged.set(g.gameId, true);
+          events.push(baseEvent(g, 'cap', {
+            ts: now,
+            reason: 'unpaired_cap',
+            maxUnpairedQty: cfg.maxUnpairedQty,
+            maxUnpairedUsd: cfg.maxUnpairedUsd,
+          }));
+        }
+        events.push(...hedgeEvents(g, now));
+        continue;
+      }
+      if (!oneSided.length) capLogged.delete(g.gameId);
       const decisions = {};
       for (const team of g.teams) {
         if (unpairedQty(g, team) > 0) continue;
@@ -842,6 +1252,9 @@ function createPaperSession(cfg) {
       league: g.league,
       quotes: { ...g.quotes },
       lockedPnl: g.lockedPnl,
+      legacyLockedPnl: g.legacyLockedPnl,
+      exitPnl: g.exitPnl,
+      settled: g.settled,
       pairedQty: g.pairedQty,
       positions: positions(g),
     }));
@@ -855,6 +1268,9 @@ function createPaperSession(cfg) {
     replaceOdds,
     setKickoff,
     restoreFromEvents,
+    settleGames,
+    unsettledGames,
+    pnlTotals,
     openLots,
     applyTrade,
     tick,

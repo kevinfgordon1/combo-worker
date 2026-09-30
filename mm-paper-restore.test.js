@@ -1,4 +1,5 @@
 'use strict';
+const LEGACY_ENV = { MM_FILL_LATENCY_MS: '0', MM_MAX_UNPAIRED_QTY: '100000', MM_MAX_UNPAIRED_USD: '1000000', MM_EXIT: '0', MM_SETTLE: '0', MM_FILL_MODEL: 'legacy' };
 const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
@@ -176,6 +177,7 @@ assert.ok(!src.includes('from < 50000'), 'restore must not stop at a 50000-row o
 assert.ok(src.includes(".in('kind'"), 'restore must filter fill/pair/cutoff on the server');
 
 const cfg = readConfig({
+  ...LEGACY_ENV,
   MM_PAPER: '1',
   MM_ORDER_SIZE: '2000',
   MM_POSITION_CAP: '100000',
@@ -213,7 +215,7 @@ assert.ok(historyKinds.length > 1000, `expected >1000 fill/pair events, got ${hi
 const before = lotsOf(live);
 assert.ok(before.some((lot) => lot.gameId === GAME && lot.team === 'kc' && Math.abs(lot.qty - 4.27) < 1e-6));
 
-const restored = createPaperSession(readConfig({ MM_PAPER: '1' }));
+const restored = createPaperSession(readConfig({ ...LEGACY_ENV, MM_PAPER: '1' }));
 const once = quiet(() => restored.restoreFromEvents(emitted, now + 30_000)).value;
 const twice = quiet(() => restored.restoreFromEvents(emitted, now + 30_000)).value;
 assertSameLots(restored.openLots(), before);
@@ -228,7 +230,7 @@ const stripped = emitted.map((ev) => {
   delete copy.createdAt;
   return copy;
 });
-const historical = createPaperSession(readConfig({ MM_PAPER: '1' }));
+const historical = createPaperSession(readConfig({ ...LEGACY_ENV, MM_PAPER: '1' }));
 quiet(() => historical.restoreFromEvents(stripped, now + 30_000));
 assertSameLots(historical.openLots(), before);
 quiet(() => historical.restoreFromEvents(stripped, now + 31_000));
@@ -249,7 +251,7 @@ async function main() {
   assert.ok(paged.calls.some((call) => call.from === 1000));
   assert.ok(paged.calls.every((call) => call.to - call.from + 1 === 1000));
   assert.ok(paged.calls[0].kinds.includes('fill') && paged.calls[0].kinds.includes('pair'));
-  const fromPages = createPaperSession(readConfig({ MM_PAPER: '1' }));
+  const fromPages = createPaperSession(readConfig({ ...LEGACY_ENV, MM_PAPER: '1' }));
   quiet(() => fromPages.restoreFromEvents(loaded.events, now + 30_000));
   assertSameLots(fromPages.openLots(), before);
 
@@ -257,7 +259,7 @@ async function main() {
   const pastJunk = await loadSupabasePaperEvents(junked);
   assert.ok(junked.calls.length >= 2);
   assert.ok(pastJunk.rowsRead > pastJunk.events.length);
-  const fromJunk = createPaperSession(readConfig({ MM_PAPER: '1' }));
+  const fromJunk = createPaperSession(readConfig({ ...LEGACY_ENV, MM_PAPER: '1' }));
   quiet(() => fromJunk.restoreFromEvents(pastJunk.events, now + 30_000));
   assertSameLots(fromJunk.openLots(), before);
 
@@ -277,7 +279,7 @@ async function main() {
     SUPABASE_SERVICE_KEY: 'test-key',
   }, {
     supabase: pagingClient(shuffled),
-    session: createPaperSession(readConfig({ MM_PAPER: '1' })),
+    session: createPaperSession(readConfig({ ...LEGACY_ENV, MM_PAPER: '1' })),
     kalshi: null,
     poly: null,
     polyWs: false,
