@@ -1,0 +1,3547 @@
+{
+ "locks": [
+  {
+   "id": "12e698d5-7436-4848-9b6e-12607bb5de69",
+   "label": "Jacksonville Jaguars ML + Seattle Seahawks -6.5 + Denver Broncos +2.5",
+   "legs": [
+    {
+     "game": "JAC Jaguars vs CIN Bengals",
+     "side": "yes",
+     "type": "side",
+     "label": "Jacksonville",
+     "ticker": "KXNFLGAME-26OCT04JACCIN-JAC",
+     "gameKey": "nfl:26OCT04JACCIN"
+    },
+    {
+     "game": "LA Chargers vs SEA Seahawks",
+     "side": "yes",
+     "type": "spread",
+     "label": "Seattle −6.5",
+     "ticker": "KXNFLSPREAD-26OCT04LACSEA-SEA7",
+     "gameKey": "nfl:26OCT04LACSEA"
+    },
+    {
+     "game": "DEN Broncos vs SF 49ers",
+     "side": "no",
+     "type": "spread",
+     "label": "Denver +2.5",
+     "ticker": "KXNFLSPREAD-26OCT04DENSF-SF3",
+     "gameKey": "nfl:26OCT04DENSF"
+    }
+   ],
+   "leg_keys": [
+    "KXNFLGAME-26OCT04JACCIN-JAC:yes",
+    "KXNFLSPREAD-26OCT04DENSF-SF3:no",
+    "KXNFLSPREAD-26OCT04LACSEA-SEA7:yes"
+   ],
+   "starts_at": "2026-10-04T17:00:00+00:00",
+   "parlay_stake": 50,
+   "parlay_american": 1106,
+   "fill_american": 850,
+   "fair_american": 769,
+   "max_contracts": 603,
+   "hedge_mode": "1x",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": false
+  },
+  {
+   "id": "86833295-c77e-4603-9e11-a50bd380b4c8",
+   "label": "Los Angeles Rams ML + San Francisco 49ers ML + Pittsburgh Steelers ML",
+   "legs": [
+    {
+     "game": "LA Rams vs PHI Eagles",
+     "side": "yes",
+     "type": "side",
+     "label": "Los Angeles R",
+     "ticker": "KXNFLGAME-26OCT04LARPHI-LAR",
+     "gameKey": "nfl:26OCT04LARPHI"
+    },
+    {
+     "game": "DEN Broncos vs SF 49ers",
+     "side": "yes",
+     "type": "side",
+     "label": "San Francisco",
+     "ticker": "KXNFLGAME-26OCT04DENSF-SF",
+     "gameKey": "nfl:26OCT04DENSF"
+    },
+    {
+     "game": "PIT Steelers vs CLE Browns",
+     "side": "yes",
+     "type": "side",
+     "label": "Pittsburgh",
+     "ticker": "KXNFLGAME-26OCT01PITCLE-PIT",
+     "gameKey": "nfl:26OCT01PITCLE"
+    }
+   ],
+   "leg_keys": [
+    "KXNFLGAME-26OCT01PITCLE-PIT:yes",
+    "KXNFLGAME-26OCT04DENSF-SF:yes",
+    "KXNFLGAME-26OCT04LARPHI-LAR:yes"
+   ],
+   "starts_at": "2026-10-02T00:15:00+00:00",
+   "parlay_stake": 100,
+   "parlay_american": 539,
+   "fill_american": 450,
+   "fair_american": 440,
+   "max_contracts": 658,
+   "hedge_mode": "riskfree_open",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": false
+  },
+  {
+   "id": "b051c7b8-937c-47af-88d6-420cfefecd77",
+   "label": "Las Vegas Raiders ML + Detroit Lions ML + Denver Broncos ML",
+   "legs": [
+    {
+     "game": "KC Chiefs vs LV Raiders",
+     "side": "yes",
+     "type": "side",
+     "label": "Las Vegas",
+     "ticker": "KXNFLGAME-26OCT04KCLV-LV",
+     "gameKey": "nfl:26OCT04KCLV"
+    },
+    {
+     "game": "DET Lions vs CAR Panthers",
+     "side": "yes",
+     "type": "side",
+     "label": "Detroit",
+     "ticker": "KXNFLGAME-26OCT04DETCAR-DET",
+     "gameKey": "nfl:26OCT04DETCAR"
+    },
+    {
+     "game": "DEN Broncos vs SF 49ers",
+     "side": "yes",
+     "type": "side",
+     "label": "Denver",
+     "ticker": "KXNFLGAME-26OCT04DENSF-DEN",
+     "gameKey": "nfl:26OCT04DENSF"
+    }
+   ],
+   "leg_keys": [
+    "KXNFLGAME-26OCT04DENSF-DEN:yes",
+    "KXNFLGAME-26OCT04DETCAR-DET:yes",
+    "KXNFLGAME-26OCT04KCLV-LV:yes"
+   ],
+   "starts_at": "2026-10-04T20:25:00+00:00",
+   "parlay_stake": 50,
+   "parlay_american": 1380,
+   "fill_american": 1000,
+   "fair_american": 973,
+   "max_contracts": 740,
+   "hedge_mode": "1x",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": false
+  },
+  {
+   "id": "d4ef51d2-2317-43e5-ab91-1f9ca143e5b8",
+   "label": "Miami Dolphins ML + Tampa Bay Buccaneers ML + Pittsburgh Steelers ML",
+   "legs": [
+    {
+     "game": "MIA Dolphins vs MIN Vikings",
+     "side": "yes",
+     "type": "side",
+     "label": "Miami",
+     "ticker": "KXNFLGAME-26OCT04MIAMIN-MIA",
+     "gameKey": "nfl:26OCT04MIAMIN"
+    },
+    {
+     "game": "GB Packers vs TB Buccaneers",
+     "side": "yes",
+     "type": "side",
+     "label": "Tampa Bay",
+     "ticker": "KXNFLGAME-26OCT04GBTB-TB",
+     "gameKey": "nfl:26OCT04GBTB"
+    },
+    {
+     "game": "PIT Steelers vs CLE Browns",
+     "side": "yes",
+     "type": "side",
+     "label": "Pittsburgh",
+     "ticker": "KXNFLGAME-26OCT01PITCLE-PIT",
+     "gameKey": "nfl:26OCT01PITCLE"
+    }
+   ],
+   "leg_keys": [
+    "KXNFLGAME-26OCT01PITCLE-PIT:yes",
+    "KXNFLGAME-26OCT04GBTB-TB:yes",
+    "KXNFLGAME-26OCT04MIAMIN-MIA:yes"
+   ],
+   "starts_at": "2026-10-02T00:15:00+00:00",
+   "parlay_stake": 20,
+   "parlay_american": 2426,
+   "fill_american": 2600,
+   "fair_american": 2837,
+   "max_contracts": 485,
+   "hedge_mode": "1x",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": true
+  },
+  {
+   "id": "1614740a-7da8-444b-9aac-69a938b24ffd",
+   "label": "Denver Broncos ML + Las Vegas Raiders ML + Los Angeles Rams ML",
+   "legs": [
+    {
+     "game": "DEN Broncos vs SF 49ers",
+     "side": "yes",
+     "type": "side",
+     "label": "Denver",
+     "ticker": "KXNFLGAME-26OCT04DENSF-DEN",
+     "gameKey": "nfl:26OCT04DENSF"
+    },
+    {
+     "game": "KC Chiefs vs LV Raiders",
+     "side": "yes",
+     "type": "side",
+     "label": "Las Vegas",
+     "ticker": "KXNFLGAME-26OCT04KCLV-LV",
+     "gameKey": "nfl:26OCT04KCLV"
+    },
+    {
+     "game": "LA Rams vs PHI Eagles",
+     "side": "yes",
+     "type": "side",
+     "label": "Los Angeles R",
+     "ticker": "KXNFLGAME-26OCT04LARPHI-LAR",
+     "gameKey": "nfl:26OCT04LARPHI"
+    }
+   ],
+   "leg_keys": [
+    "KXNFLGAME-26OCT04DENSF-DEN:yes",
+    "KXNFLGAME-26OCT04KCLV-LV:yes",
+    "KXNFLGAME-26OCT04LARPHI-LAR:yes"
+   ],
+   "starts_at": "2026-10-04T17:00:00+00:00",
+   "parlay_stake": 100,
+   "parlay_american": 1450,
+   "fill_american": 1100,
+   "fair_american": 1042,
+   "max_contracts": 1550,
+   "hedge_mode": "1x",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": false
+  },
+  {
+   "id": "b9a3c72b-504e-4f36-a3c8-b06f94f3afad",
+   "label": "North Texas Mean Green +1.5 + Denver Broncos ML (CMC  30 rush) + Virginia Cavaliers -2.5",
+   "legs": [
+    {
+     "game": "North Texas vs Tulsa",
+     "side": "no",
+     "type": "spread",
+     "label": "North Texas +1.5",
+     "ticker": "KXNCAAFSPREAD-26OCT01UNTTLSA-TLSA2",
+     "gameKey": "ncaaf:26OCT01UNTTLSA"
+    },
+    {
+     "game": "DEN Broncos vs SF 49ers",
+     "side": "yes",
+     "type": "side",
+     "label": "Denver",
+     "ticker": "KXNFLGAME-26OCT04DENSF-DEN",
+     "gameKey": "nfl:26OCT04DENSF"
+    },
+    {
+     "game": "Virginia vs Florida St.",
+     "side": "yes",
+     "type": "spread",
+     "label": "Virginia −2.5",
+     "ticker": "KXNCAAFSPREAD-26OCT03UVAFSU-UVA3",
+     "gameKey": "ncaaf:26OCT03UVAFSU"
+    }
+   ],
+   "leg_keys": [
+    "KXNCAAFSPREAD-26OCT01UNTTLSA-TLSA2:no",
+    "KXNCAAFSPREAD-26OCT03UVAFSU-UVA3:yes",
+    "KXNFLGAME-26OCT04DENSF-DEN:yes"
+   ],
+   "starts_at": "2026-10-02T01:00:00+00:00",
+   "parlay_stake": 50,
+   "parlay_american": 960,
+   "fill_american": 772,
+   "fair_american": 772,
+   "max_contracts": 530,
+   "hedge_mode": "1x",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": false
+  },
+  {
+   "id": "9058322b-3b51-44e8-a2d0-2a56926b99c0",
+   "label": "Denver Broncos ML + Tampa Bay Buccaneers +3.5 + Las Vegas Raiders ML",
+   "legs": [
+    {
+     "game": "DEN Broncos vs SF 49ers",
+     "side": "yes",
+     "type": "side",
+     "label": "Denver",
+     "ticker": "KXNFLGAME-26OCT04DENSF-DEN",
+     "gameKey": "nfl:26OCT04DENSF"
+    },
+    {
+     "game": "GB Packers vs TB Buccaneers",
+     "side": "no",
+     "type": "spread",
+     "label": "Tampa Bay +3.5",
+     "ticker": "KXNFLSPREAD-26OCT04GBTB-GB4",
+     "gameKey": "nfl:26OCT04GBTB"
+    },
+    {
+     "game": "KC Chiefs vs LV Raiders",
+     "side": "yes",
+     "type": "side",
+     "label": "Las Vegas",
+     "ticker": "KXNFLGAME-26OCT04KCLV-LV",
+     "gameKey": "nfl:26OCT04KCLV"
+    }
+   ],
+   "leg_keys": [
+    "KXNFLGAME-26OCT04DENSF-DEN:yes",
+    "KXNFLGAME-26OCT04KCLV-LV:yes",
+    "KXNFLSPREAD-26OCT04GBTB-GB4:no"
+   ],
+   "starts_at": "2026-10-04T17:00:00+00:00",
+   "parlay_stake": 100,
+   "parlay_american": 2316,
+   "fill_american": 1400,
+   "fair_american": 1244,
+   "max_contracts": 2416,
+   "hedge_mode": "1x",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": false
+  },
+  {
+   "id": "3bdc5fdd-bb0c-45b6-8885-766b14782b91",
+   "label": "Houston Texans -2.5 + New England Patriots ML + Las Vegas Raiders +4.5 + Los Angeles Rams ML",
+   "legs": [
+    {
+     "game": "DAL Cowboys vs HOU Texans",
+     "side": "yes",
+     "type": "spread",
+     "label": "Houston −2.5",
+     "ticker": "KXNFLSPREAD-26OCT04DALHOU-HOU3",
+     "gameKey": "nfl:26OCT04DALHOU"
+    },
+    {
+     "game": "NE Patriots vs BUF Bills",
+     "side": "yes",
+     "type": "side",
+     "label": "New England",
+     "ticker": "KXNFLGAME-26OCT04NEBUF-NE",
+     "gameKey": "nfl:26OCT04NEBUF"
+    },
+    {
+     "game": "KC Chiefs vs LV Raiders",
+     "side": "no",
+     "type": "spread",
+     "label": "Las Vegas +4.5",
+     "ticker": "KXNFLSPREAD-26OCT04KCLV-KC5",
+     "gameKey": "nfl:26OCT04KCLV"
+    },
+    {
+     "game": "LA Rams vs PHI Eagles",
+     "side": "yes",
+     "type": "side",
+     "label": "Los Angeles R",
+     "ticker": "KXNFLGAME-26OCT04LARPHI-LAR",
+     "gameKey": "nfl:26OCT04LARPHI"
+    }
+   ],
+   "leg_keys": [
+    "KXNFLGAME-26OCT04LARPHI-LAR:yes",
+    "KXNFLGAME-26OCT04NEBUF-NE:yes",
+    "KXNFLSPREAD-26OCT04DALHOU-HOU3:yes",
+    "KXNFLSPREAD-26OCT04KCLV-KC5:no"
+   ],
+   "starts_at": "2026-10-04T17:00:00+00:00",
+   "parlay_stake": 25,
+   "parlay_american": 3007,
+   "fill_american": 2150,
+   "fair_american": 2186,
+   "max_contracts": 777,
+   "hedge_mode": "1x",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": false
+  },
+  {
+   "id": "2c2611f8-6922-42cb-9a8c-79bd95f93f2e",
+   "label": "Texas State Bobcats ML + UCF Knights ML + Auburn Tigers ML",
+   "legs": [
+    {
+     "game": "Texas St. vs San Diego St.",
+     "side": "yes",
+     "type": "side",
+     "label": "Texas St.",
+     "ticker": "KXNCAAFGAME-26OCT03TXSTSDSU-TXST",
+     "gameKey": "ncaaf:26OCT03TXSTSDSU"
+    },
+    {
+     "game": "UCF vs Houston",
+     "side": "yes",
+     "type": "side",
+     "label": "UCF",
+     "ticker": "KXNCAAFGAME-26OCT03UCFHOU-UCF",
+     "gameKey": "ncaaf:26OCT03UCFHOU"
+    },
+    {
+     "game": "Auburn vs Tennessee",
+     "side": "yes",
+     "type": "side",
+     "label": "Auburn",
+     "ticker": "KXNCAAFGAME-26OCT03AUBTENN-AUB",
+     "gameKey": "ncaaf:26OCT03AUBTENN"
+    }
+   ],
+   "leg_keys": [
+    "KXNCAAFGAME-26OCT03AUBTENN-AUB:yes",
+    "KXNCAAFGAME-26OCT03TXSTSDSU-TXST:yes",
+    "KXNCAAFGAME-26OCT03UCFHOU-UCF:yes"
+   ],
+   "starts_at": "2026-10-03T16:00:00+00:00",
+   "parlay_stake": 40,
+   "parlay_american": 2214,
+   "fill_american": 2400,
+   "fair_american": 2466,
+   "max_contracts": 886,
+   "hedge_mode": "1x",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": true
+  },
+  {
+   "id": "2d0c35e8-d8e8-4959-a935-2643790254ff",
+   "label": "Tampa Bay Buccaneers ML + Denver Broncos ML + Jacksonville Jaguars ML + Pittsburgh Steelers ML + Indianapolis Colts ML",
+   "legs": [
+    {
+     "game": "GB Packers vs TB Buccaneers",
+     "side": "yes",
+     "type": "side",
+     "label": "Tampa Bay",
+     "ticker": "KXNFLGAME-26OCT04GBTB-TB",
+     "gameKey": "nfl:26OCT04GBTB"
+    },
+    {
+     "game": "DEN Broncos vs SF 49ers",
+     "side": "yes",
+     "type": "side",
+     "label": "Denver",
+     "ticker": "KXNFLGAME-26OCT04DENSF-DEN",
+     "gameKey": "nfl:26OCT04DENSF"
+    },
+    {
+     "game": "JAC Jaguars vs CIN Bengals",
+     "side": "yes",
+     "type": "side",
+     "label": "Jacksonville",
+     "ticker": "KXNFLGAME-26OCT04JACCIN-JAC",
+     "gameKey": "nfl:26OCT04JACCIN"
+    },
+    {
+     "game": "PIT Steelers vs CLE Browns",
+     "side": "yes",
+     "type": "side",
+     "label": "Pittsburgh",
+     "ticker": "KXNFLGAME-26OCT01PITCLE-PIT",
+     "gameKey": "nfl:26OCT01PITCLE"
+    },
+    {
+     "game": "IND Colts vs WAS Commanders",
+     "side": "yes",
+     "type": "side",
+     "label": "Indianapolis",
+     "ticker": "KXNFLGAME-26OCT04INDWAS-IND",
+     "gameKey": "nfl:26OCT04INDWAS"
+    }
+   ],
+   "leg_keys": [
+    "KXNFLGAME-26OCT01PITCLE-PIT:yes",
+    "KXNFLGAME-26OCT04DENSF-DEN:yes",
+    "KXNFLGAME-26OCT04GBTB-TB:yes",
+    "KXNFLGAME-26OCT04INDWAS-IND:yes",
+    "KXNFLGAME-26OCT04JACCIN-JAC:yes"
+   ],
+   "starts_at": "2026-10-02T00:15:00+00:00",
+   "parlay_stake": 20,
+   "parlay_american": 3219,
+   "fill_american": 3900,
+   "fair_american": 3900,
+   "max_contracts": 644,
+   "hedge_mode": "1x",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": true
+  },
+  {
+   "id": "abc96ca1-9984-4dd1-a0c4-782f0d896268",
+   "label": "Denver Broncos ML + Dallas Cowboys ML + Pittsburgh Steelers ML",
+   "legs": [
+    {
+     "game": "DEN Broncos vs SF 49ers",
+     "side": "yes",
+     "type": "side",
+     "label": "Denver",
+     "ticker": "KXNFLGAME-26OCT04DENSF-DEN",
+     "gameKey": "nfl:26OCT04DENSF"
+    },
+    {
+     "game": "DAL Cowboys vs HOU Texans",
+     "side": "yes",
+     "type": "side",
+     "label": "Dallas",
+     "ticker": "KXNFLGAME-26OCT04DALHOU-DAL",
+     "gameKey": "nfl:26OCT04DALHOU"
+    },
+    {
+     "game": "PIT Steelers vs CLE Browns",
+     "side": "yes",
+     "type": "side",
+     "label": "Pittsburgh",
+     "ticker": "KXNFLGAME-26OCT01PITCLE-PIT",
+     "gameKey": "nfl:26OCT01PITCLE"
+    }
+   ],
+   "leg_keys": [
+    "KXNFLGAME-26OCT01PITCLE-PIT:yes",
+    "KXNFLGAME-26OCT04DALHOU-DAL:yes",
+    "KXNFLGAME-26OCT04DENSF-DEN:yes"
+   ],
+   "starts_at": "2026-10-02T00:15:00+00:00",
+   "parlay_stake": 500,
+   "parlay_american": 952,
+   "fill_american": 900,
+   "fair_american": 881,
+   "max_contracts": 5260,
+   "hedge_mode": "1x",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": false
+  },
+  {
+   "id": "70e496ad-f884-4767-8aed-5367cd8f70e5",
+   "label": "Las Vegas Raiders ML + Tennessee Titans ML",
+   "legs": [
+    {
+     "game": "KC Chiefs vs LV Raiders",
+     "side": "yes",
+     "type": "side",
+     "label": "Las Vegas",
+     "ticker": "KXNFLGAME-26OCT04KCLV-LV",
+     "gameKey": "nfl:26OCT04KCLV"
+    },
+    {
+     "game": "TEN Titans vs BAL Ravens",
+     "side": "yes",
+     "type": "side",
+     "label": "Tennessee",
+     "ticker": "KXNFLGAME-26OCT04TENBAL-TEN",
+     "gameKey": "nfl:26OCT04TENBAL"
+    }
+   ],
+   "leg_keys": [
+    "KXNFLGAME-26OCT04KCLV-LV:yes",
+    "KXNFLGAME-26OCT04TENBAL-TEN:yes"
+   ],
+   "starts_at": "2026-10-04T17:00:00+00:00",
+   "parlay_stake": 200,
+   "parlay_american": 1650,
+   "fill_american": 1900,
+   "fair_american": 1901,
+   "max_contracts": 3473,
+   "hedge_mode": "riskfree_open",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": true
+  },
+  {
+   "id": "d9d21c9a-47b1-4992-a078-5e2ee030be3c",
+   "label": "Tampa Bay Buccaneers +3.5 + North Texas Mean Green ML + Las Vegas Raiders ML",
+   "legs": [
+    {
+     "game": "GB Packers vs TB Buccaneers",
+     "side": "no",
+     "type": "spread",
+     "label": "Tampa Bay +3.5",
+     "ticker": "KXNFLSPREAD-26OCT04GBTB-GB4",
+     "gameKey": "nfl:26OCT04GBTB"
+    },
+    {
+     "game": "North Texas vs Tulsa",
+     "side": "yes",
+     "type": "side",
+     "label": "North Texas",
+     "ticker": "KXNCAAFGAME-26OCT01UNTTLSA-UNT",
+     "gameKey": "ncaaf:26OCT01UNTTLSA"
+    },
+    {
+     "game": "KC Chiefs vs LV Raiders",
+     "side": "yes",
+     "type": "side",
+     "label": "Las Vegas",
+     "ticker": "KXNFLGAME-26OCT04KCLV-LV",
+     "gameKey": "nfl:26OCT04KCLV"
+    }
+   ],
+   "leg_keys": [
+    "KXNCAAFGAME-26OCT01UNTTLSA-UNT:yes",
+    "KXNFLGAME-26OCT04KCLV-LV:yes",
+    "KXNFLSPREAD-26OCT04GBTB-GB4:no"
+   ],
+   "starts_at": "2026-10-02T01:00:00+00:00",
+   "parlay_stake": 25,
+   "parlay_american": 1366,
+   "fill_american": 1000,
+   "fair_american": 954,
+   "max_contracts": 367,
+   "hedge_mode": "1x",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": false
+  },
+  {
+   "id": "faa100b7-6b6d-41ce-96ca-9585a225417e",
+   "label": "San Diego Padres ML + New York Yankees ML",
+   "legs": [
+    {
+     "game": "Game 1: San Diego vs Milwaukee",
+     "side": "yes",
+     "type": "side",
+     "label": "San Diego",
+     "ticker": "KXMLBGAME-26OCT032030SDMIL-SD",
+     "gameKey": "mlb:26OCT032030SDMIL"
+    },
+    {
+     "game": "Game 1: New York Y vs Tampa Bay",
+     "side": "yes",
+     "type": "side",
+     "label": "New York Y",
+     "ticker": "KXMLBGAME-26OCT031830NYYTB-NYY",
+     "gameKey": "mlb:26OCT031830NYYTB"
+    }
+   ],
+   "leg_keys": [
+    "KXMLBGAME-26OCT031830NYYTB-NYY:yes",
+    "KXMLBGAME-26OCT032030SDMIL-SD:yes"
+   ],
+   "starts_at": "2026-10-03T22:31:00+00:00",
+   "parlay_stake": 250,
+   "parlay_american": 516,
+   "fill_american": 588,
+   "fair_american": 588,
+   "max_contracts": 1509,
+   "hedge_mode": "riskfree_open",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": true
+  },
+  {
+   "id": "ab6f0129-8842-4c68-af5b-b3cda6f27fbf",
+   "label": "Cincinnati Bengals ML + Las Vegas Raiders ML + Los Angeles Chargers ML",
+   "legs": [
+    {
+     "game": "JAC Jaguars vs CIN Bengals",
+     "side": "yes",
+     "type": "side",
+     "label": "Cincinnati",
+     "ticker": "KXNFLGAME-26OCT04JACCIN-CIN",
+     "gameKey": "nfl:26OCT04JACCIN"
+    },
+    {
+     "game": "KC Chiefs vs LV Raiders",
+     "side": "yes",
+     "type": "side",
+     "label": "Las Vegas",
+     "ticker": "KXNFLGAME-26OCT04KCLV-LV",
+     "gameKey": "nfl:26OCT04KCLV"
+    },
+    {
+     "game": "LA Chargers vs SEA Seahawks",
+     "side": "yes",
+     "type": "side",
+     "label": "Los Angeles C",
+     "ticker": "KXNFLGAME-26OCT04LACSEA-LAC",
+     "gameKey": "nfl:26OCT04LACSEA"
+    }
+   ],
+   "leg_keys": [
+    "KXNFLGAME-26OCT04JACCIN-CIN:yes",
+    "KXNFLGAME-26OCT04KCLV-LV:yes",
+    "KXNFLGAME-26OCT04LACSEA-LAC:yes"
+   ],
+   "starts_at": "2026-10-04T17:00:00+00:00",
+   "parlay_stake": 100,
+   "parlay_american": 1887,
+   "fill_american": 2000,
+   "fair_american": 2013,
+   "max_contracts": 1981,
+   "hedge_mode": "riskfree_open",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": true
+  },
+  {
+   "id": "14f70076-7d8d-4dd5-ae28-011693422072",
+   "label": "Army Black Knights ML + Western Kentucky Hilltoppers ML + California Golden Bears ML + Jacksonville State Gamecocks ML + Ohio Bobcats ML + BYU Cougars ML + Florida Gators ML + Air Force Falcons ML + Oregon State Beavers ML + Iowa State Cyclones ML",
+   "legs": [
+    {
+     "game": "Army vs Louisiana Tech",
+     "side": "yes",
+     "type": "side",
+     "label": "Army",
+     "ticker": "KXNCAAFGAME-26OCT03ARMYLT-ARMY",
+     "gameKey": "ncaaf:26OCT03ARMYLT"
+    },
+    {
+     "game": "Western Kentucky vs New Mexico St.",
+     "side": "yes",
+     "type": "side",
+     "label": "Western Kentucky",
+     "ticker": "KXNCAAFGAME-26OCT01WKUNMSU-WKU",
+     "gameKey": "ncaaf:26OCT01WKUNMSU"
+    },
+    {
+     "game": "California vs UNLV",
+     "side": "yes",
+     "type": "side",
+     "label": "California",
+     "ticker": "KXNCAAFGAME-26OCT03CALUNLV-CAL",
+     "gameKey": "ncaaf:26OCT03CALUNLV"
+    },
+    {
+     "game": "Jacksonville St. vs Kennesaw St.",
+     "side": "yes",
+     "type": "side",
+     "label": "Jacksonville St.",
+     "ticker": "KXNCAAFGAME-26OCT07JVSTKENN-JVST",
+     "gameKey": "ncaaf:26OCT07JVSTKENN"
+    },
+    {
+     "game": "Ohio vs Kent St.",
+     "side": "yes",
+     "type": "side",
+     "label": "Ohio",
+     "ticker": "KXNCAAFGAME-26OCT03OHIOKENT-OHIO",
+     "gameKey": "ncaaf:26OCT03OHIOKENT"
+    },
+    {
+     "game": "BYU vs TCU",
+     "side": "yes",
+     "type": "side",
+     "label": "BYU",
+     "ticker": "KXNCAAFGAME-26OCT03BYUTCU-BYU",
+     "gameKey": "ncaaf:26OCT03BYUTCU"
+    },
+    {
+     "game": "Florida vs Missouri",
+     "side": "yes",
+     "type": "side",
+     "label": "Florida",
+     "ticker": "KXNCAAFGAME-26OCT03FLAMIZZ-FLA",
+     "gameKey": "ncaaf:26OCT03FLAMIZZ"
+    },
+    {
+     "game": "Navy vs Air Force",
+     "side": "yes",
+     "type": "side",
+     "label": "Air Force",
+     "ticker": "KXNCAAFGAME-26OCT03NAVYAFA-AFA",
+     "gameKey": "ncaaf:26OCT03NAVYAFA"
+    },
+    {
+     "game": "Oregon St. vs Colorado St.",
+     "side": "yes",
+     "type": "side",
+     "label": "Oregon St.",
+     "ticker": "KXNCAAFGAME-26OCT03ORSTCSU-ORST",
+     "gameKey": "ncaaf:26OCT03ORSTCSU"
+    },
+    {
+     "game": "West Virginia vs Iowa St.",
+     "side": "yes",
+     "type": "side",
+     "label": "Iowa St.",
+     "ticker": "KXNCAAFGAME-26OCT03WVUISU-ISU",
+     "gameKey": "ncaaf:26OCT03WVUISU"
+    }
+   ],
+   "leg_keys": [
+    "KXNCAAFGAME-26OCT01WKUNMSU-WKU:yes",
+    "KXNCAAFGAME-26OCT03ARMYLT-ARMY:yes",
+    "KXNCAAFGAME-26OCT03BYUTCU-BYU:yes",
+    "KXNCAAFGAME-26OCT03CALUNLV-CAL:yes",
+    "KXNCAAFGAME-26OCT03FLAMIZZ-FLA:yes",
+    "KXNCAAFGAME-26OCT03NAVYAFA-AFA:yes",
+    "KXNCAAFGAME-26OCT03OHIOKENT-OHIO:yes",
+    "KXNCAAFGAME-26OCT03ORSTCSU-ORST:yes",
+    "KXNCAAFGAME-26OCT03WVUISU-ISU:yes",
+    "KXNCAAFGAME-26OCT07JVSTKENN-JVST:yes"
+   ],
+   "starts_at": "2026-10-02T00:00:00+00:00",
+   "parlay_stake": 25,
+   "parlay_american": 30415,
+   "fill_american": 20000,
+   "fair_american": 23131,
+   "max_contracts": 7629,
+   "hedge_mode": "1x",
+   "mve_collection": "KXMVESPORTSMULTIGAMEEXTENDED-R",
+   "active": true,
+   "is_free_bet": false
+  }
+ ],
+ "capturedAt": "2026-10-01T20:33:05.843Z",
+ "note": "Real Polymarket US GET /v1/rfqs (RFQ_STATUS_OPEN) rows and GET /v1/market/slug/{slug} metadata, trimmed to the fields the mapper reads.",
+ "rfqs": [
+  {
+   "id": "cbbbe9fa-5934-405d-9eeb-a41689decf0d",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-884b3d86a6f10c45",
+   "createdTime": "2026-10-01T20:16:32.060879737Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-nfl-pit-cle-2026-10-01",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "asc-mlb-phi-atl-2026-10-01-neg-1pt5",
+     "side": "SIDE_SELL"
+    }
+   ]
+  },
+  {
+   "id": "cf6cfc0a-becb-426d-8e7d-a97037e9ef00",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-9677e3a297397043",
+   "createdTime": "2026-10-01T20:16:32.009932059Z",
+   "comboLegs": [
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-neg-10pt5",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-total-32pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "d24e24d6-247d-4b1c-88c6-5712d06c83f7",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-40eeef5923303810",
+   "createdTime": "2026-10-01T20:16:31.620207737Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-nfl-pit-cle-2026-10-01",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-total-37pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "9e0f2856-2ada-40b1-a9c2-234ac64c18e5",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-01354c4c890dd491",
+   "createdTime": "2026-10-01T20:16:31.609470524Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-nfl-pit-cle-2026-10-01",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-neg-2pt5",
+     "side": "SIDE_SELL"
+    }
+   ]
+  },
+  {
+   "id": "c2abe9eb-68c9-4b9f-abc9-de5c5a013711",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-288d599b1a1fbf96",
+   "createdTime": "2026-10-01T20:16:31.312616536Z",
+   "comboLegs": [
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-neg-7pt5",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-total-37pt5",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-total-50pt5",
+     "side": "SIDE_SELL"
+    }
+   ]
+  },
+  {
+   "id": "d58ce761-f5c7-4e52-ae64-2560708ec010",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-5e46aee28614556d",
+   "createdTime": "2026-10-01T20:16:31.059446085Z",
+   "comboLegs": [
+    {
+     "symbol": "asc-mlb-phi-atl-2026-10-01-neg-1pt5",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "tsc-mlb-phi-atl-2026-10-01-6pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "042307a9-ce7f-4eed-ae27-a907a19df022",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-4aacd987869e59c2",
+   "createdTime": "2026-10-01T20:16:30.811329844Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-nhl-phi-nj-2026-10-01",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-nhl-phi-nj-2026-10-01-tt-phi-2pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "ed949e7f-0be6-4e2a-b34b-e3e49451bc95",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-e1fe207a120c511e",
+   "createdTime": "2026-10-01T20:16:30.759680358Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-mlb-cws-cle-2026-10-03",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "asc-mlb-phi-atl-2026-10-01-neg-1pt5",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-mlb-cws-cle-2026-10-03-6pt5",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-mlb-phi-atl-2026-10-01-7pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "2f85fcfd-916a-411e-8a9c-768b273b5154",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-70ff47dff6e05c00",
+   "createdTime": "2026-10-01T20:16:30.517073899Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-mlb-phi-atl-2026-10-01",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "aec-nhl-edm-van-2026-10-01",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "aec-nhl-tb-nyr-2026-10-01",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-neg-8pt5",
+     "side": "SIDE_SELL"
+    }
+   ]
+  },
+  {
+   "id": "79e17d96-cfc5-45dc-8a86-bb8eceb77fc0",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-06ea824bc3e1e346",
+   "createdTime": "2026-10-01T20:16:30.443340966Z",
+   "comboLegs": [
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-1h-neg-1pt5",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-2h-neg-1pt5",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-neg-1pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "9c2ddfd3-0f97-401d-9392-b5f6e23af106",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-013209b01e544991",
+   "createdTime": "2026-10-01T20:16:30.361718435Z",
+   "comboLegs": [
+    {
+     "symbol": "asc-mlb-phi-atl-2026-10-01-neg-1pt5",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-mlb-cws-cle-2026-10-03-6pt5",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-mlb-phi-atl-2026-10-01-7pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "8c551815-4915-4d2d-b945-084a53daae01",
+   "cashOrderQty": "70",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-c62adf9a247eeddd",
+   "createdTime": "2026-10-01T20:16:30.261314617Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-nfl-pit-cle-2026-10-01",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-1h-neg-1pt5",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-total-28pt5",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-total-39pt5",
+     "side": "SIDE_SELL"
+    }
+   ]
+  },
+  {
+   "id": "1e9eb1b1-6ef2-4ab4-8d3c-c13942f4231c",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-73c9a00241d16c04",
+   "createdTime": "2026-10-01T20:16:29.740998085Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-mlb-phi-atl-2026-10-01",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-neg-9pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "8d9ee0f0-d04d-4183-aace-73d45254a684",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-07b62d1dfb69df2d",
+   "createdTime": "2026-10-01T20:16:29.520773760Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-nfl-mia-min-2026-10-04",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "aec-nfl-nyj-chi-2026-10-04",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "tsc-nfl-mia-min-2026-10-04-total-38pt5",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-nfl-mia-min-2026-10-04-total-41pt5",
+     "side": "SIDE_SELL"
+    }
+   ]
+  },
+  {
+   "id": "35dd6daf-853f-410e-b414-d97001fbb3fb",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-4af954bcf8ae4188",
+   "createdTime": "2026-10-01T20:16:29.438473669Z",
+   "comboLegs": [
+    {
+     "symbol": "asc-mlb-phi-atl-2026-10-01-neg-1pt5",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-neg-2pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "df842338-5d11-4495-84c1-0cfd6645f3c0",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-9667c5e125efb7fe",
+   "createdTime": "2026-10-01T20:16:28.618964436Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-nfl-den-sf-2026-10-04",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-neg-4pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "341ffdcc-fb21-4916-92cd-85fb6d75676d",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-77055b9f7d34841c",
+   "createdTime": "2026-10-01T20:16:28.515371137Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-mlb-phi-atl-2026-10-01",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-neg-2pt5",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-total-38pt5",
+     "side": "SIDE_SELL"
+    }
+   ]
+  },
+  {
+   "id": "77f8cce4-8403-4f77-b1bd-b28407f2c50d",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-7fd51f3da067a7b2",
+   "createdTime": "2026-10-01T20:16:27.874727029Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-mlb-phi-atl-2026-10-01",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "tsc-mlb-phi-atl-2026-10-01-tt-phi-2pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "8352cbeb-a61c-4b0b-92be-a8b4d2731b8a",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-381be08956778632",
+   "createdTime": "2026-10-01T20:16:27.497897727Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-nfl-pit-cle-2026-10-01",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-total-37pt5",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-tt-pit-17pt5",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-tt1h-pit-9pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "ad82ae32-1588-4319-af96-aabf06de9dd4",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-92332dad633e47cf",
+   "createdTime": "2026-10-01T20:16:26.631176375Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-mlb-phi-atl-2026-10-01",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "aec-nhl-edm-van-2026-10-01",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-neg-3pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "49a7275c-df4b-473b-92c7-8897d5cdc2cd",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-df2aed3c0f37d9fb",
+   "createdTime": "2026-10-01T20:16:21.725515593Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-nfl-mia-min-2026-10-04",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "aec-nfl-nyj-chi-2026-10-04",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "tsc-nfl-mia-min-2026-10-04-total-38pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "aba96982-6e36-472b-95cb-a03576ea116b",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-6c11ee77a4a10c94",
+   "createdTime": "2026-10-01T20:16:20.741909929Z",
+   "comboLegs": [
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-1q-neg-0pt5",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-2q-neg-0pt5",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-3q-neg-0pt5",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-4q-neg-0pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "8fcedcd7-4af0-4ea3-90c2-94247a95f54f",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-8924af48f45fa361",
+   "createdTime": "2026-10-01T20:16:19.442615640Z",
+   "comboLegs": [
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-total-40pt5",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-tt-pit-33pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "8a4629f5-d1ca-4ac0-b30a-f9d1b15f814f",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-c9876e1e4028206a",
+   "createdTime": "2026-10-01T20:16:17.265897353Z",
+   "comboLegs": [
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-1q-neg-0pt5",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-2q-neg-0pt5",
+     "side": "SIDE_SELL"
+    }
+   ]
+  },
+  {
+   "id": "78aca3f0-4551-4199-83a2-0250cc42f67f",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-58733366de6f1796",
+   "createdTime": "2026-10-01T20:16:16.721406983Z",
+   "comboLegs": [
+    {
+     "symbol": "asc-nfl-ari-nyg-2026-10-04-neg-9pt5",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "asc-nfl-gb-tb-2026-10-04-neg-13pt5",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "asc-nfl-lar-phi-2026-10-04-neg-10pt5",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "asc-nfl-ne-buf-2026-10-04-pos-9pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "21dce296-05f1-441b-ad9f-ec0a46c67512",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-8a33b8fe7d36a32f",
+   "createdTime": "2026-10-01T20:16:16.361249189Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-mlb-phi-atl-2026-10-01",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "aec-nfl-pit-cle-2026-10-01",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-total-28pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "83821d38-9e52-4bd6-9a09-06cb321d1150",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-f34581df0cfe73d1",
+   "createdTime": "2026-10-01T20:16:13.155856389Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-nfl-ari-nyg-2026-10-04",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "aec-nfl-dal-hou-2026-10-04",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "aec-nfl-ind-was-2026-10-04",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "asc-nfl-lac-sea-2026-10-04-pos-6pt5",
+     "side": "SIDE_SELL"
+    }
+   ]
+  },
+  {
+   "id": "3a34f626-5de8-4a13-9003-9e3954bca7b6",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-d28f2dc654094e42",
+   "createdTime": "2026-10-01T20:16:11.782330529Z",
+   "comboLegs": [
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-1h-14pt5",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-nhl-fla-sj-2026-10-01-4pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "80d1b5eb-1ce6-44fb-8ba0-aecf6f481bdd",
+   "cashOrderQty": "37",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-00540421aa1b09fe",
+   "createdTime": "2026-10-01T20:15:58.706602117Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-mlb-phi-atl-2026-10-01",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "tsc-mlb-phi-atl-2026-10-01-7pt5",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-total-42pt5",
+     "side": "SIDE_SELL"
+    }
+   ]
+  },
+  {
+   "id": "4238432d-e36b-4742-a3b2-33f6ab3ded69",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-dd3866cdc43741bf",
+   "createdTime": "2026-10-01T20:15:58.439343172Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-mlb-phi-atl-2026-10-01",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "aec-nfl-pit-cle-2026-10-01",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "tsc-mlb-phi-atl-2026-10-01-tt-phi-2pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "f675397d-4d04-4bad-aa40-25af65c454c0",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-a649db64fa8a094f",
+   "createdTime": "2026-10-01T20:15:55.699604962Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-mlb-phi-atl-2026-10-01",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "aec-nhl-chi-uta-2026-10-01",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "aec-nhl-tb-nyr-2026-10-01",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-total-37pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "8292cc7c-37b5-4dfe-bdf8-2d93a09c1c68",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-8c2b8850ca0a6c2a",
+   "createdTime": "2026-10-01T20:15:55.184403515Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-mlb-nyy-tb-2026-10-03",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "aec-mlb-phi-atl-2026-10-01",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "tsc-mlb-nyy-tb-2026-10-03-6pt5",
+     "side": "SIDE_SELL"
+    }
+   ]
+  },
+  {
+   "id": "ab52f148-398d-4108-921d-f814db90bbcf",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-426e5dacc6218b72",
+   "createdTime": "2026-10-01T20:15:53.022730417Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-nhl-edm-van-2026-10-01",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "aec-nhl-min-nas-2026-10-01",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-nhl-buf-cbj-2026-10-01-5pt5",
+     "side": "SIDE_BUY"
+    }
+   ]
+  },
+  {
+   "id": "dd2b5ff7-9f4d-4cef-bcd0-6ae06ee28e63",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-aea3dec5ea033a1f",
+   "createdTime": "2026-10-01T20:15:52.433765636Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-nfl-pit-cle-2026-10-01",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-total-37pt5",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-tt-pit-17pt5",
+     "side": "SIDE_SELL"
+    }
+   ]
+  },
+  {
+   "id": "f0e7e80e-bc62-49f3-8e6e-8926642deff8",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-1304b7e9127d5dc0",
+   "createdTime": "2026-10-01T20:15:48.505233892Z",
+   "comboLegs": [
+    {
+     "symbol": "aec-mlb-phi-atl-2026-10-01",
+     "side": "SIDE_SELL"
+    },
+    {
+     "symbol": "aec-nhl-tb-nyr-2026-10-01",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-neg-3pt5",
+     "side": "SIDE_SELL"
+    }
+   ]
+  },
+  {
+   "id": "30684e36-b00f-497b-869b-02c5b8834f04",
+   "cashOrderQty": "10",
+   "status": "RFQ_STATUS_OPEN",
+   "symbol": "caoc-69a282a076fbea1b",
+   "createdTime": "2026-10-01T20:16:30.440917335Z",
+   "comboLegs": [
+    {
+     "symbol": "asc-nfl-pit-cle-2026-10-01-neg-2pt5",
+     "side": "SIDE_BUY"
+    },
+    {
+     "symbol": "tsc-nfl-pit-cle-2026-10-01-total-37pt5",
+     "side": "SIDE_SELL"
+    }
+   ]
+  }
+ ],
+ "markets": {
+  "aec-nfl-jax-cin-2026-10-04": {
+   "slug": "aec-nfl-jax-cin-2026-10-04",
+   "sportsMarketType": "football_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Who will win in the upcoming football event Jacksonville Jaguars vs Cincinnati Bengals scheduled for October 4, 2026 at 5:00 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Jaguars",
+     "team": {
+      "abbreviation": "jax",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Bengals",
+     "team": {
+      "abbreviation": "cin",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-jax-cin-2026-10-04-pos-2pt5": {
+   "slug": "asc-nfl-jax-cin-2026-10-04-pos-2pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": 2.5,
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Will the Jacksonville Jaguars cover 2.5 vs the Cincinnati Bengals in JAC Jaguars vs. CIN Bengals?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "+2.50",
+     "team": {
+      "abbreviation": "jax",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "-2.50",
+     "team": {
+      "abbreviation": "cin",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "tsc-nhl-buf-cbj-2026-10-01-4pt5": {
+   "slug": "tsc-nhl-buf-cbj-2026-10-01-4pt5",
+   "sportsMarketType": "hockey_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 4.5,
+   "gameStartTime": "2026-10-01T23:00:00Z",
+   "question": "Will the total in BUF vs CBJ be more than 4.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "aec-nfl-kc-lv-2026-10-04": {
+   "slug": "aec-nfl-kc-lv-2026-10-04",
+   "sportsMarketType": "football_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-04T20:25:00Z",
+   "question": "Who will win in the upcoming football event Kansas City Chiefs vs Las Vegas Raiders scheduled for October 4, 2026 at 8:25 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Chiefs",
+     "team": {
+      "abbreviation": "kc",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Raiders",
+     "team": {
+      "abbreviation": "lv",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "aec-nfl-gb-tb-2026-10-04": {
+   "slug": "aec-nfl-gb-tb-2026-10-04",
+   "sportsMarketType": "football_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Who will win in the upcoming football event Green Bay Packers vs Tampa Bay Buccaneers scheduled for October 4, 2026 at 5:00 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Packers",
+     "team": {
+      "abbreviation": "gb",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Buccaneers",
+     "team": {
+      "abbreviation": "tb",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "aec-nfl-ne-buf-2026-10-04": {
+   "slug": "aec-nfl-ne-buf-2026-10-04",
+   "sportsMarketType": "football_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Who will win in the upcoming football event New England Patriots vs Buffalo Bills scheduled for October 4, 2026 at 5:00 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Patriots",
+     "team": {
+      "abbreviation": "ne",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Bills",
+     "team": {
+      "abbreviation": "buf",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "aec-nfl-lar-phi-2026-10-04": {
+   "slug": "aec-nfl-lar-phi-2026-10-04",
+   "sportsMarketType": "football_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Who will win in the upcoming football event Los Angeles Rams vs Philadelphia Eagles scheduled for October 4, 2026 at 5:00 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Rams",
+     "team": {
+      "abbreviation": "lar",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Eagles",
+     "team": {
+      "abbreviation": "phi",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "aec-nfl-dal-hou-2026-10-04": {
+   "slug": "aec-nfl-dal-hou-2026-10-04",
+   "sportsMarketType": "football_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Who will win in the upcoming football event Dallas Cowboys vs Houston Texans scheduled for October 4, 2026 at 5:00 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Cowboys",
+     "team": {
+      "abbreviation": "dal",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Texans",
+     "team": {
+      "abbreviation": "hou",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "aec-nfl-det-car-2026-10-04": {
+   "slug": "aec-nfl-det-car-2026-10-04",
+   "sportsMarketType": "football_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-05T00:20:00Z",
+   "question": "Who will win in the upcoming football event Detroit Lions vs Carolina Panthers scheduled for October 5, 2026 at 12:20 AM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Lions",
+     "team": {
+      "abbreviation": "det",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Panthers",
+     "team": {
+      "abbreviation": "car",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "aec-nfl-ten-bal-2026-10-04": {
+   "slug": "aec-nfl-ten-bal-2026-10-04",
+   "sportsMarketType": "football_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Who will win in the upcoming football event Tennessee Titans vs Baltimore Ravens scheduled for October 4, 2026 at 5:00 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Titans",
+     "team": {
+      "abbreviation": "ten",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Ravens",
+     "team": {
+      "abbreviation": "bal",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "aec-nfl-mia-min-2026-10-04": {
+   "slug": "aec-nfl-mia-min-2026-10-04",
+   "sportsMarketType": "football_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-04T20:05:00Z",
+   "question": "Who will win in the upcoming football event Miami Dolphins vs Minnesota Vikings scheduled for October 4, 2026 at 8:05 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Dolphins",
+     "team": {
+      "abbreviation": "mia",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Vikings",
+     "team": {
+      "abbreviation": "min",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "aec-nfl-ind-was-2026-10-04": {
+   "slug": "aec-nfl-ind-was-2026-10-04",
+   "sportsMarketType": "football_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-04T13:30:00Z",
+   "question": "Who will win in the upcoming football event Indianapolis Colts vs Washington Commanders scheduled for October 4, 2026 at 1:30 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Colts",
+     "team": {
+      "abbreviation": "ind",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Commanders",
+     "team": {
+      "abbreviation": "was",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "aec-mlb-nyy-tb-2026-10-03": {
+   "slug": "aec-mlb-nyy-tb-2026-10-03",
+   "sportsMarketType": "baseball_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-03T22:30:00Z",
+   "question": "Who will win in the upcoming baseball event New York Yankees vs Tampa Bay Rays scheduled for October 3, 2026 at 10:30 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "New York Yankees",
+     "team": {
+      "abbreviation": "nyy",
+      "league": "mlb"
+     }
+    },
+    {
+     "long": false,
+     "description": "Tampa Bay Rays",
+     "team": {
+      "abbreviation": "tb",
+      "league": "mlb"
+     }
+    }
+   ]
+  },
+  "aec-mlb-sd-mil-2026-10-03": {
+   "slug": "aec-mlb-sd-mil-2026-10-03",
+   "sportsMarketType": "baseball_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-04T00:30:00Z",
+   "question": "Who will win in the upcoming baseball event San Diego Padres vs Milwaukee Brewers scheduled for October 4, 2026 at 12:30 AM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "San Diego Padres",
+     "team": {
+      "abbreviation": "sd",
+      "league": "mlb"
+     }
+    },
+    {
+     "long": false,
+     "description": "Milwaukee Brewers",
+     "team": {
+      "abbreviation": "mil",
+      "league": "mlb"
+     }
+    }
+   ]
+  },
+  "asc-nfl-ne-buf-2026-10-04-pos-6pt5": {
+   "slug": "asc-nfl-ne-buf-2026-10-04-pos-6pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": 6.5,
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Will the New England Patriots cover 6.5 vs the Buffalo Bills in NE Patriots vs. BUF Bills?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "+6.50",
+     "team": {
+      "abbreviation": "ne",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "-6.50",
+     "team": {
+      "abbreviation": "buf",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nhl-wpg-det-2026-10-04-neg-1pt5": {
+   "slug": "asc-nhl-wpg-det-2026-10-04-neg-1pt5",
+   "sportsMarketType": "hockey_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -1.5,
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Will the WPG Jets cover -1.5 vs the DET Red Wings in WPG vs DET?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-1.50",
+     "team": {
+      "abbreviation": "wpg",
+      "league": "nhl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+1.50",
+     "team": {
+      "abbreviation": "det",
+      "league": "nhl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-lac-sea-2026-10-04-pos-6pt5": {
+   "slug": "asc-nfl-lac-sea-2026-10-04-pos-6pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": 6.5,
+   "gameStartTime": "2026-10-04T20:25:00Z",
+   "question": "Will the Los Angeles Chargers cover 6.5 vs the Seattle Seahawks in LA Chargers vs. SEA Seahawks?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "+6.50",
+     "team": {
+      "abbreviation": "lac",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "-6.50",
+     "team": {
+      "abbreviation": "sea",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-lac-sea-2026-10-04-neg-6pt5": {
+   "slug": "asc-nfl-lac-sea-2026-10-04-neg-6pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -6.5,
+   "gameStartTime": "2026-10-04T20:25:00Z",
+   "question": "Will the Los Angeles Chargers cover -6.5 vs the Seattle Seahawks in LA Chargers vs. SEA Seahawks?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-6.50",
+     "team": {
+      "abbreviation": "lac",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+6.50",
+     "team": {
+      "abbreviation": "sea",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-den-sf-2026-10-04-neg-2pt5": {
+   "slug": "asc-nfl-den-sf-2026-10-04-neg-2pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -2.5,
+   "gameStartTime": "2026-10-04T20:25:00Z",
+   "question": "Will the Denver Broncos cover -2.5 vs the San Francisco 49ers in DEN Broncos vs. SF 49ers?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-2.50",
+     "team": {
+      "abbreviation": "den",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+2.50",
+     "team": {
+      "abbreviation": "sf",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-den-sf-2026-10-04-pos-2pt5": {
+   "slug": "asc-nfl-den-sf-2026-10-04-pos-2pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": 2.5,
+   "gameStartTime": "2026-10-04T20:25:00Z",
+   "question": "Will the Denver Broncos cover 2.5 vs the San Francisco 49ers in DEN Broncos vs. SF 49ers?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "+2.50",
+     "team": {
+      "abbreviation": "den",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "-2.50",
+     "team": {
+      "abbreviation": "sf",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-gb-tb-2026-10-04-neg-3pt5": {
+   "slug": "asc-nfl-gb-tb-2026-10-04-neg-3pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -3.5,
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Will the Green Bay Packers cover -3.5 vs the Tampa Bay Buccaneers in GB Packers vs. TB Buccaneers?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-3.50",
+     "team": {
+      "abbreviation": "gb",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+3.50",
+     "team": {
+      "abbreviation": "tb",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-gb-tb-2026-10-04-pos-3pt5": {
+   "slug": "asc-nfl-gb-tb-2026-10-04-pos-3pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": 3.5,
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Will the Green Bay Packers cover 3.5 vs the Tampa Bay Buccaneers in GB Packers vs. TB Buccaneers?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "+3.50",
+     "team": {
+      "abbreviation": "gb",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "-3.50",
+     "team": {
+      "abbreviation": "tb",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-dal-hou-2026-10-04-pos-2pt5": {
+   "slug": "asc-nfl-dal-hou-2026-10-04-pos-2pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": 2.5,
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Will the Dallas Cowboys cover 2.5 vs the Houston Texans in DAL Cowboys vs. HOU Texans?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "+2.50",
+     "team": {
+      "abbreviation": "dal",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "-2.50",
+     "team": {
+      "abbreviation": "hou",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-dal-hou-2026-10-04-neg-2pt5": {
+   "slug": "asc-nfl-dal-hou-2026-10-04-neg-2pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -2.5,
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Will the Dallas Cowboys cover -2.5 vs the Houston Texans in DAL Cowboys vs. HOU Texans?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-2.50",
+     "team": {
+      "abbreviation": "dal",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+2.50",
+     "team": {
+      "abbreviation": "hou",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-kc-lv-2026-10-04-neg-4pt5": {
+   "slug": "asc-nfl-kc-lv-2026-10-04-neg-4pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -4.5,
+   "gameStartTime": "2026-10-04T20:25:00Z",
+   "question": "Will the Kansas City Chiefs cover -4.5 vs the Las Vegas Raiders in KC Chiefs vs. LV Raiders?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-4.50",
+     "team": {
+      "abbreviation": "kc",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+4.50",
+     "team": {
+      "abbreviation": "lv",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-kc-lv-2026-10-04-pos-4pt5": {
+   "slug": "asc-nfl-kc-lv-2026-10-04-pos-4pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": 4.5,
+   "gameStartTime": "2026-10-04T20:25:00Z",
+   "question": "Will the Kansas City Chiefs cover 4.5 vs the Las Vegas Raiders in KC Chiefs vs. LV Raiders?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "+4.50",
+     "team": {
+      "abbreviation": "kc",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "-4.50",
+     "team": {
+      "abbreviation": "lv",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "tsc-nfl-hou-ind-2026-09-27-total-42pt5": {
+   "slug": "tsc-nfl-hou-ind-2026-09-27-total-42pt5",
+   "sportsMarketType": "football_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 42.5,
+   "gameStartTime": "2026-09-27T17:00:00Z",
+   "question": "Will the total in Houston vs. Indianapolis be more than 42.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "aec-nfl-lac-sea-2026-10-04": {
+   "slug": "aec-nfl-lac-sea-2026-10-04",
+   "sportsMarketType": "football_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-04T20:25:00Z",
+   "question": "Who will win in the upcoming football event Los Angeles Chargers vs Seattle Seahawks scheduled for October 4, 2026 at 8:25 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Chargers",
+     "team": {
+      "abbreviation": "lac",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Seahawks",
+     "team": {
+      "abbreviation": "sea",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "aec-nfl-den-sf-2026-10-04": {
+   "slug": "aec-nfl-den-sf-2026-10-04",
+   "sportsMarketType": "football_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-04T20:25:00Z",
+   "question": "Who will win in the upcoming football event Denver Broncos vs San Francisco 49ers scheduled for October 4, 2026 at 8:25 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Broncos",
+     "team": {
+      "abbreviation": "den",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "49ers",
+     "team": {
+      "abbreviation": "sf",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "aec-nfl-pit-cle-2026-10-01": {
+   "slug": "aec-nfl-pit-cle-2026-10-01",
+   "sportsMarketType": "football_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Who will win in the upcoming football event Pittsburgh Steelers vs Cleveland Browns scheduled for October 2, 2026 at 12:15 AM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Steelers",
+     "team": {
+      "abbreviation": "pit",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Browns",
+     "team": {
+      "abbreviation": "cle",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "tsc-nfl-pit-cle-2026-10-01-total-37pt5": {
+   "slug": "tsc-nfl-pit-cle-2026-10-01-total-37pt5",
+   "sportsMarketType": "football_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 37.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the total in PIT Steelers vs. CLE Browns be more than 37.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "asc-nfl-pit-cle-2026-10-01-neg-2pt5": {
+   "slug": "asc-nfl-pit-cle-2026-10-01-neg-2pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -2.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the Pittsburgh Steelers cover -2.5 vs the Cleveland Browns in PIT Steelers vs. CLE Browns?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-2.50",
+     "team": {
+      "abbreviation": "pit",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+2.50",
+     "team": {
+      "abbreviation": "cle",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "tsc-mlb-chc-sd-2026-09-30-6pt5": {
+   "slug": "tsc-mlb-chc-sd-2026-09-30-6pt5",
+   "sportsMarketType": "baseball_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 6.5,
+   "gameStartTime": "2026-10-01T02:00:00Z",
+   "question": "Will the total in Game 2: CHI Cubs vs. SD Padres be more than 6.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "tsc-nhl-buf-cbj-2026-10-01-3pt5": {
+   "slug": "tsc-nhl-buf-cbj-2026-10-01-3pt5",
+   "sportsMarketType": "hockey_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 3.5,
+   "gameStartTime": "2026-10-01T23:00:00Z",
+   "question": "Will the total in BUF vs CBJ be more than 3.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "asc-nhl-edm-van-2026-10-01-pos-1pt5": {
+   "slug": "asc-nhl-edm-van-2026-10-01-pos-1pt5",
+   "sportsMarketType": "hockey_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": 1.5,
+   "gameStartTime": "2026-10-02T02:00:00Z",
+   "question": "Will the EDM Oilers cover 1.5 vs the VAN Canucks in EDM vs VAN?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "+1.50",
+     "team": {
+      "abbreviation": "edm",
+      "league": "nhl"
+     }
+    },
+    {
+     "long": false,
+     "description": "-1.50",
+     "team": {
+      "abbreviation": "van",
+      "league": "nhl"
+     }
+    }
+   ]
+  },
+  "asc-mlb-phi-atl-2026-10-01-neg-1pt5": {
+   "slug": "asc-mlb-phi-atl-2026-10-01-neg-1pt5",
+   "sportsMarketType": "baseball_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -1.5,
+   "gameStartTime": "2026-10-02T00:00:00Z",
+   "question": "Will the Philadelphia Phillies cover -1.5 vs the Atlanta Braves in Game 3: PHI Phillies vs. ATL Braves?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-1.50",
+     "team": {
+      "abbreviation": "phi",
+      "league": "mlb"
+     }
+    },
+    {
+     "long": false,
+     "description": "+1.50",
+     "team": {
+      "abbreviation": "atl",
+      "league": "mlb"
+     }
+    }
+   ]
+  },
+  "tsc-mlb-phi-atl-2026-10-01-6pt5": {
+   "slug": "tsc-mlb-phi-atl-2026-10-01-6pt5",
+   "sportsMarketType": "baseball_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 6.5,
+   "gameStartTime": "2026-10-02T00:00:00Z",
+   "question": "Will the total in Game 3: PHI Phillies vs. ATL Braves be more than 6.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "asc-nfl-pit-cle-2026-10-01-neg-10pt5": {
+   "slug": "asc-nfl-pit-cle-2026-10-01-neg-10pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -10.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the Pittsburgh Steelers cover -10.5 vs the Cleveland Browns in PIT Steelers vs. CLE Browns?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-10.50",
+     "team": {
+      "abbreviation": "pit",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+10.50",
+     "team": {
+      "abbreviation": "cle",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "tsc-nfl-pit-cle-2026-10-01-total-32pt5": {
+   "slug": "tsc-nfl-pit-cle-2026-10-01-total-32pt5",
+   "sportsMarketType": "football_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 32.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the total in PIT Steelers vs. CLE Browns be more than 32.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "asc-nfl-pit-cle-2026-10-01-neg-7pt5": {
+   "slug": "asc-nfl-pit-cle-2026-10-01-neg-7pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -7.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the Pittsburgh Steelers cover -7.5 vs the Cleveland Browns in PIT Steelers vs. CLE Browns?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-7.50",
+     "team": {
+      "abbreviation": "pit",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+7.50",
+     "team": {
+      "abbreviation": "cle",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "tsc-nfl-pit-cle-2026-10-01-total-50pt5": {
+   "slug": "tsc-nfl-pit-cle-2026-10-01-total-50pt5",
+   "sportsMarketType": "football_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 50.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the total in PIT Steelers vs. CLE Browns be more than 50.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "aec-nhl-phi-nj-2026-10-01": {
+   "slug": "aec-nhl-phi-nj-2026-10-01",
+   "sportsMarketType": "hockey_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-01T23:00:00Z",
+   "question": "Who will win in the upcoming hockey event PHI Flyers vs NJ Devils scheduled for October 1, 2026 at 11:00 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Flyers",
+     "team": {
+      "abbreviation": "phi",
+      "league": "nhl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Devils",
+     "team": {
+      "abbreviation": "nj",
+      "league": "nhl"
+     }
+    }
+   ]
+  },
+  "tsc-nhl-phi-nj-2026-10-01-tt-phi-2pt5": {
+   "slug": "tsc-nhl-phi-nj-2026-10-01-tt-phi-2pt5",
+   "sportsMarketType": "hockey_team_total_goals",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_PROP",
+   "marketType": "props",
+   "line": 2.5,
+   "gameStartTime": "2026-10-01T23:00:00Z",
+   "question": "Will PHI Flyers score more than 2.5 goals in PHI vs NJ?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Yes"
+    },
+    {
+     "long": false,
+     "description": "No"
+    }
+   ]
+  },
+  "aec-mlb-cws-cle-2026-10-03": {
+   "slug": "aec-mlb-cws-cle-2026-10-03",
+   "sportsMarketType": "baseball_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-03T17:00:00Z",
+   "question": "Who will win in the upcoming baseball event Chicago White Sox vs Cleveland Guardians scheduled for October 3, 2026 at 5:00 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Chicago White Sox",
+     "team": {
+      "abbreviation": "cws",
+      "league": "mlb"
+     }
+    },
+    {
+     "long": false,
+     "description": "Cleveland Guardians",
+     "team": {
+      "abbreviation": "cle",
+      "league": "mlb"
+     }
+    }
+   ]
+  },
+  "tsc-mlb-cws-cle-2026-10-03-6pt5": {
+   "slug": "tsc-mlb-cws-cle-2026-10-03-6pt5",
+   "sportsMarketType": "baseball_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 6.5,
+   "gameStartTime": "2026-10-03T17:00:00Z",
+   "question": "Will the total in Game 1: CHI White Sox vs. CLE Guardians be more than 6.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "tsc-mlb-phi-atl-2026-10-01-7pt5": {
+   "slug": "tsc-mlb-phi-atl-2026-10-01-7pt5",
+   "sportsMarketType": "baseball_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 7.5,
+   "gameStartTime": "2026-10-02T00:00:00Z",
+   "question": "Will the total in Game 3: PHI Phillies vs. ATL Braves be more than 7.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "aec-mlb-phi-atl-2026-10-01": {
+   "slug": "aec-mlb-phi-atl-2026-10-01",
+   "sportsMarketType": "baseball_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-02T00:00:00Z",
+   "question": "Who will win in the upcoming baseball event Philadelphia Phillies vs Atlanta Braves scheduled for October 1, 2026 at 6:00 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Philadelphia Phillies",
+     "team": {
+      "abbreviation": "phi",
+      "league": "mlb"
+     }
+    },
+    {
+     "long": false,
+     "description": "Atlanta Braves",
+     "team": {
+      "abbreviation": "atl",
+      "league": "mlb"
+     }
+    }
+   ]
+  },
+  "aec-nhl-edm-van-2026-10-01": {
+   "slug": "aec-nhl-edm-van-2026-10-01",
+   "sportsMarketType": "hockey_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-02T02:00:00Z",
+   "question": "Who will win in the upcoming hockey event EDM Oilers vs VAN Canucks scheduled for October 2, 2026 at 2:00 AM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Oilers",
+     "team": {
+      "abbreviation": "edm",
+      "league": "nhl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Canucks",
+     "team": {
+      "abbreviation": "van",
+      "league": "nhl"
+     }
+    }
+   ]
+  },
+  "aec-nhl-tb-nyr-2026-10-01": {
+   "slug": "aec-nhl-tb-nyr-2026-10-01",
+   "sportsMarketType": "hockey_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-01T23:00:00Z",
+   "question": "Who will win in the upcoming hockey event TB Lightning vs NYR Rangers scheduled for October 1, 2026 at 11:00 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Lightning",
+     "team": {
+      "abbreviation": "tb",
+      "league": "nhl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Rangers",
+     "team": {
+      "abbreviation": "nyr",
+      "league": "nhl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-pit-cle-2026-10-01-neg-8pt5": {
+   "slug": "asc-nfl-pit-cle-2026-10-01-neg-8pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -8.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the Pittsburgh Steelers cover -8.5 vs the Cleveland Browns in PIT Steelers vs. CLE Browns?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-8.50",
+     "team": {
+      "abbreviation": "pit",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+8.50",
+     "team": {
+      "abbreviation": "cle",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-pit-cle-2026-10-01-1h-neg-1pt5": {
+   "slug": "asc-nfl-pit-cle-2026-10-01-1h-neg-1pt5",
+   "sportsMarketType": "football_team_first_half_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -1.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the Pittsburgh Steelers cover -1.5 vs the Cleveland Browns in PIT Steelers vs. CLE Browns?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-1.50",
+     "team": {
+      "abbreviation": "pit",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+1.50",
+     "team": {
+      "abbreviation": "cle",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-pit-cle-2026-10-01-2h-neg-1pt5": {
+   "slug": "asc-nfl-pit-cle-2026-10-01-2h-neg-1pt5",
+   "sportsMarketType": "football_team_second_half_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -1.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the Pittsburgh Steelers cover -1.5 vs the Cleveland Browns in PIT Steelers vs. CLE Browns?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-1.50",
+     "team": {
+      "abbreviation": "pit",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+1.50",
+     "team": {
+      "abbreviation": "cle",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-pit-cle-2026-10-01-neg-1pt5": {
+   "slug": "asc-nfl-pit-cle-2026-10-01-neg-1pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -1.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the Pittsburgh Steelers cover -1.5 vs the Cleveland Browns in PIT Steelers vs. CLE Browns?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-1.50",
+     "team": {
+      "abbreviation": "pit",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+1.50",
+     "team": {
+      "abbreviation": "cle",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "tsc-nfl-pit-cle-2026-10-01-total-28pt5": {
+   "slug": "tsc-nfl-pit-cle-2026-10-01-total-28pt5",
+   "sportsMarketType": "football_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 28.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the total in PIT Steelers vs. CLE Browns be more than 28.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "tsc-nfl-pit-cle-2026-10-01-total-39pt5": {
+   "slug": "tsc-nfl-pit-cle-2026-10-01-total-39pt5",
+   "sportsMarketType": "football_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 39.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the total in PIT Steelers vs. CLE Browns be more than 39.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "asc-nfl-pit-cle-2026-10-01-neg-9pt5": {
+   "slug": "asc-nfl-pit-cle-2026-10-01-neg-9pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -9.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the Pittsburgh Steelers cover -9.5 vs the Cleveland Browns in PIT Steelers vs. CLE Browns?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-9.50",
+     "team": {
+      "abbreviation": "pit",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+9.50",
+     "team": {
+      "abbreviation": "cle",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "aec-nfl-nyj-chi-2026-10-04": {
+   "slug": "aec-nfl-nyj-chi-2026-10-04",
+   "sportsMarketType": "football_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Who will win in the upcoming football event New York Jets vs Chicago Bears scheduled for October 4, 2026 at 5:00 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Jets",
+     "team": {
+      "abbreviation": "nyj",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Bears",
+     "team": {
+      "abbreviation": "chi",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "tsc-nfl-mia-min-2026-10-04-total-38pt5": {
+   "slug": "tsc-nfl-mia-min-2026-10-04-total-38pt5",
+   "sportsMarketType": "football_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 38.5,
+   "gameStartTime": "2026-10-04T20:05:00Z",
+   "question": "Will the total in MIA Dolphins vs. MIN Vikings be more than 38.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "tsc-nfl-mia-min-2026-10-04-total-41pt5": {
+   "slug": "tsc-nfl-mia-min-2026-10-04-total-41pt5",
+   "sportsMarketType": "football_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 41.5,
+   "gameStartTime": "2026-10-04T20:05:00Z",
+   "question": "Will the total in MIA Dolphins vs. MIN Vikings be more than 41.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "asc-nfl-pit-cle-2026-10-01-neg-4pt5": {
+   "slug": "asc-nfl-pit-cle-2026-10-01-neg-4pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -4.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the Pittsburgh Steelers cover -4.5 vs the Cleveland Browns in PIT Steelers vs. CLE Browns?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-4.50",
+     "team": {
+      "abbreviation": "pit",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+4.50",
+     "team": {
+      "abbreviation": "cle",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "tsc-nfl-pit-cle-2026-10-01-total-38pt5": {
+   "slug": "tsc-nfl-pit-cle-2026-10-01-total-38pt5",
+   "sportsMarketType": "football_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 38.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the total in PIT Steelers vs. CLE Browns be more than 38.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "tsc-mlb-phi-atl-2026-10-01-tt-phi-2pt5": {
+   "slug": "tsc-mlb-phi-atl-2026-10-01-tt-phi-2pt5",
+   "sportsMarketType": "baseball_team_total_runs",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_PROP",
+   "marketType": "props",
+   "line": 2.5,
+   "gameStartTime": "2026-10-02T00:00:00Z",
+   "question": "Will Philadelphia Phillies score more than 2.5 runs in Game 3: PHI Phillies vs. ATL Braves?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Yes"
+    },
+    {
+     "long": false,
+     "description": "No"
+    }
+   ]
+  },
+  "tsc-nfl-pit-cle-2026-10-01-tt-pit-17pt5": {
+   "slug": "tsc-nfl-pit-cle-2026-10-01-tt-pit-17pt5",
+   "sportsMarketType": "football_team_points_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 17.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the total in PIT Steelers vs. CLE Browns be more than 17.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "tsc-nfl-pit-cle-2026-10-01-tt1h-pit-9pt5": {
+   "slug": "tsc-nfl-pit-cle-2026-10-01-tt1h-pit-9pt5",
+   "sportsMarketType": "football_team_first_half_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 9.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the total in PIT Steelers vs. CLE Browns be more than 9.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "asc-nfl-pit-cle-2026-10-01-neg-3pt5": {
+   "slug": "asc-nfl-pit-cle-2026-10-01-neg-3pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -3.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the Pittsburgh Steelers cover -3.5 vs the Cleveland Browns in PIT Steelers vs. CLE Browns?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-3.50",
+     "team": {
+      "abbreviation": "pit",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+3.50",
+     "team": {
+      "abbreviation": "cle",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-pit-cle-2026-10-01-1q-neg-0pt5": {
+   "slug": "asc-nfl-pit-cle-2026-10-01-1q-neg-0pt5",
+   "sportsMarketType": "football_team_first_quarter_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -0.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the Pittsburgh Steelers cover -0.5 vs the Cleveland Browns in PIT Steelers vs. CLE Browns?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-0.50",
+     "team": {
+      "abbreviation": "pit",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+0.50",
+     "team": {
+      "abbreviation": "cle",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-pit-cle-2026-10-01-2q-neg-0pt5": {
+   "slug": "asc-nfl-pit-cle-2026-10-01-2q-neg-0pt5",
+   "sportsMarketType": "football_team_second_quarter_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -0.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the Pittsburgh Steelers cover -0.5 vs the Cleveland Browns in PIT Steelers vs. CLE Browns?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-0.50",
+     "team": {
+      "abbreviation": "pit",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+0.50",
+     "team": {
+      "abbreviation": "cle",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-pit-cle-2026-10-01-3q-neg-0pt5": {
+   "slug": "asc-nfl-pit-cle-2026-10-01-3q-neg-0pt5",
+   "sportsMarketType": "football_team_third_quarter_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -0.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the Pittsburgh Steelers cover -0.5 vs the Cleveland Browns in PIT Steelers vs. CLE Browns?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-0.50",
+     "team": {
+      "abbreviation": "pit",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+0.50",
+     "team": {
+      "abbreviation": "cle",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-pit-cle-2026-10-01-4q-neg-0pt5": {
+   "slug": "asc-nfl-pit-cle-2026-10-01-4q-neg-0pt5",
+   "sportsMarketType": "football_team_fourth_quarter_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -0.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the Pittsburgh Steelers cover -0.5 vs the Cleveland Browns in PIT Steelers vs. CLE Browns?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-0.50",
+     "team": {
+      "abbreviation": "pit",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+0.50",
+     "team": {
+      "abbreviation": "cle",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "tsc-nfl-pit-cle-2026-10-01-total-40pt5": {
+   "slug": "tsc-nfl-pit-cle-2026-10-01-total-40pt5",
+   "sportsMarketType": "football_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 40.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the total in PIT Steelers vs. CLE Browns be more than 40.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "tsc-nfl-pit-cle-2026-10-01-tt-pit-33pt5": {
+   "slug": "tsc-nfl-pit-cle-2026-10-01-tt-pit-33pt5",
+   "sportsMarketType": "football_team_points_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 33.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the total in PIT Steelers vs. CLE Browns be more than 33.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "asc-nfl-ari-nyg-2026-10-04-neg-9pt5": {
+   "slug": "asc-nfl-ari-nyg-2026-10-04-neg-9pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -9.5,
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Will the Arizona Cardinals cover -9.5 vs the New York Giants in ARI Cardinals vs. NY Giants?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-9.50",
+     "team": {
+      "abbreviation": "ari",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+9.50",
+     "team": {
+      "abbreviation": "nyg",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-gb-tb-2026-10-04-neg-13pt5": {
+   "slug": "asc-nfl-gb-tb-2026-10-04-neg-13pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -13.5,
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Will the Green Bay Packers cover -13.5 vs the Tampa Bay Buccaneers in GB Packers vs. TB Buccaneers?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-13.50",
+     "team": {
+      "abbreviation": "gb",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+13.50",
+     "team": {
+      "abbreviation": "tb",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-lar-phi-2026-10-04-neg-10pt5": {
+   "slug": "asc-nfl-lar-phi-2026-10-04-neg-10pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": -10.5,
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Will the Los Angeles Rams cover -10.5 vs the Philadelphia Eagles in LA Rams vs. PHI Eagles?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "-10.50",
+     "team": {
+      "abbreviation": "lar",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "+10.50",
+     "team": {
+      "abbreviation": "phi",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "asc-nfl-ne-buf-2026-10-04-pos-9pt5": {
+   "slug": "asc-nfl-ne-buf-2026-10-04-pos-9pt5",
+   "sportsMarketType": "football_team_full_game_spread",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "marketType": "spreads",
+   "line": 9.5,
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Will the New England Patriots cover 9.5 vs the Buffalo Bills in NE Patriots vs. BUF Bills?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "+9.50",
+     "team": {
+      "abbreviation": "ne",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "-9.50",
+     "team": {
+      "abbreviation": "buf",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "aec-nfl-ari-nyg-2026-10-04": {
+   "slug": "aec-nfl-ari-nyg-2026-10-04",
+   "sportsMarketType": "football_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-04T17:00:00Z",
+   "question": "Who will win in the upcoming football event Arizona Cardinals vs New York Giants scheduled for October 4, 2026 at 5:00 PM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Cardinals",
+     "team": {
+      "abbreviation": "ari",
+      "league": "nfl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Giants",
+     "team": {
+      "abbreviation": "nyg",
+      "league": "nfl"
+     }
+    }
+   ]
+  },
+  "tsc-nfl-pit-cle-2026-10-01-1h-14pt5": {
+   "slug": "tsc-nfl-pit-cle-2026-10-01-1h-14pt5",
+   "sportsMarketType": "football_game_first_half_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 14.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the total in PIT Steelers vs. CLE Browns be more than 14.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "tsc-nhl-fla-sj-2026-10-01-4pt5": {
+   "slug": "tsc-nhl-fla-sj-2026-10-01-4pt5",
+   "sportsMarketType": "hockey_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 4.5,
+   "gameStartTime": "2026-10-02T02:00:00Z",
+   "question": "Will the total in FLA vs SJ be more than 4.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "tsc-nfl-pit-cle-2026-10-01-total-42pt5": {
+   "slug": "tsc-nfl-pit-cle-2026-10-01-total-42pt5",
+   "sportsMarketType": "football_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 42.5,
+   "gameStartTime": "2026-10-02T00:15:00Z",
+   "question": "Will the total in PIT Steelers vs. CLE Browns be more than 42.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "aec-nhl-chi-uta-2026-10-01": {
+   "slug": "aec-nhl-chi-uta-2026-10-01",
+   "sportsMarketType": "hockey_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-02T01:30:00Z",
+   "question": "Who will win in the upcoming hockey event CHI Blackhawks vs UTA Mammoth scheduled for October 2, 2026 at 1:30 AM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Blackhawks",
+     "team": {
+      "abbreviation": "chi",
+      "league": "nhl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Mammoth",
+     "team": {
+      "abbreviation": "uta",
+      "league": "nhl"
+     }
+    }
+   ]
+  },
+  "tsc-mlb-nyy-tb-2026-10-03-6pt5": {
+   "slug": "tsc-mlb-nyy-tb-2026-10-03-6pt5",
+   "sportsMarketType": "baseball_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 6.5,
+   "gameStartTime": "2026-10-03T22:30:00Z",
+   "question": "Will the total in Game 1: NY Yankees vs. TB Rays be more than 6.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  },
+  "aec-nhl-min-nas-2026-10-01": {
+   "slug": "aec-nhl-min-nas-2026-10-01",
+   "sportsMarketType": "hockey_team_full_game_winner",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "marketType": "moneyline",
+   "gameStartTime": "2026-10-02T00:00:00Z",
+   "question": "Who will win in the upcoming hockey event MIN Wild vs NAS Predators scheduled for October 2, 2026 at 12:00 AM UTC?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Wild",
+     "team": {
+      "abbreviation": "min",
+      "league": "nhl"
+     }
+    },
+    {
+     "long": false,
+     "description": "Predators",
+     "team": {
+      "abbreviation": "nas",
+      "league": "nhl"
+     }
+    }
+   ]
+  },
+  "tsc-nhl-buf-cbj-2026-10-01-5pt5": {
+   "slug": "tsc-nhl-buf-cbj-2026-10-01-5pt5",
+   "sportsMarketType": "hockey_team_full_game_total",
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "marketType": "totals",
+   "line": 5.5,
+   "gameStartTime": "2026-10-01T23:00:00Z",
+   "question": "Will the total in BUF vs CBJ be more than 5.5?",
+   "marketSides": [
+    {
+     "long": true,
+     "description": "Over"
+    },
+    {
+     "long": false,
+     "description": "Under"
+    }
+   ]
+  }
+ }
+}

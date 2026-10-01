@@ -12,6 +12,23 @@
 // BUY = first team and SELL = second; those parse without HTTP. Skip when
 // the market type is not a full-game moneyline Combo Locks can price, or
 // more than one parlay matches. TEAM:no canonicalizes to opponent:yes.
+//
+// LINE LEGS (spread / total; NFL, MLB, NHL full game only). Both venues are
+// canonicalized to ONE exact space and compared by exact string equality:
+//   spread  canonical (first team alphabetically, line from ITS side, yes|no); the
+//           other team's cover is the complement => same team/line with side NO
+//           Kalshi KXNFLSPREAD-…-SEA7:yes  = SEA wins by over 6.5 = SEA -6.5
+//           Kalshi …-SEA7:no               = opponent +6.5
+//           Poly asc-nfl-lac-sea-…-pos-6pt5 BUY  = LAC +6.5 (long = FIRST slug team)
+//           Poly …-pos-6pt5 SELL = SEA -6.5 ; …-neg-6pt5 BUY = LAC -6.5, SELL = SEA +6.5
+//   total   selection=over|under line=<exact> side=yes
+//           Kalshi KXNFLTOTAL-…-43:yes = Over 42.5, :no = Under 42.5 (ticker N => N-0.5)
+//           Poly tsc-nfl-…-total-42pt5 (NHL/MLB: …-6pt5) BUY = Over, SELL = Under
+// Half-point lines only (no pushes, so :no is exactly the opponent cover / Under).
+// The line is part of the key: 42.5 never equals 43.5 (NO snapping). The Poly side
+// is only trusted after the market metadata (GET /v1/market/slug) confirms the
+// sportsMarketType, signed line, long/short team (or Over/Under) and ET game date;
+// anything that disagrees or is missing => no identity => never quoted.
 'use strict';
 const { parseKalshiTickerStart, parseTs } = require('./started');
 
@@ -120,7 +137,7 @@ function parseKalshiDateRest(rest) {
     if (hour <= 23 && minute <= 59) {
       const startMs = parseKalshiTickerStart(timed[1] + timed[2] + timed[3] + timed[4]);
       const date = etDateFromMs(startMs);
-      if (date) return { date, teamsBlob: timed[5] || '' };
+      if (date) return { date, teamsBlob: timed[5] || '', startMs };
     }
   }
   const dated = DT_DATE_RE.exec(String(rest || ''));
@@ -181,7 +198,7 @@ function identityKey(id) {
   if (!Array.isArray(id.teams) || id.teams.length < 2) return null;
   const teams = id.teams.map((t) => normTeam(id.league, t)).filter(Boolean).sort();
   if (teams.length < 2) return null;
-  return [
+  const parts = [
     id.league,
     id.date,
     teams.join('+'),
@@ -189,7 +206,12 @@ function identityKey(id) {
     id.period || 'full',
     normTeam(id.league, id.selection),
     id.side,
-  ].join('|');
+  ];
+  // Spread / total legs carry the EXACT line in the key (signed from the
+  // selection's side for spreads, e.g. sea|-6.5 ; over|42.5 for totals). ML keys
+  // keep their historical 7-part shape.
+  if (id.line != null) parts.push(`L${id.line}`);
+  return parts.join('|');
 }
 
 function makeIdentity(partial) {
@@ -202,6 +224,10 @@ function makeIdentity(partial) {
     selection: normTeam(partial.league, partial.selection),
     side: partial.side,
   };
+  if (partial.line != null) id.line = partial.line;
+  // First-pitch / kickoff ms (Kalshi ticker HHMM, or Poly gameStartTime). NOT part
+  // of the key; used only by startTimesAgree() to reject doubleheader mix-ups.
+  if (partial.startMs != null && Number.isFinite(partial.startMs)) id.startMs = partial.startMs;
   if (id.teams.length >= 2) {
     const uniq = [...new Set(id.teams)].sort();
     id.teams = uniq;
@@ -211,6 +237,7 @@ function makeIdentity(partial) {
   // (long=tb / first slug team, side=no).
   if (
     id.marketType === 'moneyline'
+    && id.line == null
     && id.side === 'no'
     && id.teams.length === 2
     && id.selection
@@ -219,6 +246,18 @@ function makeIdentity(partial) {
     if (other) {
       id.selection = other;
       id.side = 'yes';
+    }
+  }
+  // Spread canonical form: (alphabetically-first team F, line from F's side, yes|no).
+  // "S covers l" for the OTHER team S is the exact COMPLEMENT of "F covers -l" on a
+  // half-point line (no push), so it becomes (F, -l, NO). It is NEVER the same key as
+  // "F covers l" — that would turn a -6.5 favourite into the +6.5 dog (wrong side).
+  if (id.marketType === 'spread' && id.teams.length === 2 && id.selection && id.line != null) {
+    const first = id.teams[0];
+    if (id.selection !== first && id.teams.includes(id.selection)) {
+      id.selection = first;
+      id.line = -id.line;
+      id.side = id.side === 'yes' ? 'no' : 'yes';
     }
   }
   return identityKey(id) ? id : null;
@@ -293,6 +332,222 @@ function parseKalshiTicker(text, sideOverride) {
   });
 }
 
+// ── Line legs (spread / total) ─────────────────────────────────────────────
+const LINE_SERIES = {
+  KXNFLSPREAD: { league: 'nfl', kind: 'spread', teamLen: null },
+  KXNFLTOTAL: { league: 'nfl', kind: 'total', teamLen: null },
+  KXMLBSPREAD: { league: 'mlb', kind: 'spread', teamLen: 3 },
+  KXMLBTOTAL: { league: 'mlb', kind: 'total', teamLen: 3 },
+  KXNHLSPREAD: { league: 'nhl', kind: 'spread', teamLen: null },
+  KXNHLTOTAL: { league: 'nhl', kind: 'total', teamLen: null },
+};
+
+// Poly full-game market types we map (football = NFL only here: college codes
+// differ between Kalshi and Poly and are NOT mapped).
+const POLY_LINE_SPORT = {
+  football_team_full_game_spread: { league: 'nfl', kind: 'spread' },
+  football_team_full_game_total: { league: 'nfl', kind: 'total' },
+  baseball_team_full_game_spread: { league: 'mlb', kind: 'spread' },
+  baseball_team_full_game_total: { league: 'mlb', kind: 'total' },
+  hockey_team_full_game_spread: { league: 'nhl', kind: 'spread' },
+  hockey_team_full_game_total: { league: 'nhl', kind: 'total' },
+};
+
+const POLY_LINE_SLUG_RE =
+  /^(asc|tsc)-(nfl|mlb|nhl)-([a-z0-9]+)-([a-z0-9]+)-(\d{4})-(\d{2})-(\d{2})-(?:(neg|pos)-|(?:total-)?)(\d{1,3})pt(\d)$/;
+
+function isPolyLineSlug(symbol) {
+  return /^(asc|tsc)-/.test(String(symbol || '').trim().toLowerCase());
+}
+
+function isHalfPoint(n) {
+  return Number.isFinite(n) && Math.abs(Math.abs(n) % 1 - 0.5) < 1e-9;
+}
+
+function parseLabelLine(label) {
+  const m = String(label || '').match(/([+\-\u2212])?\s*(\d+(?:\.\d+)?)\s*$/);
+  if (!m) return null;
+  const mag = parseFloat(m[2]);
+  if (!Number.isFinite(mag)) return null;
+  const sign = m[1] === '-' || m[1] === '\u2212' ? '-' : (m[1] === '+' ? '+' : '');
+  return { sign, mag };
+}
+
+// Kalshi spread / total ticker → canonical line identity (null if not exact).
+// `label` (optional Combo Locks leg label such as "Seattle −6.5" / "Under 42.5")
+// is a cross-check: any disagreement on side or line => null (never guess).
+function parseKalshiLineTicker(text, sideOverride, label, opts) {
+  const needLabel = !!(opts && opts.requireLabel);
+  if (needLabel && (label == null || label === '')) return null;
+  if (text == null || text === '') return null;
+  let raw = String(text).trim();
+  let side = sideOverride ? String(sideOverride).toLowerCase() : '';
+  const sideAt = raw.lastIndexOf(':');
+  if (sideAt > 0) {
+    const maybe = raw.slice(sideAt + 1).toLowerCase();
+    if (maybe === 'yes' || maybe === 'no') {
+      if (!side) side = maybe;
+      raw = raw.slice(0, sideAt);
+    }
+  }
+  if (!side) side = 'yes';
+  if (side !== 'yes' && side !== 'no') return null;
+  const dash = raw.indexOf('-');
+  if (dash <= 0) return null;
+  const spec = LINE_SERIES[raw.slice(0, dash).toUpperCase()];
+  if (!spec) return null;
+  const parsed = parseKalshiDateRest(raw.slice(dash + 1));
+  if (!parsed) return null;
+  const selDash = parsed.teamsBlob.lastIndexOf('-');
+  if (selDash <= 0) return null;
+  const blob = parsed.teamsBlob.slice(0, selDash);
+  const suffix = parsed.teamsBlob.slice(selDash + 1);
+  const pair = splitTeams(blob, spec.league, spec.teamLen);
+  if (!pair) return null;
+  const teams = [String(pair[0]).toLowerCase(), String(pair[1]).toLowerCase()];
+
+  let selection;
+  let line;
+  let marketType;
+  if (spec.kind === 'spread') {
+    const m = /^([A-Za-z]+)(\d{1,3})$/.exec(suffix);
+    if (!m) return null;
+    const code = normTeam(spec.league, m[1].toLowerCase());
+    const normTeams = teams.map((t) => normTeam(spec.league, t));
+    if (!normTeams.includes(code)) return null;
+    const mag = parseInt(m[2], 10) - 0.5;
+    if (!isHalfPoint(mag) || mag <= 0) return null;
+    // yes: <code> wins by over <mag> => <code> -mag. no: opponent +mag.
+    // no: opponent +mag (exact complement, half-point line => no push).
+    if (side === 'yes') { selection = code; line = -mag; } else {
+      selection = normTeams.find((t) => t !== code);
+      line = mag;
+    }
+    marketType = 'spread';
+    if (label != null && label !== '') {
+      const l = parseLabelLine(label);
+      if (!l || l.mag !== mag || l.sign !== (line < 0 ? '-' : '+')) return null;
+    }
+  } else {
+    if (!/^\d{1,3}$/.test(suffix)) return null;
+    const mag = parseInt(suffix, 10) - 0.5;
+    if (!isHalfPoint(mag) || mag <= 0) return null;
+    selection = side === 'yes' ? 'over' : 'under';
+    line = mag;
+    marketType = 'total';
+    if (label != null && label !== '') {
+      const l = parseLabelLine(label);
+      const hasOver = /\bover\b/i.test(label);
+      const hasUnder = /\bunder\b/i.test(label);
+      const word = hasOver && !hasUnder ? 'over' : (hasUnder && !hasOver ? 'under' : null);
+      // The label must say Over or Under explicitly, and agree with :yes/:no.
+      if (!l || l.mag !== mag || word !== selection) return null;
+    }
+  }
+  return makeIdentity({
+    league: spec.league,
+    date: parsed.date,
+    teams,
+    marketType,
+    period: 'full',
+    selection,
+    side: 'yes',
+    line,
+    startMs: parsed.startMs,
+  });
+}
+
+// Poly asc-/tsc- slug (+ optional verified market metadata) → canonical identity.
+// Without `market` the identity is slug-derived and marked unverified: usable
+// only as a cheap candidate prefilter, never to quote. With `market`, every
+// field is cross-checked against the metadata; any disagreement => no identity.
+function identityFromPolymarketLine(symbol, rfqSide, market) {
+  const s = String(symbol || '').trim().toLowerCase();
+  const m = POLY_LINE_SLUG_RE.exec(s);
+  if (!m) return { identity: null, reason: 'not_priceable' };
+  const yesNo = polymarketYesNo(rfqSide);
+  if (!yesNo) return { identity: null, reason: 'unmatched_leg' };
+  const kind = m[1] === 'asc' ? 'spread' : 'total';
+  const league = m[2];
+  const t1 = m[3];
+  const t2 = m[4];
+  const date = `${m[5]}-${m[6]}-${m[7]}`;
+  if (kind === 'spread' && !m[8]) return { identity: null, reason: 'not_priceable' };
+  if (kind === 'total' && m[8]) return { identity: null, reason: 'not_priceable' };
+  const mag = parseFloat(`${m[9]}.${m[10]}`);
+  if (!isHalfPoint(mag) || mag <= 0) return { identity: null, reason: 'not_priceable' };
+  const signed = kind === 'spread' ? (m[8] === 'neg' ? -mag : mag) : mag;
+
+  let verified = false;
+  if (market != null) {
+    const mk = unwrapMarket(market);
+    if (!mk || typeof mk !== 'object') return { identity: null, reason: 'missing_metadata' };
+    const spec = POLY_LINE_SPORT[String(mk.sportsMarketType || mk.sports_market_type || '')];
+    if (!spec || spec.kind !== kind || spec.league !== league) {
+      return { identity: null, reason: 'not_priceable' };
+    }
+    if (mk.slug && String(mk.slug).toLowerCase() !== s) return { identity: null, reason: 'meta_mismatch' };
+    if (Number(mk.line) !== signed) return { identity: null, reason: 'meta_mismatch' };
+    const metaDate = etDateFromValue(mk.gameStartTime || mk.game_start_time);
+    if (!metaDate || metaDate !== date) return { identity: null, reason: 'meta_mismatch' };
+    const sides = mk.marketSides || mk.market_sides;
+    if (!Array.isArray(sides) || sides.length !== 2) return { identity: null, reason: 'meta_mismatch' };
+    const longs = sides.filter((x) => x && x.long === true);
+    const shorts = sides.filter((x) => x && x.long === false);
+    if (longs.length !== 1 || shorts.length !== 1) return { identity: null, reason: 'meta_mismatch' };
+    if (kind === 'spread') {
+      const abbr = (x) => {
+        const t = (x && x.team) || {};
+        return normTeam(league, String(t.abbreviation || t.displayAbbreviation || '').toLowerCase());
+      };
+      if (abbr(longs[0]) !== normTeam(league, t1) || abbr(shorts[0]) !== normTeam(league, t2)) {
+        return { identity: null, reason: 'meta_mismatch' };
+      }
+      if (String((longs[0].team || {}).league || '').toLowerCase() !== league) {
+        return { identity: null, reason: 'meta_mismatch' };
+      }
+      // The long side's printed handicap must equal the signed slug/line.
+      const ld = String(longs[0].description || '').trim();
+      if (ld !== '' && Number(ld) !== signed) return { identity: null, reason: 'meta_mismatch' };
+    } else {
+      const d = (x) => String((x && x.description) || '').trim().toLowerCase();
+      if (d(longs[0]) !== 'over' || d(shorts[0]) !== 'under') {
+        return { identity: null, reason: 'meta_mismatch' };
+      }
+    }
+    verified = true;
+  }
+
+  let selection;
+  let line;
+  if (kind === 'spread') {
+    // long (BUY) = first slug team at the signed line; short (SELL) = opponent, -line.
+    if (yesNo === 'yes') { selection = t1; line = signed; } else { selection = t2; line = -signed; }
+  } else {
+    selection = yesNo === 'yes' ? 'over' : 'under';
+    line = signed;
+  }
+  let startMs = null;
+  if (verified) {
+    const mk = unwrapMarket(market);
+    const t = Date.parse(mk.gameStartTime || mk.game_start_time || '');
+    if (Number.isFinite(t)) startMs = t;
+  }
+  const id = makeIdentity({
+    league,
+    date,
+    teams: [t1, t2],
+    marketType: kind,
+    period: 'full',
+    selection,
+    side: 'yes',
+    line,
+    startMs,
+  });
+  if (!id) return { identity: null, reason: 'missing_metadata' };
+  return { identity: id, reason: null, verified };
+}
+
 function identityFromLockFields(leg, sideFallback) {
   if (!leg || typeof leg !== 'object') {
     return typeof leg === 'string' ? parseKalshiTicker(leg, sideFallback) : null;
@@ -324,12 +579,39 @@ function identityFromLockFields(leg, sideFallback) {
   );
 }
 
-function identitiesFromParlay(parlay) {
+function lockLegLabel(parlay, key) {
+  const legs = parlay && Array.isArray(parlay.legs) ? parlay.legs : null;
+  if (!legs) return null;
+  const base = String(key || '').replace(/:(yes|no)$/i, '').toUpperCase();
+  const sideAt = String(key || '').lastIndexOf(':');
+  const keySide = sideAt > 0 ? String(key).slice(sideAt + 1).toLowerCase() : '';
+  const same = legs.filter((l) => l && typeof l === 'object'
+    && String(l.ticker || l.market_ticker || '').toUpperCase() === base);
+  if (!same.length) return null;
+  // The stored leg side must agree with the key side (when both are present).
+  const hit = same.find((l) => !l.side || !keySide || String(l.side).toLowerCase() === keySide);
+  if (!hit) return { conflict: true };
+  return { label: hit.label || null };
+}
+
+// opts.lines (Poly only): also read KX{NFL,MLB,NHL}{SPREAD,TOTAL} legs as exact
+// line identities. Default off so the Kalshi matcher (rfq.js) is unchanged.
+function identitiesFromParlay(parlay, opts) {
   const out = [];
+  const lines = !!(opts && opts.lines);
   const keys = parlay && (parlay.leg_keys || parlay.legKeys);
   if (Array.isArray(keys) && keys.length) {
     for (const k of keys) {
-      const id = parseKalshiTicker(k) || identityFromLockFields(k);
+      let id = parseKalshiTicker(k);
+      if (!id && lines) {
+        const info = lockLegLabel(parlay, k);
+        if (info && info.conflict) return { ok: false, identities: [], keys: [] };
+        // Lock legs MUST carry their human label ("Seattle −6.5" / "Under 42.5"):
+        // it is the independent proof that ticker N really means N-0.5 and which
+        // side :yes/:no is. No label => the leg is not mapped.
+        id = parseKalshiLineTicker(k, null, info && info.label, { requireLabel: true });
+      }
+      id = id || identityFromLockFields(k);
       if (!id) return { ok: false, identities: [], keys: [] };
       out.push(id);
     }
@@ -339,7 +621,10 @@ function identitiesFromParlay(parlay) {
   }
   if (parlay && Array.isArray(parlay.legs) && parlay.legs.length) {
     for (const leg of parlay.legs) {
-      const id = identityFromLockFields(leg);
+      let id = identityFromLockFields(leg);
+      if (!id && lines && leg && typeof leg === 'object') {
+        id = parseKalshiLineTicker(leg.ticker || leg.market_ticker, leg.side, leg.label, { requireLabel: true });
+      }
       if (!id) return { ok: false, identities: [], keys: [] };
       out.push(id);
     }
@@ -553,7 +838,10 @@ function identitiesFromPolymarketSlugs(legs) {
     const symbol = (leg && (leg.symbol || leg.slug || leg.market_slug)) || (typeof leg === 'string' ? leg : '');
     const yesNo = polymarketYesNo(leg && typeof leg === 'object' ? (leg.side || 'SIDE_BUY') : 'yes');
     if (!yesNo) return { ok: false, reason: 'unmatched_leg', identities: out, keys: [] };
-    const id = identityFromPolymarketSlug(symbol, yesNo);
+    // Unverified line identity: candidate prefilter only (never used to quote).
+    const id = isPolyLineSlug(symbol)
+      ? identityFromPolymarketLine(symbol, yesNo, null).identity
+      : identityFromPolymarketSlug(symbol, yesNo);
     if (!id) return { ok: false, reason: 'unmatched_leg', identities: out, keys: [] };
     out.push(id);
   }
@@ -574,6 +862,16 @@ function identitiesFromPolymarketLegs(legs, markets) {
 
     const market = (leg && (leg.market || (leg.metadata && { metadata: leg.metadata })))
       || (markets && ((markets.get && markets.get(symbol)) || markets[symbol]));
+    if (isPolyLineSlug(symbol)) {
+      // Spread / total: ONLY with verified market metadata. No slug fallback.
+      if (!market) return { ok: false, reason: 'missing_metadata', identities: out, keys: [] };
+      const line = identityFromPolymarketLine(symbol, yesNo, market);
+      if (!line.identity || !line.verified) {
+        return { ok: false, reason: line.reason || 'missing_metadata', identities: out, keys: [] };
+      }
+      out.push(line.identity);
+      continue;
+    }
     const got = identityFromMarket(market, yesNo);
     if (!got.identity) {
       if (got.reason === 'not_priceable') {
@@ -600,8 +898,38 @@ function sameIdentitySet(a, b) {
   return A.every((x, i) => x === B[i]);
 }
 
+// Same date + same teams can still be two games (MLB doubleheaders / playoff
+// series). Kalshi MLB tickers carry first pitch (HHMM, ET); Poly carries
+// gameStartTime. For every line leg: if both clocks are known they must agree
+// within slack, and an MLB line leg whose lock side has no clock is rejected.
+function startTimesAgree(lockIds, polyIds, slackMs = 45 * 60 * 1000) {
+  const by = new Map();
+  for (const id of polyIds || []) {
+    const k = identityKey(id);
+    if (k) by.set(k, id);
+  }
+  for (const id of lockIds || []) {
+    if (id.line == null) continue;
+    const k = identityKey(id);
+    const p = k && by.get(k);
+    if (!p) return false;
+    if (id.startMs == null || p.startMs == null) {
+      if (id.league === 'mlb') return false;
+      continue;
+    }
+    if (Math.abs(p.startMs - id.startMs) > slackMs) return false;
+  }
+  return true;
+}
+
 module.exports = {
   SERIES,
+  startTimesAgree,
+  LINE_SERIES,
+  POLY_LINE_SPORT,
+  parseKalshiLineTicker,
+  identityFromPolymarketLine,
+  isPolyLineSlug,
   PRICEABLE_SPORT_TYPES,
   TEAM_ALIASES,
   normTeam,

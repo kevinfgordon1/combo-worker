@@ -172,6 +172,9 @@ function formatPolyHeartbeat(snap) {
     `crawl_truncated=${s.crawl_truncated} open_max=${s.open_max} ` +
     `candidates=${s.candidates} matched=${s.matched} quoted=${s.quoted} ` +
     `would_quote=${s.would_quote} declined=${s.declined}` +
+    (s.locks != null
+      ? ` locks=${s.locks} priceable=${s.priceable_locks} priceable_line=${s.priceable_line_locks || 0}`
+      : '') +
     (reasons ? ` reasons=${reasons}` : '')
   );
 }
