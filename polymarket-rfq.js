@@ -682,7 +682,13 @@ function evaluatePolymarketRfq({
     maxContracts: parlay.max_contracts,
     filledSoFar,
     outstanding,
-    allowPartial: true,
+    // NEVER clip on Polymarket US. CreateQuote has no size field: the venue
+    // sizes the quote from the RFQ (qtyDecimal, or cash / price) and the
+    // requester's accept fills that FULL size. Production data (198 clipped
+    // quotes, 5 executed) shows the venue recorded the full RFQ size every time,
+    // so a "clipped" quote was really a full-size quote. Oversized RFQs
+    // (size > min(remaining, per-fill cap)) are declined as rfq_too_large.
+    allowPartial: false,
     isFreeBet: isFreeBetRow(parlay),
   });
   if (!decision.ok) {
@@ -746,24 +752,19 @@ function formatQtyDecimal(n) {
   return String(Math.round(x * 1e8) / 1e8);
 }
 
+// Documented CreateQuote body only: rfqId, buyPrice, sellPrice, restRemainder
+// (+ postOnly/account where used). Never send a size: the venue ignores it and
+// sizes from the RFQ, so sending one only hid the real quote size from us.
 function quoteBodyFromEval(evaluation) {
   const q = evaluation && evaluation.quote;
   const rfq = evaluation && evaluation.rfq;
   if (!q || !rfq) return null;
-  const body = {
+  return {
     rfqId: rfq.rfqId,
     buyPrice: q.buyPrice,
     sellPrice: q.sellPrice,
     restRemainder: false,
   };
-  const d = evaluation.decision;
-  const want = q.estimatedContracts;
-  const n = d && d.contracts;
-  if (d && d.ok && n > 0 && want > n) {
-    const qty = formatQtyDecimal(n);
-    if (qty) body.qtyDecimal = qty;
-  }
-  return body;
 }
 
 function pendingEntry(p, rfq, contracts, extra) {
@@ -783,6 +784,19 @@ function pendingEntry(p, rfq, contracts, extra) {
     postedAt: extra && extra.postedAt != null ? extra.postedAt : Date.now(),
     ...extra,
   };
+}
+
+function positiveNum(n) {
+  const x = parseFloat(n);
+  return Number.isFinite(x) && x > 0 ? x : 0;
+}
+
+// Quantity the venue recorded for the side the requester accepted.
+function acceptedVenueQty(evt, acceptedSide) {
+  const q = (evt && evt.quote) || {};
+  const side = String(acceptedSide || '').toLowerCase().replace(/^side_/, '');
+  const raw = side === 'sell' ? (q.sellQtyDecimal ?? q.sell_qty_decimal) : (q.buyQtyDecimal ?? q.buy_qty_decimal);
+  return positiveNum(raw);
 }
 
 function acceptedFromEvent(evt) {
@@ -1737,6 +1751,16 @@ function startPolymarketRfqLoop(ctx = {}) {
     confirmingQuotes.add(quoteId);
     try {
       const want = maxPolymarketFillSize(pending, evt);
+      // Venue-recorded size (selected side) vs what we booked at quote time. The
+      // cap check below already uses the larger, so a bigger venue size can only
+      // make us decline; log it so a mismatch is visible before it is a fill.
+      const venueQty = acceptedVenueQty(evt, acceptedSide);
+      if (venueQty > 0 && positiveNum(pending.contracts) > 0 && venueQty > positiveNum(pending.contracts) + 1) {
+        console.warn(
+          `[${MODE}] SIZE MISMATCH quote_id=${quoteId} label=${pending.label || '(unknown)'} ` +
+          `ours=${pending.contracts} venue=${venueQty} want=${want}`
+        );
+      }
       const decision = await confirmAgainstCap(capBook, {
         parlayId: pending.parlayId,
         quoteId,
@@ -2401,6 +2425,7 @@ module.exports = {
   parlayFromPending,
   quoteBodyFromEval,
   formatQtyDecimal,
+  acceptedVenueQty,
   acceptedFromEvent,
   parsePositiveShares,
   orderIdFromExecution,
