@@ -416,7 +416,7 @@ function isKalshiMoneylineLock(parlay) {
   return kalshiMlTickersFromParlay(parlay).some((text) => {
     const raw = String(text).trim();
     const series = raw.split('-')[0].split(':')[0].toUpperCase();
-    return Boolean(SERIES[series] || LINE_SERIES[series]);
+    return Boolean(SERIES[series] || LINE_SERIES[series] || series === 'KXNCAAFGAME');
   });
 }
 
@@ -508,7 +508,8 @@ function explainLockOverlapMiss(rfq, parlays) {
 }
 
 // Why a lock cannot be mapped to Poly legs (log `why=`): player_prop (not
-// mapped; see notes), ncaaf_not_mapped (Kalshi/Poly college team codes differ),
+// mapped; see notes), ncaaf_not_mapped (a college team/game is not in the verified
+// Kalshi<->Poly crosswalk, or its label/line could not be proven),
 // line_leg_unparsed (NFL/MLB/NHL line leg whose ticker/label could not be proven exact).
 function unpriceableReason(parlay) {
   const tickers = kalshiMlTickersFromParlay(parlay).map((t) => String(t).split('-')[0].split(':')[0].toUpperCase());
@@ -526,7 +527,7 @@ function logUnpriceablePolyLocks(parlays, log = console.log) {
     if (lock.ok) continue;
     const tickers = kalshiMlTickersFromParlay(p);
     const series = tickers.map((t) => String(t).split('-')[0].split(':')[0].toUpperCase());
-    if (!series.some((s) => /SPREAD|TOTAL|PROP/.test(s))) continue;
+    if (!series.some((s) => /SPREAD|TOTAL|PROP/.test(s) || s === 'KXNCAAFGAME')) continue;
     failing.push(p);
   }
   const n = failing.length;
@@ -667,11 +668,12 @@ function matchPolymarketParlayDetailed(rfq, parlays, opts = {}) {
   return { parlay: null, reason: startMismatch ? 'start_mismatch' : 'unmatched', identityKeys: pm.keys };
 }
 
-// Earliest Poly-reported kickoff / first pitch among VERIFIED line legs (ms).
+// Earliest Poly-reported kickoff / first pitch among VERIFIED line legs and verified
+// NCAAF moneyline legs (ms). Other ML identities carry no Poly clock.
 function earliestPolyStart(identities) {
   let at = null;
   for (const id of identities || []) {
-    if (id && id.line != null && id.startMs != null && (at == null || id.startMs < at)) at = id.startMs;
+    if (id && (id.line != null || id.league === 'ncaaf') && id.startMs != null && (at == null || id.startMs < at)) at = id.startMs;
   }
   return at;
 }

@@ -247,7 +247,7 @@ const mk = (id) => ({ id, status: 'RFQ_STATUS_OPEN', qtyDecimal: '10', comboLegs
   {
     const mkLock = (id, label) => ({
       id, label,
-      leg_keys: ['KXNCAAFSPREAD-26OCT04JAXSEA-SEA7:no'],
+      leg_keys: ['KXNCAAFSPREAD-26OCT04ZZZYYY-ZZZ7:no'], // team not in the verified crosswalk
     });
     const a = mkLock('a', 'Jaguars/Seahawks spread');
     const b = mkLock('b', 'Texans spread');
