@@ -11,6 +11,9 @@ const {
   usdCashFromBalances,
   isOpenPosition,
   createKalshiBucketClient,
+  parseTransfers,
+  transferStatusClass,
+  TRANSFERS_PATH,
   readPolyCashFromHttp,
   polyReaderFromEnv,
   createBucketManager,
@@ -228,6 +231,15 @@ function fakeBook(initial) {
     flatError: initial.flatError || null,
     transferError: initial.transferError || null,
     applyTransfer: initial.applyTransfer !== false,
+    // Kalshi transfer record status for each POST: 'complete' (default when the
+    // balance moves), 'processing', 'failed', or null for no record at all.
+    recordStatus: initial.recordStatus !== undefined
+      ? initial.recordStatus
+      : (initial.applyTransfer !== false ? 'complete' : null),
+    recordsError: initial.recordsError || null,
+    // Combo spend landing on shard 1 while the transfer settles.
+    spendOnTransferCents: initial.spendOnTransferCents || 0,
+    records: [],
   };
   const transfers = [];
   const calls = { getShard: 0, transfer: 0, shardActivity: 0 };
@@ -264,7 +276,23 @@ function fakeBook(initial) {
           state.main.availableCents += centsMoved;
         }
       }
-      return { transferId: `tr_${transfers.length}` };
+      const transferId = `tr_${transfers.length}`;
+      if (state.spendOnTransferCents) state.bucket.availableCents -= state.spendOnTransferCents;
+      if (state.recordStatus) {
+        state.records.unshift({
+          transferId,
+          status: state.recordStatus,
+          amountCents: body.amountCenticents / 100,
+          fromShard: body.fromShard,
+          toShard: body.toShard,
+        });
+      }
+      return { transferId };
+    },
+    async getTransfers() {
+      calls.getTransfers = (calls.getTransfers || 0) + 1;
+      if (state.recordsError) throw new Error(state.recordsError);
+      return state.records.map((r) => ({ ...r }));
     },
     async shardActivity() {
       calls.shardActivity += 1;
@@ -292,6 +320,7 @@ function harness(env, book, when) {
     now: () => current,
     alert(text) { alerts.push(text); },
     log(line) { logs.push(String(line)); },
+    sleep: async () => {},
     client: book.client,
     readPolyCash: env.readPolyCash === undefined ? null : env.readPolyCash,
   });
@@ -678,6 +707,7 @@ async function main() {
       now: () => WED,
       alert(text) { alerts.push(text); },
       log() {},
+      sleep: async () => {},
       client,
       readPolyCash: null,
     });
@@ -741,7 +771,7 @@ async function main() {
     let current = when || WED;
     const alerts = [];
     const mgr = createBucketManager({
-      env, now: () => current, alert(t) { alerts.push(t); }, log() {},
+      env, now: () => current, alert(t) { alerts.push(t); }, log() {}, sleep: async () => {},
       client: book.client, readPolyCash: null, appAlerts,
     });
     return { mgr, alerts, setNow(d) { current = d; }, now() { return current; } };
@@ -868,6 +898,229 @@ async function main() {
     const h = harnessApp(LIVE, book, WED, bad);
     const out = await h.mgr.check('interval');
     assert.strictEqual(out.confirmed, true);
+  }
+
+  // --- transfer confirmation (record first, shard 0 fallback, hold while pending) ---
+
+  assert.strictEqual(TRANSFERS_PATH, '/trade-api/v2/portfolio/intra_exchange_instance_transfers');
+  assert.strictEqual(transferStatusClass('complete'), 'complete');
+  assert.strictEqual(transferStatusClass('COMPLETED'), 'complete');
+  assert.strictEqual(transferStatusClass('failed'), 'failed');
+  assert.strictEqual(transferStatusClass('pending'), 'processing');
+  assert.strictEqual(transferStatusClass(undefined), 'processing');
+  assert.deepStrictEqual(parseTransfers({
+    transfers: [{
+      amount: '667.5700', created_ts: 1, destination: 'event_contract', destination_exchange_shard: 1,
+      source: 'event_contract', source_exchange_shard: 0, status: 'complete',
+      transfer_id: '7bb3493e-1fbf-4233-b37b-95c2e24085a3',
+    }, { amount: 'x' }],
+  }), [{
+    transferId: '7bb3493e-1fbf-4233-b37b-95c2e24085a3', status: 'complete',
+    amountCents: 66757, fromShard: 0, toShard: 1,
+  }]);
+  assert.deepStrictEqual(parseTransfers(null), []);
+
+  // Oct 1 incident: the balance re-read lags (and combo spend lands on shard 1),
+  // but Kalshi's record says complete. Confirmed, no unconfirmed alert, no Telegram error.
+  {
+    const book = fakeBook({
+      main: cents(20_000), bucket: cents(2_000), applyTransfer: false, recordStatus: 'complete',
+    });
+    const app = fakeAppAlerts();
+    const slept = [];
+    let current = WED;
+    const alerts = [];
+    const mgr = createBucketManager({
+      env: LIVE, now: () => current, alert(t) { alerts.push(t); }, log() {},
+      sleep: async (ms) => { slept.push(ms); }, client: book.client, readPolyCash: null, appAlerts: app,
+    });
+    const out = await mgr.check('interval');
+    assert.strictEqual(out.confirmed, true);
+    assert.strictEqual(out.via, 'record');
+    assert.deepStrictEqual(slept, [2_000], 'first confirm is deferred, not the immediate re-read');
+    assert.ok(!alerts.some((t) => /not confirmed/.test(t)));
+    assert.ok(!app.rows.some((r) => r.kind === 'bucket_transfer_unconfirmed'));
+    assert.strictEqual(app.rows.filter((r) => r.kind === 'bucket_transfer')[0].meta.state, 'confirmed');
+    const next = await mgr.check('interval');
+    assert.notStrictEqual(next.held, true, 'nothing pending after a confirmed transfer');
+    void current;
+  }
+
+  // Shard 1 spend during the settle window must not read as a failed transfer.
+  {
+    const book = fakeBook({
+      main: cents(20_000), bucket: cents(2_000), spendOnTransferCents: cents(3_000),
+    });
+    const app = fakeAppAlerts();
+    const h = harnessApp(LIVE, book, WED, app);
+    const out = await h.mgr.check('interval');
+    assert.strictEqual(out.confirmed, true, 'record complete beats spend-masked balance');
+    assert.strictEqual(book.state.bucket.availableCents, cents(2_000), 'spend ate the top-up');
+    assert.ok(!app.rows.some((r) => r.kind === 'bucket_transfer_unconfirmed'));
+    assert.ok(!h.alerts.some((t) => /not confirmed/.test(t)));
+  }
+
+  // Record API down: shard 0 drop confirms even when shard 1 spend hides the landing.
+  {
+    const book = fakeBook({
+      main: cents(20_000), bucket: cents(2_000), spendOnTransferCents: cents(3_000),
+      recordStatus: null, recordsError: 'Kalshi GET transfers 500',
+    });
+    const app = fakeAppAlerts();
+    const h = harnessApp(LIVE, book, WED, app);
+    const out = await h.mgr.check('interval');
+    assert.strictEqual(out.confirmed, true);
+    assert.strictEqual(out.via, 'shard0');
+    assert.strictEqual(book.state.main.availableCents, cents(17_000));
+    assert.ok(!app.rows.some((r) => r.kind === 'bucket_transfer_unconfirmed'));
+  }
+
+  // Record says failed: failed alert, pending cleared, cooldown, no resend inside it.
+  {
+    const book = fakeBook({
+      main: cents(20_000), bucket: cents(2_000), applyTransfer: false, recordStatus: 'failed',
+    });
+    const app = fakeAppAlerts();
+    const h = harnessApp(LIVE, book, WED, app);
+    const out = await h.mgr.check('interval');
+    assert.strictEqual(out.failed, true);
+    assert.ok(h.alerts.some((t) => /transfer failed/.test(t)));
+    const rows = app.rows.filter((r) => r.kind === 'bucket_transfer_failed');
+    assert.strictEqual(rows.length, 1);
+    assert.strictEqual(rows[0].severity, 'error');
+    const again = await h.mgr.check('interval');
+    assert.strictEqual(again.cooledDown, true);
+    assert.strictEqual(book.transfers.length, 1);
+    h.setNow(new Date(h.now().getTime() + 6 * 60 * 1000));
+    const later = await h.mgr.check('interval');
+    assert.strictEqual(later.decision.action, 'topup', 'a failed transfer is retried after the cooldown');
+    assert.strictEqual(book.transfers.length, 2);
+  }
+
+  // Record still processing: hold, no alert inside the settle window, late confirm when it completes.
+  {
+    const book = fakeBook({
+      main: cents(20_000), bucket: cents(2_000), applyTransfer: false, recordStatus: 'processing',
+    });
+    const app = fakeAppAlerts();
+    const h = harnessApp(LIVE, book, WED, app);
+    const first = await h.mgr.check('interval');
+    assert.strictEqual(first.confirmed, false);
+    assert.strictEqual(first.verify, 'processing');
+    assert.strictEqual(app.rows.filter((r) => r.kind === 'bucket_transfer')[0].meta.state, 'accepted');
+    assert.ok(!app.rows.some((r) => r.kind === 'bucket_transfer_unconfirmed'));
+    assert.ok(!h.alerts.some((t) => /not confirmed|transfer failed/.test(t)));
+    h.setNow(new Date(h.now().getTime() + 60_000));
+    const held = await h.mgr.check('interval');
+    assert.strictEqual(held.held, true);
+    assert.strictEqual(book.transfers.length, 1);
+    book.state.records[0].status = 'complete';
+    h.setNow(new Date(h.now().getTime() + 60_000));
+    const done = await h.mgr.check('interval');
+    assert.strictEqual(done.confirmed, true);
+    assert.strictEqual(done.late, true);
+    assert.strictEqual(done.via, 'record');
+    assert.ok(!app.rows.some((r) => r.kind === 'bucket_transfer_unconfirmed'));
+    assert.strictEqual(book.transfers.length, 1, 'no second transfer while it was pending');
+  }
+
+  // No record and no balance trace: alert once after the settle window, keep holding,
+  // release only after the long timeout (record API healthy => it never happened).
+  {
+    const book = fakeBook({
+      main: cents(20_000), bucket: cents(2_000), applyTransfer: false, recordStatus: null,
+    });
+    const app = fakeAppAlerts();
+    const h = harnessApp(LIVE, book, WED, app);
+    const first = await h.mgr.check('interval');
+    assert.strictEqual(first.confirmed, false);
+    assert.strictEqual(first.verify, 'missing');
+    assert.ok(!app.rows.some((r) => r.kind === 'bucket_transfer_unconfirmed'), 'no alert on the immediate read');
+    h.setNow(new Date(h.now().getTime() + 181_000));
+    const over = await h.mgr.check('interval');
+    assert.strictEqual(over.held, true);
+    assert.strictEqual(over.unconfirmed, true);
+    assert.strictEqual(app.rows.filter((r) => r.kind === 'bucket_transfer_unconfirmed').length, 1);
+    assert.ok(h.alerts.some((t) => /not confirmed/.test(t)));
+    assert.strictEqual(book.transfers.length, 1);
+    h.setNow(new Date(h.now().getTime() + 5 * 60_000));
+    const still = await h.mgr.check('interval');
+    assert.strictEqual(still.held, true);
+    assert.strictEqual(app.rows.filter((r) => r.kind === 'bucket_transfer_unconfirmed').length, 1, 'alerts once');
+    assert.strictEqual(book.transfers.length, 1, 'still never drops pending without verifying');
+    h.setNow(new Date(h.now().getTime() + 31 * 60_000));
+    const lost = await h.mgr.check('interval');
+    assert.strictEqual(lost.lost, true);
+    assert.ok(app.rows.some((r) => r.kind === 'bucket_transfer_failed' && /never appeared/.test(r.title)));
+    h.setNow(new Date(h.now().getTime() + 6 * 60_000));
+    const resumed = await h.mgr.check('interval');
+    assert.strictEqual(resumed.decision.action, 'topup');
+    assert.strictEqual(book.transfers.length, 2);
+  }
+
+  // Record unreadable and balances show nothing: unknown. Hold indefinitely, never release.
+  {
+    const book = fakeBook({
+      main: cents(20_000), bucket: cents(2_000), applyTransfer: false,
+      recordStatus: null, recordsError: 'Kalshi GET transfers 503',
+    });
+    const app = fakeAppAlerts();
+    const h = harnessApp(LIVE, book, WED, app);
+    const first = await h.mgr.check('interval');
+    assert.strictEqual(first.verify, 'unknown');
+    for (let i = 0; i < 20; i += 1) {
+      h.setNow(new Date(h.now().getTime() + 6 * 60_000));
+      const out = await h.mgr.check('interval');
+      assert.strictEqual(out.held, true);
+    }
+    assert.strictEqual(book.transfers.length, 1, 'two hours later, still only the one transfer');
+    assert.strictEqual(app.rows.filter((r) => r.kind === 'bucket_transfer_unconfirmed').length, 1);
+    book.state.recordsError = null;
+    book.state.records.unshift({ transferId: 'tr_1', status: 'complete', amountCents: cents(3_000), fromShard: 0, toShard: 1 });
+    const ok = await h.mgr.check('interval');
+    assert.strictEqual(ok.confirmed, true);
+  }
+
+  // The confirm path must not loosen the safeguards: floor, per-transfer cap, daily cap, ceiling, minimum.
+  {
+    const cfg = loadBucketConfig({});
+    assert.strictEqual(cfg.floorCents, cents(2_000));
+    assert.strictEqual(cfg.maxTransferCents, cents(10_000));
+    assert.strictEqual(cfg.dailyCapCents, cents(15_000));
+    assert.strictEqual(cfg.ceilingCents, cents(15_000));
+    assert.strictEqual(cfg.minTransferCents, cents(100));
+    assert.strictEqual(cfg.confirmDelayMs, 2_000);
+    // Big deficit with plenty of main: one transfer clamped to $10k, held while pending.
+    const book = fakeBook({
+      main: cents(50_000), bucket: cents(0), applyTransfer: false, recordStatus: 'processing',
+    });
+    const h = harness({ ...LIVE, KALSHI_BUCKET_TARGET_DEFAULT: '15000' }, book);
+    const first = await h.mgr.check('interval');
+    assert.strictEqual(first.decision.amountCents, cents(10_000));
+    const second = await h.mgr.check('interval');
+    assert.strictEqual(second.held, true);
+    assert.strictEqual(book.transfers.length, 1);
+  }
+
+  // Wire: the client reads Kalshi's transfer records (GET, signed path, no body).
+  {
+    const seen = [];
+    const signed = async (method, signPath, opts) => {
+      seen.push({ method, signPath, path: opts.path, body: opts.body });
+      return {
+        statusCode: 200,
+        text: JSON.stringify({ transfers: [{
+          amount: '382.1200', source_exchange_shard: 0, destination_exchange_shard: 1,
+          status: 'complete', transfer_id: '2828cf44-1487-4bbf-872d-16a3b713a9cc',
+        }] }),
+      };
+    };
+    const rows = await createKalshiBucketClient(signed).getTransfers();
+    assert.strictEqual(seen[0].method, 'GET');
+    assert.strictEqual(seen[0].signPath, TRANSFERS_PATH);
+    assert.strictEqual(seen[0].body, undefined);
+    assert.strictEqual(rows[0].amountCents, 38212);
+    assert.strictEqual(rows[0].toShard, 1);
   }
 
   console.log('bucket-manager.test.js ok');
