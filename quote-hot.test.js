@@ -172,4 +172,20 @@ assert.strictEqual(teamPairFromTicker(''), null);
 assert.strictEqual(fastDropDisabled({ KALSHI_WS_FAST_DROP: '0' }), true);
 assert.strictEqual(fastDropDisabled({}), false);
 
+{
+  const { createDeletedFilter, dropDeletedDisabled } = require('./quote-hot');
+  const held = new Set();
+  const f = createDeletedFilter((cb) => held.forEach(cb));
+  const frame = (id) => `{"type":"rfq_deleted","msg":{"id":"${id}"}}`;
+  assert.strictEqual(f(frame('abc')), true, 'nothing pending → drop');
+  held.add('rfq-1');
+  held.add(undefined);
+  assert.strictEqual(f(frame('rfq-1')), false, 'pending rfq → keep');
+  assert.strictEqual(f(Buffer.from(frame('rfq-1')).toString()), false);
+  assert.strictEqual(f(frame('rfq-2')), true);
+  assert.strictEqual(dropDeletedDisabled({ KALSHI_WS_DROP_DELETED: '0' }), true);
+  assert.strictEqual(dropDeletedDisabled({ KALSHI_WS_DROP_DELETED: 'off' }), true);
+  assert.strictEqual(dropDeletedDisabled({}), false);
+}
+
 console.log('quote-hot.test.js ok');
