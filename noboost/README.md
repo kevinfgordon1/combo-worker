@@ -2,15 +2,19 @@
 
 Quotes incoming Kalshi (and, where possible, Polymarket) RFQ combos that are **all NFL moneyline, every leg in a different game** — with no sportsbook boost / saved lock. Today this is **shadow only**: it logs what it *would* quote. No orders, quotes, confirms or cancels are ever sent (tests assert the modules contain no send code).
 
-## Files
+## Files (all under `noboost/`; nothing in the repo root or `package.json` is touched, so combo-worker / mm-paper / odds-relay are NOT redeployed by this code)
 | file | role |
 |---|---|
-| `noboost-quote.js` | pure pricing (formula below), config/env |
-| `noboost-risk.js` | pure risk book: per-combo / per-game / per-selection / total caps, daily loss limit, inventory skew, quote pull |
-| `noboost-book.js` | in-memory NFL price book (Kalshi `KXNFLGAME` asks/bids, Poly ML), kickoff = `occurrence_datetime − 3h` |
-| `noboost-shadow.js` | classifier + `onRfq` / `sweep` (logs `[NOBOOST] WOULD_QUOTE / SKIP / PULL`, American odds only) |
-| `noboost-runner.js`, `start-noboost.js` | standalone paper job (`npm run start:noboost-paper`), **GET-only**, no WebSocket |
-| `scripts/noboost-backtest.js` | `npm run backtest:noboost -- --data <dir> [--since-created ISO]` |
+| `quote.js` | pure pricing (formula below), config/env |
+| `risk.js` | pure risk book: per-combo / per-game / per-selection / total caps, daily loss limit, inventory skew, quote pull |
+| `book.js` | in-memory NFL price book. **Per-leg true/mid/lock prices are precomputed on every price (re)ingest**, so the per-RFQ decision is lookup + multiply + caps (no I/O, no sportsbook fetch). Stale (>15s) or missing leg price => RFQ skipped |
+| `shadow.js` | classifier + timed `onRfq` / `sweep` (logs `[NOBOOST][PRIMARY|LOCKCF] WOULD_QUOTE / SKIP / PULL … ms=<decision ms> maxLegAgeMs=<age>`; American odds only) |
+| `paper.js` | paper-run bookkeeping: runs PRIMARY + LOCKCF (guardrail ON counterfactual) on every RFQ, matches later taker prints, simulates fills/positions vs caps, settles |
+| `store.js` | writes `noboost_paper_rfqs` / `noboost_paper_stats` in our own Supabase |
+| `runner.js`, `start.js` | the paper service (`node noboost/start.js`), **GET-only toward Kalshi, no WebSocket** |
+| `summary.js` | report: wins, simulated P&L vs mid, exposure, by leg count, decision-latency + staleness p50/p99 |
+| `backtest.js` | `node noboost/backtest.js --data <dir> [--since-created ISO]` |
+| `run-tests.js` | runs the five `*.test.js` files (`node noboost/run-tests.js`) |
 
 ## Flags (all default OFF / safe)
 `NOBOOST_SHADOW=1` turns shadow logging on (default off). `NOBOOST_LIVE` is never honoured — if set, the module **refuses to start**.
@@ -47,4 +51,8 @@ We **sell** the parlay: the taker buys YES at price `y` (per $1 payout), we coll
 Max loss of a fill = `contracts × (1 − y)` (venues fill the **full** RFQ size, so all-or-nothing). Caps: per-combo, per-game (Σ open combos touching a game), per-selection (Σ combos that need the same team to win), total; optional daily loss limit; inventory skew widens the margin as utilisation (max of game/selection/total) → 1; fast pull of any open paper quote when the new fair makes edge < `pullMinEdge`, price drops below the lock, quote is older than TTL, or becomes unpriceable.
 
 ## Backtest
-See the PR description and `docs/noboost-backtest-output*.txt` (raw output). Data is Kalshi-only 1-minute ask/bid candles + public taker prints on KXMVE combos Sep 24 – Oct 1 2026; Polymarket history is not available, so Poly is wired (BUY = first slug team, SELL = other) but not backtested.
+See the PR description and `noboost/backtest-output*.txt` (raw output). Data is Kalshi-only 1-minute ask/bid candles + public taker prints on KXMVE combos Sep 24 – Oct 1 2026; Polymarket history is not available, so Poly is wired (BUY = first slug team, SELL = other) but not backtested.
+
+## Paper service (Railway `noboost-paper`)
+Env: `NOBOOST_SHADOW=1`, `NOBOOST_FAIR_METHOD=mid`, `NOBOOST_GUARDRAIL=off`, `NOBOOST_MARGIN=0.10` (+ the shared `KALSHI_KEY_ID`/`Kalshi_combo_key` for REST GETs and `SUPABASE_URL`/`SUPABASE_SERVICE_KEY`). `NOBOOST_LIVE` must never be set (the service refuses to start). Start: `node noboost/start.js`.
+Read results: `railway run -s noboost-paper -- node noboost/summary.js [--since ISO] [--json]`, or query `noboost_paper_rfqs` / `noboost_paper_stats` in Supabase (migration `migrations/20261001_noboost_paper.sql`).

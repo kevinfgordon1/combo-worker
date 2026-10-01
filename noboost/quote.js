@@ -32,12 +32,12 @@
 //   6. Tick: y rounded UP (never undercut our own target) to 0.001 (0.0001 when
 //      subcent=true and y<0.01). American odds are derived from the final y.
 'use strict';
-const { americanFromProb } = require('./engine');
+const { americanFromProb } = require('../engine');
 const {
   validProb, productFair, ourTrueFromOpponents, feeIncludedAmerican,
   applyTakerFeeToProb, takerThetaForVenue, bestOpponentAmerican, kalshiMakerRate,
   POLY_MAKER_RATE,
-} = require('./unhedged-quote');
+} = require('../unhedged-quote');
 
 const DEFAULTS = Object.freeze({
   margin: 0.10,
@@ -119,12 +119,10 @@ function costWithFee(askProb, venue, hint) {
 //   source.ownQuotes(leg)      -> [{venue, yesProb, key}]            (this leg's own ASK)
 //   source.reference(leg)      -> optional no-vig prob (e.g. Pinnacle) for diagnostics
 // Returns null when the leg cannot be priced (never invents a price).
-function priceLeg(leg, source) {
-  if (!source || typeof source.opponentQuotes !== 'function') return null;
-  const opp = source.opponentQuotes(leg) || [];
+// Pure leg math from venue quotes (opp = opposite side asks, own = this side asks).
+function priceLegFromQuotes(opp, own, referenceProb) {
   const inverse = ourTrueFromOpponents(opp);
   if (inverse == null) return null;
-  const own = typeof source.ownQuotes === 'function' ? (source.ownQuotes(leg) || []) : [];
   let lockCost = null;
   let lockVenue = null;
   for (const q of own) {
@@ -142,11 +140,26 @@ function priceLeg(leg, source) {
   const oppMid = midOf(opp);
   const mid = (ownMid != null && oppMid != null && ownMid > 0 && oppMid > 0)
     ? validProb(ownMid / (ownMid + oppMid)) : null;
-  const reference = typeof source.reference === 'function' ? validProb(source.reference(leg)) : null;
   return {
-    inverse, lockCost, lockVenue, mid, reference,
+    inverse, lockCost, lockVenue, mid, reference: validProb(referenceProb),
     oppAmerican: bestOpponentAmerican(opp),
   };
+}
+
+// Per-leg numbers from a price source.
+//   source.legStats(leg)       -> PRECOMPUTED cached stats (+ ageMs) — the fast RFQ path (no I/O, no recompute)
+//   else:
+//   source.opponentQuotes(leg) -> [{venue, yesProb, key, theta?}]   (opponent ASK, YES prob)
+//   source.ownQuotes(leg)      -> [{venue, yesProb, key}]            (this leg's own ASK)
+//   source.reference(leg)      -> optional no-vig prob (e.g. Pinnacle) for diagnostics
+// Returns null when the leg cannot be priced (never invents a price).
+function priceLeg(leg, source) {
+  if (!source) return null;
+  if (typeof source.legStats === 'function') return source.legStats(leg) || null;
+  if (typeof source.opponentQuotes !== 'function') return null;
+  const own = typeof source.ownQuotes === 'function' ? (source.ownQuotes(leg) || []) : [];
+  return priceLegFromQuotes(source.opponentQuotes(leg) || [], own,
+    typeof source.reference === 'function' ? source.reference(leg) : null);
 }
 
 // target price for fair prob P and margin m (before skew/guardrail/tick)
@@ -218,6 +231,8 @@ function priceCombo(legs, source, opts = {}) {
     ok: true,
     legs: per.length,
     fair, fairMid, fairRef, yLock, yTarget, mEff, binding,
+    legAgesMs: per.map((p) => (p.ageMs == null ? null : Math.round(p.ageMs))),
+    maxLegAgeMs: per.reduce((a, p) => (p.ageMs != null && p.ageMs > a ? p.ageMs : a), 0),
     quoteYes: yq,
     noBid: r4(1 - yq),
     yesBid: yBid,
@@ -225,6 +240,7 @@ function priceCombo(legs, source, opts = {}) {
     evPerContract: yq - fair,
     // American odds (never percentages) — the only odds fields the logger prints.
     fair_american: americanFromProb(fair),
+    fair_inverse_american: americanFromProb(fairInverse),
     fair_mid_american: fairMid == null ? null : americanFromProb(fairMid),
     ref_american: fairRef == null ? null : americanFromProb(fairRef),
     lock_american: yLock == null ? null : americanFromProb(yLock),
@@ -264,6 +280,7 @@ function contractsFor({ contracts, targetCostDollars }, quoteYes) {
 }
 
 module.exports = {
+  priceLegFromQuotes,
   DEFAULTS, configFromEnv, isNoBoostShadow, isNoBoostLive,
   priceLeg, priceCombo, targetPrice, winsPrint, fmtAm, contractsFor,
   costWithFee, ceilTo, floorTo, tickFor, americanFromProb,

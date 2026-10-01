@@ -1,8 +1,8 @@
 'use strict';
 const assert = require('assert');
 const fs = require('fs');
-const { classifyNfl, createNoBoostShadow } = require('./noboost-shadow');
-const { makeBook } = require('./noboost-test-util');
+const { classifyNfl, createNoBoostShadow } = require('./shadow');
+const { makeBook } = require('./test-util');
 
 const K = (...keys) => ({ rfqId: 'r', legKeys: keys, contracts: 20 });
 const g = (game, team) => `KXNFLGAME-${game}-${team}:yes`;
@@ -86,12 +86,12 @@ const G2 = { game: '26OCT04DENSF', a: 'DEN', b: 'SF', askA: 0.40, bidA: 0.38, as
 }
 
 // ── safety: no network / order code anywhere in the module graph
-for (const f of ['noboost-quote.js', 'noboost-risk.js', 'noboost-book.js', 'noboost-shadow.js']) {
+for (const f of ['quote.js', 'risk.js', 'book.js', 'shadow.js']) {
   const src = fs.readFileSync(`${__dirname}/${f}`, 'utf8');
   assert.ok(!/fetch\(|https?\.request|createQuote|confirmQuote|\/quotes|WebSocket|\.post\(/.test(src.replace(/\/\/.*$/gm, '')), `${f} must not send anything`);
 }
 {
-  const src = fs.readFileSync(`${__dirname}/noboost-runner.js`, 'utf8').replace(/\/\/.*$/gm, '');
+  const src = fs.readFileSync(`${__dirname}/runner.js`, 'utf8').replace(/\/\/.*$/gm, '');
   assert.ok(!/method:\s*'(POST|PUT|DELETE)'|createQuote|confirm|WebSocket|createKalshiWs/.test(src), 'runner is GET-only');
 }
 console.log('noboost-shadow.test.js ok');

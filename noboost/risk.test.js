@@ -1,6 +1,6 @@
 'use strict';
 const assert = require('assert');
-const { createRiskBook, riskConfigFromEnv, RISK_DEFAULTS } = require('./noboost-risk');
+const { createRiskBook, riskConfigFromEnv, RISK_DEFAULTS } = require('./risk');
 
 let t = Date.parse('2026-10-04T12:00:00-04:00');
 const now = () => t;

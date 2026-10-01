@@ -1,6 +1,6 @@
 'use strict';
 const assert = require('assert');
-const { createNflBook, KICKOFF_OFFSET_MS } = require('./noboost-book');
+const { createNflBook, KICKOFF_OFFSET_MS } = require('./book');
 
 let t = 1e12;
 const book = createNflBook({ now: () => t, staleMs: 15000 });

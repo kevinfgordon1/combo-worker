@@ -2,9 +2,9 @@
 // Backtest the no-boost NFL moneyline combo quoter against historical Kalshi RFQ fills.
 // PAPER ONLY — reads local JSON, prints a report, sends nothing.
 //
-//   node scripts/noboost-backtest.js --data /workspace/nb-data/raw [--margins 0,.025,.05,.075,.1,.15]
+//   node noboost/backtest.js --data /workspace/nb-data/raw [--margins 0,.025,.05,.075,.1,.15]
 //
-// Inputs (built by scripts/noboost-data/*):
+// Inputs (built by the nb-data pull scripts):
 //   prints_nfl.json   [{k,t,c,y,legs:["6OCT04TENBAL-BAL:yes",…]}]  one row per executed RFQ print
 //                     on an all-KXNFLGAME combo (t epoch s, c contracts, y YES price paid by the taker)
 //   E_candles.json    {ticker:{c:[[end_ts,yes_ask_close,yes_bid_close]…],res,close}}   1-min Kalshi candles
@@ -21,9 +21,9 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
-const { classifyNfl } = require('./../noboost-shadow');
-const q = require('./../noboost-quote');
-const { createRiskBook, RISK_DEFAULTS } = require('./../noboost-risk');
+const { classifyNfl } = require('./shadow');
+const q = require('./quote');
+const { createRiskBook, RISK_DEFAULTS } = require('./risk');
 
 const args = process.argv.slice(2);
 const arg = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : d; };

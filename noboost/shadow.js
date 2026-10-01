@@ -12,10 +12,10 @@
 //   • pregame only (kickoff from the book, ticker has no clock for NFL),
 //   • priceable from fresh venue prices (never invents a price).
 'use strict';
-const { parseKalshiUnhedgedTicker, parsePmUnhedgedSlug } = require('./unhedged-rfq');
-const { normTeam } = require('./leg-identity');
-const { priceCombo, winsPrint, fmtAm, contractsFor, configFromEnv, isNoBoostShadow, isNoBoostLive } = require('./noboost-quote');
-const { createRiskBook, riskConfigFromEnv } = require('./noboost-risk');
+const { parseKalshiUnhedgedTicker, parsePmUnhedgedSlug } = require('../unhedged-rfq');
+const { normTeam } = require('../leg-identity');
+const { priceCombo, winsPrint, fmtAm, contractsFor, configFromEnv, isNoBoostShadow, isNoBoostLive } = require('./quote');
+const { createRiskBook, riskConfigFromEnv } = require('./risk');
 
 function splitKey(k) {
   const s = String(k || '');
@@ -75,14 +75,16 @@ function classifyNfl(rfq, venue) {
       team = inp.side === 'yes' ? sel : other;
     }
     if (!team) return { ok: false, reason: 'team_parse' };
-    legs.push({ gameId: parsed.gameId, team, id: inp.id });
+    legs.push({ gameId: parsed.gameId, team, id: inp.id, side: inp.side });
   }
   return { ok: true, legs };
 }
 
 function createNoBoostShadow({
-  book, env = process.env, now = () => Date.now(), log = console.log, risk = null,
+  book, env = process.env, now = () => Date.now(), log = console.log, risk = null, label = '',
+  clock = () => Number(process.hrtime.bigint()) / 1e6,
 } = {}) {
+  const tag = label ? `[${label}]` : '';
   if (isNoBoostLive(env)) {
     throw new Error('NOBOOST_LIVE is set but the no-boost quoter is paper-only; refusing to start');
   }
@@ -93,9 +95,11 @@ function createNoBoostShadow({
     pulled: 0, started: 0, flag_off: 0,
   };
   const skips = new Map();
+  const decisionMs = [];
+  let pending = null; // decision line, logged by onRfq with the measured decision ms
   const bumpSkip = (r) => skips.set(r, (skips.get(r) || 0) + 1);
 
-  function onRfq(rfq, { venue = 'kalshi' } = {}) {
+  function decide(rfq, { venue = 'kalshi' } = {}) {
     if (!isNoBoostShadow(env)) { counts.flag_off += 1; return { action: 'skip', reason: 'flag_off' }; }
     counts.rfqs += 1;
     const cls = classifyNfl(rfq, venue);
@@ -123,21 +127,35 @@ function createNoBoostShadow({
     if (!chk.ok) {
       counts.risk_blocked += 1;
       bumpSkip(`risk:${chk.reason}`);
-      log(`[NOBOOST] SKIP rfq=${rfqId} ${venue} legs=${cls.legs.length} risk=${chk.reason} fair=${fmtAm(priced.fair_american)} would=${fmtAm(priced.quote_american)}`);
-      return { action: 'skip', reason: `risk:${chk.reason}`, priced };
+      pending = (`[NOBOOST]${tag} SKIP rfq=${rfqId} ${venue} legs=${cls.legs.length} risk=${chk.reason} fair=${fmtAm(priced.fair_american)} would=${fmtAm(priced.quote_american)}`);
+      return { action: 'skip', reason: `risk:${chk.reason}`, priced, contracts, risk: chk };
     }
     counts.would_quote += 1;
     rk.registerQuote(rfqId, {
       venue, legs: cls.legs, quoteYes: priced.quoteYes, fair: priced.fair, contracts,
       guardrail: cfg.guardrail === 'lock',
     });
-    log(
-      `[NOBOOST] WOULD_QUOTE rfq=${rfqId} ${venue} legs=${cls.legs.length} `
+    pending = (
+      `[NOBOOST]${tag} WOULD_QUOTE rfq=${rfqId} ${venue} legs=${cls.legs.length} `
       + `fair=${fmtAm(priced.fair_american)} lock=${fmtAm(priced.lock_american)} `
       + `quote=${fmtAm(priced.quote_american)}${priced.binding ? '(lock-bound)' : ''} `
-      + `contracts=${contracts} maxloss=$${chk.loss.toFixed(2)} util=${util.toFixed(2)}`
+      + `contracts=${contracts} maxloss=$${chk.loss.toFixed(2)} util=${util.toFixed(2)} `
+      + `mid=${fmtAm(priced.fair_mid_american)} maxLegAgeMs=${Math.round(priced.maxLegAgeMs || 0)}`
     );
     return { action: 'would_quote', priced, contracts, legs: cls.legs, risk: chk };
+  }
+
+  // Timed decision: ms = wall time of classify+price+risk (all in-memory; no I/O on this path).
+  function onRfq(rfq, opts) {
+    pending = null;
+    const t0 = clock();
+    const d = decide(rfq, opts);
+    d.decisionMs = clock() - t0;
+    if (pending) { log(`${pending} ms=${d.decisionMs.toFixed(3)}`); pending = null; }
+    if (d.reason === 'flag_off' || /^(not_|correlated|no_game|team_parse|poly_team)/.test(d.reason || '')) return d; // out-of-scope RFQs are not latency samples
+    decisionMs.push(d.decisionMs);
+    if (decisionMs.length > 20000) decisionMs.splice(0, 10000);
+    return d;
   }
 
   // Re-price every open paper quote with the CURRENT book; pull those that went stale.
@@ -148,7 +166,7 @@ function createNoBoostShadow({
     });
     for (const p of pulled) {
       counts.pulled += 1;
-      log(`[NOBOOST] PULL rfq=${p.rfqId} reason=${p.reason} was=${fmtAm(require('./engine').americanFromProb(p.quote.quoteYes))}`);
+      log(`[NOBOOST]${tag} PULL rfq=${p.rfqId} reason=${p.reason} was=${fmtAm(require('../engine').americanFromProb(p.quote.quoteYes))}`);
     }
     return pulled;
   }
@@ -157,7 +175,12 @@ function createNoBoostShadow({
   function onPaperFill(rfqId, legs, price, contracts) { return rk.addFill(rfqId, legs, price, contracts); }
 
   function summary() {
-    return { counts: { ...counts }, skips: Object.fromEntries(skips), risk: rk.snapshot() };
+    const a = decisionMs.slice().sort((x, y) => x - y);
+    const pct = (p) => (a.length ? +a[Math.min(a.length - 1, Math.floor(a.length * p))].toFixed(3) : null);
+    return {
+      label, counts: { ...counts }, skips: Object.fromEntries(skips), risk: rk.snapshot(),
+      decision_ms: { n: a.length, p50: pct(0.5), p99: pct(0.99), max: a.length ? +a[a.length - 1].toFixed(3) : null },
+    };
   }
 
   return { onRfq, sweep, onPaperFill, summary, cfg, risk: rk, counts };

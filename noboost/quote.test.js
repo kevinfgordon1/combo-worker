@@ -1,7 +1,7 @@
 'use strict';
 const assert = require('assert');
-const q = require('./noboost-quote');
-const { makeBook } = require('./noboost-test-util');
+const q = require('./quote');
+const { makeBook } = require('./test-util');
 
 const G1 = { game: '26OCT04ARINYG', a: 'ARI', b: 'NYG', askA: 0.52, bidA: 0.50, askB: 0.50, bidB: 0.48 };
 const G2 = { game: '26OCT04DENSF', a: 'DEN', b: 'SF', askA: 0.40, bidA: 0.38, askB: 0.62, bidB: 0.60 };
