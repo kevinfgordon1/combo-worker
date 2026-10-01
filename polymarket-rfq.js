@@ -87,6 +87,7 @@ const {
   startTimesAgree,
   POLY_LINE_SPORT,
   LINE_SERIES,
+  PROP_SERIES,
   identitiesFromPolymarketSlugs,
   sameIdentitySet,
   TEAM_ALIASES,
@@ -355,7 +356,9 @@ function identityHitsTokens(id, tokens) {
   // (asc / tsc; NFL, MLB, NHL). Player-prop prefixes
   // (astatc, …) share league/date tokens and emit 2-char stat suffixes
   // (`tb` = total bases) that collide with team codes (TB Rays).
-  // Line legs (spread/total) ride asc-/tsc- slugs instead.
+  // Line legs (spread/total) ride asc-/tsc- slugs instead. Mapped player props (astatc,
+  // anytime TD / MLB HR) carry a `line` too but are NEVER token-matched: they only match
+  // through the exact verified slug-identity set (see couldMatchActiveLocks).
   if (id.line != null ? !(tokens.has('asc') || tokens.has('tsc')) : !tokens.has('aec')) return false;
   const leagueTokens = LEAGUE_SLUG_TOKENS[id.league] || (id.league ? [id.league] : []);
   if (!leagueTokens.some((t) => tokens.has(t))) return false;
@@ -416,7 +419,7 @@ function isKalshiMoneylineLock(parlay) {
   return kalshiMlTickersFromParlay(parlay).some((text) => {
     const raw = String(text).trim();
     const series = raw.split('-')[0].split(':')[0].toUpperCase();
-    return Boolean(SERIES[series] || LINE_SERIES[series] || series === 'KXNCAAFGAME');
+    return Boolean(SERIES[series] || LINE_SERIES[series] || PROP_SERIES[series] || series === 'KXNCAAFGAME');
   });
 }
 
@@ -513,6 +516,10 @@ function explainLockOverlapMiss(rfq, parlays) {
 // line_leg_unparsed (NFL/MLB/NHL line leg whose ticker/label could not be proven exact).
 function unpriceableReason(parlay) {
   const tickers = kalshiMlTickersFromParlay(parlay).map((t) => String(t).split('-')[0].split(':')[0].toUpperCase());
+  // KXNFLTD / KXMLBHR legs: mapped only through the verified player crosswalk with an
+  // exact "Player: N+" label; anything else about them (player not in the crosswalk,
+  // D/ST, label missing, game text disagreeing) lands here.
+  if (tickers.some((t) => PROP_SERIES[t])) return 'prop_not_mapped';
   if (tickers.some((t) => /PROP|TD|YDS|REC|RUSH|PASS|HR|HITS/.test(t) && !SERIES[t] && !LINE_SERIES[t])) return 'player_prop';
   if (tickers.some((t) => /^KXNCAAF/.test(t))) return 'ncaaf_not_mapped';
   if (tickers.some((t) => LINE_SERIES[t])) return 'line_leg_unparsed';
@@ -527,7 +534,7 @@ function logUnpriceablePolyLocks(parlays, log = console.log) {
     if (lock.ok) continue;
     const tickers = kalshiMlTickersFromParlay(p);
     const series = tickers.map((t) => String(t).split('-')[0].split(':')[0].toUpperCase());
-    if (!series.some((s) => /SPREAD|TOTAL|PROP/.test(s) || s === 'KXNCAAFGAME')) continue;
+    if (!series.some((s) => /SPREAD|TOTAL|PROP/.test(s) || s === 'KXNCAAFGAME' || PROP_SERIES[s])) continue;
     failing.push(p);
   }
   const n = failing.length;

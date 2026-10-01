@@ -38,6 +38,7 @@
 'use strict';
 const { parseKalshiTickerStart, parseTs } = require('./started');
 const NCAAF = require('./ncaaf-crosswalk');
+const PROPX = require('./player-prop-crosswalk');
 
 const MONTHS = {
   JAN: 1, FEB: 2, MAR: 3, APR: 4, MAY: 5, JUN: 6,
@@ -659,6 +660,151 @@ function identityFromPolymarketLine(symbol, rfqSide, market) {
   return { identity: id, reason: null, verified };
 }
 
+// ── Player props (anytime TD / MLB HR) ─────────────────────────────────────────
+// Kalshi KXNFLTD-26OCT01PITCLE-CLEDWATSON4-1 : yes  <=>  Poly BUY astatc-nfl-pit-cle-2026-10-01-td-deswat-gte1
+// (Kalshi :no is NOT mapped: no proven label form; a Poly SELL leg therefore never matches a
+// lock). The player pairing comes ONLY from the verified crosswalk
+// (player-prop-crosswalk.json: full name + team + game). The threshold is part of the key
+// (1+ never equals 2+), :yes/:no is part of the key, and every cross-check below must hold
+// or there is NO identity (fail closed). Poly-only (opts.lines); the Kalshi matcher never
+// sees props. D/ST, passing/first TDs and other props are never mapped.
+const PROP_SERIES = {
+  KXNFLTD: { league: 'nfl', kind: 'td', polyType: 'football_player_touchdowns' },
+  KXMLBHR: { league: 'mlb', kind: 'hr', polyType: 'baseball_player_home_runs' },
+};
+const POLY_PROP_SLUG_RE =
+  /^astatc-(nfl|mlb)-([a-z0-9]+)-([a-z0-9]+)-(\d{4})-(\d{2})-(\d{2})-(td|hr)-([a-z0-9]+)-gte([1-9])$/;
+const PROP_KIND_LEAGUE = { td: 'nfl', hr: 'mlb' };
+
+function isPolyPropSlug(symbol) {
+  return /^astatc-/.test(String(symbol || '').trim().toLowerCase());
+}
+
+function propLabelOk(label, name, n) {
+  const l = String(label == null ? '' : label).trim();
+  if (!l) return false;
+  const m = /^(.*?):\s*(\d)\+\s*$/.exec(l);
+  if (!m || Number(m[2]) !== n) return false;
+  return PROPX.nname(m[1]) === PROPX.nname(name);
+}
+
+// idx: optional crosswalk index (tests); label REQUIRED (independent proof of player,
+// threshold and side).
+function parseKalshiPropTicker(text, sideOverride, label, opts) {
+  if (text == null || text === '') return null;
+  let raw = String(text).trim();
+  let side = sideOverride ? String(sideOverride).toLowerCase() : '';
+  const sideAt = raw.lastIndexOf(':');
+  if (sideAt > 0) {
+    const maybe = raw.slice(sideAt + 1).toLowerCase();
+    if (maybe === 'yes' || maybe === 'no') { if (!side) side = maybe; raw = raw.slice(0, sideAt); }
+  }
+  if (!side) side = 'yes';
+  // Only :yes ("Player: N+" bought) is mapped. A :no leg has no proven label form, so it
+  // is not mapped (never guessed).
+  if (side !== 'yes') return null;
+  const dash = raw.indexOf('-');
+  if (dash <= 0) return null;
+  const series = raw.slice(0, dash).toUpperCase();
+  const spec = PROP_SERIES[series];
+  if (!spec) return null;
+  const tm = /^(.+)-([1-9])$/.exec(raw);
+  if (!tm) return null;
+  const n = Number(tm[2]);
+  const xw = PROPX.byKalshi(tm[1].toUpperCase(), opts && opts.idx);
+  if (!xw || xw.league !== spec.league || xw.kind !== spec.kind) return null;
+  if (!xw.kalshiThresholds.includes(n) || !xw.polyThresholds.includes(n)) return null;
+  if (!propLabelOk(label, xw.name, n)) return null;
+  const parsed = parseKalshiDateRest(raw.slice(dash + 1));
+  if (!parsed) return null;
+  const sm = new RegExp(`^${spec.league}-([a-z0-9]+)-([a-z0-9]+)-(\\d{4}-\\d{2}-\\d{2})$`).exec(xw.poly.stem);
+  if (!sm || sm[3] !== parsed.date) return null;
+  // The ticker's own game blob must be exactly the crosswalk game's two teams.
+  const blob = parsed.teamsBlob.split('-')[0];
+  const pair = splitTeams(blob, spec.league, null);
+  if (!pair) return null;
+  const A = [normTeam(spec.league, pair[0]), normTeam(spec.league, pair[1])].sort().join('+');
+  const B = [normTeam(spec.league, sm[1]), normTeam(spec.league, sm[2])].sort().join('+');
+  if (A !== B) return null;
+  if (spec.league === 'mlb' && parsed.startMs == null) return null; // first pitch is required
+  return makeIdentity({
+    league: spec.league,
+    date: parsed.date,
+    teams: [sm[1], sm[2]],
+    marketType: spec.kind,
+    period: 'full',
+    selection: `p.${xw.poly.abbr}`,
+    side,
+    line: n,
+    startMs: parsed.startMs,
+  });
+}
+
+// Poly astatc leg -> identity. Without `market` this is a slug-only PREFILTER candidate
+// (still requires the player to be in the crosswalk); only verified:true identities may be
+// quoted. BUY = Yes (long), SELL = No.
+function identityFromPolymarketProp(symbol, rfqSide, market, opts) {
+  const s = String(symbol || '').trim().toLowerCase();
+  const m = POLY_PROP_SLUG_RE.exec(s);
+  if (!m) return { identity: null, reason: 'not_priceable' };
+  const yesNo = polymarketYesNo(rfqSide);
+  if (!yesNo) return { identity: null, reason: 'unmatched_leg' };
+  const league = m[1];
+  const kind = m[7];
+  if (PROP_KIND_LEAGUE[kind] !== league) return { identity: null, reason: 'not_priceable' };
+  const date = `${m[4]}-${m[5]}-${m[6]}`;
+  const abbr = m[8];
+  const n = Number(m[9]);
+  const stem = `${league}-${m[2]}-${m[3]}-${date}`;
+  const xw = PROPX.byPoly(stem, abbr, opts && opts.idx);
+  if (!xw || xw.league !== league || xw.kind !== kind) return { identity: null, reason: 'not_priceable' };
+  if (!xw.polyThresholds.includes(n)) return { identity: null, reason: 'not_priceable' };
+  let startMs = null;
+  let verified = false;
+  if (market != null) {
+    const mk = unwrapMarket(market);
+    if (!mk || typeof mk !== 'object') return { identity: null, reason: 'missing_metadata' };
+    const md = mk.metadata && typeof mk.metadata === 'object' ? mk.metadata : null;
+    const bad = { identity: null, reason: 'meta_mismatch' };
+    if (!md) return { identity: null, reason: 'missing_metadata' };
+    const spec = PROP_SERIES[league === 'nfl' ? 'KXNFLTD' : 'KXMLBHR'];
+    if (String(mk.sportsMarketType || mk.sports_market_type || '') !== spec.polyType) return bad;
+    if (!mk.slug || String(mk.slug).toLowerCase() !== s) return bad;
+    if (Number(mk.line) !== n) return bad;
+    if (md.playerAbbreviation !== abbr) return bad;
+    if (PROPX.nname(md.playerName) !== PROPX.nname(xw.poly.name)) return bad;
+    if (String(md.playerId) !== String(xw.poly.playerId) || String(md.teamId) !== String(xw.poly.teamId)) return bad;
+    if (md.lineLabel != null && String(md.lineLabel) !== `${n}+`) return bad;
+    const metaDate = etDateFromValue(mk.gameStartTime || mk.game_start_time);
+    if (!metaDate || metaDate !== date) return bad;
+    const sides = mk.marketSides || mk.market_sides;
+    if (!Array.isArray(sides) || sides.length !== 2) return bad;
+    const longs = sides.filter((x) => x && x.long === true);
+    const shorts = sides.filter((x) => x && x.long === false);
+    if (longs.length !== 1 || shorts.length !== 1) return bad;
+    const d = (x) => String((x && x.description) || '').trim().toLowerCase();
+    if (d(longs[0]) !== 'yes' || d(shorts[0]) !== 'no') return bad;
+    const t = Date.parse(mk.gameStartTime || mk.game_start_time || '');
+    if (!Number.isFinite(t)) return bad;
+    if (new Date(t).toISOString() !== new Date(Date.parse(xw.poly.kickoff)).toISOString()) return bad;
+    startMs = t;
+    verified = true;
+  }
+  const id = makeIdentity({
+    league,
+    date,
+    teams: [m[2], m[3]],
+    marketType: kind,
+    period: 'full',
+    selection: `p.${abbr}`,
+    side: yesNo,
+    line: n,
+    startMs,
+  });
+  if (!id) return { identity: null, reason: 'missing_metadata' };
+  return { identity: id, reason: null, verified };
+}
+
 function identityFromLockFields(leg, sideFallback) {
   if (!leg || typeof leg !== 'object') {
     return typeof leg === 'string' ? parseKalshiTicker(leg, sideFallback) : null;
@@ -722,7 +868,8 @@ function identitiesFromParlay(parlay, opts) {
         // side :yes/:no is. No label => the leg is not mapped.
         const o = { requireLabel: true, game: info && info.game };
         id = parseKalshiLineTicker(k, null, info && info.label, o)
-          || parseKalshiNcaafMlTicker(k, null, info && info.label, o);
+          || parseKalshiNcaafMlTicker(k, null, info && info.label, o)
+          || parseKalshiPropTicker(k, null, info && info.label, o);
       }
       id = id || identityFromLockFields(k);
       if (!id) return { ok: false, identities: [], keys: [] };
@@ -739,7 +886,8 @@ function identitiesFromParlay(parlay, opts) {
         const o = { requireLabel: true, game: leg.game };
         const tk = leg.ticker || leg.market_ticker;
         id = parseKalshiLineTicker(tk, leg.side, leg.label, o)
-          || parseKalshiNcaafMlTicker(tk, leg.side, leg.label, o);
+          || parseKalshiNcaafMlTicker(tk, leg.side, leg.label, o)
+          || parseKalshiPropTicker(tk, leg.side, leg.label, o);
       }
       if (!id) return { ok: false, identities: [], keys: [] };
       out.push(id);
@@ -1017,9 +1165,10 @@ function identitiesFromPolymarketSlugs(legs) {
     const yesNo = polymarketYesNo(leg && typeof leg === 'object' ? (leg.side || 'SIDE_BUY') : 'yes');
     if (!yesNo) return { ok: false, reason: 'unmatched_leg', identities: out, keys: [] };
     // Unverified line identity: candidate prefilter only (never used to quote).
-    const id = isPolyLineSlug(symbol)
-      ? identityFromPolymarketLine(symbol, yesNo, null).identity
-      : identityFromPolymarketSlug(symbol, yesNo);
+    let id;
+    if (isPolyLineSlug(symbol)) id = identityFromPolymarketLine(symbol, yesNo, null).identity;
+    else if (isPolyPropSlug(symbol)) id = identityFromPolymarketProp(symbol, yesNo, null).identity;
+    else id = identityFromPolymarketSlug(symbol, yesNo);
     if (!id) return { ok: false, reason: 'unmatched_leg', identities: out, keys: [] };
     out.push(id);
   }
@@ -1040,6 +1189,16 @@ function identitiesFromPolymarketLegs(legs, markets) {
 
     const market = (leg && (leg.market || (leg.metadata && { metadata: leg.metadata })))
       || (markets && ((markets.get && markets.get(symbol)) || markets[symbol]));
+    if (isPolyPropSlug(symbol)) {
+      // Player props: ONLY with verified market metadata + a crosswalk player. No fallback.
+      if (!market) return { ok: false, reason: 'missing_metadata', identities: out, keys: [] };
+      const pr = identityFromPolymarketProp(symbol, yesNo, market);
+      if (!pr.identity || !pr.verified) {
+        return { ok: false, reason: pr.reason || 'missing_metadata', identities: out, keys: [] };
+      }
+      out.push(pr.identity);
+      continue;
+    }
     if (isPolyLineSlug(symbol)) {
       // Spread / total: ONLY with verified market metadata. No slug fallback.
       if (!market) return { ok: false, reason: 'missing_metadata', identities: out, keys: [] };
@@ -1111,6 +1270,10 @@ module.exports = {
   POLY_LINE_SPORT,
   parseKalshiLineTicker,
   parseKalshiNcaafMlTicker,
+  PROP_SERIES,
+  parseKalshiPropTicker,
+  identityFromPolymarketProp,
+  isPolyPropSlug,
   identityFromPolymarketLine,
   isPolyLineSlug,
   PRICEABLE_SPORT_TYPES,
@@ -1123,6 +1286,7 @@ module.exports = {
   makeIdentity,
   parseKalshiTicker,
   kalshiTickerPieces,
+  splitKnownCodes,
   identityFromLockFields,
   identitiesFromParlay,
   identityFromMarket,
