@@ -123,7 +123,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { createKalshiFirehose, readShardFactor, DEFAULT_LIVE_SHARD_FACTOR, summarizeThroughput } = require('./kalshi-ws');
 const { normalizePem, clockOffset, signedRequest } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
-const { decideAtFill, isFreeBetRow, fillView, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, isRfqClosedFailure, quotePostFailReason, formatQuoteLatency, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse } = require('./engine');
+const { decideAtFill, isFreeBetRow, fillView, subcentEnabled, isPriceGridFailure, pennyNoBid, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, isRfqClosedFailure, quotePostFailReason, formatQuoteLatency, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse, isSubcentPrice } = require('./engine');
 const { findStartedEvent } = require('./started');
 const {
   RESERVE_TTL_MS,
@@ -291,6 +291,14 @@ function exposureBit(n) {
 // implied YES at POST time from the no_bid actually sent — do not use this
 // staged 0.00 on that path (Kalshi would derive ~1000 contracts).
 let staged = {};
+// KALSHI_SUBCENT=1 quotes at the exact lock target on the 0.001 grid (Kalshi MVE
+// price_level_structure center_deci_edge_centi_cent) instead of flooring to the cent.
+// Read once at boot; flip the Railway variable and redeploy to change it.
+let SUBCENT = subcentEnabled(process.env);
+// Safety latch: if the venue ever rejects a sub-cent price as off-grid AND the penny twin
+// then succeeds, count it. 3 in a row → fall back to penny quoting until the next deploy.
+let subcentGridFails = 0;
+const SUBCENT_LATCH_AFTER = 3;
 
 const counts = {
   rfqs: 0, combos: 0, matched: 0, wouldQuote: 0,
@@ -350,7 +358,7 @@ async function refresh() {
     if (!parlaysFailed) {
       const next = {};
       for (const row of parlays) {
-        const v = fillView(row.fill_american);
+        const v = fillView(row.fill_american, { subcent: SUBCENT });
         next[row.id] = {
           noBid: v.noBid,
           yesBid: YES_DECLINE,
@@ -1051,7 +1059,7 @@ function resolveRfqContracts(rfq, fillAmerican, stagedNoBid) {
   if (rfq.targetCostDollars != null && rfq.targetCostDollars > 0) {
     const noBid = stagedNoBid != null
       ? parseFloat(stagedNoBid)
-      : parseFloat(fillView(fillAmerican).noBid);
+      : parseFloat(fillView(fillAmerican, { subcent: SUBCENT }).noBid);
     const implied = impliedYesBid(noBid);
     const yesPrice = implied ? parseFloat(implied) : Math.max(0.01, 1 - noBid);
     const estimated = Math.floor(rfq.targetCostDollars / yesPrice);
@@ -1873,9 +1881,18 @@ async function onRfq(rfq, env) {
     filledSoFar,
     outstanding,
     isFreeBet: isFreeBetRow(p),
+    subcent: SUBCENT,
   });
 
   if (!d.ok) {
+    if (d.reason === 'quote_below_target') {
+      counts.declined++;
+      console.error(
+        `[${MODE}] SKIP quote_below_target ${p.label} rfq=${rfq.rfqId} no_bid=${d.quotedNoBid} fill=${p.fill_american}`
+      );
+      logAsync(p, rfq, null, 'declined');
+      return;
+    }
     if (d.reason === 'no_cap') {
       counts.declined++;
       console.log(
@@ -1972,7 +1989,31 @@ async function onRfq(rfq, env) {
     pendingQuotes.set(reserveKey, pendingEntry(p, rfq, d.contracts, { yesBid }));
     const t2 = performance.now();
     try {
-      const result = await postQuote(rfq.rfqId, noBid, yesBid, restRemainder);
+      let result;
+      let sentNoBid = noBid;
+      let sentYesBid = yesBid;
+      try {
+        result = await postQuote(rfq.rfqId, sentNoBid, sentYesBid, restRemainder);
+        if (SUBCENT) subcentGridFails = 0;
+      } catch (firstErr) {
+        // Sub-cent price rejected as off-grid: retry ONCE at the penny floor (never above the
+        // sub-cent price, so still never worse than the lock target) instead of losing the RFQ.
+        if (!(SUBCENT && isSubcentPrice(noBid) && isPriceGridFailure(firstErr.message))) throw firstErr;
+        sentNoBid = pennyNoBid(noBid);
+        sentYesBid = quoteYesBid(size.source, sentNoBid);
+        console.error(
+          `[${MODE}] SUBCENT price rejected no_bid=${noBid} yes_bid=${yesBid} — retry penny no_bid=${sentNoBid}: ${firstErr.message}`
+        );
+        result = await postQuote(rfq.rfqId, sentNoBid, sentYesBid, restRemainder);
+        counts.subcentFallback = (counts.subcentFallback || 0) + 1;
+        subcentGridFails += 1;
+        if (subcentGridFails >= SUBCENT_LATCH_AFTER) {
+          SUBCENT = false;
+          staged = {};
+          console.error(`[${MODE}] SUBCENT latched OFF after ${subcentGridFails} consecutive off-grid rejections — penny quoting until redeploy`);
+          sendAlert(`⚠️ KALSHI_SUBCENT latched OFF (venue rejected sub-cent prices ${subcentGridFails}x). Quoting at the cent until redeploy.`).catch(() => {});
+        }
+      }
       const t3 = performance.now();
       const reservedContracts = size.source === 'dollar'
         ? contractsFromQuoteResponse(result, d.contracts)
@@ -1991,11 +2032,12 @@ async function onRfq(rfq, env) {
 
       counts.posted++;
       pendingQuotes.delete(reserveKey);
-      pendingQuotes.set(result.id, pendingEntry(p, rfq, reservedContracts, { yesBid }));
+      pendingQuotes.set(result.id, pendingEntry(p, rfq, reservedContracts, { yesBid: sentYesBid }));
 
       console.log(
         `[${MODE}] QUOTED ${p.label} rfq=${rfq.rfqId} quote_id=${result.id} ` +
-        `contracts=${reservedContracts} yes_bid=${yesBid} no_bid=${noBid} ` +
+        `contracts=${reservedContracts} yes_bid=${sentYesBid} no_bid=${sentNoBid}` +
+        `${d.subcent ? ` subcent eff=${d.quotedEffAmerican} worstAtQuote=$${d.worstAtQuote}` : ''} ` +
         `${exposureBit(capBook.enabled ? outstanding : outstanding + reservedContracts)}/${d.totalLimit} locks=${d.locks}`
       );
 
@@ -2020,8 +2062,8 @@ async function onRfq(rfq, env) {
         `${formatAlertStatus('✅ QUOTED', 'kalshi')} — ${p.label}\n` +
         `rfq ${shortId(rfq.rfqId)} · quote ${shortId(result.id)}\n` +
         `match→POST ${totalMs}ms\n` +
-        `${reservedContracts} contracts · NO @ $${noBid}` +
-        (size.source === 'dollar' ? ` · YES @ $${yesBid}` : '') +
+        `${reservedContracts} contracts · NO @ $${sentNoBid}` +
+        (size.source === 'dollar' ? ` · YES @ $${sentYesBid}` : '') +
         (p.fill_american != null ? ` · ${sgn(p.fill_american)}` : '')
       ).catch(() => {});
     } catch (e) {

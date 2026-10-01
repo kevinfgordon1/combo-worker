@@ -57,8 +57,8 @@ function normalizeTrade(t, parseTs) {
   const count = tradeCount(t);
   let yes = t ? toPriceDollars(t.yes_price_dollars ?? t.yes_price_fixed, t.yes_price) : null;
   let no = t ? toPriceDollars(t.no_price_dollars ?? t.no_price_fixed, t.no_price) : null;
-  if (yes == null && no != null) yes = Math.round((1 - no) * 100) / 100;
-  if (no == null && yes != null) no = Math.round((1 - yes) * 100) / 100;
+  if (yes == null && no != null) yes = Math.round((1 - no) * 10000) / 10000;
+  if (no == null && yes != null) no = Math.round((1 - yes) * 10000) / 10000;
   const ts = parseTs ? parseTs(t && (t.created_time || t.ts || t.created_ts)) : null;
   return { count, yes, no, ts, isBlockTrade: blockFlag(t), raw: t };
 }
@@ -128,7 +128,7 @@ function fmtCount(n) {
 function impliedYes(noPrice) {
   const n = toNum(noPrice);
   if (n == null) return null;
-  return Math.round((1 - n) * 100) / 100;
+  return Math.round((1 - n) * 10000) / 10000; // keep sub-cent (0.001 / 0.0001 tick) prices exact
 }
 
 function yesAmericanBit(yesPrice) {
@@ -141,12 +141,22 @@ function outbidDelta(ourNo, theirNo) {
   const ours = toNum(ourNo);
   const theirs = toNum(theirNo);
   if (ours == null || theirs == null) return null;
-  return Math.round((theirs - ours) * 100) / 100;
+  return Math.round((theirs - ours) * 10000) / 10000;
+}
+
+// 2 dp for whole-cent prices, 3-4 dp only when the price is sub-cent ($0.771).
+function fmtPrice(price) {
+  const n = toNum(price);
+  if (n == null) return null;
+  for (const dp of [2, 3, 4]) {
+    if (Math.abs(Number(n.toFixed(dp)) - n) < 1e-9) return n.toFixed(dp);
+  }
+  return n.toFixed(4);
 }
 
 function fmtNo(price) {
-  const n = toNum(price);
-  return n == null ? null : `$${n.toFixed(2)}`;
+  const p = fmtPrice(price);
+  return p == null ? null : `$${p}`;
 }
 
 function fillBit(fillAmerican) {
@@ -192,14 +202,14 @@ function formatLostAlert({ label, rfqId, lossReason, tape, ourNo, fillAmerican }
     const cnt = tape.count != null ? ` · ${fmtCount(tape.count)} contracts` : '';
     let text = `📉 LOST (outbid) — ${name}\nRFQ ${rfq}`;
     if (our) text += `\nOur NO @ ${our}${yesAmericanBit(ourYes)}`;
-    if (theirNo != null) text += `\nTape NO @ $${theirNo.toFixed(2)}${yesAmericanBit(tapeYes)}${cnt}`;
-    else if (tapeYes != null) text += `\nTape YES @ $${Number(tapeYes).toFixed(2)}${yesAmericanBit(tapeYes)}${cnt}`;
+    if (theirNo != null) text += `\nTape NO @ $${fmtPrice(theirNo)}${yesAmericanBit(tapeYes)}${cnt}`;
+    else if (tapeYes != null) text += `\nTape YES @ $${fmtPrice(tapeYes)}${yesAmericanBit(tapeYes)}${cnt}`;
     const delta = outbidDelta(ourNo, theirNo);
     if (delta != null && delta > 0) {
       const ourAm = formatAmerican(americanFromProb(ourYes));
       const theirAm = formatAmerican(americanFromProb(tapeYes));
       const gap = (ourAm && theirAm) ? ` (YES ${ourAm} vs ${theirAm})` : '';
-      text += `\nOutbid by $${delta.toFixed(2)} on NO${gap}`;
+      text += `\nOutbid by $${fmtPrice(delta)} on NO${gap}`;
     }
     return text;
   }
