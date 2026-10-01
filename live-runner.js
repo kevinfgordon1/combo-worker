@@ -145,6 +145,7 @@ const {
   formatMissingContext,
 } = require('./cap-confirm');
 const { startHeartbeat } = require('./heartbeat');
+const { createLatencyStats, createLoopLagSampler } = require('./latency-stats');
 const { startPolymarketRfqLoop } = require('./polymarket-rfq');
 const { shortId } = require('./short-id');
 const {
@@ -179,8 +180,8 @@ const {
   formatRepeatSkipAlert,
   REPEAT_SKIP_REASON,
 } = require('./rfq-repeat');
-const { createKalshiRestPair, QUOTE_WARM_MS } = require('./kalshi-http');
-const { createQuoteHot, lockNeedlePlan, fastDropDisabled } = require('./quote-hot');
+const { createKalshiRestPair, QUOTE_WARM_MS, QUOTE_CONNECTIONS } = require('./kalshi-http');
+const { createQuoteHot, lockNeedlePlan, fastDropDisabled, dropDeletedDisabled, createDeletedFilter } = require('./quote-hot');
 const { resolveWorkerMode, shouldRunUnhedged } = require('./worker-mode');
 const { startUnhedgedSide } = require('./unhedged-boot');
 const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
@@ -207,6 +208,10 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 // defaults to one connection).
 const { rest: kalshiHttp, quote: kalshiQuoteHttp } = createKalshiRestPair();
 const quoteHot = createQuoteHot();
+// Quote-path latency / late-post / reconnect metrics → [LATENCY] log + combo_worker_stats.latency.
+const latency = createLatencyStats();
+let loopLag = null;
+let latencyClient = null; // the kalshi firehose, set in main()
 const QUOTE_PATH = '/trade-api/v2/communications/quotes';
 const WARM_PATH = '/trade-api/v2/exchange/status';
 
@@ -298,6 +303,12 @@ let SUBCENT = subcentEnabled(process.env);
 // Safety latch: if the venue ever rejects a sub-cent price as off-grid AND the penny twin
 // then succeeds, count it. 3 in a row → fall back to penny quoting until the next deploy.
 let subcentGridFails = 0;
+// RFQs that reach the handler older than this are skipped, not quoted (KALSHI_STALE_RFQ_MS, 0 = off).
+const STALE_RFQ_MS = (() => {
+  const n = Number(process.env.KALSHI_STALE_RFQ_MS);
+  if (process.env.KALSHI_STALE_RFQ_MS == null || process.env.KALSHI_STALE_RFQ_MS === '') return 15000;
+  return Number.isFinite(n) && n > 0 ? n : Infinity;
+})();
 const SUBCENT_LATCH_AFTER = 3;
 
 const counts = {
@@ -905,24 +916,30 @@ async function confirmQuote(rfqId, quoteId) {
   });
 }
 
-async function warmOne(http, label) {
+async function warmOne(http, label, fanout = 1) {
   try {
-    const { statusCode } = await kalshiSigned('GET', WARM_PATH, { http });
+    // A Pool spreads concurrent requests over its sockets, so firing `fanout` at once
+    // keeps EVERY socket warm (sequential GETs would reuse only the first idle one and let
+    // the others hit the LB idle-kill, costing a TLS handshake on the next burst POST).
+    const results = await Promise.all(
+      Array.from({ length: Math.max(1, fanout) }, () => kalshiSigned('GET', WARM_PATH, { http }))
+    );
+    const statusCode = results[0].statusCode;
     const offset = clockOffset();
     if (Math.abs(offset) > 2000) {
       console.warn(`[${MODE}] kalshi clock offset ${offset}ms (from Date header)`);
     }
-    console.log(`[${MODE}] connection warm ${label} ok status=${statusCode} clockOffset=${offset}ms`);
+    console.log(`[${MODE}] connection warm ${label} ok status=${statusCode} sockets=${results.length} clockOffset=${offset}ms`);
   } catch (e) {
     console.error(`[${MODE}] connection warm ${label} failed`, e.message);
   }
 }
 
 async function warmConnection() {
-  // Warm quote + rest in parallel — different Clients, same origin.
+  // Warm quote + rest in parallel — different pools, same origin.
   // Skip the quote-pool GET while a POST/confirm owns those sockets.
-  const tasks = [warmOne(kalshiHttp, 'rest')];
-  if (!quoteHot.inFlight) tasks.push(warmOne(kalshiQuoteHttp, 'quote'));
+  const tasks = [warmOne(kalshiHttp, 'rest', 1)];
+  if (!quoteHot.inFlight) tasks.push(warmOne(kalshiQuoteHttp, 'quote', QUOTE_CONNECTIONS));
   await Promise.all(tasks);
 }
 
@@ -1774,6 +1791,17 @@ async function onRfq(rfq, env) {
   }
 
   const p = matchParlay(rfq, parlays);
+  const intakeAgeMs = p ? latency.noteIntake(rfq.createdTs) : null;
+  if (p && intakeAgeMs != null && intakeAgeMs > STALE_RFQ_MS) {
+    // Delivered late (reconnect gap / backlog). Kalshi has almost surely closed it (the 234
+    // rfq_closed 409s had a median RFQ age of 15s) and no quote older than 1s ever filled.
+    // Skip the POST instead of burning a request + a 409.
+    latency.noteStaleSkip();
+    if (latency.staleSkipsTotal() <= 5 || latency.staleSkipsTotal() % 50 === 0) {
+      console.log(`[${MODE}] STALE RFQ skipped rfq=${rfq.rfqId} age=${Math.round(intakeAgeMs)}ms (> ${STALE_RFQ_MS}ms) n=${latency.staleSkipsTotal()}`);
+    }
+    return;
+  }
   if (!p) {
     // lockMiss ≠ noLock. noLock is "matched a parlay but hedge does not lock".
     // lockMiss is "combo RFQ did not hit any staged parlay" — the quiet-Kalshi
@@ -2006,6 +2034,7 @@ async function onRfq(rfq, env) {
         );
         result = await postQuote(rfq.rfqId, sentNoBid, sentYesBid, restRemainder);
         counts.subcentFallback = (counts.subcentFallback || 0) + 1;
+        latency.noteSubcentFallback();
         subcentGridFails += 1;
         if (subcentGridFails >= SUBCENT_LATCH_AFTER) {
           SUBCENT = false;
@@ -2031,6 +2060,10 @@ async function onRfq(rfq, env) {
       }));
 
       counts.posted++;
+      const postNote = latency.notePost({ totalMs: t3 - t0, createdTs: rfq.createdTs, ok: true });
+      if (postNote.late) {
+        console.log(`[${MODE}] LATE POST ok rfq=${rfq.rfqId} rfq_age=${Math.round(postNote.ageMs)}ms post=${(t3 - t2).toFixed(1)}ms`);
+      }
       pendingQuotes.delete(reserveKey);
       pendingQuotes.set(result.id, pendingEntry(p, rfq, reservedContracts, { yesBid: sentYesBid }));
 
@@ -2081,9 +2114,11 @@ async function onRfq(rfq, env) {
       }));
       counts.postFailed++;
       const closed = isRfqClosedFailure(e.message);
+      const failNote = latency.notePost({ totalMs: t3 - t0, createdTs: rfq.createdTs, ok: false, rfqClosed: closed });
       console.error(
         `[${MODE}] POST FAILED${closed ? ' rfq_closed' : ''} ${p.label} ` +
-        `rfq=${rfq.rfqId} in ${totalMs}ms`,
+        `rfq=${rfq.rfqId} in ${totalMs}ms` +
+        (failNote.ageMs != null ? ` rfq_age=${Math.round(failNote.ageMs)}ms` : ''),
         e.message
       );
       if (quoteFailureSkipReason(e.message)) {
@@ -2191,6 +2226,7 @@ async function main() {
       `(Kalshi/Polymarket US quotes carry no size) — still dry-run only, no order-flow change`
     );
   }
+  loopLag = createLoopLagSampler();
   const partialTimer = setInterval(() => { partialQuote.tick(); }, 60 * 1000);
   if (partialTimer.unref) partialTimer.unref();
   let polyHeartbeatSnap = null;
@@ -2199,7 +2235,23 @@ async function main() {
     () => {
       const snap = polyHeartbeatSnap;
       polyHeartbeatSnap = null; // each interval is persisted once
-      return { ...(snap ? { poly: snap } : {}), partial_quote: partialQuote.statsJson() };
+      let lat = null;
+      try {
+        lat = latency.rollInterval({
+          ws: latencyClient && latencyClient.takeReconnects ? latencyClient.takeReconnects() : null,
+          loop: loopLag ? loopLag.take() : null,
+          extra: (() => {
+            const h = latencyClient && latencyClient.health ? latencyClient.health() : null;
+            return h ? { ws_backlog: h.backlog, shards_up: h.shardsUp, shard_factor: h.shardFactor } : null;
+          })(),
+        });
+        console.log(latency.formatLine(lat));
+      } catch (e) { lat = null; }
+      return {
+        ...(snap ? { poly: snap } : {}),
+        partial_quote: partialQuote.statsJson(),
+        ...(lat ? { latency: lat } : {}),
+      };
     }
   );
 
@@ -2225,6 +2277,8 @@ async function main() {
     initialFillReconcile: true,
     sendAlert,
     onPolyHeartbeat: (snap) => { polyHeartbeatSnap = snap; },
+    // Poly REST crawl pages wait while a Kalshi quote POST/confirm is in flight.
+    shouldPause: () => quoteHot.inFlight,
     counts,
     sessionFilledByParlay,
     supabase,
@@ -2251,6 +2305,11 @@ async function main() {
     onStatus: noteWsStatus,
     shouldDeferCreated: (raw) => quoteHot.shouldDeferCreated(raw),
     shouldDropCreated: (raw) => quoteHot.shouldDropCreated(raw),
+    // rfq_deleted for an RFQ we hold no reserve/quote on is dropped before JSON.parse.
+    // Off when unhedged shares this process (it needs every close) or KALSHI_WS_DROP_DELETED=0.
+    shouldDropDeleted: (runUnhedged || dropDeletedDisabled(process.env))
+      ? undefined
+      : createDeletedFilter((cb) => { pendingQuotes.forEach((q) => cb(q && q.rfqId)); }),
     onRfqCreated: (rfq, env) => onRfq(rfq, env).catch((e) => console.error('onRfq', e)),
     onRfqDeleted: (evt, env) => { try { onRfqDeleted(evt, env); } catch (e) { console.error('onRfqDeleted', e); } },
     onQuoteAccepted: (evt) => onQuoteAccepted(evt).catch((e) => console.error('onQuoteAccepted', e)),
@@ -2315,6 +2374,7 @@ async function main() {
     console.log(`[${MODE}] final`, counts);
     process.exit(0);
   });
+  latencyClient = client;
   client.start();
 }
 main();

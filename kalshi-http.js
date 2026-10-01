@@ -5,8 +5,13 @@
 // refresh every 4s, skip-tape, fill tracker, warm). Combo Lock auctions
 // close in that window → 409 rfq_closed even when our price is best.
 // Quote mutations (POST/PUT/DELETE) get their own warm pool.
+//
+// IMPORTANT: undici `Client` IGNORES the `connections` option (it is a Pool option) —
+// a Client with connections:3 still owns ONE socket, so every quote POST, confirm and
+// cancel was serialized behind each other (measured: 3×100ms requests = 321ms on a
+// Client, 107ms on a Pool). Use Pool so the documented 3/4 sockets really exist.
 'use strict';
-const { Client } = require('undici');
+const { Pool } = require('undici');
 
 const KALSHI_ORIGIN = 'https://external-api.kalshi.com';
 const REST_CONNECTIONS = 4;
@@ -32,11 +37,11 @@ function kalshiClientOptions(overrides = {}) {
   };
 }
 
-function createKalshiClient(overrides, ClientImpl = Client) {
+function createKalshiClient(overrides, ClientImpl = Pool) {
   return new ClientImpl(KALSHI_ORIGIN, kalshiClientOptions(overrides));
 }
 
-function createKalshiRestPair(ClientImpl = Client) {
+function createKalshiRestPair(ClientImpl = Pool) {
   return {
     rest: createKalshiClient({ connections: REST_CONNECTIONS }, ClientImpl),
     quote: createKalshiClient({ connections: QUOTE_CONNECTIONS }, ClientImpl),

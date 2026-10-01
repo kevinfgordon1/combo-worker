@@ -167,6 +167,13 @@ function fastDropDisabled(env = process.env) {
   return /^(0|false|off|no)$/i.test(String(raw).trim());
 }
 
+// KALSHI_WS_DROP_DELETED=0 turns the rfq_deleted fast-drop off (parse every close frame again).
+function dropDeletedDisabled(env = process.env) {
+  const raw = env && env.KALSHI_WS_DROP_DELETED;
+  if (raw == null || raw === '') return false;
+  return /^(0|false|off|no)$/i.test(String(raw).trim());
+}
+
 function rawLooksLikeLock(raw, needles) {
   if (!needles || !needles.length) return false;
   const s = typeof raw === 'string' ? raw : '';
@@ -176,6 +183,28 @@ function rawLooksLikeLock(raw, needles) {
     if (n && s.includes(n)) return true;
   }
   return false;
+}
+
+// KALSHI_WS_DROP_DELETED=0 turns the rfq_deleted fast-drop off (parse every close frame again).
+function dropDeletedDisabled(env = process.env) {
+  const raw = env && env.KALSHI_WS_DROP_DELETED;
+  if (raw == null || raw === '') return false;
+  return /^(0|false|off|no)$/i.test(String(raw).trim());
+}
+
+// rfq_deleted frames are one per closed RFQ (~half the communications firehose). The runner
+// only needs one when it holds a reserve / pending quote for that rfq_id. `forEachRfqId(cb)`
+// walks the (small) set of rfq ids currently pending; a frame is dropped unless its raw text
+// mentions one. Exact-substring test — never drops a frame for an RFQ we are tracking.
+function createDeletedFilter(forEachRfqId) {
+  return function shouldDropDeleted(raw) {
+    const s = typeof raw === 'string' ? raw : String(raw == null ? '' : raw);
+    let keep = false;
+    forEachRfqId((id) => {
+      if (!keep && id && s.includes(id)) keep = true;
+    });
+    return !keep;
+  };
 }
 
 function createQuoteHot() {
@@ -236,5 +265,7 @@ module.exports = {
   fallbackNeedle,
   rawLooksLikeLock,
   fastDropDisabled,
+  dropDeletedDisabled,
+  createDeletedFilter,
   createQuoteHot,
 };

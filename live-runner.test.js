@@ -306,7 +306,7 @@ assert.ok(
     'Kalshi WS stall watchdog must treat pong as liveness (quiet book must not reconnect)'
   );
   assert.ok(
-    /deadChannelReason/.test(wsSrc) && /forceReconnect\(deadReason\)/.test(wsSrc) &&
+    /deadChannelReason/.test(wsSrc) && /forceReconnect\(deadReason(, \{ fast: true \})?\)/.test(wsSrc) &&
       /unsubscribed/.test(wsSrc),
     'Kalshi WS must force-reconnect when communications unsubscribes'
   );
@@ -449,8 +449,8 @@ assert.ok(
   'confirm and cancel share the quote client'
 );
 assert.ok(
-  /warmOne\(kalshiHttp, 'rest'\)/.test(liveSrc) &&
-    /warmOne\(kalshiQuoteHttp, 'quote'\)/.test(liveSrc),
+  /warmOne\(kalshiHttp, 'rest', 1\)/.test(liveSrc) &&
+    /warmOne\(kalshiQuoteHttp, 'quote', QUOTE_CONNECTIONS\)/.test(liveSrc),
   'both REST pools must be warmed so the first quote POST is not a cold TLS'
 );
 assert.ok(
@@ -543,7 +543,7 @@ assert.ok(
   'both POST and confirm wrap withQuoteHot'
 );
 assert.ok(
-  /if \(!quoteHot\.inFlight\) tasks\.push\(warmOne\(kalshiQuoteHttp, 'quote'\)\)/.test(liveSrc),
+  /if \(!quoteHot\.inFlight\) tasks\.push\(warmOne\(kalshiQuoteHttp, 'quote', QUOTE_CONNECTIONS\)\)/.test(liveSrc),
   'do not steal the quote pool for a warm GET during POST/confirm'
 );
 assert.ok(

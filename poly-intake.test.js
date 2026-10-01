@@ -74,6 +74,26 @@ const mk = (id) => ({ id, status: 'RFQ_STATUS_OPEN', qtyDecimal: '10', comboLegs
     assert.strictEqual(res.pages, 2);
     assert.strictEqual(res.truncated, true);
   }
+  // ── crawl: waits (bounded) while the Kalshi quote path is mid-POST ────────
+  {
+    const http = pagedHttp([[mk('a')], [mk('b')], [mk('c')]]);
+    let busy = 4; // quote hot for the first 4 polls of each page
+    const sleeps = [];
+    const res = await crawlOpenRfqs(http, {
+      pageDelayMs: 0,
+      sleep: async (ms) => { sleeps.push(ms); },
+      shouldPause: () => (busy-- > 0),
+      pauseStepMs: 25,
+    });
+    assert.deepStrictEqual(res.rows.map((r) => r.id), ['a', 'b', 'c']);
+    assert.ok(sleeps.filter((ms) => ms === 25).length === 4, 'crawl yielded while quote-hot');
+    // a stuck flag cannot stall the crawl forever
+    const http2 = pagedHttp([[mk('a')], [mk('b')]]);
+    const s2 = [];
+    const r2 = await crawlOpenRfqs(http2, { pageDelayMs: 0, sleep: async (ms) => { s2.push(ms); }, shouldPause: () => true, pauseStepMs: 25, maxPauseMs: 100 });
+    assert.strictEqual(r2.rows.length, 2);
+    assert.strictEqual(s2.filter((ms) => ms === 25).length, 8, 'pause is bounded per page (4 polls x 2 pages)');
+  }
   // ── crawl: reuses a prefetched first page ────────────────────────────────
   {
     const http = pagedHttp([[mk('a')], [mk('b')]]);

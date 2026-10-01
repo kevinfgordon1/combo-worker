@@ -173,6 +173,16 @@ npm run start:odds-relay  # board relay only (port 8787 or $PORT)
 npm test
 ```
 
+## Kalshi sub-cent quoting and burst-latency knobs
+
+- `KALSHI_SUBCENT=1` — quote Kalshi at the exact lock target on the 0.001 grid (MVE `price_level_structure` `center_deci_edge_centi_cent`) instead of flooring to the cent. Read at boot. Latches off (penny quoting) after 3 consecutive off-grid rejections and sends a Telegram alert.
+- `KALSHI_WS_DROP_DELETED` (default on, `0` disables) — drop `rfq_deleted` frames before JSON.parse unless we hold a reserve/quote on that rfq. Ignored when unhedged shares the process.
+- `KALSHI_STALE_RFQ_MS` (default `15000`, `0` disables) — skip, rather than quote, an RFQ that reaches the handler older than this.
+- Dead-channel WS reconnects (`channel_error`, `unsubscribed`) wait ~100-200ms (jittered), doubling per repeat drop of one socket inside 60s, capped at 8s.
+- Quote HTTP uses an undici `Pool` of `QUOTE_CONNECTIONS` sockets (was a single-socket `Client`); warm pings fan out to all of them.
+- Poly REST crawl pauses (bounded) while a Kalshi quote POST/confirm is in flight.
+- Heartbeat: `[LATENCY]` log line + `combo_worker_stats.latency` jsonb (migration `20261002_combo_worker_stats_latency.sql`): `quote_ms`, `intake_ms` (RFQ age at our handler), `posted_age_ms` histograms, `late_posts` (>1s), `rfq_closed`, `stale_skipped`, reconnects by reason, `resubscribe_gap_max_ms`, `loop_lag_ms`.
+
 ## Success checks after you deploy
 
 - Combo Locks logs: `WORKER_MODE=combo` and `Unhedged /markets, fill ticks, and shadow miss are off`.

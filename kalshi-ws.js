@@ -52,6 +52,14 @@ const STALL_TICK_MS = 5_000;
 const PING_MS = 10_000;
 const INITIAL_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 30_000;
+// Dead-channel reconnects (code 25 buffer overflow / code 10 / unsubscribed). The old fixed
+// 1000ms wait blacked a shard out for ~1.3s per event (480 events Sep 25-27). First retry is
+// now ~100-200ms with jitter; repeated drops of the SAME socket inside the storm window
+// escalate (x2 each, capped) so a genuine storm cannot hammer Kalshi.
+const FAST_RECONNECT_MS = 100;
+const FAST_RECONNECT_JITTER_MS = 100;
+const STORM_WINDOW_MS = 60_000;
+const STORM_MAX_WAIT_MS = 8_000;
 const MAX_SHARD_FACTOR = 100;
 // Combo Locks default. Other callers pass 1 (a single unsharded socket).
 const DEFAULT_LIVE_SHARD_FACTOR = 8;
@@ -105,8 +113,17 @@ function createStats() {
     quotes: 0,
     backlog: 0,
     maxHandlerNs: 0,
+    reconnects: 0,
+    windowReconnects: 0,
+    reconnectByReason: {},
+    windowReconnectByReason: {},
+    lastGapMs: null,
+    maxGapMs: 0,
+    windowMaxGapMs: 0,
     windowRecv: 0,
     windowDrop: 0,
+    dropDeleted: 0,
+    windowDropDeleted: 0,
     windowParse: 0,
     windowQuotes: 0,
     windowStarted: Date.now(),
@@ -184,10 +201,13 @@ function createKalshiWs({
   stallMs,
   shouldDeferCreated,
   shouldDropCreated,
+  shouldDropDeleted,
   shardFactor,
   shardKey,
   captureRfq: captureFn,
   WebSocket: WsImpl,
+  random,
+  fastReconnectMs,
 } = {}) {
   const Ws = WsImpl || WebSocket;
   const capture = captureFn || captureRfq;
@@ -197,6 +217,12 @@ function createKalshiWs({
   let ws = null, subId = 1, pingTimer = null, stallTimer = null;
   let backoff = INITIAL_BACKOFF_MS, closedByUs = false, reconnectTimer = null;
   let lastCommAt = 0;
+  let droppedAt = 0;          // when the current outage began (forceReconnect / close)
+  let awaitingFirstFrame = false;
+  const recentDrops = [];     // timestamps of this socket's recent dead-channel drops
+  const rnd = typeof random === 'function' ? random : Math.random;
+  const fastMs = fastReconnectMs != null && Number.isFinite(Number(fastReconnectMs))
+    ? Number(fastReconnectMs) : FAST_RECONNECT_MS;
   const stats = createStats();
   const status = (s, i) => {
     let payload = i;
@@ -219,6 +245,32 @@ function createKalshiWs({
   function touchComm() {
     touchAlive();
     backoff = INITIAL_BACKOFF_MS;
+    if (awaitingFirstFrame && droppedAt) {
+      // First proven-live frame after a reconnect: how long this shard was blind.
+      const gap = Date.now() - droppedAt;
+      stats.lastGapMs = gap;
+      if (gap > stats.maxGapMs) stats.maxGapMs = gap;
+      if (gap > stats.windowMaxGapMs) stats.windowMaxGapMs = gap;
+      awaitingFirstFrame = false;
+    }
+  }
+
+  function noteReconnect(reason) {
+    stats.reconnects++;
+    stats.windowReconnects++;
+    const k = String(reason || 'unknown');
+    stats.reconnectByReason[k] = (stats.reconnectByReason[k] || 0) + 1;
+    stats.windowReconnectByReason[k] = (stats.windowReconnectByReason[k] || 0) + 1;
+  }
+
+  // Wait before re-dialing a socket whose channel died. Jittered, fast first retry,
+  // doubling for repeated drops of this socket inside STORM_WINDOW_MS.
+  function deadChannelWait(now) {
+    while (recentDrops.length && now - recentDrops[0] > STORM_WINDOW_MS) recentDrops.shift();
+    const n = recentDrops.length; // prior drops in the window (this one not yet counted)
+    recentDrops.push(now);
+    const base = Math.min(fastMs * Math.pow(2, n), STORM_MAX_WAIT_MS);
+    return Math.round(base + rnd() * Math.min(FAST_RECONNECT_JITTER_MS * Math.pow(2, n), base));
   }
 
   function clearTimers() {
@@ -241,11 +293,17 @@ function createKalshiWs({
       return;
     }
     const immediate = !!(opts.immediate);
-    const wait = immediate ? 250 : Math.min(backoff, MAX_BACKOFF_MS);
+    const now = Date.now();
+    if (!droppedAt || !awaitingFirstFrame) droppedAt = now;
+    awaitingFirstFrame = true;
+    let wait;
+    if (opts.fast) wait = deadChannelWait(now);
+    else wait = immediate ? 250 : Math.min(backoff, MAX_BACKOFF_MS);
+    noteReconnect(reason);
     status('reconnecting', { wait, reason });
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
-      if (!immediate) backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
+      if (!immediate && !opts.fast) backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
       connect();
     }, wait);
   }
@@ -372,7 +430,7 @@ function createKalshiWs({
         const code = envelopeCode(env);
         if (code != null) info.code = code;
         status(deadReason === 'unsubscribed' ? 'unsubscribed' : 'error', info);
-        forceReconnect(deadReason);
+        forceReconnect(deadReason, { fast: true });
         return;
       }
 
@@ -458,6 +516,19 @@ function createKalshiWs({
         }
       }
       const raw = toRawString(d);
+      // rfq_deleted is ~half the firehose (one per closed RFQ). It only matters when the
+      // RFQ is one we hold a reserve / quote for (release it). Everything else is dropped
+      // before JSON.parse + the pendingQuotes scan. quote_* frames are never dropped.
+      if (kind === 'rfq_deleted' && shouldDropDeleted) {
+        let dropD = false;
+        try { dropD = !!shouldDropDeleted(raw); } catch (_) { dropD = false; }
+        if (dropD) {
+          stats.dropDeleted++;
+          stats.windowDropDeleted++;
+          noteHandler(started);
+          return;
+        }
+      }
       // While a quote POST/confirm is in flight, unmatched rfq_created
       // frames are deferred (setImmediate) so the HTTP callback is not
       // stuck behind JSON.parse of the communications book. Lock-needle
@@ -512,7 +583,23 @@ function createKalshiWs({
         drop: stats.drop,
         parse: stats.parse,
         quotes: stats.quotes,
+        reconnects: stats.reconnects,
+        reconnectByReason: { ...stats.reconnectByReason },
+        lastGapMs: stats.lastGapMs,
+        maxGapMs: stats.maxGapMs,
       };
+    },
+    // Reconnects since the last call (heartbeat window), then reset.
+    takeReconnects() {
+      const out = {
+        count: stats.windowReconnects,
+        byReason: { ...stats.windowReconnectByReason },
+        maxGapMs: stats.windowMaxGapMs || null,
+      };
+      stats.windowReconnects = 0;
+      stats.windowReconnectByReason = {};
+      stats.windowMaxGapMs = 0;
+      return out;
     },
     takeThroughput() {
       const now = Date.now();
@@ -522,6 +609,7 @@ function createKalshiWs({
         windowMs,
         recv: stats.windowRecv,
         drop: stats.windowDrop,
+        dropDeleted: stats.windowDropDeleted,
         parse: stats.windowParse,
         quotes: stats.windowQuotes,
         maxHandlerNs: stats.maxHandlerNs,
@@ -531,6 +619,7 @@ function createKalshiWs({
       };
       stats.windowRecv = 0;
       stats.windowDrop = 0;
+      stats.windowDropDeleted = 0;
       stats.windowParse = 0;
       stats.windowQuotes = 0;
       stats.windowStarted = now;
@@ -603,6 +692,7 @@ function createKalshiFirehose(opts = {}) {
       WebSocket: opts.WebSocket,
       stallMs: opts.stallMs,
       shouldDropCreated: opts.shouldDropCreated,
+      shouldDropDeleted: opts.shouldDropDeleted,
       shouldDeferCreated: opts.shouldDeferCreated,
       onRfqCreated,
       onRfqDeleted: opts.onRfqDeleted,
@@ -728,12 +818,27 @@ function createKalshiFirehose(opts = {}) {
       }
     },
     health,
+    // Reconnects (and the worst blind gap) across every shard since the last call.
+    takeReconnects() {
+      let count = 0;
+      let maxGapMs = null;
+      const byReason = {};
+      for (const sock of sockets) {
+        const r = sock.takeReconnects ? sock.takeReconnects() : null;
+        if (!r) continue;
+        count += r.count;
+        if (r.maxGapMs != null && (maxGapMs == null || r.maxGapMs > maxGapMs)) maxGapMs = r.maxGapMs;
+        for (const [k, v] of Object.entries(r.byReason || {})) byReason[k] = (byReason[k] || 0) + v;
+      }
+      return { count, byReason, maxGapMs };
+    },
     takeThroughput() {
       const parts = sockets.map((s) => s.takeThroughput());
       const windowMs = parts.reduce((m, p) => Math.max(m, p.windowMs || 0), 0);
       const sec = Math.max(0.001, windowMs / 1000);
       let recv = 0;
       let drop = 0;
+      let dropDeleted = 0;
       let parse = 0;
       let quotes = 0;
       let maxHandlerNs = 0;
@@ -742,6 +847,7 @@ function createKalshiFirehose(opts = {}) {
       for (const p of parts) {
         recv += p.recv;
         drop += p.drop;
+        dropDeleted += p.dropDeleted || 0;
         parse += p.parse;
         quotes += p.quotes;
         backlog += p.backlog || 0;
@@ -759,6 +865,7 @@ function createKalshiFirehose(opts = {}) {
         windowMs,
         recv,
         drop,
+        dropDeleted,
         parse,
         quotes,
         backlog,
@@ -792,6 +899,7 @@ function summarizeThroughput(snap) {
     recvPerSec: Math.round(recv / sec),
     drop,
     dropPerSec: Math.round(drop / sec),
+    dropDeleted: snap && snap.dropDeleted || 0,
     parse,
     parsePerSec: Math.round(parse / sec),
     quotes: snap && snap.quotes || 0,
@@ -817,6 +925,9 @@ module.exports = {
   PING_MS,
   INITIAL_BACKOFF_MS,
   MAX_BACKOFF_MS,
+  FAST_RECONNECT_MS,
+  STORM_WINDOW_MS,
+  STORM_MAX_WAIT_MS,
   readStallMs,
   readShardFactor,
   shardsLookUnsplit,

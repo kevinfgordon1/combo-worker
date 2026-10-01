@@ -206,6 +206,9 @@ async function crawlOpenRfqs(http, {
   sleep = sleepMs,
   isStopped = () => false,
   firstPage = null,
+  shouldPause = null,   // () => truthy while the Kalshi quote path is mid-POST/confirm
+  pauseStepMs = 25,
+  maxPauseMs = 2000,
 } = {}) {
   const rows = [];
   const seenIds = new Set();
@@ -216,6 +219,12 @@ async function crawlOpenRfqs(http, {
   let pending = firstPage;
   for (;;) {
     if (isStopped()) { truncated = true; break; }
+    // Yield to the Kalshi quote path: do not start another page (HTTP + JSON.parse + signing)
+    // while a quote POST/confirm is in flight. Bounded so a stuck flag cannot stall the crawl.
+    if (typeof shouldPause === 'function') {
+      let waited = 0;
+      while (waited < maxPauseMs && shouldPause()) { await sleep(pauseStepMs); waited += pauseStepMs; }
+    }
     let listed;
     try {
       if (pending) { listed = pending; pending = null; }
