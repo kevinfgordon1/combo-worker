@@ -187,6 +187,7 @@ const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
 const { formatAlertStatus } = require('./venue-alert');
 const { createBucketManager } = require('./bucket-manager');
 const { createAppAlerts } = require('./app-alerts');
+const { createPartialQuoteDryRun, isPartialQuoteFlagOn } = require('./partial-quote');
 
 const MODE = 'LIVE';
 let bucketManager = null;
@@ -299,6 +300,10 @@ const counts = {
   tapeMatched: 0, tapeNone: 0,
   rfqRepeat: 0,
 };
+// Oversized-RFQ partial-quote DRY-RUN counter (COMBO_PARTIAL_QUOTE_OVERSIZED,
+// default OFF). Observability only — Kalshi quotes cannot be smaller than the RFQ.
+const partialQuote = createPartialQuoteDryRun();
+
 const repeatGuard = createRepeatGuard({
   cooldownMs: readCooldownMs(process.env),
   maxQuotes: readMaxQuotes(process.env),
@@ -1896,10 +1901,15 @@ async function onRfq(rfq, env) {
     }
     counts.declined++;
     if (d.reason === 'rfq_too_large') {
+      const wouldClip = partialQuote.note({
+        venue: 'kalshi', parlayId: p.id, rfqContracts: size.contracts, remaining: d.remaining,
+      });
+      if (wouldClip > 0) counts.partialWouldQuote = (counts.partialWouldQuote || 0) + 1;
       console.log(
         `[${MODE}] SKIP oversized RFQ ${p.label} rfq=${rfq.rfqId} ` +
         `want=${size.contracts} remaining=${d.remaining}/${d.totalLimit} ` +
-        `filled=${filledSoFar} ${exposureBit(outstanding)}`
+        `filled=${filledSoFar} ${exposureBit(outstanding)}` +
+        (wouldClip > 0 ? ` partial_would_quote=${wouldClip}` : '')
       );
       logSkip(p, rfq, d, 'declined', size);
       return;
@@ -2133,13 +2143,21 @@ async function main() {
   await warmConnection();
   setInterval(warmConnection, QUOTE_WARM_MS);
 
+  if (isPartialQuoteFlagOn()) {
+    console.log(
+      `[${MODE}] COMBO_PARTIAL_QUOTE_OVERSIZED is ON but no venue can quote fewer contracts than the RFQ ` +
+      `(Kalshi/Polymarket US quotes carry no size) — still dry-run only, no order-flow change`
+    );
+  }
+  const partialTimer = setInterval(() => { partialQuote.tick(); }, 60 * 1000);
+  if (partialTimer.unref) partialTimer.unref();
   let polyHeartbeatSnap = null;
   startHeartbeat(
     supabase, MODE, counts, () => parlays.length, 60000,
     () => {
       const snap = polyHeartbeatSnap;
       polyHeartbeatSnap = null; // each interval is persisted once
-      return snap ? { poly: snap } : null;
+      return { ...(snap ? { poly: snap } : {}), partial_quote: partialQuote.statsJson() };
     }
   );
 
