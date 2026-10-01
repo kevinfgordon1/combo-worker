@@ -11,6 +11,19 @@ const americanFromProb = (p) => (!(p > 0 && p < 1) ? null : p < 0.5 ? Math.round
 const r2 = (x) => Math.round(x * 100) / 100;
 // Floor to the cent — never round NO bid UP past the fill target (we buy NO / sell the parlay).
 const floor2 = (x) => Math.floor(x * 100 + 1e-9) / 100;
+// Floor to the 0.001 tick. Kalshi combo (MVE) markets are on price_level_structure
+// center_deci_edge_centi_cent: step 0.0001 below $0.01 and above $0.99, step 0.001
+// in between. Every price we quote lives on the 0.001 grid (a subset of both bands).
+const floor3 = (x) => Math.floor(x * 1000 + 1e-9) / 1000;
+
+// KALSHI_SUBCENT — quote at the exact lock target on the 0.001 grid instead of
+// flooring to the cent. Default OFF in code; production turns it on with
+// KALSHI_SUBCENT=1. Anything else (unset, 0, false, off, no) = penny grid.
+function subcentEnabled(env = process.env) {
+  const raw = env && env.KALSHI_SUBCENT;
+  if (raw == null || raw === '') return false;
+  return /^(1|true|on|yes)$/i.test(String(raw).trim());
+}
 // Kalshi REST quotes require FixedPointDollars (two decimal places). Bare "0" is
 // invalid_yes_bid / invalid_dollar_precision. Contract-count RFQs decline YES
 // with "0.00". Dollar RFQs cannot — Kalshi treats 0.00 like 1¢ and explodes size.
@@ -28,9 +41,19 @@ function yesBidForQuote(yesBid) {
 function impliedYesBid(noBid) {
   const no = parseFloat(noBid);
   if (!Number.isFinite(no)) return null;
-  const yes = floor2(1 - no);
+  // A sub-cent NO (3 dp) gets a 3 dp YES on the same grid, so yes + no is
+  // exactly $1.000 and neither side is rounded past the lock target.
+  const subcent = isSubcentPrice(noBid);
+  const yes = subcent ? floor3(1 - no) : floor2(1 - no);
   if (!(yes >= 0.01)) return null;
-  return yes.toFixed(2);
+  return yes.toFixed(subcent ? 3 : 2);
+}
+
+// True when the price string carries a non-zero 3rd/4th decimal (e.g. "0.771").
+function isSubcentPrice(price) {
+  const n = parseFloat(price);
+  if (!Number.isFinite(n)) return false;
+  return Math.abs(Math.round(n * 100) / 100 - n) > 1e-9;
 }
 
 function isRealYesBid(yesBid) {
@@ -140,19 +163,48 @@ function isSilentQuoteFailure(message) {
   return /invalid_yes_bid|invalid_dollar_precision/.test(msg);
 }
 
+// A 400 that says the price is not on the market's tick grid / has too many decimals.
+// Used ONLY to fall back from a sub-cent quote to the penny grid for the same RFQ.
+function isPriceGridFailure(message) {
+  return /invalid_(?:yes|no)_bid|invalid_dollar_precision|invalid_price|price_level|tick|precision/i.test(String(message || ''));
+}
+
+// Penny-grid twin of a sub-cent NO price (floor to the cent → never above the sub-cent price).
+function pennyNoBid(noBid) {
+  const n = parseFloat(noBid);
+  return Number.isFinite(n) ? floor2(n).toFixed(2) : null;
+}
+
 // Your fill is net of your maker fee. Recover the nominal exchange price you'd quote, and from it
 // the taker's matched odds (nominal price + their 7% taker fee — worse than yours).
 function nominalProbFromEff(sEff) {
   const b = 1 - KFEE; // solve KFEE*sNom^2 + (1-KFEE)*sNom - sEff = 0
   return (-b + Math.sqrt(b * b + 4 * KFEE * sEff)) / (2 * KFEE);
 }
-function fillView(fillAfterFeeAmerican) {
+function fillView(fillAfterFeeAmerican, opts = {}) {
   const sEff = impliedProb(fillAfterFeeAmerican);
   const sNom = nominalProbFromEff(sEff);
   const takerProb = sNom + TAKER_FEE * sNom * (1 - sNom);
-  // Penny grid: floor no_bid so effective sell odds are never worse than fillAfterFeeAmerican.
+  const subcent = !!(opts && opts.subcent);
+  // Grid: floor no_bid so effective sell odds are never worse than fillAfterFeeAmerican.
   // (Nearest-cent rounding turned +1100 into no_bid 0.92 ≈ +1170 after fee.)
-  return { sEff, sNom, effTaker: americanFromProb(takerProb), noBid: floor2(1 - sNom).toFixed(2) };
+  // KALSHI_SUBCENT: floor to 0.001 instead of 0.01 — still never past the target,
+  // but gives back up to 0.9¢ of price that the penny floor left on the table.
+  const target = 1 - sNom;
+  let noBidNum = subcent ? floor3(target) : floor2(target);
+  // floor*()'s 1e-9 float guard may land a hair ABOVE the exact target; never allow that.
+  if (subcent && noBidNum > target + 1e-12) noBidNum = Math.round((noBidNum - 0.001) * 1000) / 1000;
+  // Sub-cent mode never quotes NO above $0.99: keeps implied YES >= $0.01 (dollar RFQs need a real
+  // YES) and a lower NO bid is always the safe direction (we are the NO buyer / parlay seller).
+  if (subcent && noBidNum > 0.99) noBidNum = 0.99;
+  const noBid = noBidNum.toFixed(subcent ? 3 : 2);
+  // What the quoted price actually nets after the maker fee (prob + American).
+  const sNomQuoted = 1 - noBidNum;
+  const sEffQuoted = sNomQuoted - KFEE * sNomQuoted * (1 - sNomQuoted);
+  return {
+    sEff, sNom, effTaker: americanFromProb(takerProb), noBid,
+    subcent, sEffQuoted, effQuoted: americanFromProb(sEffQuoted),
+  };
 }
 
 // Contracts cap for a hedge mode. Fill odds already include your maker fee, so no fee term here.
@@ -227,7 +279,7 @@ function freeBetRiskfreeMissingCap({ hedgeMode, maxContracts, isFreeBet }) {
   return !(maxContracts != null && maxContracts !== '' && Number.isFinite(max) && max > 0);
 }
 
-function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican = null, rfqContracts, hedgeMode = '1x', maxContracts = null, filledSoFar = 0, outstanding = 0, allowPartial = false, isFreeBet = false }) {
+function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican = null, rfqContracts, hedgeMode = '1x', maxContracts = null, filledSoFar = 0, outstanding = 0, allowPartial = false, isFreeBet = false, subcent = false }) {
   if (!(parlayStake > 0) || !parlayAmerican || !fillAmerican || !(rfqContracts > 0)) return { ok: false, reason: 'bad_inputs' };
   if (freeBetRiskfreeMissingCap({ hedgeMode, maxContracts, isFreeBet })) {
     return { ok: false, reason: 'no_cap', cap: 0, totalLimit: 0, filledSoFar: filledSoFar > 0 ? filledSoFar : 0, outstanding: outstanding > 0 ? outstanding : 0, remaining: 0 };
@@ -255,7 +307,18 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
   if (!(N > 0)) return { ok: false, reason: 'zero_cap', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved, remaining: remainingBefore };
   const s = impliedProb(fillAmerican); // already net of your maker fee
   const hit = bookHit + N * s - N, miss = bookMiss + N * s, worst = Math.min(hit, miss);
-  const v = fillView(fillAmerican);
+  const v = fillView(fillAmerican, { subcent });
+  // Exact-price recheck. The quote sits on the grid at or below the target no_bid, so the
+  // premium we collect (net of maker fee) can only be >= the target fill. Prove it instead of
+  // trusting the rounding, and report the profit at the price we actually send.
+  const sQuoted = v.sEffQuoted;
+  if (subcent && (!(sQuoted + 1e-12 >= s) || !(parseFloat(v.noBid) >= 0.001))) {
+    return {
+      ok: false, reason: 'quote_below_target', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved,
+      remaining: remainingBefore, rfqContracts, quotedNoBid: v.noBid,
+    };
+  }
+  const hitQ = bookHit + N * sQuoted - N, missQ = bookMiss + N * sQuoted, worstQ = Math.min(hitQ, missQ);
   const remainingAfter = remainingBefore - N;
   const clipped = N < rfqContracts;
   return {
@@ -264,15 +327,17 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
     totalLimit, filledSoFar: alreadyFilled, outstanding: reserved, remaining: remainingAfter, limitReached: remainingAfter <= 0,
     competitive: fairAmerican == null ? null : fillAmerican >= fairAmerican, fillAmerican,
     effTakerOdds: v.effTaker, rfqContracts,
+    quotedEffAmerican: v.effQuoted, worstAtQuote: r2(worstQ), hitAtQuote: r2(hitQ), missAtQuote: r2(missQ), subcent: !!subcent,
     quote: { yes_bid: YES_DECLINE, no_bid: v.noBid, rest_remainder: false }, contracts: N,
   };
 }
 module.exports = {
+  floor2, floor3, subcentEnabled, isSubcentPrice,
   decideAtFill, impliedProb, hedgeCap, fillView, americanFromProb,
   isFreeBetRow, freeBetRiskfreeMissingCap,
   YES_DECLINE, yesBidForQuote, impliedYesBid, quoteYesBid, isRealYesBid,
   shouldConfirmAccept, contractsFromQuoteResponse,
-  buildQuoteBody, shouldPostQuote, isSilentQuoteFailure,
+  buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, isPriceGridFailure, pennyNoBid,
   isInsufficientFundsFailure, quoteFailureSkipReason,
   isRfqClosedFailure, quotePostFailReason, formatQuoteLatency,
 };
