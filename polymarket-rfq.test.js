@@ -51,8 +51,12 @@ const { createMarketCache } = require('./polymarket-market-cache');
 const polySrc = fs.readFileSync(path.join(__dirname, 'polymarket-rfq.js'), 'utf8');
 assert.ok(polySrc.includes('createPolyMissTape'), 'reconcile must persist Combo Locks Miss tape');
 assert.ok(
-  /allowPartial:\s*true/.test(polySrc),
-  'Poly evaluate must clip leftover remaining instead of rfq_too_large'
+  /allowPartial:\s*false/.test(polySrc) && !/allowPartial:\s*true/.test(polySrc),
+  'Poly must never clip: CreateQuote has no size field, the venue fills the full RFQ size'
+);
+assert.ok(
+  !/body\.qtyDecimal/.test(polySrc),
+  'Poly CreateQuote body must not carry an undocumented qtyDecimal'
 );
 assert.ok(
   /includeAccepted:\s*true/.test(polySrc),
@@ -1102,17 +1106,12 @@ const cashEval = evaluatePolymarketRfq({
   outstanding: sharedOut,
 });
 assert.strictEqual(cashEval.quote.estimatedContracts, 45);
-assert.strictEqual(cashEval.action, 'quoteable');
-assert.strictEqual(cashEval.decision.contracts, 116 - SIZE * 2);
-assert.strictEqual(cashEval.decision.partial, true);
-assert.strictEqual(cashEval.decision.remaining, 0);
-assert.deepStrictEqual(quoteBodyFromEval(cashEval), {
-  rfqId: 'rfq_cash_45',
-  buyPrice: '0.222',
-  sellPrice: '0',
-  restRemainder: false,
-  qtyDecimal: '30',
-});
+// Cash RFQ whose full size (45) exceeds what is left (116 - 2*SIZE = 30): the venue
+// would fill all 45, so Poly declines instead of "clipping" to 30.
+assert.strictEqual(cashEval.action, 'skip');
+assert.strictEqual(cashEval.reason, 'rfq_too_large');
+assert.strictEqual(cashEval.decision.remaining, 116 - SIZE * 2);
+assert.strictEqual(cashEval.decision.rfqContracts, 45);
 assert.strictEqual(formatQtyDecimal(30), '30');
 
 const cashAlone = evaluatePolymarketRfq({
@@ -1124,7 +1123,9 @@ const cashAlone = evaluatePolymarketRfq({
 assert.strictEqual(cashAlone.action, 'quoteable');
 assert.strictEqual(cashAlone.decision.contracts, 45);
 assert.strictEqual(cashAlone.decision.outstanding, SIZE);
-assert.ok(!('qtyDecimal' in quoteBodyFromEval(cashAlone)));
+assert.deepStrictEqual(quoteBodyFromEval(cashAlone), {
+  rfqId: 'rfq_cash_45', buyPrice: '0.222', sellPrice: '0', restRemainder: false,
+});
 
 const qtyFit = evaluatePolymarketRfq({
   rfq: { ...pmRfq, id: 'rfq_qty_10', qtyDecimal: '10' },
@@ -1155,10 +1156,10 @@ const over = evaluatePolymarketRfq({
   filledSoFar: 0,
   outstanding: SIZE,
 });
-assert.strictEqual(over.action, 'quoteable');
-assert.strictEqual(over.decision.contracts, 116 - SIZE);
-assert.strictEqual(over.decision.partial, true);
-assert.strictEqual(quoteBodyFromEval(over).qtyDecimal, '73');
+assert.strictEqual(over.action, 'skip');
+assert.strictEqual(over.reason, 'rfq_too_large');
+assert.strictEqual(over.decision.remaining, 116 - SIZE);
+assert.ok(!('qtyDecimal' in quoteBodyFromEval(over)));
 
 const exhausted = evaluatePolymarketRfq({
   rfq: { ...pmRfq, id: 'rfq_qty_exhausted', qtyDecimal: '10' },
@@ -2663,16 +2664,29 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
         id: 'rfq_ari_jac_oversized',
         qtyDecimal: '8000',
       });
-      assert.strictEqual(partial.action, 'quoteable');
-      assert.strictEqual(partial.post, true);
-      assert.strictEqual(partial.decision.contracts, ariJacSept13Lock.max_contracts);
-      assert.strictEqual(partial.decision.partial, true);
+      // Oversized RFQ (8000 > cap 150): declined, nothing posted, nothing reserved.
+      assert.strictEqual(partial.action, 'skip');
+      assert.strictEqual(partial.reason, 'rfq_too_large');
+      assert.strictEqual(partial.post, undefined);
+      assert.strictEqual(sizePosts.length, 0);
+      assert.strictEqual(sumOutstanding(sizePending, ariJacSept13Lock.id), 0);
+
+      // An RFQ that fits is quoted at its FULL size with the documented body only.
+      const fits = await sizeLoop.handleRfq({
+        ...ariJacQuoteRfq,
+        id: 'rfq_ari_jac_fits',
+        qtyDecimal: '150',
+      });
+      assert.strictEqual(fits.post, true);
+      assert.strictEqual(fits.decision.contracts, 150);
+      assert.strictEqual(fits.decision.partial, false);
       assert.strictEqual(sizePosts.length, 1);
-      assert.strictEqual(sizePosts[0].qtyDecimal, '150');
+      assert.ok(!('qtyDecimal' in sizePosts[0]), 'no undocumented size field on CreateQuote');
+      assert.deepStrictEqual(
+        Object.keys(sizePosts[0]).sort(),
+        ['buyPrice', 'restRemainder', 'rfqId', 'sellPrice']
+      );
       assert.strictEqual(sumOutstanding(sizePending, ariJacSept13Lock.id), 150);
-      assert.strictEqual(sizeRows.length, 1);
-      assert.strictEqual(sizeRows[0].status, 'quoted');
-      assert.strictEqual(sizeRows[0].contracts, 150);
 
       const capped = await sizeLoop.handleRfq({
         ...ariJacQuoteRfq,
@@ -3017,7 +3031,7 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
 
   const capParlay = { ...pmParlay, id: 'cap-lock', label: 'MIA+IND+TEN', max_contracts: 100 };
 
-  // Flag off: the open quote still reserves, so a second 60 is clipped to the leftover.
+  // Flag off: the open quote still reserves, so a second 60 no longer fits and is declined.
   {
     const off = polyHttp();
     const offPending = new Map();
@@ -3040,10 +3054,9 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
       assert.strictEqual(first.post, true);
       assert.strictEqual(first.decision.contracts, 60);
       const second = await offLoop.handleRfq({ ...pmRfq, id: 'rfq_off_2', qtyDecimal: '60' });
-      assert.strictEqual(second.post, true);
-      assert.strictEqual(second.decision.partial, true);
-      assert.strictEqual(second.decision.contracts, 40, 'flag off: open quote still reserves');
-      assert.strictEqual(sumOutstanding(offPending, 'cap-lock'), 100);
+      assert.strictEqual(second.post, undefined);
+      assert.strictEqual(second.reason, 'rfq_too_large', 'flag off: open quote reserves, 60 > 40 left is declined (never clipped)');
+      assert.strictEqual(sumOutstanding(offPending, 'cap-lock'), 60);
     } finally {
       offLoop.stop();
     }
