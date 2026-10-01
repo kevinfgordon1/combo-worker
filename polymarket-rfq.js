@@ -2130,6 +2130,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         maxPages: crawlMaxPages,
         pageDelayMs: crawlPageDelayMs,
         isStopped: () => stopped,
+        shouldPause: ctx.shouldPause,
       });
       intake.recordCrawl(res, Date.now() - t0);
       const fresh = [];

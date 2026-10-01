@@ -2,7 +2,7 @@
 const assert = require('assert');
 const { EventEmitter } = require('events');
 const { generateKeyPairSync } = require('crypto');
-const { createKalshiWs, createKalshiFirehose, DEFAULT_STALL_MS, DEFAULT_LIVE_SHARD_FACTOR, PING_MS, INITIAL_BACKOFF_MS, readStallMs, readShardFactor, shardsLookUnsplit, summarizeThroughput, deadChannelReason, shouldOpenQuoteWatcherWs } = require('./kalshi-ws');
+const { createKalshiWs, createKalshiFirehose, FAST_RECONNECT_MS, STORM_MAX_WAIT_MS, DEFAULT_STALL_MS, DEFAULT_LIVE_SHARD_FACTOR, PING_MS, INITIAL_BACKOFF_MS, readStallMs, readShardFactor, shardsLookUnsplit, summarizeThroughput, deadChannelReason, shouldOpenQuoteWatcherWs } = require('./kalshi-ws');
 const { normalizeRfq, matchParlay } = require('./rfq');
 const { createQuoteHot, lockNeedlePlan } = require('./quote-hot');
 const { applyServerDate, resetClockOffset, signedNow, authHeaders } = require('./kalshi-auth');
@@ -606,6 +606,111 @@ async function runAsync() {
     assert.strictEqual(snap.recvPerSec, 2700);
     assert.strictEqual(snap.backlog, 0);
     assert.strictEqual(snap.shardsUp, 8);
+  }
+
+
+  // ── burst-latency: dead-channel reconnect is fast + jittered, storms escalate, gap is measured ──
+  {
+    assert.ok(FAST_RECONNECT_MS <= 150, 'first dead-channel retry must be well under the old fixed 1000ms');
+    FakeWs.instances = [];
+    const statuses = [];
+    const client = createKalshiWs({
+      keyId: 'test-key', pem: PEM, WebSocket: FakeWs, stallMs: 60_000,
+      random: () => 0.5,
+      onStatus: (s, i) => statuses.push({ s, i }),
+    });
+    client.start();
+    await wait(15);
+    const n0 = FakeWs.instances.length;
+    const t0 = Date.now();
+    FakeWs.instances[FakeWs.instances.length - 1].emit('message', JSON.stringify({ type: 'error', msg: { code: 25, msg: 'Subscription buffer overflow' } }));
+    const r1 = statuses.filter((x) => x.s === 'reconnecting' && x.i.reason === 'channel_error');
+    assert.strictEqual(r1.length, 1);
+    assert.ok(r1[0].i.wait >= FAST_RECONNECT_MS && r1[0].i.wait <= FAST_RECONNECT_MS + 100, `fast wait, got ${r1[0].i.wait}`);
+    await wait(r1[0].i.wait + 60);
+    assert.ok(FakeWs.instances.length > n0, 'redialed within ~wait');
+    assert.ok(Date.now() - t0 < 600, 'resubscribed well under the old ~1.3s blackout');
+    assert.ok(statuses.filter((x) => x.s === 'subscribed').length >= 2, 'resubscribed after the drop');
+    // first proven-live frame after the reconnect closes the gap measurement
+    FakeWs.instances[FakeWs.instances.length - 1].emit('message', JSON.stringify({ type: 'subscribed', msg: { channel: 'communications' } }));
+    const h = client.health();
+    assert.strictEqual(h.reconnects, 1);
+    assert.deepStrictEqual(h.reconnectByReason, { channel_error: 1 });
+    assert.ok(h.lastGapMs != null && h.lastGapMs >= r1[0].i.wait && h.lastGapMs < 600, `gap ${h.lastGapMs}`);
+    const win = client.takeReconnects();
+    assert.strictEqual(win.count, 1);
+    assert.deepStrictEqual(win.byReason, { channel_error: 1 });
+    assert.ok(win.maxGapMs >= r1[0].i.wait);
+    assert.strictEqual(client.takeReconnects().count, 0, 'window resets after take');
+    client.stop();
+  }
+  {
+    // A storm on the SAME socket escalates (x2, capped) instead of hammering Kalshi, and the
+    // jitter really is applied (two different random values → two different waits).
+    FakeWs.instances = [];
+    const waits = [];
+    const mkClient = (rnd) => {
+      const c = createKalshiWs({
+        keyId: 'test-key', pem: PEM, WebSocket: FakeWs, stallMs: 60_000, random: rnd,
+        onStatus: (s, i) => { if (s === 'reconnecting') waits.push(i.wait); },
+      });
+      c.start();
+      return c;
+    };
+    const lo = mkClient(() => 0);
+    await wait(15);
+    const sockLo = FakeWs.instances[FakeWs.instances.length - 1];
+    sockLo.emit('message', JSON.stringify({ type: 'error', msg: { code: 25 } }));
+    const loWait = waits[waits.length - 1];
+    lo.stop();
+    const hi = mkClient(() => 0.999);
+    await wait(15);
+    FakeWs.instances[FakeWs.instances.length - 1].emit('message', JSON.stringify({ type: 'error', msg: { code: 25 } }));
+    const hiWait = waits[waits.length - 1];
+    hi.stop();
+    assert.ok(hiWait > loWait, `jitter must spread reconnects (${loWait} vs ${hiWait})`);
+    assert.strictEqual(loWait, FAST_RECONNECT_MS);
+
+    FakeWs.instances = [];
+    waits.length = 0;
+    const storm = mkClient(() => 0);
+    for (let i = 0; i < 7; i++) {
+      await wait(i === 0 ? 15 : waits[waits.length - 1] + 40);
+      FakeWs.instances[FakeWs.instances.length - 1].emit('message', JSON.stringify({ type: 'error', msg: { code: 25 } }));
+    }
+    storm.stop();
+    assert.strictEqual(waits[0], FAST_RECONNECT_MS);
+    assert.strictEqual(waits[1], FAST_RECONNECT_MS * 2);
+    assert.strictEqual(waits[2], FAST_RECONNECT_MS * 4);
+    assert.ok(waits.every((w) => w <= STORM_MAX_WAIT_MS), 'storm wait is capped');
+    assert.ok(waits[waits.length - 1] > waits[0], 'a storm backs off');
+  }
+
+  // ── rfq_deleted fast-drop: dropped unless it mentions an rfq we hold; quote_* never dropped ──
+  {
+    FakeWs.instances = [];
+    const closed = [];
+    const accepted = [];
+    const held = new Set(['rfq-held']);
+    const { createDeletedFilter } = require('./quote-hot');
+    const client = createKalshiWs({
+      keyId: 'test-key', pem: PEM, WebSocket: FakeWs, stallMs: 60_000,
+      shouldDropDeleted: createDeletedFilter((cb) => held.forEach(cb)),
+      onRfqDeleted: (e) => closed.push(e.rfqId),
+      onQuoteAccepted: (e) => accepted.push(e.quoteId),
+    });
+    client.start();
+    await wait(15);
+    const sock = FakeWs.instances[FakeWs.instances.length - 1];
+    for (let i = 0; i < 50; i++) sock.emit('message', JSON.stringify({ type: 'rfq_deleted', msg: { id: `rfq-noise-${i}` } }));
+    assert.strictEqual(closed.length, 0, 'unheld rfq_deleted frames are dropped before parse');
+    sock.emit('message', JSON.stringify({ type: 'rfq_deleted', msg: { id: 'rfq-held' } }));
+    assert.deepStrictEqual(closed, ['rfq-held'], 'a held RFQ close still releases the reserve');
+    sock.emit('message', JSON.stringify({ type: 'quote_accepted', msg: { quote_id: 'q-1', rfq_id: 'rfq-other', accepted_side: 'no' } }));
+    assert.deepStrictEqual(accepted, ['q-1'], 'quote_accepted is never dropped');
+    const tp = client.takeThroughput();
+    assert.strictEqual(tp.dropDeleted, 50);
+    client.stop();
   }
 
   console.log('kalshi-ws.test.js ok');

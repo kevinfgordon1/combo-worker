@@ -467,3 +467,96 @@ for (const file of ['live-runner.js', 'shadow-runner.js', 'polymarket-rfq.js']) 
 
 console.log('engine.test.js ok');
 
+
+// ─── KALSHI_SUBCENT: exact-target quoting on the 0.001 grid ──────────────────
+{
+  const { floor3, subcentEnabled, isSubcentPrice, isPriceGridFailure, pennyNoBid, americanFromProb: amFromProb } = require('./engine');
+  const { impliedProb: impProb } = require('./engine');
+  const aToDecT = (a) => (a > 0 ? 1 + a / 100 : 1 + 100 / Math.abs(a));
+
+  assert.strictEqual(subcentEnabled({}), false, 'default OFF in code');
+  assert.strictEqual(subcentEnabled({ KALSHI_SUBCENT: '' }), false);
+  assert.strictEqual(subcentEnabled({ KALSHI_SUBCENT: '0' }), false);
+  assert.strictEqual(subcentEnabled({ KALSHI_SUBCENT: 'off' }), false);
+  assert.strictEqual(subcentEnabled({ KALSHI_SUBCENT: '1' }), true);
+  assert.strictEqual(subcentEnabled({ KALSHI_SUBCENT: 'true' }), true);
+  assert.strictEqual(floor3(0.7749999999), 0.774);
+  assert.strictEqual(floor3(0.775), 0.775);
+  assert.strictEqual(isSubcentPrice('0.774'), true);
+  assert.strictEqual(isSubcentPrice('0.77'), false);
+  assert.strictEqual(isSubcentPrice('0.770'), false);
+
+  // Flag OFF keeps the penny floor byte-for-byte.
+  assert.strictEqual(fillView(350).noBid, '0.77');
+  assert.strictEqual(fillView(350, { subcent: false }).noBid, '0.77');
+  assert.strictEqual(fillView(1100).noBid, '0.91');
+
+  // +350 → exact target no_bid 0.7747… → 0.774 on the 0.001 grid (penny floor was 0.77).
+  assert.strictEqual(fillView(350, { subcent: true }).noBid, '0.774');
+  assert.strictEqual(fillView(1100, { subcent: true }).noBid, '0.915');
+  assert.strictEqual(impliedYesBid('0.774'), '0.226');
+  assert.strictEqual(impliedYesBid('0.77'), '0.23', 'penny NO still gets the penny YES');
+  assert.strictEqual(quoteYesBid('dollar', '0.774'), '0.226');
+  assert.strictEqual(quoteYesBid('contracts', '0.774'), YES_DECLINE);
+  assert.strictEqual(parseFloat(impliedYesBid('0.774')) + 0.774, 1);
+  assert.strictEqual(pennyNoBid('0.774'), '0.77');
+  assert.strictEqual(pennyNoBid('0.915'), '0.91');
+  assert.ok(isPriceGridFailure('Kalshi quote failed 400: {"error":{"code":"invalid_yes_bid"}}'));
+  assert.ok(!isPriceGridFailure('Kalshi quote failed 409: {"error":{"code":"rfq_closed"}}'));
+  assert.ok(!isPriceGridFailure('Kalshi quote failed 400: insufficient_balance'));
+
+  // Sweep every American fill from −2000..+5000: the quote is NEVER worse than the lock's
+  // target odds (net of the maker fee), always on the 0.001 grid, always at least as good as
+  // the penny floor, never more than 0.9¢ above it, and profit at the exact price ≥ target profit.
+  let swept = 0;
+  for (let a = -2000; a <= 5000; a++) {
+    if (a > -100 && a < 100) continue;
+    const pen = fillView(a);
+    const sub = fillView(a, { subcent: true });
+    const noP = parseFloat(pen.noBid), noS = parseFloat(sub.noBid);
+    assert.match(sub.noBid, /^\d\.\d{3}$/, `3dp string for ${a}`);
+    assert.ok(Math.abs(noS * 1000 - Math.round(noS * 1000)) < 1e-9, `on 0.001 grid ${a}`);
+    assert.ok(noS >= noP - 1e-12, `sub-cent never below penny ${a}`);
+    assert.ok(noS - noP < 0.0100001, `within one cent of penny ${a}`);
+    assert.ok(noS <= 0.99 + 1e-12, `cap 0.99 ${a}`);
+    // Effective sell odds at the quoted price are >= lock target (probability ≥ target prob).
+    const target = impProb(a);
+    assert.ok(sub.sEffQuoted + 1e-9 >= target || noS >= 0.99 - 1e-12, `quote not worse than target ${a}: ${sub.sEffQuoted} < ${target}`);
+    swept++;
+  }
+  assert.ok(swept > 6000);
+
+  // decideAtFill: recheck profit at the exact price for every hedge mode, keep guards.
+  for (const mode of ['1x', 'riskfree', 'riskfree_open']) {
+    for (const fill of [350, 163, 1100, 800, 450, 275]) {
+      const base = { parlayStake: 100, parlayAmerican: 900, fillAmerican: fill, rfqContracts: 10, hedgeMode: mode, maxContracts: 10000 };
+      const off = decideAtFill(base);
+      const on = decideAtFill({ ...base, subcent: true });
+      assert.ok(off.ok === on.ok, `same decision ${mode}/${fill}`);
+      if (!on.ok) continue;
+      assert.strictEqual(on.contracts, off.contracts);
+      assert.strictEqual(on.subcent, true);
+      assert.ok(on.worstAtQuote >= on.worst - 0.01, `profit at quote ≥ target profit (${mode}/${fill}) ${on.worstAtQuote} vs ${on.worst}`);
+      assert.strictEqual(on.quote.yes_bid, '0.00');
+      assert.match(on.quote.no_bid, /^\d\.\d{3}$/);
+      assert.strictEqual(off.quote.no_bid, fillView(fill).noBid);
+    }
+  }
+  // Guards unchanged with the flag on: cap, limit, free-bet no_cap.
+  const capOn = decideAtFill({ parlayStake: 100, parlayAmerican: 400, fillAmerican: 350, rfqContracts: 8000, hedgeMode: '1x', maxContracts: 116, subcent: true });
+  assert.strictEqual(capOn.ok, false);
+  assert.strictEqual(capOn.reason, 'rfq_too_large');
+  const limOn = decideAtFill({ parlayStake: 100, parlayAmerican: 400, fillAmerican: 350, rfqContracts: 10, hedgeMode: '1x', maxContracts: 116, filledSoFar: 116, subcent: true });
+  assert.strictEqual(limOn.reason, 'limit_reached');
+  const noCapOn = decideAtFill({ parlayStake: 100, parlayAmerican: 400, fillAmerican: 350, rfqContracts: 10, hedgeMode: 'riskfree', maxContracts: 0, isFreeBet: true, subcent: true });
+  assert.strictEqual(noCapOn.reason, 'no_cap');
+
+  // Dollar RFQ at +350 with sub-cent: 0.774 NO / 0.226 YES → 10/0.226 = 44 contracts (43 at penny).
+  const sc = fillView(350, { subcent: true });
+  assert.strictEqual(Math.floor(10 / parseFloat(impliedYesBid(sc.noBid))), 44);
+  const scBody = buildQuoteBody('rfq-sub', sc.noBid, quoteYesBid('dollar', sc.noBid), false);
+  assert.deepStrictEqual(scBody, { rfq_id: 'rfq-sub', yes_bid: '0.226', no_bid: '0.774', rest_remainder: false });
+  const scCount = buildQuoteBody('rfq-sub2', sc.noBid, quoteYesBid('contracts', sc.noBid), false);
+  assert.deepStrictEqual(scCount, { rfq_id: 'rfq-sub2', yes_bid: '0.00', no_bid: '0.774', rest_remainder: false });
+}
+console.log('engine subcent ok');
