@@ -47,7 +47,7 @@ function createStore({ url, key, fetchImpl = fetch, log = console.log, flushMs =
   function start() { if (!timer) timer = setInterval(flush, flushMs); return flush; }
   async function loadOpenFills() {
     try {
-      const r = await call('GET', 'noboost_paper_rfqs?settled=eq.false&or=(primary_fill.eq.true,lock_fill.eq.true)&select=*&limit=5000');
+      const r = await call('GET', 'noboost_paper_rfqs?settled=eq.false&or=(primary_fill.eq.true,lock_fill.eq.true,promo_fill.eq.true)&select=*&limit=5000');
       return await r.json();
     } catch (e) { warn(e.message); return []; }
   }
