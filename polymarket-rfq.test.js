@@ -99,12 +99,12 @@ assert.ok(
 );
 assert.ok(
   /LOCK_DIAG_LOG_MS/.test(polySrc) && /resetLockDiagLogs/.test(polySrc),
-  'lock-identity-fail / lock-unpriceable-on-poly must share a 10s rate-limit'
+  'lock-identity-fail / lock-unpriceable-on-poly must share a per-lock rate-limit'
 );
 assert.ok(
-  /const allowLog = now - lockDiagLog\.identityAt >= LOCK_DIAG_LOG_MS/.test(polySrc) &&
-    /const allowLog = now - lockDiagLog\.unpriceableAt >= LOCK_DIAG_LOG_MS/.test(polySrc),
-  'lock-identity-fail / lock-unpriceable rate-limit must run before label/keys joins'
+  /dueLockDiag\(lockDiagLog\.identity,/.test(polySrc) &&
+    /dueLockDiag\(lockDiagLog\.unpriceable,/.test(polySrc),
+  'lock-identity-fail / lock-unpriceable are rate-limited per lock before label/keys joins'
 );
 assert.ok(
   /const enableLocks = ctx\.enableLocks !== false/.test(polySrc) &&

@@ -25,7 +25,7 @@
  * @param {number} [intervalMs]    heartbeat cadence (default 60s)
  * @returns {function} stop        call to stop the heartbeat
  */
-function startHeartbeat(supabase, mode, counts, getActive, intervalMs = 60000) {
+function startHeartbeat(supabase, mode, counts, getActive, intervalMs = 60000, getExtra = null) {
   let lastRfqs = -1;
 
   async function beat() {
@@ -40,7 +40,7 @@ function startHeartbeat(supabase, mode, counts, getActive, intervalMs = 60000) {
       const activeParlays =
         typeof getActive === 'function' ? Number(getActive()) || 0 : 0;
 
-      await supabase.from('combo_worker_stats').insert({
+      const row = {
         ts: new Date().toISOString(),
         mode,
         ws_connected: wsConnected,
@@ -55,7 +55,17 @@ function startHeartbeat(supabase, mode, counts, getActive, intervalMs = 60000) {
         post_failed: c.postFailed || 0,
         limit_reached: c.limitReached || 0,
         dollar_rfqs: c.dollarRfqs || 0,
-      });
+      };
+      // Optional extra columns (e.g. { poly: {...} } jsonb). If the column is
+      // not migrated yet the insert is retried once without them.
+      let extra = null;
+      try { extra = typeof getExtra === 'function' ? getExtra() : null; } catch (_) { extra = null; }
+      if (extra && typeof extra === 'object') {
+        const res = await supabase.from('combo_worker_stats').insert({ ...row, ...extra });
+        if (res && res.error) await supabase.from('combo_worker_stats').insert(row);
+      } else {
+        await supabase.from('combo_worker_stats').insert(row);
+      }
     } catch (e) {
       // Observability must never disrupt the worker — swallow and log only.
       console.error(`[${mode}] heartbeat insert failed`, e && e.message);

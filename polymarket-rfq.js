@@ -102,6 +102,18 @@ const {
   isNearMissCode,
   createPolyMissTape,
 } = require('./poly-miss-tape');
+const {
+  DEFAULT_CRAWL_MS,
+  DEFAULT_MAX_PAGES,
+  DEFAULT_PAGE_DELAY_MS,
+  DEFAULT_HEARTBEAT_MS,
+  yieldLoop,
+  createPolyIntakeStats,
+  createWsSeenSet,
+  formatPolyHeartbeat,
+  crawlOpenRfqs,
+  prioritizeRfqs,
+} = require('./poly-intake');
 const { shortId } = require('./short-id');
 const { formatAlertStatus } = require('./venue-alert');
 const {
@@ -113,12 +125,18 @@ const {
 } = require('./polymarket-fill-reconcile');
 
 const MODE = 'POLY';
+function envIntLocal(name, def) {
+  const n = Number(process.env[name]);
+  return process.env[name] != null && process.env[name] !== '' && Number.isFinite(n) && n >= 0 ? n : def;
+}
 const RECONCILE_MS = 3000;
 const FILL_RECONCILE_MS = 20000;
 const SEEN_RFQS_MAX = 256;
 const SKIP_SUMMARY_MS = 10000;
-const LOCK_DIAG_LOG_MS = 10000;
-const lockDiagLog = { identityAt: 0, unpriceableAt: 0 };
+// Per-LOCK interval: each failing lock is logged at most once per interval
+// (previously one sample lock was re-logged every 10s, ~1,700x/day).
+const LOCK_DIAG_LOG_MS = 10 * 60 * 1000;
+const lockDiagLog = { identity: new Map(), unpriceable: new Map() };
 const NOISY_SKIP_REASONS = new Set([
   'no_lock_overlap',
   'unmatched',
@@ -136,8 +154,24 @@ function resetSkipSummary() {
 }
 
 function resetLockDiagLogs() {
-  lockDiagLog.identityAt = 0;
-  lockDiagLog.unpriceableAt = 0;
+  lockDiagLog.identity.clear();
+  lockDiagLog.unpriceable.clear();
+}
+
+// Returns the failing locks that are due a log line now (and stamps them).
+// Rate-limit is per lock id; stale ids (lock gone) are pruned.
+function dueLockDiag(map, failing, now) {
+  const live = new Set(failing.map((p) => (p && (p.id || p.label)) || '?'));
+  for (const id of map.keys()) if (!live.has(id)) map.delete(id);
+  const due = [];
+  for (const p of failing) {
+    const id = (p && (p.id || p.label)) || '?';
+    const at = map.get(id);
+    if (at != null && now - at < LOCK_DIAG_LOG_MS) continue;
+    map.set(id, now);
+    due.push(p);
+  }
+  return due;
 }
 
 function noteNoisySkip(evaluation) {
@@ -372,21 +406,18 @@ function isKalshiMoneylineLock(parlay) {
 // cannot join keys= on every 3s tick. Rate-limit before string building.
 function logActiveLockIdentityFails(parlays, log = console.log) {
   if (!Array.isArray(parlays) || !parlays.length) return 0;
-  const now = Date.now();
-  const allowLog = now - lockDiagLog.identityAt >= LOCK_DIAG_LOG_MS;
-  let n = 0;
-  let sample = null;
+  const failing = [];
   for (const p of parlays) {
     if (!isKalshiMoneylineLock(p)) continue;
     const lock = identitiesFromParlay(p);
     if (lock.ok) continue;
-    n += 1;
-    if (allowLog && !sample) sample = p;
+    failing.push(p);
   }
-  if (allowLog && n) {
-    lockDiagLog.identityAt = now;
-    const label = (sample && (sample.label || sample.id)) || '?';
-    const keys = kalshiMlTickersFromParlay(sample);
+  const n = failing.length;
+  if (!n) { lockDiagLog.identity.clear(); return 0; }
+  for (const p of dueLockDiag(lockDiagLog.identity, failing, Date.now())) {
+    const label = p.label || p.id || '?';
+    const keys = kalshiMlTickersFromParlay(p);
     log(`[${MODE}] lock-identity-fail n=${n} label=${label} keys=${keys.join('|') || '(none)'}`);
   }
   return n;
@@ -458,22 +489,19 @@ function explainLockOverlapMiss(rfq, parlays) {
 
 function logUnpriceablePolyLocks(parlays, log = console.log) {
   if (!Array.isArray(parlays) || !parlays.length) return 0;
-  const now = Date.now();
-  const allowLog = now - lockDiagLog.unpriceableAt >= LOCK_DIAG_LOG_MS;
-  let n = 0;
-  let sample = null;
+  const failing = [];
   for (const p of parlays) {
     const lock = identitiesFromParlay(p);
     if (lock.ok) continue;
     const tickers = kalshiMlTickersFromParlay(p);
     const series = tickers.map((t) => String(t).split('-')[0].split(':')[0].toUpperCase());
     if (!series.some((s) => /SPREAD|TOTAL|PROP/.test(s))) continue;
-    n += 1;
-    if (allowLog && !sample) sample = p;
+    failing.push(p);
   }
-  if (allowLog && n) {
-    lockDiagLog.unpriceableAt = now;
-    const label = (sample && (sample.label || sample.id)) || '?';
+  const n = failing.length;
+  if (!n) { lockDiagLog.unpriceable.clear(); return 0; }
+  for (const p of dueLockDiag(lockDiagLog.unpriceable, failing, Date.now())) {
+    const label = p.label || p.id || '?';
     log(`[${MODE}] lock-unpriceable-on-poly reason=not_moneyline n=${n} label=${label}`);
   }
   return n;
@@ -1454,7 +1482,17 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
   }
 
-  async function handleRfq(raw) {
+  const intake = ctx.intakeStats || createPolyIntakeStats();
+  const wsSeen = createWsSeenSet();
+
+  // Every RFQ the Poly path handles is tallied (seen / source / reason).
+  async function handleRfq(raw, src) {
+    const out = await handleRfqCore(raw);
+    try { intake.recordOutcome(out, src); } catch (_) { /* observability only */ }
+    return out;
+  }
+
+  async function handleRfqCore(raw) {
     const locks = parlays();
     let rfq = normalizePolymarketRfq(raw);
     if (!rfq || !rfq.rfqId) return { action: 'skip', reason: 'bad_rfq' };
@@ -2013,6 +2051,10 @@ function startPolymarketRfqLoop(ctx = {}) {
     return null;
   }
 
+  function rowId(row) {
+    return row && (row.id || row.rfqId || row.rfq_id || (row.rfq && row.rfq.id)) || null;
+  }
+
   async function reconcileOpenRfqs() {
     const locks = parlays();
     const priceable = countPriceableLocks(locks);
@@ -2030,7 +2072,10 @@ function startPolymarketRfqLoop(ctx = {}) {
       const reasons = {};
       for (const row of rows) {
         if (stopped) return;
-        const out = await handleRfq(row);
+        // WS already ran this RFQ through handleRfq — don't redo it.
+        const id = rowId(row);
+        if (id && wsSeen.has(id)) { intake.bump('rest_dup'); continue; }
+        const out = await handleRfq(row, 'rest');
         tallyReconcileOutcome(reasons, out);
       }
       if (missTape) missTape.flushNoise();
@@ -2041,6 +2086,75 @@ function startPolymarketRfqLoop(ctx = {}) {
       );
     } catch (e) {
       logReconcileAuthFailure(e);
+    }
+  }
+
+  // Full open-RFQ crawl (REST cursor pagination). The first-page poll above
+  // only ever sees the newest 100 of several thousand. Candidates (could share
+  // a game with an active lock) are evaluated first; everything else is
+  // counted in bulk without touching the order/persist path. Rows the WS
+  // already delivered are skipped. Runs ≪ every 3s and yields to the event
+  // loop so the Kalshi WS is never starved.
+  let crawling = false;
+  async function crawlAllOpenRfqs() {
+    if (crawling || stopped) return null;
+    crawling = true;
+    const t0 = Date.now();
+    try {
+      const locks = parlays();
+      const res = await crawlOpenRfqs(http, {
+        maxPages: crawlMaxPages,
+        pageDelayMs: crawlPageDelayMs,
+        isStopped: () => stopped,
+      });
+      intake.recordCrawl(res, Date.now() - t0);
+      const fresh = [];
+      for (const row of res.rows) {
+        const id = rowId(row);
+        if (id && wsSeen.has(id)) intake.bump('rest_dup');
+        else fresh.push(row);
+      }
+      let bulk = 0;
+      let exact = 0;
+      let near = 0;
+      if (!locks.length) {
+        intake.noteBulkNoOverlap(fresh.length);
+      } else {
+        const norm = new Map();
+        const nrm = (row) => {
+          let n = norm.get(row);
+          if (!n) { n = normalizePolymarketRfq(row); norm.set(row, n); }
+          return n;
+        };
+        const { exact: hot, near: nearRows, noise } = await prioritizeRfqs(fresh, (row) => {
+          const r = nrm(row);
+          if (couldMatchActiveLocks(r, locks)) return 2;
+          return couldMatchActiveLocks(r, locks, { partial: true }) ? 1 : 0;
+        });
+        exact = hot.length;
+        near = nearRows.length;
+        bulk = noise.length;
+        let n = 0;
+        for (const row of hot.concat(nearRows)) {
+          if (stopped) break;
+          await handleRfq(row, 'rest').catch((e) => console.error(`[${MODE}] crawl rfq`, e.message));
+          if (++n % 25 === 0) await yieldLoop();
+        }
+        intake.noteBulkNoOverlap(bulk);
+      }
+      if (missTape) missTape.flushNoise();
+      console.log(
+        `[${MODE}] crawl open=${res.rows.length} pages=${res.pages} ms=${Date.now() - t0}` +
+        ` ws_dup=${res.rows.length - fresh.length} fresh=${fresh.length}` +
+        ` lock_exact=${exact} lock_near=${near} noise=${bulk}` +
+        (res.truncated ? ` TRUNCATED${res.error ? ` err=${res.error.statusCode || '?'}${res.error.forbidden ? '(403)' : ''}` : ''}` : '')
+      );
+      return { ...res, rows: undefined, open: res.rows.length, exact, near, bulk };
+    } catch (e) {
+      logReconcileAuthFailure(e);
+      return null;
+    } finally {
+      crawling = false;
     }
   }
 
@@ -2095,7 +2209,10 @@ function startPolymarketRfqLoop(ctx = {}) {
   function onWsEvent(evt) {
     if (!evt || stopped) return;
     if (evt.type === 'rfqCreated') {
-      handleRfq(evt.rfq || evt).catch((e) => console.error(`[${MODE}] onRfq`, e.message));
+      const wsRaw = evt.rfq || evt;
+      const wsId = rowId(wsRaw);
+      if (wsId) wsSeen.add(wsId);
+      handleRfq(wsRaw, 'ws').catch((e) => console.error(`[${MODE}] onRfq`, e.message));
     } else if (evt.type === 'rfqClosed') {
       handleRfqClosed(evt);
     } else if (evt.type === 'quoteAccepted') {
@@ -2158,7 +2275,39 @@ function startPolymarketRfqLoop(ctx = {}) {
     );
   });
 
+  const crawlEnabled = !!http && ctx.crawl !== false && (ctx.crawlMs == null || ctx.crawlMs > 0);
+  const crawlMs = ctx.crawlMs != null ? ctx.crawlMs : envIntLocal('POLY_CRAWL_MS', DEFAULT_CRAWL_MS);
+  const crawlMaxPages = ctx.crawlMaxPages != null ? ctx.crawlMaxPages : envIntLocal('POLY_CRAWL_MAX_PAGES', DEFAULT_MAX_PAGES);
+  const crawlPageDelayMs = ctx.crawlPageDelayMs != null ? ctx.crawlPageDelayMs : envIntLocal('POLY_CRAWL_PAGE_DELAY_MS', DEFAULT_PAGE_DELAY_MS);
+  const heartbeatMs = ctx.polyHeartbeatMs != null ? ctx.polyHeartbeatMs : envIntLocal('POLY_HEARTBEAT_MS', DEFAULT_HEARTBEAT_MS);
+
+  function emitPolyHeartbeat() {
+    const snap = intake.rollInterval();
+    snap.locks = parlays().length;
+    snap.priceable_locks = countPriceableLocks(parlays());
+    snap.pending_quotes = pendingQuotes.size;
+    console.log(formatPolyHeartbeat(snap));
+    if (typeof ctx.onPolyHeartbeat === 'function') {
+      try { ctx.onPolyHeartbeat(snap); } catch (_) { /* observability only */ }
+    }
+    return snap;
+  }
+
   reconcileOpenRfqs().catch((e) => console.error(`[${MODE}] initial reconcile`, e.message));
+  let crawlTimer = null;
+  if (crawlEnabled && ctx.startWs !== false) {
+    // Stagger the first crawl so it does not collide with startup work.
+    const first = setTimeout(() => {
+      crawlAllOpenRfqs().catch((e) => console.error(`[${MODE}] crawl`, e.message));
+    }, ctx.crawlFirstMs != null ? ctx.crawlFirstMs : 5000);
+    if (first.unref) first.unref();
+    crawlTimer = setInterval(() => {
+      crawlAllOpenRfqs().catch((e) => console.error(`[${MODE}] crawl`, e.message));
+    }, crawlMs);
+    if (crawlTimer.unref) crawlTimer.unref();
+  }
+  const heartbeatTimer = heartbeatMs > 0 ? setInterval(emitPolyHeartbeat, heartbeatMs) : null;
+  if (heartbeatTimer && heartbeatTimer.unref) heartbeatTimer.unref();
   const reconcileTimer = setInterval(() => {
     reconcileOpenRfqs().catch((e) => console.error(`[${MODE}] reconcile`, e.message));
   }, ctx.reconcileMs != null ? ctx.reconcileMs : RECONCILE_MS);
@@ -2189,6 +2338,8 @@ function startPolymarketRfqLoop(ctx = {}) {
     stop() {
       stopped = true;
       clearInterval(reconcileTimer);
+      if (crawlTimer) clearInterval(crawlTimer);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
       clearInterval(ttlTimer);
       clearInterval(fillReconcileTimer);
       if (fillTimer) clearInterval(fillTimer);
@@ -2196,6 +2347,10 @@ function startPolymarketRfqLoop(ctx = {}) {
       try { http.close && http.close(); } catch (_) {}
     },
     handleRfq,
+    crawlAllOpenRfqs,
+    emitPolyHeartbeat,
+    intake,
+    wsSeen,
     handleQuoteAccepted,
     handleRfqClosed,
     handleQuoteExecuted,
