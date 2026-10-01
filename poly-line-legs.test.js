@@ -88,8 +88,8 @@ const pkey = (slug, side) => {
   assert.strictEqual(kkey('KXNFLTOTAL-26SEP27HOUIND-43:yes', 'Under 42.5'), null);
   assert.strictEqual(kkey('KXNFLTOTAL-26SEP27HOUIND-43:yes', 'Over 43.5'), null, 'no snapping to nearest line');
   assert.strictEqual(kkey('KXNFLTOTAL-26SEP27HOUIND-43:yes', 'Total 42.5'), null, 'label must say Over/Under');
-  assert.strictEqual(kkey('KXNCAAFSPREAD-26OCT01UNTTLSA-TLSA2:no', 'North Texas +1.5'), null, 'college not mapped');
-  assert.strictEqual(kkey('KXNCAAFTOTAL-26OCT03BCSMU-56:yes', 'Over 55.5'), null);
+  assert.strictEqual(kkey('KXNCAAFTOTAL-26OCT03ZZZYYY-56:yes', 'Over 55.5'), null, 'college team not in the crosswalk');
+  assert.strictEqual(kkey('KXNCAAFSPREAD-26OCT01UNTTLSA-TLSA2:no', 'North Texas +1.5'), null, 'college needs the lock game text (see poly-ncaaf.test.js)');
   assert.strictEqual(kkey('KXNFLSPREAD-26OCT04LACSEA-DAL7:yes', 'Dallas −6.5'), null, 'team not in game');
   assert.strictEqual(kkey('KXNFLSPREAD-26OCT04LACSEA-SEA:yes', 'Seattle −0.5'), null);
   assert.strictEqual(kkey('KXNFLGAME-26OCT04LACSEA-SEA:yes', 'Seattle'), null, 'ML is not a line leg');
@@ -154,9 +154,9 @@ const pkey = (slug, side) => {
     'tsc-mlb-phi-atl-2026-10-01-tt-phi-2pt5',
     'tsc-nhl-phi-nj-2026-10-01-tt-phi-2pt5',
     'astatc-nfl-pit-cle-2026-10-01-td-jaywar-gte1',
-    'asc-cfb-ntx-tulsa-2026-10-01-pos-1pt5',
+    'asc-cfb-ntx-tulsa-2026-10-01-pos-1pt5', // college lines are covered in poly-ncaaf.test.js
     'tsc-cfb-ntx-tulsa-2026-10-01-total-49pt5',
-  ]) {
+  ].filter((slug) => markets.has(slug) || !/-cfb-/.test(slug))) {
     assert.strictEqual(identityFromPolymarketLine(slug, BUY, markets.get(slug)).identity, null, slug);
   }
 }
@@ -298,7 +298,7 @@ const pkey = (slug, side) => {
   assert.ok(identitiesFromParlay(jac, { lines: true }).ok);
   assert.ok(identitiesFromParlay(hou, { lines: true }).ok);
   assert.ok(identitiesFromParlay(gb, { lines: true }).ok);
-  assert.strictEqual(identitiesFromParlay(unt, { lines: true }).ok, false, 'NCAAF spread not mapped');
+  assert.strictEqual(identitiesFromParlay(unt, { lines: true }).ok, true, 'NCAAF spread now mapped via the verified crosswalk');
   assert.ok(identitiesFromParlay(mlOnly, { lines: true }).ok);
   // Same lock with a stripped label / conflicting leg side is NOT mapped.
   const noLabel = JSON.parse(JSON.stringify(jac));
@@ -311,8 +311,8 @@ const pkey = (slug, side) => {
   wrongLabel.legs[1].label = 'Seattle +6.5';
   assert.strictEqual(identitiesFromParlay(wrongLabel, { lines: true }).ok, false);
 
-  assert.strictEqual(countPriceableLocks(FX.locks), 12, '12 of 16 active locks are Poly-mappable (9 before)');
-  assert.strictEqual(countPriceableLineLocks(FX.locks), 3);
+  assert.strictEqual(countPriceableLocks(FX.locks), 16, '16 of 16 active locks are Poly-mappable (12 before NCAAF, 9 before lines)');
+  assert.strictEqual(countPriceableLineLocks(FX.locks), 5); // + b9a3c72b (NCAAF spreads), d9d21c9a (NFL GB +3.5 now unblocked)
   const mlBefore = FX.locks.filter((l) => identitiesFromParlay(l).ok).length;
   assert.strictEqual(mlBefore, 9);
 }

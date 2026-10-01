@@ -13,7 +13,13 @@
 // the market type is not a full-game moneyline Combo Locks can price, or
 // more than one parlay matches. TEAM:no canonicalizes to opponent:yes.
 //
-// LINE LEGS (spread / total; NFL, MLB, NHL full game only). Both venues are
+// NCAAF (college football): Kalshi KXNCAAF* and Poly cfb use DIFFERENT team codes, so
+// every NCAAF team is translated through ncaaf-crosswalk.json (built from real Kalshi
+// events + Poly team metadata, names AND ET date must agree). The canonical team in an
+// NCAAF identity is the Polymarket abbreviation. Unknown team / ambiguous blob =>
+// no identity. NCAAF is Poly-only (opts.lines): the Kalshi matcher never sees it.
+//
+// LINE LEGS (spread / total; NFL, MLB, NHL, NCAAF full game only). Both venues are
 // canonicalized to ONE exact space and compared by exact string equality:
 //   spread  canonical (first team alphabetically, line from ITS side, yes|no); the
 //           other team's cover is the complement => same team/line with side NO
@@ -31,6 +37,7 @@
 // anything that disagrees or is missing => no identity => never quoted.
 'use strict';
 const { parseKalshiTickerStart, parseTs } = require('./started');
+const NCAAF = require('./ncaaf-crosswalk');
 
 const MONTHS = {
   JAN: 1, FEB: 2, MAR: 3, APR: 4, MAY: 5, JUN: 6,
@@ -340,21 +347,29 @@ const LINE_SERIES = {
   KXMLBTOTAL: { league: 'mlb', kind: 'total', teamLen: 3 },
   KXNHLSPREAD: { league: 'nhl', kind: 'spread', teamLen: null },
   KXNHLTOTAL: { league: 'nhl', kind: 'total', teamLen: null },
+  // NCAAF: team codes only via the verified crosswalk (never even-split / guessed).
+  KXNCAAFSPREAD: { league: 'ncaaf', kind: 'spread', teamLen: null, crosswalk: true },
+  KXNCAAFTOTAL: { league: 'ncaaf', kind: 'total', teamLen: null, crosswalk: true },
 };
 
-// Poly full-game market types we map (football = NFL only here: college codes
-// differ between Kalshi and Poly and are NOT mapped).
+// Poly full-game market types we map. `slugLeagues` = the Poly slug/team league
+// token(s) allowed for that sportsMarketType: football is shared by NFL ("nfl") and
+// college ("cfb"); the slug league decides, and team.league must agree with it.
 const POLY_LINE_SPORT = {
-  football_team_full_game_spread: { league: 'nfl', kind: 'spread' },
-  football_team_full_game_total: { league: 'nfl', kind: 'total' },
-  baseball_team_full_game_spread: { league: 'mlb', kind: 'spread' },
-  baseball_team_full_game_total: { league: 'mlb', kind: 'total' },
-  hockey_team_full_game_spread: { league: 'nhl', kind: 'spread' },
-  hockey_team_full_game_total: { league: 'nhl', kind: 'total' },
+  football_team_full_game_spread: { league: 'nfl', slugLeagues: ['nfl', 'cfb'], kind: 'spread' },
+  football_team_full_game_total: { league: 'nfl', slugLeagues: ['nfl', 'cfb'], kind: 'total' },
+  baseball_team_full_game_spread: { league: 'mlb', slugLeagues: ['mlb'], kind: 'spread' },
+  baseball_team_full_game_total: { league: 'mlb', slugLeagues: ['mlb'], kind: 'total' },
+  hockey_team_full_game_spread: { league: 'nhl', slugLeagues: ['nhl'], kind: 'spread' },
+  hockey_team_full_game_total: { league: 'nhl', slugLeagues: ['nhl'], kind: 'total' },
 };
 
+// Poly slug league token -> identity league.
+const POLY_SLUG_TO_LEAGUE = { nfl: 'nfl', mlb: 'mlb', nhl: 'nhl', cfb: 'ncaaf' };
+
+const NCAAF_ML_SERIES = 'KXNCAAFGAME';
 const POLY_LINE_SLUG_RE =
-  /^(asc|tsc)-(nfl|mlb|nhl)-([a-z0-9]+)-([a-z0-9]+)-(\d{4})-(\d{2})-(\d{2})-(?:(neg|pos)-|(?:total-)?)(\d{1,3})pt(\d)$/;
+  /^(asc|tsc)-(nfl|mlb|nhl|cfb)-([a-z0-9]+)-([a-z0-9]+)-(\d{4})-(\d{2})-(\d{2})-(?:(neg|pos)-|(?:total-)?)(\d{1,3})pt(\d)$/;
 
 function isPolyLineSlug(symbol) {
   return /^(asc|tsc)-/.test(String(symbol || '').trim().toLowerCase());
@@ -402,7 +417,19 @@ function parseKalshiLineTicker(text, sideOverride, label, opts) {
   if (selDash <= 0) return null;
   const blob = parsed.teamsBlob.slice(0, selDash);
   const suffix = parsed.teamsBlob.slice(selDash + 1);
-  const pair = splitTeams(blob, spec.league, spec.teamLen);
+  let pair;
+  let kcodes = null; // NCAAF: the two Kalshi codes behind `pair` (poly abbreviations)
+  if (spec.crosswalk) {
+    const sp = NCAAF.splitBlob(blob);
+    if (!sp) return null; // unknown team / ambiguous blob => unmapped
+    pair = sp.pair;
+    kcodes = sp.codes;
+    // The lock leg's own "A vs B" text must name exactly these two teams.
+    if (needLabel && !NCAAF.gameNamesAgree(opts && opts.game, kcodes)) return null;
+    if (!needLabel && opts && opts.game != null && !NCAAF.gameNamesAgree(opts.game, kcodes)) return null;
+  } else {
+    pair = splitTeams(blob, spec.league, spec.teamLen);
+  }
   if (!pair) return null;
   const teams = [String(pair[0]).toLowerCase(), String(pair[1]).toLowerCase()];
 
@@ -412,7 +439,14 @@ function parseKalshiLineTicker(text, sideOverride, label, opts) {
   if (spec.kind === 'spread') {
     const m = /^([A-Za-z]+)(\d{1,3})$/.exec(suffix);
     if (!m) return null;
-    const code = normTeam(spec.league, m[1].toLowerCase());
+    let code;
+    if (spec.crosswalk) {
+      const kc = m[1].toUpperCase();
+      if (!kcodes.includes(kc)) return null;
+      code = NCAAF.teamByCode(kc).p;
+    } else {
+      code = normTeam(spec.league, m[1].toLowerCase());
+    }
     const normTeams = teams.map((t) => normTeam(spec.league, t));
     if (!normTeams.includes(code)) return null;
     const mag = parseInt(m[2], 10) - 0.5;
@@ -427,6 +461,12 @@ function parseKalshiLineTicker(text, sideOverride, label, opts) {
     if (label != null && label !== '') {
       const l = parseLabelLine(label);
       if (!l || l.mag !== mag || l.sign !== (line < 0 ? '-' : '+')) return null;
+      if (spec.crosswalk) {
+        // The label's team (the side actually being bought) must be that team by name.
+        const t = NCAAF.teamByPoly(selection);
+        const labelTeam = String(label).replace(/\s*[+\-\u2212]?\s*\d+(?:\.\d+)?\s*$/, '');
+        if (!t || NCAAF.norm(labelTeam) !== NCAAF.norm(t.name)) return null;
+      }
     }
   } else {
     if (!/^\d{1,3}$/.test(suffix)) return null;
@@ -457,6 +497,55 @@ function parseKalshiLineTicker(text, sideOverride, label, opts) {
   });
 }
 
+// NCAAF moneyline (KXNCAAFGAME-26OCT03TXSTSDSU-TXST:yes). Poly-only (never added to
+// SERIES, so the Kalshi matcher is untouched). Teams come ONLY from the verified
+// crosswalk; the lock leg label must be the picked team's name and the leg's
+// "A vs B" text must name both teams. :no is not mapped (label semantics unproven).
+function parseKalshiNcaafMlTicker(text, sideOverride, label, opts) {
+  const needLabel = !!(opts && opts.requireLabel);
+  if (text == null || text === '') return null;
+  let raw = String(text).trim();
+  let side = sideOverride ? String(sideOverride).toLowerCase() : '';
+  const sideAt = raw.lastIndexOf(':');
+  if (sideAt > 0) {
+    const maybe = raw.slice(sideAt + 1).toLowerCase();
+    if (maybe === 'yes' || maybe === 'no') {
+      if (!side) side = maybe;
+      raw = raw.slice(0, sideAt);
+    }
+  }
+  if (!side) side = 'yes';
+  if (side !== 'yes') return null;
+  const dash = raw.indexOf('-');
+  if (dash <= 0 || raw.slice(0, dash).toUpperCase() !== NCAAF_ML_SERIES) return null;
+  const parsed = parseKalshiDateRest(raw.slice(dash + 1));
+  if (!parsed || parsed.startMs != null) return null;
+  const selDash = parsed.teamsBlob.lastIndexOf('-');
+  if (selDash <= 0) return null;
+  const sp = NCAAF.splitBlob(parsed.teamsBlob.slice(0, selDash));
+  if (!sp) return null;
+  const kc = parsed.teamsBlob.slice(selDash + 1).toUpperCase();
+  if (!sp.codes.includes(kc)) return null;
+  const team = NCAAF.teamByCode(kc);
+  if (!team) return null;
+  if (needLabel) {
+    if (label == null || label === '') return null;
+    if (!NCAAF.gameNamesAgree(opts && opts.game, sp.codes)) return null;
+  } else if (opts && opts.game != null && !NCAAF.gameNamesAgree(opts.game, sp.codes)) {
+    return null;
+  }
+  if (label != null && label !== '' && NCAAF.norm(label) !== NCAAF.norm(team.name)) return null;
+  return makeIdentity({
+    league: 'ncaaf',
+    date: parsed.date,
+    teams: sp.pair,
+    marketType: 'moneyline',
+    period: 'full',
+    selection: team.p,
+    side: 'yes',
+  });
+}
+
 // Poly asc-/tsc- slug (+ optional verified market metadata) → canonical identity.
 // Without `market` the identity is slug-derived and marked unverified: usable
 // only as a cheap candidate prefilter, never to quote. With `market`, every
@@ -468,7 +557,8 @@ function identityFromPolymarketLine(symbol, rfqSide, market) {
   const yesNo = polymarketYesNo(rfqSide);
   if (!yesNo) return { identity: null, reason: 'unmatched_leg' };
   const kind = m[1] === 'asc' ? 'spread' : 'total';
-  const league = m[2];
+  const slugLeague = m[2]; // nfl | mlb | nhl | cfb (Poly team.league uses the same token)
+  const league = POLY_SLUG_TO_LEAGUE[slugLeague];
   const t1 = m[3];
   const t2 = m[4];
   const date = `${m[5]}-${m[6]}-${m[7]}`;
@@ -483,7 +573,7 @@ function identityFromPolymarketLine(symbol, rfqSide, market) {
     const mk = unwrapMarket(market);
     if (!mk || typeof mk !== 'object') return { identity: null, reason: 'missing_metadata' };
     const spec = POLY_LINE_SPORT[String(mk.sportsMarketType || mk.sports_market_type || '')];
-    if (!spec || spec.kind !== kind || spec.league !== league) {
+    if (!spec || spec.kind !== kind || !spec.slugLeagues.includes(slugLeague)) {
       return { identity: null, reason: 'not_priceable' };
     }
     if (mk.slug && String(mk.slug).toLowerCase() !== s) return { identity: null, reason: 'meta_mismatch' };
@@ -503,7 +593,8 @@ function identityFromPolymarketLine(symbol, rfqSide, market) {
       if (abbr(longs[0]) !== normTeam(league, t1) || abbr(shorts[0]) !== normTeam(league, t2)) {
         return { identity: null, reason: 'meta_mismatch' };
       }
-      if (String((longs[0].team || {}).league || '').toLowerCase() !== league) {
+      if (String((longs[0].team || {}).league || '').toLowerCase() !== slugLeague
+        || String((shorts[0].team || {}).league || '').toLowerCase() !== slugLeague) {
         return { identity: null, reason: 'meta_mismatch' };
       }
       // The long side's printed handicap must equal the signed slug/line.
@@ -515,7 +606,27 @@ function identityFromPolymarketLine(symbol, rfqSide, market) {
         return { identity: null, reason: 'meta_mismatch' };
       }
     }
+    if (league === 'ncaaf') {
+      // College: both slug abbreviations must be crosswalk teams and the metadata's
+      // own team names (spread) / question (total) must name exactly those teams.
+      const T1 = NCAAF.teamByPoly(t1);
+      const T2 = NCAAF.teamByPoly(t2);
+      if (!T1 || !T2 || t1 === t2) return { identity: null, reason: 'meta_mismatch' };
+      if (kind === 'spread') {
+        const nm = (x) => NCAAF.norm(((x && x.team) || {}).name);
+        if (nm(longs[0]) !== NCAAF.norm(T1.pname) || nm(shorts[0]) !== NCAAF.norm(T2.pname)) {
+          return { identity: null, reason: 'meta_mismatch' };
+        }
+      } else {
+        const q = NCAAF.norm(mk.question);
+        if (!q || !q.includes(NCAAF.norm(T1.pname)) || !q.includes(NCAAF.norm(T2.pname))) {
+          return { identity: null, reason: 'meta_mismatch' };
+        }
+      }
+    }
     verified = true;
+  } else if (league === 'ncaaf' && !(NCAAF.teamByPoly(t1) && NCAAF.teamByPoly(t2) && t1 !== t2)) {
+    return { identity: null, reason: 'not_priceable' };
   }
 
   let selection;
@@ -591,7 +702,7 @@ function lockLegLabel(parlay, key) {
   // The stored leg side must agree with the key side (when both are present).
   const hit = same.find((l) => !l.side || !keySide || String(l.side).toLowerCase() === keySide);
   if (!hit) return { conflict: true };
-  return { label: hit.label || null };
+  return { label: hit.label || null, game: hit.game || null };
 }
 
 // opts.lines (Poly only): also read KX{NFL,MLB,NHL}{SPREAD,TOTAL} legs as exact
@@ -609,7 +720,9 @@ function identitiesFromParlay(parlay, opts) {
         // Lock legs MUST carry their human label ("Seattle −6.5" / "Under 42.5"):
         // it is the independent proof that ticker N really means N-0.5 and which
         // side :yes/:no is. No label => the leg is not mapped.
-        id = parseKalshiLineTicker(k, null, info && info.label, { requireLabel: true });
+        const o = { requireLabel: true, game: info && info.game };
+        id = parseKalshiLineTicker(k, null, info && info.label, o)
+          || parseKalshiNcaafMlTicker(k, null, info && info.label, o);
       }
       id = id || identityFromLockFields(k);
       if (!id) return { ok: false, identities: [], keys: [] };
@@ -623,7 +736,10 @@ function identitiesFromParlay(parlay, opts) {
     for (const leg of parlay.legs) {
       let id = identityFromLockFields(leg);
       if (!id && lines && leg && typeof leg === 'object') {
-        id = parseKalshiLineTicker(leg.ticker || leg.market_ticker, leg.side, leg.label, { requireLabel: true });
+        const o = { requireLabel: true, game: leg.game };
+        const tk = leg.ticker || leg.market_ticker;
+        id = parseKalshiLineTicker(tk, leg.side, leg.label, o)
+          || parseKalshiNcaafMlTicker(tk, leg.side, leg.label, o);
       }
       if (!id) return { ok: false, identities: [], keys: [] };
       out.push(id);
@@ -677,6 +793,11 @@ function classifySportType(st) {
   return { marketType: 'other', period: 'other', priceable: false };
 }
 
+function retailLeagueIsCfb(market) {
+  const sides = market.marketSides || market.market_sides;
+  return Array.isArray(sides) && sides.some((x) => x && x.team && String(x.team.league || '').toLowerCase() === 'cfb');
+}
+
 function teamsFromRetailSides(market) {
   const sides = market.marketSides || market.market_sides;
   if (!Array.isArray(sides)) return { teams: [], long: '', league: '' };
@@ -693,9 +814,60 @@ function teamsFromRetailSides(market) {
   return { teams, long, league };
 }
 
-function identityFromMarket(marketRaw, rfqSide) {
+// Poly cfb moneyline (aec-cfb-{long}-{short}-{ET date}) from retail market metadata.
+// Everything is cross-checked; any disagreement => no identity (never a slug fallback).
+function identityFromNcaafMlMarket(market, rfqSide) {
+  const bad = (reason) => ({ identity: null, reason });
+  const slug = String(market.slug || '').toLowerCase();
+  const sm = /^aec-cfb-([a-z0-9]+)-([a-z0-9]+)-(\d{4})-(\d{2})-(\d{2})$/.exec(slug);
+  if (!sm) return bad('not_priceable');
+  const st = String(market.sportsMarketType || market.sports_market_type || '');
+  if (st !== 'football_team_full_game_winner') return bad('not_priceable');
+  const sides = market.marketSides || market.market_sides;
+  if (!Array.isArray(sides) || sides.length !== 2) return bad('meta_mismatch');
+  const longs = sides.filter((x) => x && x.long === true);
+  const shorts = sides.filter((x) => x && x.long === false);
+  if (longs.length !== 1 || shorts.length !== 1) return bad('meta_mismatch');
+  const tl = longs[0].team || {};
+  const ts = shorts[0].team || {};
+  const lAbbr = String(tl.abbreviation || '').toLowerCase();
+  const sAbbr = String(ts.abbreviation || '').toLowerCase();
+  if (lAbbr !== sm[1] || sAbbr !== sm[2] || lAbbr === sAbbr) return bad('meta_mismatch');
+  if (String(tl.league || '').toLowerCase() !== 'cfb' || String(ts.league || '').toLowerCase() !== 'cfb') {
+    return bad('meta_mismatch');
+  }
+  const L = NCAAF.teamByPoly(lAbbr);
+  const S = NCAAF.teamByPoly(sAbbr);
+  if (!L || !S) return bad('not_priceable');
+  if (NCAAF.norm(tl.name) !== NCAAF.norm(L.pname) || NCAAF.norm(ts.name) !== NCAAF.norm(S.pname)) {
+    return bad('meta_mismatch');
+  }
+  const date = `${sm[3]}-${sm[4]}-${sm[5]}`;
+  const metaDate = etDateFromValue(market.gameStartTime || market.game_start_time);
+  if (!metaDate || metaDate !== date) return bad('meta_mismatch');
+  const yesNo = polymarketYesNo(rfqSide);
+  if (!yesNo) return bad('unmatched_leg');
+  const id = makeIdentity({
+    league: 'ncaaf',
+    date,
+    teams: [lAbbr, sAbbr],
+    marketType: 'moneyline',
+    period: 'full',
+    selection: lAbbr, // BUY = long = first slug team
+    side: yesNo,
+    startMs: Date.parse(market.gameStartTime || market.game_start_time || ''),
+  });
+  return id ? { identity: id, reason: null } : bad('missing_metadata');
+}
+
+// opts.ncaaf (Poly combo path only): verify college ML through the crosswalk. Other
+// callers (mm-paper, unhedged price cache) keep their historical behaviour.
+function identityFromMarket(marketRaw, rfqSide, opts) {
   const market = unwrapMarket(marketRaw);
   if (!market) return { identity: null, reason: 'missing_metadata' };
+  if (opts && opts.ncaaf && (/^aec-cfb-/i.test(String(market.slug || '')) || retailLeagueIsCfb(market))) {
+    return identityFromNcaafMlMarket(market, rfqSide);
+  }
   const meta = market.metadata && typeof market.metadata === 'object' ? market.metadata : {};
   const side = rfqSide === 'no' ? 'no' : 'yes';
 
@@ -817,6 +989,12 @@ function identityFromPolymarketSlug(symbol, rfqSide) {
     selection = yesNo === 'yes' ? teamTokens[0] : teamTokens[1];
   }
   if (!selection) return null;
+  if (league === 'ncaaf') {
+    // College teams are only trusted through the verified crosswalk.
+    if (teamTokens.length !== 2 || teamTokens[0] === teamTokens[1]
+      || !teamTokens.every((t) => NCAAF.teamByPoly(t))) return null;
+    if (tokens[leagueIdx] !== 'cfb' || tokens.length !== dateIdx + 3 || afterDate.length) return null;
+  }
 
   return makeIdentity({
     league,
@@ -872,10 +1050,14 @@ function identitiesFromPolymarketLegs(legs, markets) {
       out.push(line.identity);
       continue;
     }
-    const got = identityFromMarket(market, yesNo);
+    const got = identityFromMarket(market, yesNo, { ncaaf: true });
     if (!got.identity) {
       if (got.reason === 'not_priceable') {
         return { ok: false, reason: 'not_priceable', identities: out, keys: [] };
+      }
+      // College ML is only ever trusted through verified market metadata.
+      if (/^aec-(cfb|ncaaf)-/i.test(String(symbol))) {
+        return { ok: false, reason: got.reason || 'missing_metadata', identities: out, keys: [] };
       }
       const fromSlug = identityFromPolymarketSlug(symbol, yesNo);
       if (fromSlug) {
@@ -928,6 +1110,7 @@ module.exports = {
   LINE_SERIES,
   POLY_LINE_SPORT,
   parseKalshiLineTicker,
+  parseKalshiNcaafMlTicker,
   identityFromPolymarketLine,
   isPolyLineSlug,
   PRICEABLE_SPORT_TYPES,
