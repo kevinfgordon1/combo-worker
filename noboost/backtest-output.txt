@@ -1,0 +1,84 @@
+=== NO-BOOST NFL ML COMBO QUOTER — BACKTEST (paper) ===
+prints on all-NFL-ML combos in data: 114847
+excluded: {"price:unpriceable_leg":8196,"taker_bought_no":6052,"price:price_out_of_range":2,"game_started":26762}
+priceable & pregame & taker-bought-YES prints tested: 73835
+
+-- Traded price vs model, by leg count (American odds; ratio = traded price / model price, >1 = taker paid MORE than model) --
+legs | prints | median traded | median fair(inverse) | median fair(mid) | median lock | ratio vs inverse (p25/p50/p75) | ratio vs mid (p25/p50/p75) | ratio vs lock p50
+2-3 | 2722 | +669 | +796 | +683 | +588 | 1.15/1.18/1.23 | 1.01/1.02/1.04 | 0.89
+4-6 | 17016 | +1823 | +2441 | +1928 | +1532 | 1.25/1.31/1.40 | 1.04/1.05/1.08 | 0.86
+7-8 | 14208 | +10538 | +16246 | +11410 | +8175 | 1.43/1.54/1.58 | 1.07/1.10/1.13 | 0.81
+9-10 | 15567 | +39900 | +95218 | +59273 | +37918 | 1.62/2.16/4.09 | 1.14/1.37/2.28 | 0.91
+11-40 | 24322 | +62400 | +262948 | +149994 | +87767 | 2.22/3.34/7.29 | 1.38/1.93/3.89 | 1.14
+
+-- Margin sweep [fair = INVERSE method]: guardrail=lock maxLegs=10 (win = our YES price < traded YES price, 0.001 tick, rounded up) --
+margin | quoted | won | win rate | $ premium on wins | EV $ vs inverse-fair | EV $ vs mid-fair | EV $/fill vs mid | settled P&L $ (known games)
+0.0% | 48210 | 2170 (+3966 ties) | 4.5% | $9,848 | $6,403 | $4,618 | $2 | $2,246 (389 settled)
+2.5% | 48210 | 2170 (+3966 ties) | 4.5% | $9,848 | $6,403 | $4,618 | $2 | $2,246 (389 settled)
+5.0% | 48210 | 2170 (+3966 ties) | 4.5% | $9,848 | $6,403 | $4,618 | $2 | $2,246 (389 settled)
+7.5% | 48210 | 2170 (+3966 ties) | 4.5% | $9,848 | $6,403 | $4,618 | $2 | $2,246 (389 settled)
+10.0% | 48210 | 2170 (+3966 ties) | 4.5% | $9,848 | $6,403 | $4,618 | $2 | $2,246 (389 settled)
+15.0% | 48210 | 2170 (+3966 ties) | 4.5% | $9,848 | $6,403 | $4,618 | $2 | $2,246 (389 settled)
+
+-- Margin sweep [fair = INVERSE method]: guardrail=off maxLegs=10 (win = our YES price < traded YES price, 0.001 tick, rounded up) --
+margin | quoted | won | win rate | $ premium on wins | EV $ vs inverse-fair | EV $ vs mid-fair | EV $/fill vs mid | settled P&L $ (known games)
+0.0% | 49513 | 44307 (+4055 ties) | 89.5% | $439,674 | $19,855 | -$90,248 | -$2 | $44,268 (7910 settled)
+2.5% | 49513 | 44264 (+4078 ties) | 89.4% | $449,676 | $30,024 | -$80,237 | -$2 | $45,816 (7908 settled)
+5.0% | 49513 | 44210 (+4099 ties) | 89.3% | $459,624 | $40,105 | -$70,322 | -$2 | $47,337 (7901 settled)
+7.5% | 49513 | 44137 (+4126 ties) | 89.1% | $470,554 | $51,784 | -$58,853 | -$1 | $48,793 (7895 settled)
+10.0% | 49513 | 43985 (+4153 ties) | 88.8% | $477,459 | $62,183 | -$48,364 | -$1 | $50,361 (7889 settled)
+15.0% | 49513 | 42823 (+4412 ties) | 86.5% | $462,958 | $77,941 | -$29,309 | -$1 | $53,227 (7816 settled)
+
+-- Margin sweep [fair = INVERSE method]: guardrail=lock maxLegs=40 (win = our YES price < traded YES price, 0.001 tick, rounded up) --
+margin | quoted | won | win rate | $ premium on wins | EV $ vs inverse-fair | EV $ vs mid-fair | EV $/fill vs mid | settled P&L $ (known games)
+0.0% | 71331 | 6978 (+5636 ties) | 9.8% | $31,562 | $23,132 | $17,861 | $3 | $12,346 (2548 settled)
+2.5% | 71331 | 6978 (+5636 ties) | 9.8% | $31,562 | $23,132 | $17,861 | $3 | $12,346 (2548 settled)
+5.0% | 71331 | 6978 (+5636 ties) | 9.8% | $31,562 | $23,132 | $17,861 | $3 | $12,346 (2548 settled)
+7.5% | 71331 | 6978 (+5636 ties) | 9.8% | $31,562 | $23,132 | $17,861 | $3 | $12,346 (2548 settled)
+10.0% | 71331 | 6978 (+5636 ties) | 9.8% | $31,562 | $23,132 | $17,861 | $3 | $12,346 (2548 settled)
+15.0% | 71331 | 6978 (+5636 ties) | 9.8% | $31,562 | $23,132 | $17,861 | $3 | $12,346 (2548 settled)
+
+-- Margin sweep [fair = MID of book (no-vig)]: guardrail=off maxLegs=10 (win = our YES price < traded YES price, 0.001 tick, rounded up) --
+margin | quoted | won | win rate | $ premium on wins | EV $ vs inverse-fair | EV $ vs mid-fair | EV $/fill vs mid | settled P&L $ (known games)
+0.0% | 48210 | 35698 (+8268 ties) | 74.0% | $473,908 | $109,329 | $13,675 | $0 | $56,767 (6688 settled)
+2.5% | 48210 | 28036 (+12140 ties) | 58.2% | $361,200 | $95,374 | $19,993 | $1 | $51,377 (5356 settled)
+5.0% | 48210 | 19353 (+13431 ties) | 40.1% | $224,264 | $69,386 | $19,272 | $1 | $35,237 (3602 settled)
+7.5% | 48210 | 10641 (+11934 ties) | 22.1% | $121,557 | $43,180 | $15,200 | $1 | $22,133 (2310 settled)
+10.0% | 48210 | 7071 (+9518 ties) | 14.7% | $69,804 | $28,779 | $12,108 | $2 | $15,819 (1705 settled)
+15.0% | 48210 | 5053 (+6202 ties) | 10.5% | $38,878 | $18,883 | $9,538 | $2 | $9,556 (1105 settled)
+
+-- Margin sweep [fair = MID of book (no-vig)]: guardrail=off maxLegs=8 (win = our YES price < traded YES price, 0.001 tick, rounded up) --
+margin | quoted | won | win rate | $ premium on wins | EV $ vs inverse-fair | EV $ vs mid-fair | EV $/fill vs mid | settled P&L $ (known games)
+0.0% | 33078 | 26998 (+3610 ties) | 81.6% | $401,929 | $82,872 | $6,734 | $0 | $40,378 (4765 settled)
+2.5% | 33078 | 20128 (+7068 ties) | 60.9% | $294,863 | $69,824 | $12,029 | $1 | $36,334 (3625 settled)
+5.0% | 33078 | 12456 (+7824 ties) | 37.7% | $169,631 | $46,971 | $11,168 | $1 | $22,740 (2100 settled)
+7.5% | 33078 | 4967 (+5800 ties) | 15.0% | $78,193 | $24,121 | $7,364 | $1 | $12,378 (1125 settled)
+10.0% | 33078 | 2411 (+3314 ties) | 7.3% | $38,108 | $13,431 | $4,866 | $2 | $8,376 (756 settled)
+15.0% | 33078 | 1325 (+1130 ties) | 4.0% | $16,167 | $6,643 | $2,989 | $2 | $4,451 (463 settled)
+
+-- Required margin to win a print (guardrail OFF): m* = traded / inverse-fair − 1; share of tested prints with m* >= m --
+  we could quote margin -40% and still win 99.9% of prints
+  we could quote margin -30% and still win 99.9% of prints
+  we could quote margin -20% and still win 99.9% of prints
+  we could quote margin -10% and still win 99.9% of prints
+  we could quote margin 0% and still win 99.9% of prints
+  we could quote margin 5% and still win 99.9% of prints
+  we could quote margin 10% and still win 99.7% of prints
+  we could quote margin 15% and still win 98.5% of prints
+  we could quote margin 25% and still win 91.3% of prints
+-- Same, but margin measured against MID (no-vig book mid) fair — what our edge REALLY is --
+  true edge >= -30% vs mid on 99.9% of prints
+  true edge >= -20% vs mid on 99.9% of prints
+  true edge >= -10% vs mid on 99.9% of prints
+  true edge >= 0% vs mid on 98.4% of prints
+  true edge >= 5% vs mid on 83.9% of prints
+  true edge >= 10% vs mid on 64.8% of prints
+  true edge >= 15% vs mid on 51.1% of prints
+  true edge >= 25% vs mid on 42.4% of prints
+
+-- Exposure & caps (fills at margin 10%, lock guardrail ON, ≤10 legs; max-loss = contracts × (1 − price) of every OPEN combo) --
+uncapped      : fills 2170 | blocked 0 {} | premium $9,848 | EV vs inverse $6,403 | EV vs mid $4,618 | realized settled P&L $2,246 | peak max-loss: total $5,515,597, game $5,304,599, selection $5,082,406
+default caps  : fills 82 | blocked 2088 {"combo_cap":1681,"game_cap":358,"selection_cap":49} | premium $239 | EV vs inverse $66 | EV vs mid $37 | realized settled P&L -$152 | peak max-loss: total $3,091, game $1,000, selection $750
+tight caps    : fills 61 | blocked 2109 {"combo_cap":1841,"game_cap":245,"selection_cap":23} | premium $146 | EV vs inverse $38 | EV vs mid $21 | realized settled P&L -$85 | peak max-loss: total $1,296, game $399, selection $294
+-- Same at margin 0% / guardrail OFF (what flow actually looks like if we match the market) --
+uncapped m=0  : fills 44307 | blocked 0 {} | premium $439,674 | EV vs inverse $19,855 | EV vs mid -$90,248 | realized settled P&L $45,053 | peak max-loss: total $29,852,951, game $21,914,210, selection $16,580,035
