@@ -2133,7 +2133,15 @@ async function main() {
   await warmConnection();
   setInterval(warmConnection, QUOTE_WARM_MS);
 
-  startHeartbeat(supabase, MODE, counts, () => parlays.length);
+  let polyHeartbeatSnap = null;
+  startHeartbeat(
+    supabase, MODE, counts, () => parlays.length, 60000,
+    () => {
+      const snap = polyHeartbeatSnap;
+      polyHeartbeatSnap = null; // each interval is persisted once
+      return snap ? { poly: snap } : null;
+    }
+  );
 
   const poly = startPolymarketRfqLoop({
     pendingQuotes: polyPendingQuotes,
@@ -2156,6 +2164,7 @@ async function main() {
     seenFillIds,
     initialFillReconcile: true,
     sendAlert,
+    onPolyHeartbeat: (snap) => { polyHeartbeatSnap = snap; },
     counts,
     sessionFilledByParlay,
     supabase,
