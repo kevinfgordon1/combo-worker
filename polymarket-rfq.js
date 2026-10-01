@@ -82,8 +82,11 @@ const {
 const { createPolymarketHttp, createPolymarketRfqWs } = require('./polymarket-client');
 const { createMarketCache } = require('./polymarket-market-cache');
 const {
-  identitiesFromParlay,
+  identitiesFromParlay: identitiesFromParlayRaw,
   identitiesFromPolymarketLegs,
+  startTimesAgree,
+  POLY_LINE_SPORT,
+  LINE_SERIES,
   identitiesFromPolymarketSlugs,
   sameIdentitySet,
   TEAM_ALIASES,
@@ -125,6 +128,21 @@ const {
 } = require('./polymarket-fill-reconcile');
 
 const MODE = 'POLY';
+
+// Lock identities for POLY matching: ML legs plus exact-line spread/total legs
+// (NFL/MLB/NHL full game). Memoized per parlay object — the RFQ firehose runs
+// couldMatchActiveLocks for every request against every lock (the Kalshi matcher
+// in rfq.js keeps using the ML-only identitiesFromParlay).
+const lockIdMemo = new WeakMap();
+function identitiesFromParlay(parlay) {
+  if (!parlay || typeof parlay !== 'object') return identitiesFromParlayRaw(parlay, { lines: true });
+  const keys = parlay.leg_keys || parlay.legKeys;
+  const hit = lockIdMemo.get(parlay);
+  if (hit && hit.keys === keys && hit.legs === parlay.legs) return hit.res;
+  const res = identitiesFromParlayRaw(parlay, { lines: true });
+  lockIdMemo.set(parlay, { keys, legs: parlay.legs, res });
+  return res;
+}
 function envIntLocal(name, def) {
   const n = Number(process.env[name]);
   return process.env[name] != null && process.env[name] !== '' && Number.isFinite(n) && n >= 0 ? n : def;
@@ -333,10 +351,12 @@ function teamInTokens(league, team, tokens) {
 
 function identityHitsTokens(id, tokens) {
   if (!id) return false;
-  // Combo Locks only price full-game ML (`aec`). Player-prop prefixes
+  // Combo Locks price full-game ML (`aec`) and exact-line spread/total legs
+  // (asc / tsc; NFL, MLB, NHL). Player-prop prefixes
   // (astatc, …) share league/date tokens and emit 2-char stat suffixes
   // (`tb` = total bases) that collide with team codes (TB Rays).
-  if (!tokens.has('aec')) return false;
+  // Line legs (spread/total) ride asc-/tsc- slugs instead.
+  if (id.line != null ? !(tokens.has('asc') || tokens.has('tsc')) : !tokens.has('aec')) return false;
   const leagueTokens = LEAGUE_SLUG_TOKENS[id.league] || (id.league ? [id.league] : []);
   if (!leagueTokens.some((t) => tokens.has(t))) return false;
   if (!tokensHaveDate(tokens, id.date)) return false;
@@ -396,7 +416,7 @@ function isKalshiMoneylineLock(parlay) {
   return kalshiMlTickersFromParlay(parlay).some((text) => {
     const raw = String(text).trim();
     const series = raw.split('-')[0].split(':')[0].toUpperCase();
-    return Boolean(SERIES[series]);
+    return Boolean(SERIES[series] || LINE_SERIES[series]);
   });
 }
 
@@ -487,6 +507,17 @@ function explainLockOverlapMiss(rfq, parlays) {
   return { code: 'no_shared_game' };
 }
 
+// Why a lock cannot be mapped to Poly legs (log `why=`): player_prop (not
+// mapped; see notes), ncaaf_not_mapped (Kalshi/Poly college team codes differ),
+// line_leg_unparsed (NFL/MLB/NHL line leg whose ticker/label could not be proven exact).
+function unpriceableReason(parlay) {
+  const tickers = kalshiMlTickersFromParlay(parlay).map((t) => String(t).split('-')[0].split(':')[0].toUpperCase());
+  if (tickers.some((t) => /PROP|TD|YDS|REC|RUSH|PASS|HR|HITS/.test(t) && !SERIES[t] && !LINE_SERIES[t])) return 'player_prop';
+  if (tickers.some((t) => /^KXNCAAF/.test(t))) return 'ncaaf_not_mapped';
+  if (tickers.some((t) => LINE_SERIES[t])) return 'line_leg_unparsed';
+  return 'other_leg_type';
+}
+
 function logUnpriceablePolyLocks(parlays, log = console.log) {
   if (!Array.isArray(parlays) || !parlays.length) return 0;
   const failing = [];
@@ -502,7 +533,7 @@ function logUnpriceablePolyLocks(parlays, log = console.log) {
   if (!n) { lockDiagLog.unpriceable.clear(); return 0; }
   for (const p of dueLockDiag(lockDiagLog.unpriceable, failing, Date.now())) {
     const label = p.label || p.id || '?';
-    log(`[${MODE}] lock-unpriceable-on-poly reason=not_moneyline n=${n} label=${label}`);
+    log(`[${MODE}] lock-unpriceable-on-poly reason=not_moneyline why=${unpriceableReason(p)} n=${n} label=${label}`);
   }
   return n;
 }
@@ -517,6 +548,16 @@ function formatReasonTally(reasons) {
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .map(([k, n]) => `${k}=${n}`)
     .join(' ');
+}
+
+// Locks that need at least one spread/total leg to be mapped (subset of priceable).
+function countPriceableLineLocks(parlays) {
+  let n = 0;
+  for (const p of parlays || []) {
+    const r = identitiesFromParlay(p);
+    if (r.ok && r.identities.some((id) => id.line != null)) n += 1;
+  }
+  return n;
 }
 
 function countPriceableLocks(parlays) {
@@ -571,6 +612,10 @@ function couldMatchActiveLocks(rfq, parlays, { partial = false } = {}) {
     if (!lock.ok || !lock.identities.length) continue;
     if (!partial && keys.length && keys.length !== lock.identities.length) continue;
     if (!partial && slugIds.ok && sameIdentitySet(slugIds.keys, lock.keys)) return true;
+    // A lock with spread/total legs is a candidate ONLY via the exact slug
+    // identity-set route above (full leg set, exact lines + sides). Loose token
+    // overlap must never pull wide RFQs into market fetches for line locks.
+    if (!partial && lock.identities.some((id) => id.line != null)) continue;
     const hits = partial
       ? lock.identities.some((id) => identityHitsTokens(id, tokens))
       : lock.identities.every((id) => identityHitsTokens(id, tokens));
@@ -604,18 +649,31 @@ function matchPolymarketParlayDetailed(rfq, parlays, opts = {}) {
   }
 
   const hits = [];
+  let startMismatch = false;
   for (const p of parlays) {
     const lock = identitiesFromParlay(p);
     if (!lock.ok) continue;
-    if (sameIdentitySet(pm.keys, lock.keys)) hits.push(p);
+    if (!sameIdentitySet(pm.keys, lock.keys)) continue;
+    // Same legs + same lines, but a different clock (doubleheader / replay)?
+    if (!startTimesAgree(lock.identities, pm.identities)) { startMismatch = true; continue; }
+    hits.push(p);
   }
   if (hits.length === 1) {
-    return { parlay: hits[0], reason: null, identityKeys: pm.keys };
+    return { parlay: hits[0], reason: null, identityKeys: pm.keys, polyStartMs: earliestPolyStart(pm.identities) };
   }
   if (hits.length > 1) {
     return { parlay: null, reason: 'ambiguous', identityKeys: pm.keys };
   }
-  return { parlay: null, reason: 'unmatched', identityKeys: pm.keys };
+  return { parlay: null, reason: startMismatch ? 'start_mismatch' : 'unmatched', identityKeys: pm.keys };
+}
+
+// Earliest Poly-reported kickoff / first pitch among VERIFIED line legs (ms).
+function earliestPolyStart(identities) {
+  let at = null;
+  for (const id of identities || []) {
+    if (id && id.line != null && id.startMs != null && (at == null || id.startMs < at)) at = id.startMs;
+  }
+  return at;
 }
 
 function matchPolymarketParlay(rfq, parlays, opts) {
@@ -661,6 +719,24 @@ function evaluatePolymarketRfq({
     : findStartedEvent(rfq, parlay, null, now);
   if (started && started.started) {
     return { action: 'skip', reason: 'game_started', rfq, parlay, started };
+  }
+  // Poly's own kickoff for verified spread/total legs: lock keys for NFL are
+  // date-only, so this is the exact-clock backstop on top of starts_at.
+  const nowMs = now != null ? now : Date.now();
+  if (hit.polyStartMs != null && hit.polyStartMs <= nowMs) {
+    return {
+      action: 'skip',
+      reason: 'game_started',
+      rfq,
+      parlay,
+      started: {
+        started: true,
+        reason: 'game_started',
+        source: 'poly.market.gameStartTime',
+        at: new Date(hit.polyStartMs).toISOString(),
+        atMs: hit.polyStartMs,
+      },
+    };
   }
 
   const quote = buildPolymarketQuote({
@@ -711,6 +787,7 @@ function evaluatePolymarketRfq({
     quote,
     decision,
     kill,
+    polyStartMs: hit.polyStartMs != null ? hit.polyStartMs : null,
   };
 }
 
@@ -1441,6 +1518,8 @@ function startPolymarketRfqLoop(ctx = {}) {
       cashOrderQty: parsePositiveShares(rfq && rfq.cashOrderQty) || null,
       buyPrice: q && q.buyPrice,
       estimatedContracts: q && q.estimatedContracts,
+      // Poly kickoff of verified spread/total legs: re-checked at confirm.
+      polyStartMs: evaluation && evaluation.polyStartMs != null ? evaluation.polyStartMs : null,
     };
   }
 
@@ -1683,7 +1762,13 @@ function startPolymarketRfqLoop(ctx = {}) {
   async function cancelPendingIfStarted() {
     for (const [quoteId, pending] of pendingQuotes) {
       const p = parlayOfPending(pending);
-      const started = startedFor(p);
+      let started = startedFor(p);
+      if (!(started && started.started) && pending && pending.polyStartMs != null && pending.polyStartMs <= Date.now()) {
+        started = {
+          started: true, reason: 'game_started', source: 'poly.market.gameStartTime',
+          at: new Date(pending.polyStartMs).toISOString(), atMs: pending.polyStartMs,
+        };
+      }
       if (started && started.started) await deleteQuoteAndDrop(quoteId, pending, started);
     }
   }
@@ -1715,7 +1800,16 @@ function startPolymarketRfqLoop(ctx = {}) {
       }
     }
     const parlay = parlayOfPending(pending);
-    const started = parlay ? startedFor(parlay) : { started: false };
+    let started = parlay ? startedFor(parlay) : { started: false };
+    if (!(started && started.started) && pending && pending.polyStartMs != null && pending.polyStartMs <= Date.now()) {
+      started = {
+        started: true,
+        reason: 'game_started',
+        source: 'poly.market.gameStartTime',
+        at: new Date(pending.polyStartMs).toISOString(),
+        atMs: pending.polyStartMs,
+      };
+    }
     const gate = shouldConfirmNow(acceptedSide, { live, started });
     if (!gate.confirm) {
       if (gate.reason === 'game_started') {
@@ -2142,6 +2236,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       let bulk = 0;
       let exact = 0;
       let near = 0;
+      let exactMatched = 0; // fresh crawl RFQs whose FULL leg set matched an active lock
       if (!locks.length) {
         intake.noteBulkNoOverlap(fresh.length);
       } else {
@@ -2162,7 +2257,8 @@ function startPolymarketRfqLoop(ctx = {}) {
         let n = 0;
         for (const row of hot.concat(nearRows)) {
           if (stopped) break;
-          await handleRfq(row, 'rest').catch((e) => console.error(`[${MODE}] crawl rfq`, e.message));
+          const out = await handleRfq(row, 'rest').catch((e) => { console.error(`[${MODE}] crawl rfq`, e.message); return null; });
+          if (out && out.parlay) exactMatched += 1;
           if (++n % 25 === 0) await yieldLoop();
         }
         intake.noteBulkNoOverlap(bulk);
@@ -2171,7 +2267,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       console.log(
         `[${MODE}] crawl open=${res.rows.length} pages=${res.pages} ms=${Date.now() - t0}` +
         ` ws_dup=${res.rows.length - fresh.length} fresh=${fresh.length}` +
-        ` lock_exact=${exact} lock_near=${near} noise=${bulk}` +
+        ` lock_exact=${exact} lock_near=${near} lock_matched=${exactMatched} noise=${bulk}` +
         (res.truncated ? ` TRUNCATED${res.error ? ` err=${res.error.statusCode || '?'}${res.error.forbidden ? '(403)' : ''}` : ''}` : '')
       );
       return { ...res, rows: undefined, open: res.rows.length, exact, near, bulk };
@@ -2310,6 +2406,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     const snap = intake.rollInterval();
     snap.locks = parlays().length;
     snap.priceable_locks = countPriceableLocks(parlays());
+    snap.priceable_line_locks = countPriceableLineLocks(parlays());
     snap.pending_quotes = pendingQuotes.size;
     console.log(formatPolyHeartbeat(snap));
     if (typeof ctx.onPolyHeartbeat === 'function') {
@@ -2416,6 +2513,7 @@ module.exports = {
   tallyReconcileOutcome,
   formatReasonTally,
   countPriceableLocks,
+  countPriceableLineLocks,
   lockSkipReasonOf,
   isKalshiMoneylineLock,
   matchPolymarketParlay,
