@@ -193,9 +193,29 @@ const { createPartialQuoteDryRun, isPartialQuoteFlagOn } = require('./partial-qu
 const MODE = 'LIVE';
 let bucketManager = null;
 
-function noteInsufficientBalance(venue) {
+// Cash a NO quote ties up on shard 1: contracts x NO price (dollars). null when unknown.
+function quoteCostDollars(contracts, noBid) {
+  const c = Number(contracts);
+  const n = Number(noBid);
+  if (!(c > 0) || !(n > 0) || n >= 1.0001) return null;
+  return c * n;
+}
+
+// One-shot hint (set and consumed synchronously) so the rejected quote's cash
+// need reaches the bucket manager without becoming a combo_submissions column.
+let costHint = null;
+function setCostHint(costDollars) {
+  costHint = costDollars != null && Number(costDollars) > 0 ? { costDollars: Number(costDollars) } : null;
+}
+function takeCostHint() {
+  const h = costHint;
+  costHint = null;
+  return h;
+}
+
+function noteInsufficientBalance(venue, info = null) {
   if (!bucketManager) return;
-  Promise.resolve(bucketManager.onInsufficientBalance(venue)).catch((e) => {
+  Promise.resolve(bucketManager.onInsufficientBalance(venue, info)).catch((e) => {
     console.error(`[${MODE}] bucket notify`, e && e.message);
   });
 }
@@ -454,7 +474,7 @@ function logAsync(p, rfq, d, status, extra = {}) {
         : rfq.contracts != null ? rfq.contracts : null;
   const venueExtra = withVenue(extra);
   if (venueExtra.skip_reason === 'insufficient_balance') {
-    noteInsufficientBalance(venueExtra.venue || 'kalshi');
+    noteInsufficientBalance(venueExtra.venue || 'kalshi', takeCostHint());
   }
   const body = stripUnknown({
     user_id: p.user_id,
@@ -526,13 +546,15 @@ function fundingSkipExtra(d, rfq, extra = {}) {
 
 function logFundingSkip(p, rfq, d, extra = {}) {
   const persistExtra = fundingSkipExtra(d, rfq, extra);
+  // Not a column: handed to logAsync's notify through a one-shot hint.
+  setCostHint(extra.costDollars);
   logAsync(p, rfq, d, 'declined', persistExtra);
 }
 
 // Confirm already inserted a quoted row — stamp skip_reason on that attempt.
 // If the insert never landed, insert a declined funding row.
-function persistQuoteSkip(quoteId, skipReason, fallback, venue) {
-  if (skipReason === 'insufficient_balance') noteInsufficientBalance(venue || 'kalshi');
+function persistQuoteSkip(quoteId, skipReason, fallback, venue, info = null) {
+  if (skipReason === 'insufficient_balance') noteInsufficientBalance(venue || 'kalshi', info);
   if (!skipReason) return Promise.resolve(null);
   const body = stripUnknown({
     skip_reason: skipReason,
@@ -1191,13 +1213,16 @@ async function onQuoteAccepted(evt) {
     console.error(`[${MODE}] CONFIRM FAILED quote_id=${quoteId} rfq_id=${rfqId}`, e.message);
     const skipReason = quoteFailureSkipReason(e.message);
     if (skipReason) {
+      const yb = pending && Number(pending.yesBid);
+      const confirmCost = yb > 0 && yb < 1 ? quoteCostDollars(pending.contracts, 1 - yb) : null;
       persistQuoteSkip(quoteId, skipReason, () => {
         const p = parlayFromPending(pending);
         if (!p) return null;
         return logFundingSkip(p, { rfqId, contracts: pending && pending.contracts }, null, {
           contracts: pending && pending.contracts,
+          costDollars: confirmCost,
         });
-      });
+      }, 'kalshi', confirmCost != null ? { costDollars: confirmCost } : null);
     }
     if (!isSilentQuoteFailure(e.message)) {
       sendAlert(
@@ -2125,7 +2150,7 @@ async function onRfq(rfq, env) {
         e.message
       );
       if (quoteFailureSkipReason(e.message)) {
-        logFundingSkip(p, rfq, d);
+        logFundingSkip(p, rfq, d, { costDollars: quoteCostDollars(d && d.contracts, noBid) });
       } else if (closed) {
         logAsync(p, rfq, d, 'unfilled', {
           skip_reason: 'rfq_closed',
