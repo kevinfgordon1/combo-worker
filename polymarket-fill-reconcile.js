@@ -1284,13 +1284,20 @@ async function listActivitiesPage(http, { limit = 100, maxPages = 8, marketSlug 
   const out = [];
   let cursor;
   for (let page = 0; page < maxPages; page += 1) {
-    const listed = await http.listActivities({
-      types: 'ACTIVITY_TYPE_TRADE',
-      limit,
-      cursor,
-      sortOrder: 'SORT_ORDER_DESCENDING',
-      ...(marketSlug ? { marketSlug } : {}),
-    });
+    let listed;
+    try {
+      listed = await http.listActivities({
+        types: 'ACTIVITY_TYPE_TRADE',
+        limit,
+        cursor,
+        sortOrder: 'SORT_ORDER_DESCENDING',
+        ...(marketSlug ? { marketSlug } : {}),
+      });
+    } catch (e) {
+      // Keep the pages already collected when a later page is rate limited.
+      if (out.length && e && e.statusCode === 429) break;
+      throw e;
+    }
     const rows = activitiesFromListed(listed);
     out.push(...rows);
     cursor = listed && (listed.nextCursor || listed.next_cursor || listed.cursor) || null;
@@ -1325,15 +1332,35 @@ function mergeActivities(...lists) {
   return out;
 }
 
-async function listActivitiesForMarketSlugs(http, slugs, { limit = 100, maxPages = 4 } = {}) {
+// Per-slug activity scans used to hit EVERY known caoc slug (~50+ GETs) on each
+// 20s fill reconcile on top of the 8-page global scan: ~150-200 req/min, a
+// major contributor to Cloudflare 1015 (HTTP 429). The global scan already
+// covers the newest ~800 trades, so the per-slug pass only matters for older
+// trades: do ONE full pass (first call after boot), then rotate through
+// POLY_ACT_SLUGS_PER_TICK slugs per call, and stop early on a 429.
+let slugScanOffset = 0;
+let slugFullPassDone = false;
+const SLUGS_PER_TICK = Number(process.env.POLY_ACT_SLUGS_PER_TICK) > 0
+  ? Number(process.env.POLY_ACT_SLUGS_PER_TICK) : 8;
+
+async function listActivitiesForMarketSlugs(http, slugs, { limit = 100, maxPages = 4, perTick = SLUGS_PER_TICK, full } = {}) {
   const out = [];
-  for (const slug of slugs || []) {
-    const key = normalizeMarketSlug(slug);
-    if (!isComboActivitySlug(key)) continue;
+  const all = (slugs || []).map(normalizeMarketSlug).filter((k) => isComboActivitySlug(k));
+  const doFull = full != null ? full : !slugFullPassDone;
+  let pick = all;
+  if (!doFull && all.length > perTick) {
+    pick = [];
+    for (let i = 0; i < perTick; i += 1) pick.push(all[(slugScanOffset + i) % all.length]);
+    slugScanOffset = (slugScanOffset + perTick) % all.length;
+  }
+  if (doFull) slugFullPassDone = true;
+  for (const key of pick) {
     try {
       const rows = await listActivitiesPage(http, { limit, maxPages, marketSlug: key });
       out.push(...rows);
-    } catch (_) { /* keep other slugs */ }
+    } catch (e) {
+      if (e && e.statusCode === 429) break; // rate limited: stop, next tick continues
+    }
   }
   return out;
 }
@@ -1530,6 +1557,7 @@ module.exports = {
   matchActivitiesToLocks,
   listAllActivities,
   listActivitiesForMarketSlugs,
+  _resetSlugScanForTest() { slugScanOffset = 0; slugFullPassDone = false; },
   mergeActivities,
   reconcileLockActivityEvents,
   lockTeamNicknames,

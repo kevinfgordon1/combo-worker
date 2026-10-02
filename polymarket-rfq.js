@@ -2562,6 +2562,8 @@ function startPolymarketRfqLoop(ctx = {}) {
     if (http && typeof http.backoffSnapshot === 'function') {
       const bo = http.backoffSnapshot();
       snap.rest_429 = Object.values(bo).reduce((n, x) => n + x.hits, 0);
+      const top = Object.entries(bo).filter(([, x]) => x.hits > 0).sort((a, b) => b[1].hits - a[1].hits).slice(0, 3);
+      if (top.length) snap.rest_429_paths = top.map(([k, x]) => `${k}:${x.hits}`).join('|');
     }
     console.log(formatPolyHeartbeat(snap));
     if (typeof ctx.onPolyHeartbeat === 'function') {
