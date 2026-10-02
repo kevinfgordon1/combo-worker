@@ -232,8 +232,22 @@ async function testSlugScanPacing() {
   assert.ok(rows.length >= 1);
 }
 
+async function testHydrateCap() {
+  const fr = require('./polymarket-fill-reconcile');
+  let calls = 0;
+  const http = { async listQuotes() { calls += 1; return { quotes: [] }; } };
+  const cands = Array.from({ length: 15 }, (_, i) => ({ id: `q${i}`, quote: null, pending: { rfqId: `r${i}`, accepted: i === 14 } }));
+  await fr.hydrateMissingQuotes(http, cands, 15);
+  assert.strictEqual(calls, 5, 'hydrate capped to 5 GETs per tick');
+  calls = 0;
+  const h429 = { async listQuotes() { calls += 1; const e = new Error('429'); e.statusCode = 429; throw e; } };
+  await fr.hydrateMissingQuotes(h429, cands, 15);
+  assert.strictEqual(calls, 1, 'stops at first 429');
+}
+
 (async () => {
   await test429Breaker();
+  await testHydrateCap();
   await testSlugScanPacing();
   await testShallowCrawlWhenWsHealthy();
   await testWsWatchdog();
