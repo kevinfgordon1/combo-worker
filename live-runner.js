@@ -1233,7 +1233,7 @@ async function persistExecutedFill(pending, evt) {
     if (venue === 'polymarket' && pending.parlayId) {
       const { data: booked, error: bookedErr } = await supabase
         .from('combo_fills')
-        .select('fill_id,parlay_id,ticker,count,raw')
+        .select('fill_id,parlay_id,ticker,count,raw,recorded_at,kalshi_created_time')
         .eq('parlay_id', pending.parlayId)
         .eq('is_combo', true)
         .limit(500);
@@ -1246,6 +1246,7 @@ async function persistExecutedFill(pending, evt) {
           parlay_id: pending.parlayId,
           fill_id: evt.fillId,
           fillId: evt.fillId,
+          tradeTime: evt.tradeTime || null,
         },
         { id: pending.parlayId },
         booked || [],
@@ -1457,7 +1458,7 @@ async function loadPolySlugRecordsUncached() {
     const [fillsQ, subsQ] = await Promise.all([
       supabase
         .from('combo_fills')
-        .select('ticker,parlay_id,raw,count,fill_id')
+        .select('ticker,parlay_id,raw,count,fill_id,recorded_at,kalshi_created_time')
         .eq('is_combo', true)
         .gte('recorded_at', cutoff)
         .limit(1000),
@@ -1483,6 +1484,8 @@ async function loadPolySlugRecordsUncached() {
           contracts: row.count,
           fill_id: row.fill_id,
           source: row.raw && row.raw.source,
+          recorded_at: row.recorded_at,
+          kalshi_created_time: row.kalshi_created_time,
         });
       }
     }
@@ -2255,6 +2258,7 @@ async function main() {
     }
   );
 
+  const polyAppAlerts = createAppAlerts({ client: supabase });
   const poly = startPolymarketRfqLoop({
     pendingQuotes: polyPendingQuotes,
     kalshiPendingQuotes: pendingQuotes,
@@ -2277,6 +2281,18 @@ async function main() {
     initialFillReconcile: true,
     sendAlert,
     onPolyHeartbeat: (snap) => { polyHeartbeatSnap = snap; },
+    // Silent Poly WS stall (socket open, no messages): the client terminates +
+    // reconnects; here we leave an in-app alert row (one unresolved row max).
+    onWsStall: (info) => polyAppAlerts.raise({
+      kind: 'poly_ws_stall',
+      severity: 'warn',
+      title: 'Polymarket RFQ WebSocket stalled - reconnecting',
+      body: `No Polymarket WS message for ${Math.round((info.silentMs || 0) / 1000)}s while RFQ flow is expected. ` +
+        'Socket terminated and reconnected; REST crawl is covering intake meanwhile.',
+      dedupeKey: 'poly_ws_stall',
+      meta: { silent_ms: info.silentMs, stalls: info.stalls, reconnects: info.reconnects, service: 'combo-worker' },
+    }),
+    onWsRecovered: () => polyAppAlerts.resolve(['poly_ws_stall']),
     // Poly REST crawl pages wait while a Kalshi quote POST/confirm is in flight.
     shouldPause: () => quoteHot.inFlight,
     counts,

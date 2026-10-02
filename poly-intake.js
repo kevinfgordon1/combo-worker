@@ -175,6 +175,9 @@ function formatPolyHeartbeat(snap) {
     (s.locks != null
       ? ` locks=${s.locks} priceable=${s.priceable_locks} priceable_line=${s.priceable_line_locks || 0}`
       : '') +
+    (s.ws_silent_s != null ? ` ws_silent_s=${s.ws_silent_s}` : '') +
+    (s.ws_stalls != null ? ` ws_stalls=${s.ws_stalls} ws_reconnects=${s.ws_reconnects || 0}` : '') +
+    (s.rest_429 != null ? ` rest_429=${s.rest_429}` : '') +
     (reasons ? ` reasons=${reasons}` : '')
   );
 }
@@ -239,7 +242,7 @@ async function crawlOpenRfqs(http, {
     } catch (e) {
       if (pages === 0) throw e;
       truncated = true;
-      error = { statusCode: e && e.statusCode, forbidden: isForbidden(e), message: String((e && e.message) || e).slice(0, 120) };
+      error = { statusCode: e && e.statusCode, forbidden: isForbidden(e), rateLimited: !!(e && e.statusCode === 429), message: String((e && e.message) || e).slice(0, 120) };
       break;
     }
     pages += 1;
