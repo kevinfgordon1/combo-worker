@@ -1233,6 +1233,13 @@ function matchActivitiesToLocks(activities, locks, {
     ? coerceSlugMap(slugMap)
     : null;
   const bookedKeys = bookedAnyPolyKeys({ bookedFills, seenFillIds });
+  // Identity dedup: an activity trade already stored under its own fill_id is
+  // never re-emitted (restart replays must stay silent: no re-count/alert).
+  const bookedFillIds = new Set();
+  for (const row of bookedFills || []) {
+    const id = fillIdOf(row);
+    if (id) bookedFillIds.add(String(id));
+  }
   const quoteSizes = quotedByLock instanceof Map
     ? quotedByLock
     : quotedSizesByLock(quotedByLock);
@@ -1243,6 +1250,10 @@ function matchActivitiesToLocks(activities, locks, {
     const hit = lockMatchForActivity(locks, trade.hay || trade.title, trade.marketSlug, map);
     const lock = hit.lock;
     if (!lock) continue;
+    if (trade.id && bookedFillIds.has(`poly-act:${trade.id}`)) {
+      matchedLockIds.add(lock.id);
+      continue;
+    }
     if (activityAlreadyReconciled(trade, lock, bookedKeys)) {
       matchedLockIds.add(lock.id);
       continue;

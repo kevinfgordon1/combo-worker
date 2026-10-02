@@ -375,6 +375,19 @@ function emptyTitleCaocTrade(id, cost, { aggressor = true } = {}) {
     0,
     'same trade id must not rebook'
   );
+  // Restart replay: an activity trade already stored under its own fill_id is
+  // never re-emitted (would re-count + re-alert), even with other same-size rows.
+  assert.strictEqual(
+    matchActivitiesToLocks([{
+      type: 'ACTIVITY_TYPE_TRADE',
+      trade: {
+        id: 'CJDEG0BFCVAY', marketSlug: ravensSlug, qtyDecimal: '629.82', isAggressor: false,
+        state: 'TRADE_STATE_CLEARED', marketMetadata: { title: '', slug: ravensSlug },
+      },
+    }], [ravensLock], { slugMap: ravensMap, bookedFills: priorAct }).length,
+    0,
+    'booked poly-act:<tradeId> is not replayed'
+  );
   // Time-aware twin rules vs non-activity rows.
   {
     const mk = (id, iso) => ({
