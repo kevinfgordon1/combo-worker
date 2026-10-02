@@ -1872,10 +1872,14 @@ const novigFeed = (() => {
       // Sort so P(outcome 0) rises with x.
       x = side0 === 'Over' ? -strike : strike;
     }
+    // Novig charges takers c·P·(1−P) on live fills only; c is per market
+    // (fee.coefficient: 0.03, 0.06 on NCAAF spreads/totals). Null when absent.
+    const feeCoef = Number(m.fee && m.fee.coefficient);
     return {
       id: String(m.marketId),
       eventId: String(m.eventId || ''),
       type,
+      feeCoefficient: m.fee && m.fee.coefficient != null && Number.isFinite(feeCoef) ? feeCoef : null,
       strike: Number.isFinite(strike) ? strike : null,
       description: String(m.description || ''),
       outcomes,
@@ -1974,6 +1978,8 @@ const novigFeed = (() => {
         depth: askLevels(book, market, outcome.id, 5),
         is_alt: false,
         is_live: ev.status === 'OPEN_INGAME',
+        // Prices above are pre-fee asks. Consumers add the live taker fee.
+        fee_coefficient: market.feeCoefficient == null ? undefined : market.feeCoefficient,
         token_id: outcome.id,
         market_id: market.id,
         seq: book.seq,
