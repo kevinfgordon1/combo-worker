@@ -102,6 +102,25 @@ assert.strictEqual(quotes[0].book_id, 195);
 assert.strictEqual(quotes[0].bet_type, 'moneyline');
 assert.strictEqual(quotes[0].american, 104);
 
+// Live taker fee: quotes stay pre-fee asks; the market's fee.coefficient rides
+// along (consumers add c·P·(1−P) only when is_live). Absent fee → undefined.
+{
+  const feeCat = buildCatalog('NFL', {
+    items: [{ eventId: 'fe', description: 'Pittsburgh Steelers @ Cleveland Browns', league: 'NFL', status: 'OPEN_INGAME', startsTs: Date.now() - 600e3 }],
+  }, {
+    items: [
+      { marketId: 'fm', eventId: 'fe', marketType: 'MONEY', status: 'OPEN', strike: '0', fee: { coefficient: '0.03', makerCredit: '0.5', charged: 'WHEN_LIVE' }, outcomes: [{ outcomeId: 'cle', name: 'CLE' }, { outcomeId: 'pit', name: 'PIT' }] },
+      { marketId: 'nf', eventId: 'fe', marketType: 'TOTAL', status: 'OPEN', strike: '41.5', outcomes: [{ outcomeId: 'o', name: 'Over 41.5' }, { outcomeId: 'u', name: 'Under 41.5' }] },
+    ],
+  });
+  const feeBook = bookFromSnapshot({ seq: 1, orders: { cle: [{ orderId: '1', price: '0.705', qty: 100 }], pit: [{ orderId: '2', price: '0.705', qty: 100 }] } });
+  const fq = quotesForMarket(feeCat.events.get('fe'), feeCat.groups.get('fe|MONEY')[0], feeBook, 'NFL');
+  assert.ok(fq.every((q) => q.is_live === true && q.fee_coefficient === 0.03 && q.odds === 0.295 && q.american === 239));
+  const tb2 = bookFromSnapshot({ seq: 1, orders: { o: [{ orderId: '5', price: '0.460', qty: 100 }], u: [{ orderId: '6', price: '0.500', qty: 100 }] } });
+  const nfq = quotesForMarket(feeCat.events.get('fe'), feeCat.groups.get('fe|TOTAL')[0], tb2, 'NFL');
+  assert.ok(nfq.every((q) => q.fee_coefficient === undefined));
+}
+
 // Deltas: add joins, remove leaves.
 applyBookDeltas(mlBook, [
   { kind: 'add', order: 'e', outcome: 'ari', price: '0.520', qty: 5000 },
