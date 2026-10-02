@@ -1714,13 +1714,76 @@ const novigFeed = (() => {
   }
 
   function emptyBook() {
-    return { seq: -1, orders: new Map(), changedAt: 0 };
+    return { seq: -1, orders: new Map(), changedAt: 0, replica: null, source: 'rest', newestMs: 0, acceptedAt: 0 };
+  }
+
+  // Novig's public book is served by several replicas. Each one numbers its
+  // own events, so seq is only comparable within one replica (observed: the
+  // same market at seq 110, 76 and 48 at once, and ~72,000 apart on a live
+  // game). The etag is "<replica uuid>-<seq>".
+  function replicaFromEtag(etag) {
+    const s = String(etag == null ? '' : etag).replace(/^W\//, '').replace(/"/g, '');
+    const m = /^(.+)-\d+$/.exec(s);
+    return m ? m[1] : null;
+  }
+
+  // Order ids are uuidv7: the first 48 bits are the creation time in ms.
+  function uuidV7Ms(id) {
+    const m = /^([0-9a-f]{8})-([0-9a-f]{4})-7[0-9a-f]{3}-/i.exec(String(id == null ? '' : id));
+    return m ? parseInt(`${m[1]}${m[2]}`, 16) : 0;
+  }
+
+  function newestOrderMs(book) {
+    let max = 0;
+    if (!book || !book.orders) return max;
+    for (const id of book.orders.keys()) {
+      const t = uuidV7Ms(id);
+      if (t > max) max = t;
+    }
+    return max;
+  }
+
+  function sameOrders(a, b) {
+    if (!a || !b || a.orders.size !== b.orders.size) return false;
+    for (const [id, row] of a.orders) {
+      const other = b.orders.get(id);
+      if (!other || other.price !== row.price || other.qty !== row.qty || other.outcome !== row.outcome) return false;
+    }
+    return true;
+  }
+
+  // Decide whether a REST book replaces the one held. seqs is this market's
+  // replica -> last seq map (updated here). Rules:
+  //   1. Never go backwards within one replica; an equal seq is no change.
+  //   2. A WebSocket book that is still live is not replaced by REST.
+  //   3. Same replica, higher seq: accept.
+  //   4. Another replica: seq is not comparable. Identical orders: no change.
+  //      A book holding a newer order (uuidv7) than the one held is fresher:
+  //      accept. A book missing the newest held order is probably a lagging
+  //      replica: accept it only once the held book is skewMs old (so a real
+  //      cancel still lands, a stale replica cannot flip a fresh price back).
+  function acceptRestBook(prev, next, seqs, { now = Date.now(), skewMs = 3000, wsFresh = false } = {}) {
+    const rep = next.replica;
+    if (rep && seqs) {
+      const last = seqs.get(rep);
+      if (last !== undefined && next.seq <= last) return false;
+      seqs.set(rep, next.seq);
+    }
+    if (!prev) return true;
+    if (prev.source === 'ws' && wsFresh) return false;
+    if (rep && prev.replica === rep) return true;
+    if (!rep && !prev.replica) return next.seq > prev.seq;
+    if (sameOrders(prev, next)) return false;
+    if (next.newestMs > prev.newestMs) return true;
+    const heldAt = prev.acceptedAt || prev.changedAt || 0;
+    return now - heldAt >= skewMs;
   }
 
   // REST: { seq, orders: { outcomeId: [{ orderId, price, qty }] } }
   // WS snapshot: { seq, orders: { outcomeId: [{ order, price, qty }] } }
-  function bookFromSnapshot(raw, at) {
+  function bookFromSnapshot(raw, at, replica) {
     const book = emptyBook();
+    book.replica = replica || null;
     if (!raw || typeof raw !== 'object') return book;
     book.seq = Number.isFinite(Number(raw.seq)) ? Number(raw.seq) : -1;
     const orders = raw.orders || {};
@@ -1735,6 +1798,7 @@ const novigFeed = (() => {
       });
     }
     book.changedAt = at || Date.now();
+    book.newestMs = newestOrderMs(book);
     return book;
   }
 
@@ -2018,14 +2082,20 @@ const novigFeed = (() => {
 
   // ---------------------------------------------------------------- limiter
 
-  function createLimiter({ rps = 1.8, concurrency = 2, now = () => Date.now() } = {}) {
+  // live is a reserved lane: in-game hot polls go first. Every LIVE_RUN_MAX
+  // live grants one waiting non-live request is served, so catalog refreshes
+  // and main-line searches still progress (>= 1 in LIVE_RUN_MAX + 1 slots).
+  const LIVE_RUN_MAX = 3;
+
+  function createLimiter({ rps = 1.8, concurrency = 2, now = () => Date.now(), liveRunMax = LIVE_RUN_MAX } = {}) {
     let tokens = Math.max(1, rps);
     let last = now();
     let active = 0;
     let pausedUntil = 0;
     let rate = rps;
     let slowUntil = 0;
-    const queues = { high: [], mid: [], low: [] };
+    const queues = { live: [], high: [], mid: [], low: [] };
+    let liveRun = 0;
     // Weighted round robin 4:2:1: hot polls, main-line searches, then everything else.
     const pattern = ['high', 'high', 'mid', 'high', 'low', 'high', 'mid'];
     let timer = null;
@@ -2040,14 +2110,21 @@ const novigFeed = (() => {
       timer = null;
       refill();
       const t = now();
-      const waiting = () => queues.high.length + queues.mid.length + queues.low.length;
+      const others = () => queues.high.length + queues.mid.length + queues.low.length;
+      const waiting = () => queues.live.length + others();
       while (waiting() && active < concurrency && tokens >= 1 && t >= pausedUntil) {
         let q = null;
-        for (let i = 0; i < pattern.length && !q; i += 1) {
-          const name = pattern[(served + i) % pattern.length];
-          if (queues[name].length) {
-            q = queues[name];
-            served = (served + i + 1) % pattern.length;
+        if (queues.live.length && (liveRun < liveRunMax || !others())) {
+          q = queues.live;
+          liveRun += 1;
+        } else {
+          liveRun = 0;
+          for (let i = 0; i < pattern.length && !q; i += 1) {
+            const name = pattern[(served + i) % pattern.length];
+            if (queues[name].length) {
+              q = queues[name];
+              served = (served + i + 1) % pattern.length;
+            }
           }
         }
         const next = q.shift();
@@ -2079,9 +2156,10 @@ const novigFeed = (() => {
         slowUntil = t + 120_000;
       },
       stats() {
-        return { rps: rate, queued: { high: queues.high.length, mid: queues.mid.length, low: queues.low.length }, active, pausedUntil };
+        return { rps: rate, queued: { live: queues.live.length, high: queues.high.length, mid: queues.mid.length, low: queues.low.length }, active, pausedUntil };
       },
       clear() {
+        queues.live.length = 0;
         queues.high.length = 0;
         queues.mid.length = 0;
         queues.low.length = 0;
@@ -2093,9 +2171,11 @@ const novigFeed = (() => {
 
   // ---------------------------------------------------------------- feed
 
-  function pollMsFor(ev, at, opts) {
+  function pollMsFor(ev, at, opts, market) {
     if (!ev) return opts.coldMs;
-    if (ev.status === 'OPEN_INGAME') return opts.hotMs;
+    // Moneyline is what the boards chase; spread / total can wait a little so
+    // a big Sunday slate still fits the request budget.
+    if (ev.status === 'OPEN_INGAME') return market && market.type !== 'MONEY' ? (opts.hotSideMs || opts.hotMs) : opts.hotMs;
     const start = ev.startsTs || 0;
     if (start && start - at < 6 * 3600 * 1000) return opts.nearMs || opts.hotMs;
     if (start && start - at < 48 * 3600 * 1000) return opts.warmMs;
@@ -2111,6 +2191,8 @@ const novigFeed = (() => {
     const log = opts.log || ((...a) => console.log('[novig]', ...a));
     const cfg = {
       hotMs: Number(env.NOVIG_HOT_POLL_MS) || opts.hotMs || 2000,
+      hotSideMs: Number(env.NOVIG_HOT_SIDE_POLL_MS) || opts.hotSideMs || 4000,
+      replicaSkewMs: Number(env.NOVIG_REPLICA_SKEW_MS) || opts.replicaSkewMs || 3000,
       // Pregame within 6h: the book moves slowly, so leave the budget to live games.
       nearMs: Number(env.NOVIG_NEAR_POLL_MS) || opts.nearMs || 6000,
       warmMs: Number(env.NOVIG_WARM_POLL_MS) || opts.warmMs || 20000,
@@ -2142,8 +2224,10 @@ const novigFeed = (() => {
       restErrors: 0,
       restCalls: 0,
       restChanged: 0,
+      restStale: 0,
       wsMarkets: 0,
     };
+    const replicaSeqs = new Map(); // marketId -> Map(replica -> last seq)
     let stopped = false;
     let ws = null;
 
@@ -2176,7 +2260,8 @@ const novigFeed = (() => {
         let body = null;
         try { body = text ? JSON.parse(text) : null; } catch (_) { body = null; }
         if (!res.ok) status.restErrors += 1;
-        return { ok: res.ok, status: res.status, body };
+        const etag = res.headers && typeof res.headers.get === 'function' ? res.headers.get('etag') : null;
+        return { ok: res.ok, status: res.status, body, etag };
       } catch (err) {
         status.restErrors += 1;
         return { ok: false, status: 0, body: null, error: err && err.message };
@@ -2208,11 +2293,23 @@ const novigFeed = (() => {
       return out;
     }
 
-    // Keep a book only if it is not older than the one held. Replicas can lag.
+    // Keep a REST book only if it is fresher than the one held. Replicas lag
+    // and number events independently, so this is not a plain seq compare
+    // (see acceptRestBook).
     function storeBook(marketId, next) {
       const prev = books.get(marketId);
-      if (prev && prev.seq > next.seq) return false;
-      if (prev && prev.seq === next.seq) return false;
+      let seqs = replicaSeqs.get(marketId);
+      if (!seqs) {
+        seqs = new Map();
+        replicaSeqs.set(marketId, seqs);
+      }
+      const at = Date.now();
+      const wsFresh = !!(ws && status.ws === 'up' && wsOwned.has(marketId) && (at - status.lastWsMsgAt) < 20000);
+      if (!acceptRestBook(prev, next, seqs, { now: at, skewMs: cfg.replicaSkewMs, wsFresh })) {
+        if (prev && next.replica && prev.replica !== next.replica) status.restStale += 1;
+        return false;
+      }
+      next.acceptedAt = at;
       books.set(marketId, next);
       return true;
     }
@@ -2228,9 +2325,10 @@ const novigFeed = (() => {
         if (res.ok && res.body) {
           status.lastRestOkAt = Date.now();
           status.rest = 'up';
-          if (storeBook(market.id, bookFromSnapshot(res.body, Date.now()))) status.restChanged += 1;
+          if (storeBook(market.id, bookFromSnapshot(res.body, Date.now(), replicaFromEtag(res.etag)))) status.restChanged += 1;
         } else if (res.status === 404) {
           books.delete(market.id);
+          replicaSeqs.delete(market.id);
         }
         return books.get(market.id) || null;
       } finally {
@@ -2363,6 +2461,7 @@ const novigFeed = (() => {
             mains.delete(key);
             due.delete(id);
             books.delete(id);
+            replicaSeqs.delete(id);
           }
         }
       }
@@ -2391,7 +2490,7 @@ const novigFeed = (() => {
           const m = list.find((row) => row.id === id);
           if (!m) continue;
           const ev = cat.events.get(m.eventId);
-          out.push({ cat, key, m, ev, pollMs: pollMsFor(ev, at, cfg) });
+          out.push({ cat, key, m, ev, live: !!(ev && ev.status === 'OPEN_INGAME'), pollMs: pollMsFor(ev, at, cfg, m) });
         }
       }
       return out;
@@ -2409,7 +2508,7 @@ const novigFeed = (() => {
           const before = books.get(m.id);
           const beforeSeq = before ? before.seq : -2;
           // First load of a market jumps the slow rotation so a restart fills the board fast.
-          const priority = row.pollMs <= cfg.nearMs ? 'high' : (before ? 'low' : 'mid');
+          const priority = row.live ? 'live' : (row.pollMs <= cfg.nearMs ? 'high' : (before ? 'low' : 'mid'));
           fetchBook(m, priority).then((book) => {
             if (book && book.seq !== beforeSeq) schedulePublish(cat.league);
           }).catch(() => {});
@@ -2466,6 +2565,7 @@ const novigFeed = (() => {
           onLifecycle: (marketId, deltas) => {
             if ((deltas || []).includes('CLOSE')) {
               books.delete(marketId);
+              replicaSeqs.delete(marketId);
               const found = marketById(marketId);
               if (found) schedulePublish(found.cat.league);
             }
@@ -2598,6 +2698,7 @@ const novigFeed = (() => {
         if (!row || !row.book) continue;
         subscribed.add(id);
         const book = bookFromSnapshot(row.book, at);
+        book.source = 'ws';
         books.set(id, book);
         onBook(id, book, at);
       }
@@ -2615,6 +2716,7 @@ const novigFeed = (() => {
           // Market that opened under a subscription starts at seq 0.
           if (seq === 1) {
             const fresh = emptyBook();
+            fresh.source = 'ws';
             fresh.seq = 0;
             books.set(id, fresh);
             subscribed.add(id);
@@ -2740,6 +2842,9 @@ const novigFeed = (() => {
     signedHeaders,
     bookFromSnapshot,
     applyBookDeltas,
+    replicaFromEtag,
+    uuidV7Ms,
+    acceptRestBook,
     bestBid,
     askFor,
     askLevels,
@@ -2776,6 +2881,437 @@ function startNovig(state, opts, env) {
   return () => feed.stop();
 }
 
+// ------------------------------------------------------------------ Betstamp
+// One shared Betstamp live poller per (league, book set), fanned out over SSE
+// to every browser on the Pro odds board (GET /betstamp). Before this, each
+// open tab polled /api/betstamp-markets?refresh=1 itself every 5s (3 Betstamp
+// GETs per poll per tab). Betstamp's trial key allows one upstream SSE and
+// about 4 requests per second, so the relay does the pulling ONCE:
+//   - direct mode (BETSTAMP_API_KEY on this service): live markets every
+//     ~2s, fixtures every ~6s, teams every ~5min, straight from Betstamp REST.
+//   - proxy mode (BETSTAMP_PROXY_URL, e.g. https://www.aibetbuilder.io): the
+//     same poll through the app's anonymous /api/betstamp-markets route. No
+//     key needed here; the app already applies the book allowlist and 403
+//     retries. Used until the key is set on this service.
+//   - neither set: /betstamp answers 503 and the boards keep polling.
+// Polling runs only while a browser is subscribed, and only for live games
+// (is_live=true). Book ids mirror aibetbuilder lib/betstamp.js: Fliff (800),
+// Courtside, Underdog Predict (196) and, unless BETSTAMP_INCLUDE_BETMGM is
+// set, BetMGM (400) are never requested.
+const betstampRelay = (() => {
+  const REST_BASE = process.env.BETSTAMP_REST_BASE || 'https://api.pro.betstamp.com/api';
+  const RELAY_LEAGUES = new Set(['NFL', 'NCAAF']);
+  const TRIAL_BOOK_IDS = [100, 200, 400, 300, 250, 613, 642, 150, 365, 191, 193, 194, 196];
+  const OPT_IN_BOOK_IDS = [722, 614, 500, 105, 700, 850, 851, 617, 643, 181, 182];
+  const ACCEPTED_BOOK_IDS = [...TRIAL_BOOK_IDS, ...OPT_IN_BOOK_IDS];
+  const NEVER_BOOK_IDS = [196];
+  const DEFAULT_BOOK_IDS = TRIAL_BOOK_IDS.filter((id) => id !== 196 && id !== 400);
+  const MAX_HUBS = 4;
+  const MAX_CLIENTS = 150;
+  const MAX_CLIENT_BACKLOG = 2 * 1024 * 1024;
+
+  function truthy(raw) {
+    const s = String(raw == null ? '' : raw).trim().toLowerCase();
+    return s === '1' || s === 'true' || s === 'yes';
+  }
+
+  function resolveBookIds(raw, env) {
+    const includeBetmgm = truthy((env || {}).BETSTAMP_INCLUDE_BETMGM);
+    const ids = String(raw == null ? '' : raw)
+      .split(/[,\s]+/)
+      .map((s) => Number(s))
+      .filter((n) => Number.isInteger(n) && ACCEPTED_BOOK_IDS.includes(n))
+      .filter((n) => !NEVER_BOOK_IDS.includes(n))
+      .filter((n) => n !== 400 || includeBetmgm);
+    const out = [...new Set(ids.length ? ids : DEFAULT_BOOK_IDS)];
+    return out.sort((a, b) => a - b);
+  }
+
+  function marketKey(m) {
+    return [
+      m.fixture_id, m.odd_provider_id, m.bet_type, m.period, m.is_alt ? 1 : 0,
+      m.number == null ? '' : m.number, m.side, m.prop_name || '', m.player_id || '',
+    ].join('|');
+  }
+
+  function isMatchRow(row) {
+    if (!row || typeof row !== 'object') return false;
+    if (row.type == null || String(row.type).trim() === '') return true;
+    return String(row.type).trim().toLowerCase() === 'match';
+  }
+
+  function asList(payload, keys) {
+    if (Array.isArray(payload)) return payload;
+    if (!payload || typeof payload !== 'object') return [];
+    for (const k of keys || []) if (Array.isArray(payload[k])) return payload[k];
+    return [];
+  }
+
+  // Next market book from an upstream list. A duplicate key keeps the row
+  // with the newer updated_at.
+  function indexMarkets(list) {
+    const out = new Map();
+    for (const m of list || []) {
+      if (!m || typeof m !== 'object') continue;
+      const k = marketKey(m);
+      const prev = out.get(k);
+      if (prev && String(prev.m.updated_at || '') > String(m.updated_at || '')) continue;
+      out.set(k, { m, fp: JSON.stringify(m) });
+    }
+    return out;
+  }
+
+  function diffMarkets(prev, next) {
+    const up = [];
+    const rm = [];
+    for (const [k, row] of next) {
+      const old = prev.get(k);
+      if (!old || old.fp !== row.fp) up.push([k, row.m]);
+    }
+    for (const k of prev.keys()) if (!next.has(k)) rm.push(k);
+    return { up, rm };
+  }
+
+  // ---------------------------------------------------------------- upstream
+
+  function createUpstream({ env = process.env, fetchFn = (...a) => fetch(...a), timeoutMs = 8000 } = {}) {
+    const key = String(env.BETSTAMP_API_KEY || '').trim();
+    const proxy = String(env.BETSTAMP_PROXY_URL || '').trim().replace(/\/+$/, '');
+    const mode = key ? 'direct' : (proxy ? 'proxy' : 'off');
+
+    async function getJson(url, headers) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      try {
+        const res = await fetchFn(url, { signal: ctrl.signal, headers: { accept: 'application/json', 'user-agent': 'aibetbuilder-odds-relay', ...headers } });
+        const text = await res.text();
+        let body = null;
+        try { body = text ? JSON.parse(text) : null; } catch (_) { body = null; }
+        if (!res.ok) {
+          const err = new Error(`betstamp upstream ${res.status}`);
+          err.status = res.status;
+          const after = Number(res.headers && res.headers.get && res.headers.get('retry-after'));
+          if (Number.isFinite(after) && after > 0) err.retryAfterMs = after * 1000;
+          throw err;
+        }
+        return body;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    async function fetchDirect(league, bookIds, cache, at) {
+      const headers = { 'X-API-KEY': key };
+      const q = (path, params) => {
+        const u = new URL(String(path), REST_BASE.endsWith('/') ? REST_BASE : `${REST_BASE}/`);
+        for (const [k, v] of Object.entries(params)) u.searchParams.set(k, String(v));
+        return u.toString();
+      };
+      const timedelta = String(env.BETSTAMP_TIMEDELTA || '240');
+      const jobs = [getJson(q('markets', {
+        league, book_ids: bookIds.join(','), bet_types: 'moneyline,spread,total', periods: 'FT',
+        is_live: 'true', include_alts: 'false', timedelta,
+      }), headers)];
+      const needFixtures = !cache.fixtures || at - cache.fixturesAt >= (cache.fixtureEveryMs || 6000);
+      const needTeams = !cache.teams || at - cache.teamsAt >= 300000;
+      jobs.push(needFixtures ? getJson(q('fixtures', { league, timedelta }), headers) : null);
+      jobs.push(needTeams ? getJson(q('teams', { league }), headers) : null);
+      const [mk, fx, tm] = await Promise.all(jobs);
+      if (fx) { cache.fixtures = asList(fx, ['fixtures', 'data']).filter(isMatchRow); cache.fixturesAt = at; }
+      if (tm) { cache.teams = asList(tm, ['teams', 'data']); cache.teamsAt = at; }
+      return {
+        markets: asList(mk, ['markets', 'data']).filter(isMatchRow),
+        fixtures: cache.fixtures || [],
+        teams: cache.teams || [],
+        fetchedAt: new Date(at).toISOString(),
+      };
+    }
+
+    async function fetchProxy(league, bookIds) {
+      const u = new URL('/api/betstamp-markets', proxy);
+      u.searchParams.set('league', league);
+      u.searchParams.set('is_live', 'true');
+      u.searchParams.set('book_ids', bookIds.join(','));
+      u.searchParams.set('refresh', '1');
+      const body = await getJson(u.toString(), {});
+      if (!body || body.ok === false || !Array.isArray(body.markets)) {
+        const err = new Error('betstamp proxy returned no markets');
+        err.status = 502;
+        throw err;
+      }
+      return {
+        markets: body.markets,
+        fixtures: Array.isArray(body.fixtures) ? body.fixtures : [],
+        teams: Array.isArray(body.teams) ? body.teams : [],
+        fetchedAt: body.fetchedAt || new Date().toISOString(),
+      };
+    }
+
+    return {
+      mode,
+      fetch(league, bookIds, cache = {}, at = Date.now()) {
+        if (mode === 'direct') return fetchDirect(league, bookIds, cache, at);
+        if (mode === 'proxy') return fetchProxy(league, bookIds);
+        return Promise.reject(Object.assign(new Error('betstamp upstream not configured'), { status: 503 }));
+      },
+    };
+  }
+
+  // --------------------------------------------------------------------- hub
+
+  function createHub({
+    league, bookIds, upstream, pollMs = 2000, quietPollMs = 6000, idleStopMs = 8000,
+    maxBackoffMs = 15000, gapMs = () => 0, now = () => Date.now(), log = () => {}, onEmpty = () => {},
+  }) {
+    const clients = new Set();
+    const cache = {};
+    let markets = new Map();
+    let fixtures = [];
+    let teams = [];
+    let fixturesFp = '';
+    let teamsFp = '';
+    let seq = 0;
+    let hasSnapshot = false;
+    let running = false;
+    let stopped = false;
+    let timer = null;
+    let idleTimer = null;
+    let errorsInRow = 0;
+    const stats = { polls: 0, errors: 0, events: 0, lastOkAt: 0, lastError: null, lastPollMs: 0, markets: 0 };
+
+    const frame = (payload) => `event: bs\ndata: ${JSON.stringify(payload)}\n\n`;
+    const meta = (kind, extra) => ({ v: 1, kind, seq, t: now(), league, ...extra });
+
+    function send(client, text) {
+      try {
+        client.write(text);
+        const backlog = client.backlog ? client.backlog() : 0;
+        if (backlog > MAX_CLIENT_BACKLOG) client.close();
+      } catch (_) { /* gone */ }
+    }
+    function broadcast(payload) {
+      stats.events += 1;
+      const text = frame(payload);
+      for (const c of clients) send(c, text);
+    }
+    function snapshotPayload() {
+      return meta('snapshot', {
+        fetchedAt: stats.lastFetchedAt || null,
+        markets: [...markets].map(([k, row]) => [k, row.m]),
+        fixtures,
+        teams,
+      });
+    }
+
+    function apply(up) {
+      const next = indexMarkets(up.markets);
+      const fxFp = JSON.stringify(up.fixtures || []);
+      const tmFp = JSON.stringify(up.teams || []);
+      stats.lastFetchedAt = up.fetchedAt || null;
+      stats.markets = next.size;
+      const { up: ups, rm } = diffMarkets(markets, next);
+      const fxChanged = fxFp !== fixturesFp;
+      const tmChanged = tmFp !== teamsFp;
+      markets = next;
+      fixtures = up.fixtures || [];
+      teams = up.teams || [];
+      fixturesFp = fxFp;
+      teamsFp = tmFp;
+      seq += 1;
+      if (!hasSnapshot) {
+        hasSnapshot = true;
+        broadcast(snapshotPayload());
+        return;
+      }
+      if (!ups.length && !rm.length && !fxChanged && !tmChanged) {
+        // Nothing moved. The tick is the heartbeat clients use to know the relay is alive.
+        broadcast(meta('tick', { fetchedAt: stats.lastFetchedAt }));
+        return;
+      }
+      const extra = { fetchedAt: stats.lastFetchedAt, up: ups, rm };
+      if (fxChanged) extra.fixtures = fixtures;
+      if (tmChanged) extra.teams = teams;
+      broadcast(meta('delta', extra));
+    }
+
+    async function loop() {
+      if (running) return;
+      running = true;
+      while (!stopped && clients.size) {
+        const t0 = now();
+        let wait;
+        try {
+          const up = await upstream.fetch(league, bookIds, cache, t0);
+          if (stopped) break;
+          apply(up);
+          errorsInRow = 0;
+          stats.polls += 1;
+          stats.lastOkAt = now();
+          stats.lastError = null;
+          const base = up.markets && up.markets.length ? pollMs : quietPollMs;
+          wait = Math.max(base, gapMs());
+        } catch (err) {
+          errorsInRow += 1;
+          stats.errors += 1;
+          stats.lastError = String((err && err.message) || err).slice(0, 160);
+          log('betstamp poll failed', league, stats.lastError);
+          // No tick during an outage: silence is what tells the board to fall back.
+          if (clients.size) broadcast(meta('error', { error: stats.lastError, status: err && err.status ? err.status : 0 }));
+          const backoff = Math.min(maxBackoffMs, pollMs * (2 ** Math.min(errorsInRow, 5)));
+          wait = Math.max(backoff, (err && err.retryAfterMs) || 0, gapMs());
+        }
+        stats.lastPollMs = now() - t0;
+        const left = Math.max(0, wait - stats.lastPollMs);
+        await new Promise((resolve) => {
+          timer = setTimeout(resolve, left);
+          if (timer.unref) timer.unref();
+        });
+        timer = null;
+      }
+      running = false;
+    }
+
+    function subscribe(client) {
+      if (stopped) return () => {};
+      clients.add(client);
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+      // A snapshot older than a few seconds is not worth replaying. Drop it so
+      // the next poll sends everyone a fresh one.
+      if (hasSnapshot && now() - stats.lastOkAt > 5000) hasSnapshot = false;
+      if (hasSnapshot) send(client, frame(snapshotPayload()));
+      loop().catch(() => { running = false; });
+      return () => {
+        clients.delete(client);
+        if (!clients.size && !idleTimer) {
+          idleTimer = setTimeout(() => {
+            idleTimer = null;
+            if (!clients.size) {
+              stopped = true;
+              if (timer) clearTimeout(timer);
+              onEmpty();
+            }
+          }, idleStopMs);
+          if (idleTimer.unref) idleTimer.unref();
+        }
+      };
+    }
+
+    return {
+      subscribe,
+      get size() { return clients.size; },
+      get active() { return !stopped; },
+      stats: () => ({ ...stats, clients: clients.size, seq, errorsInRow, books: bookIds.length }),
+      stop() {
+        stopped = true;
+        if (timer) clearTimeout(timer);
+        if (idleTimer) clearTimeout(idleTimer);
+        for (const c of clients) { try { c.close(); } catch (_) { /* gone */ } }
+        clients.clear();
+      },
+      _apply: apply,
+    };
+  }
+
+  // ---------------------------------------------------------------- registry
+
+  function createRegistry(opts = {}) {
+    const env = opts.env || process.env;
+    const upstream = opts.upstream || createUpstream({ env, fetchFn: opts.fetchFn });
+    const pollMs = Number(env.BETSTAMP_RELAY_POLL_MS) || opts.pollMs || (upstream.mode === 'proxy' ? 2500 : 2000);
+    const hubs = new Map();
+    let clientCount = 0;
+
+    // Betstamp allows roughly 4 requests per second; a proxy poll or a direct
+    // poll with fixtures costs up to 3. Space polls out as hubs are added.
+    const gapMs = () => Math.max(0, (hubs.size - 1)) * 1000;
+
+    function open(league, rawBooks) {
+      if (upstream.mode === 'off') return { status: 503, error: 'betstamp_upstream_not_configured' };
+      if (!RELAY_LEAGUES.has(league)) return { status: 400, error: 'league must be NFL or NCAAF' };
+      if (clientCount >= MAX_CLIENTS) return { status: 503, error: 'too_many_clients' };
+      const bookIds = resolveBookIds(rawBooks, env);
+      const key = `${league}|${bookIds.join(',')}`;
+      let hub = hubs.get(key);
+      if (!hub) {
+        if (hubs.size >= MAX_HUBS) return { status: 503, error: 'too_many_feeds' };
+        hub = createHub({
+          league, bookIds, upstream, pollMs, gapMs,
+          idleStopMs: opts.idleStopMs, quietPollMs: opts.quietPollMs, log: opts.log,
+          onEmpty: () => { hubs.delete(key); },
+        });
+        hubs.set(key, hub);
+      }
+      return { hub, bookIds };
+    }
+
+    function handle(req, res, url) {
+      const league = String(url.searchParams.get('league') || 'NFL').trim().toUpperCase();
+      const opened = open(league, url.searchParams.get('book_ids'));
+      if (!opened.hub) {
+        res.writeHead(opened.status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ ok: false, error: opened.error }));
+        return;
+      }
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+        'x-accel-buffering': 'no',
+      });
+      let closed = false;
+      let unsub = () => {};
+      const client = {
+        write: (text) => res.write(text),
+        backlog: () => res.writableLength || 0,
+        close: () => { try { res.end(); } catch (_) { /* gone */ } },
+      };
+      const beat = setInterval(() => {
+        try { res.write(': ping\n\n'); } catch (_) { /* closed */ }
+      }, 15000);
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        clientCount -= 1;
+        clearInterval(beat);
+        unsub();
+      };
+      clientCount += 1;
+      req.on('close', close);
+      res.on('error', close);
+      res.write(': betstamp relay\n\n');
+      unsub = opened.hub.subscribe(client);
+    }
+
+    return {
+      mode: upstream.mode,
+      handle,
+      open,
+      health() {
+        return {
+          mode: upstream.mode,
+          clients: clientCount,
+          hubs: [...hubs].map(([key, hub]) => ({ key, ...hub.stats() })),
+        };
+      },
+      stop() {
+        for (const hub of hubs.values()) hub.stop();
+        hubs.clear();
+      },
+    };
+  }
+
+  return {
+    RELAY_LEAGUES,
+    resolveBookIds,
+    marketKey,
+    indexMarkets,
+    diffMarkets,
+    createUpstream,
+    createHub,
+    createRegistry,
+  };
+})();
+
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -2801,6 +3337,15 @@ function handleRequest(req, res, state) {
     res.end('method');
     return;
   }
+  if (url.pathname === '/betstamp') {
+    if (!state.betstamp) {
+      res.writeHead(503, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ ok: false, error: 'betstamp_relay_off' }));
+      return;
+    }
+    state.betstamp.handle(req, res, url);
+    return;
+  }
   if (url.pathname === '/health') {
     const counts = {};
     for (const venue of VENUES) {
@@ -2809,7 +3354,7 @@ function handleRequest(req, res, state) {
     }
     const novig = state.novigFeed ? state.novigFeed.health() : null;
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-    res.end(JSON.stringify({ ok: true, status: state.status, counts, novig }));
+    res.end(JSON.stringify({ ok: true, status: state.status, counts, novig, betstamp: state.betstamp ? state.betstamp.health() : null }));
     return;
   }
   if (url.pathname !== '/stream' && url.pathname !== '/board') {
@@ -2869,6 +3414,12 @@ function startOddsRelay(opts = {}) {
     stops.push(startNovig(state, opts, env));
   } else {
     state.status = { us: 'off', clob: 'off', kalshi: 'off', novig: 'off' };
+  }
+  if (opts.betstamp !== false) {
+    const env = opts.env || process.env;
+    state.betstamp = betstampRelay.createRegistry({ env, fetchFn: opts.betstampFetch, upstream: opts.betstampUpstream, pollMs: opts.betstampPollMs, idleStopMs: opts.betstampIdleStopMs, quietPollMs: opts.betstampQuietPollMs });
+    stops.push(() => state.betstamp.stop());
+    console.log(`[odds-relay] betstamp live relay mode: ${state.betstamp.mode}`);
   }
   const server = http.createServer((req, res) => {
     try {
@@ -2939,4 +3490,5 @@ module.exports = {
   kalshiSnapshotRequest,
   startOddsRelay,
   novigFeed,
+  betstampRelay,
 };

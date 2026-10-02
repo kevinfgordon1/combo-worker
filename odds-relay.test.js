@@ -288,3 +288,7 @@ function offersWorstFirst() {
 
 // Novig feed tests live in their own file; run them with the relay tests.
 require('./novig-feed.test.js');
+
+// Novig freshness (replica-aware books, reserved live lane) and the Betstamp live fan-out.
+require('./novig-fresh.test.js');
+require('./betstamp-relay.test.js');
