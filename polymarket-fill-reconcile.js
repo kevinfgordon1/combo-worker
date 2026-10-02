@@ -1095,16 +1095,40 @@ function mergeQuoteCandidates(executedQuotes, submissions, pendingQuotes) {
   return [...byId.entries()].map(([id, v]) => ({ id, ...v }));
 }
 
+// Each hydrate is one GET /v1/rfqs/quotes. With ~15 per 20s tick plus two list
+// calls this endpoint alone ran ~50 req/min and kept tripping Cloudflare 429.
+// Hydrate accepted/confirmed pending quotes first (they may have executed),
+// cap the rest, and stop on the first 429 (next tick continues).
+const HYDRATE_PER_TICK = Number(process.env.POLY_HYDRATE_PER_TICK) > 0
+  ? Number(process.env.POLY_HYDRATE_PER_TICK) : 5;
+
+function hydratePriority(c) {
+  const p = c && c.pending;
+  if (p && (p.accepted || p.confirmed || p.executed || p.creatorOrderId || p.orderId)) return 0;
+  return 1;
+}
+
 async function hydrateMissingQuotes(http, candidates, maxHydrate) {
+  const limit = Math.min(Number.isFinite(maxHydrate) ? maxHydrate : HYDRATE_PER_TICK, HYDRATE_PER_TICK);
   let n = 0;
-  for (const c of candidates) {
-    if (n >= maxHydrate) break;
+  const ordered = (candidates || []).map((c, i) => ({ c, i }))
+    .sort((a, b) => hydratePriority(a.c) - hydratePriority(b.c) || a.i - b.i)
+    .map((x) => x.c);
+  for (const c of ordered) {
+    if (n >= limit) break;
     if (c.quote && isExecutedQuoteStatus(c.quote.status) && orderIdOfQuote(c.quote)) continue;
     const rfqId = rfqIdOf(c.quote) || (c.pending && c.pending.rfqId);
     const quoteId = quoteIdOf(c.quote) || c.id;
     if (!rfqId || !quoteId) continue;
     if (c.quote && isExecutedQuoteStatus(c.quote.status)) continue;
-    const got = await fetchQuoteByIds(http, { rfqId, quoteId });
+    let got = null;
+    try {
+      const listed = await http.listQuotes({ rfqId, quoteId });
+      const rows = quotesFromListed(listed);
+      got = rows.find((q) => quoteIdOf(q) === quoteId) || rows[0] || null;
+    } catch (e) {
+      if (e && e.statusCode === 429) break;
+    }
     n += 1;
     if (got) c.quote = { ...(c.quote || {}), ...got };
   }
@@ -1557,6 +1581,7 @@ module.exports = {
   matchActivitiesToLocks,
   listAllActivities,
   listActivitiesForMarketSlugs,
+  hydrateMissingQuotes,
   _resetSlugScanForTest() { slugScanOffset = 0; slugFullPassDone = false; },
   mergeActivities,
   reconcileLockActivityEvents,
