@@ -204,12 +204,21 @@ assert.ok(
   'Kalshi POST/confirm must classify underfunded rejects'
 );
 assert.ok(
-  /if \(quoteFailureSkipReason\(e\.message\)\) \{[\s\S]*?logFundingSkip\(p, rfq, d\)/.test(liveSrc),
+  /if \(quoteFailureSkipReason\(e\.message\)\) \{[\s\S]*?logFundingSkip\(p, rfq, d(, \{[^}]*\})?\)/.test(liveSrc),
   'underfunded Kalshi POST must persist declined + skip_reason, not silent unfilled'
 );
 assert.ok(
-  /logFundingSkip\(p, rfq, d\)/.test(liveSrc) && /logAsync\(p, rfq, d, 'unfilled'\)/.test(liveSrc),
+  /logFundingSkip\(p, rfq, d(, \{[^}]*\})?\)/.test(liveSrc) && /logAsync\(p, rfq, d, 'unfilled'\)/.test(liveSrc),
   'non-funding POST fails stay unfilled'
+);
+assert.ok(
+  /costDollars:\s*quoteCostDollars\(d && d\.contracts, noBid\)/.test(liveSrc) &&
+    /takeCostHint\(\)/.test(liveSrc) && /onInsufficientBalance\(venue, info\)/.test(liveSrc),
+  'an underfunded Kalshi POST must hand its cash need (contracts x NO bid) to the bucket manager'
+);
+assert.ok(
+  !/\.\.\.withVenue\(extra\)[\s\S]{0,40}costDollars/.test(liveSrc) && !/costDollars:\s*extra\.costDollars/.test(liveSrc),
+  'costDollars is a one-shot hint, never a combo_submissions column'
 );
 assert.ok(
   /persistQuoteSkip\(quoteId, skipReason/.test(liveSrc),

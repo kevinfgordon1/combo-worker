@@ -29,8 +29,16 @@ function at(iso) {
 
 const WED = at('2026-01-14T15:00:00.000Z'); // Wednesday 10:00 EST
 
+// Pre-Oct-2 values, pinned so the older scenario tests keep their arithmetic.
+// The current defaults are asserted separately.
+const LEGACY_LIMITS = {
+  KALSHI_BUCKET_TARGET_DEFAULT: '5000',
+  KALSHI_BUCKET_TARGET_GAMEDAY: '10000',
+  KALSHI_BUCKET_CEILING: '15000',
+};
+
 function baseConfig(over = {}) {
-  const cfg = loadBucketConfig({});
+  const cfg = loadBucketConfig(LEGACY_LIMITS);
   return Object.assign(cfg, over);
 }
 
@@ -68,7 +76,10 @@ assert.strictEqual(isOpenPosition({ position: -3 }), true);
 // --- game-day schedule in America/New_York, including DST -------------------
 
 assert.strictEqual(isGameday(at('2026-01-10T05:00:00.000Z')), true, 'Sat 00:00 EST');
-assert.strictEqual(isGameday(at('2026-01-10T04:59:00.000Z')), false, 'Fri 23:59 EST');
+assert.strictEqual(isGameday(at('2026-01-10T04:59:00.000Z')), true, 'Fri 23:59 EST (Friday playoff + college window)');
+assert.strictEqual(isGameday(at('2026-01-09T16:59:00.000Z')), false, 'Fri 11:59 EST');
+assert.strictEqual(isGameday(at('2026-01-09T17:00:00.000Z')), true, 'Fri 12:00 EST');
+assert.strictEqual(isGameday(at('2026-01-09T08:01:00.000Z')), false, 'Fri 03:01 EST (between the windows)');
 assert.strictEqual(isGameday(at('2026-01-13T04:59:00.000Z')), true, 'Mon 23:59 EST');
 assert.strictEqual(isGameday(at('2026-01-13T05:00:00.000Z')), false, 'Tue 00:00 EST');
 assert.strictEqual(isGameday(at('2026-01-08T16:59:00.000Z')), false, 'Thu 11:59 EST');
@@ -79,7 +90,10 @@ assert.strictEqual(isGameday(at('2026-01-11T18:00:00.000Z')), true, 'Sunday afte
 
 // Fixed EST (UTC-5) would call Saturday 00:30 EDT Friday night.
 assert.strictEqual(isGameday(at('2026-07-11T04:00:00.000Z')), true, 'Sat 00:00 EDT');
-assert.strictEqual(isGameday(at('2026-07-11T03:59:00.000Z')), false, 'Fri 23:59 EDT');
+assert.strictEqual(isGameday(at('2026-07-11T03:59:00.000Z')), true, 'Fri 23:59 EDT');
+assert.strictEqual(isGameday(at('2026-07-10T15:59:00.000Z')), false, 'Fri 11:59 EDT');
+assert.strictEqual(isGameday(at('2026-07-10T16:00:00.000Z')), true, 'Fri 12:00 EDT');
+assert.strictEqual(isGameday(at('2026-10-02T21:20:00.000Z')), true, 'Fri 5:20 PM EDT Oct 2 2026 is gameday now');
 assert.strictEqual(isGameday(at('2026-07-11T04:30:00.000Z')), true, 'Sat 00:30 EDT');
 // Fixed EDT (UTC-4) would call Monday 23:59 EST Tuesday.
 assert.strictEqual(isGameday(at('2026-09-24T16:00:00.000Z')), true, 'Thu 12:00 EDT');
@@ -107,13 +121,14 @@ assert.strictEqual(isGameday(at('2026-11-01T06:30:00.000Z')), true);
   const cfg = loadBucketConfig({});
   assert.strictEqual(cfg.auto, false);
   assert.strictEqual(cfg.sweep, false);
-  assert.strictEqual(cfg.ceilingCents, cents(15_000));
+  assert.strictEqual(cfg.ceilingCents, cents(22_000));
   assert.strictEqual(cfg.floorCents, cents(2_000));
   assert.strictEqual(cfg.maxTransferCents, cents(10_000));
   assert.strictEqual(cfg.dailyCapCents, cents(15_000));
   assert.strictEqual(cfg.minTransferCents, cents(100));
-  assert.strictEqual(cfg.targetGamedayCents, cents(10_000));
-  assert.strictEqual(cfg.targetDefaultCents, cents(5_000));
+  assert.strictEqual(cfg.targetGamedayCents, cents(12_000));
+  assert.strictEqual(cfg.targetDefaultCents, cents(8_000));
+  assert.strictEqual(cfg.insufficientBufferCents, cents(500));
   assert.strictEqual(cfg.lowAlertCents, cents(1_500));
   assert.strictEqual(cfg.polyLowAlertCents, cents(1_500));
   assert.strictEqual(cfg.intervalMin, 5);
@@ -316,7 +331,7 @@ function harness(env, book, when) {
   const alerts = [];
   const logs = [];
   const mgr = createBucketManager({
-    env,
+    env: { ...LEGACY_LIMITS, ...env },
     now: () => current,
     alert(text) { alerts.push(text); },
     log(line) { logs.push(String(line)); },
@@ -334,6 +349,7 @@ function harness(env, book, when) {
 }
 
 const LIVE = {
+  ...LEGACY_LIMITS,
   KALSHI_BUCKET_AUTO: '1',
   KALSHI_BUCKET_SWEEP: '0',
 };
@@ -664,10 +680,17 @@ async function main() {
   }
   {
     const book = fakeBook({ main: cents(30_000), bucket: cents(6_000) });
+    const h = harness(LIVE, book, at('2026-09-25T14:00:00.000Z'));
+    const out = await h.mgr.check('interval');
+    assert.strictEqual(out.decision.gameday, false, 'Fri 10:00 EDT is still the default target');
+    assert.strictEqual(out.decision.action, 'hold');
+  }
+  {
+    const book = fakeBook({ main: cents(30_000), bucket: cents(6_000) });
     const h = harness(LIVE, book, at('2026-09-25T18:00:00.000Z'));
     const out = await h.mgr.check('interval');
-    assert.strictEqual(out.decision.gameday, false);
-    assert.strictEqual(out.decision.action, 'hold');
+    assert.strictEqual(out.decision.gameday, true, 'Fri 2:00 PM EDT: Friday playoff/college locks count as gameday');
+    assert.strictEqual(out.decision.targetCents, cents(10_000));
   }
 
   // Wire format: centicents, event_contract, shard query on the signed path.
@@ -771,7 +794,7 @@ async function main() {
     let current = when || WED;
     const alerts = [];
     const mgr = createBucketManager({
-      env, now: () => current, alert(t) { alerts.push(t); }, log() {}, sleep: async () => {},
+      env: { ...LEGACY_LIMITS, ...env }, now: () => current, alert(t) { alerts.push(t); }, log() {}, sleep: async () => {},
       client: book.client, readPolyCash: null, appAlerts,
     });
     return { mgr, alerts, setNow(d) { current = d; }, now() { return current; } };
@@ -1087,7 +1110,7 @@ async function main() {
     assert.strictEqual(cfg.floorCents, cents(2_000));
     assert.strictEqual(cfg.maxTransferCents, cents(10_000));
     assert.strictEqual(cfg.dailyCapCents, cents(15_000));
-    assert.strictEqual(cfg.ceilingCents, cents(15_000));
+    assert.strictEqual(cfg.ceilingCents, cents(22_000));
     assert.strictEqual(cfg.minTransferCents, cents(100));
     assert.strictEqual(cfg.confirmDelayMs, 2_000);
     // Big deficit with plenty of main: one transfer clamped to $10k, held while pending.
@@ -1121,6 +1144,172 @@ async function main() {
     assert.strictEqual(seen[0].body, undefined);
     assert.strictEqual(rows[0].amountCents, 38212);
     assert.strictEqual(rows[0].toShard, 1);
+  }
+
+  // --- Oct 2: new targets, ceiling, and top-up toward a rejected quote's cost ---
+
+  // New defaults on a Friday-evening gameday with the Oct 2 balances: plan a top-up to $12k.
+  {
+    const FRI_EVE = at('2026-10-02T21:20:00.000Z'); // Fri 5:20 PM EDT
+    const book = fakeBook({
+      main: cents(15_587.85), bucket: cents(4_963.42), bucketPortfolio: cents(6_343.43),
+    });
+    let current = FRI_EVE;
+    const alerts = [];
+    const mgr = createBucketManager({
+      env: { KALSHI_BUCKET_AUTO: '1' }, now: () => current, alert(t) { alerts.push(t); }, log() {},
+      sleep: async () => {}, client: book.client, readPolyCash: null,
+    });
+    const out = await mgr.check('interval');
+    assert.strictEqual(out.decision.gameday, true);
+    assert.strictEqual(out.decision.targetCents, cents(12_000));
+    assert.strictEqual(out.decision.action, 'topup');
+    assert.strictEqual(out.decision.amountCents, 703_658, '$12,000 - $4,963.42');
+    assert.strictEqual(out.decision.clamp, null, 'ceiling $22k: total 11.3k + 7.0k = 18.3k fits');
+    assert.strictEqual(out.confirmed, true);
+    assert.strictEqual(book.state.bucket.availableCents, cents(12_000));
+    assert.ok(book.state.main.availableCents >= cents(2_000));
+  }
+
+  // Non-gameday target is $8k.
+  {
+    const cfg = loadBucketConfig({});
+    const plan = planBucketAction({
+      mainAvailableCents: cents(15_000), bucketAvailableCents: cents(4_963.42), bucketPortfolioCents: 0,
+      gameday: false, sweepEnabled: false, flat: null, dailyTopupCents: 0, config: cfg,
+    });
+    assert.strictEqual(plan.targetCents, cents(8_000));
+    assert.strictEqual(plan.amountCents, cents(8_000) - cents(4_963.42));
+  }
+
+  // Ceiling is still enforced (on available + open-position value), now at $22k.
+  {
+    const cfg = loadBucketConfig({});
+    const plan = planBucketAction({
+      mainAvailableCents: cents(50_000), bucketAvailableCents: cents(4_000), bucketPortfolioCents: cents(14_000),
+      gameday: true, sweepEnabled: false, flat: null, dailyTopupCents: 0, config: cfg,
+    });
+    assert.strictEqual(plan.clamp, 'ceiling');
+    assert.strictEqual(plan.amountCents, cents(4_000), '22,000 - 18,000');
+  }
+
+  // needCents lifts the target to cost + $500 and every clamp still applies.
+  {
+    const cfg = loadBucketConfig({});
+    const base = {
+      mainAvailableCents: cents(15_000), bucketAvailableCents: cents(4_963.42), bucketPortfolioCents: cents(6_343.43),
+      gameday: false, sweepEnabled: false, flat: null, dailyTopupCents: 0, config: cfg,
+    };
+    const small = planBucketAction({ ...base, needCents: cents(5_620) });
+    assert.strictEqual(small.targetCents, cents(8_000), 'cost + buffer below the base target changes nothing');
+    const big = planBucketAction({ ...base, needCents: cents(9_000), mainAvailableCents: cents(30_000) });
+    assert.strictEqual(big.needTargetCents, cents(9_500));
+    assert.strictEqual(big.targetCents, cents(9_500));
+    assert.strictEqual(big.amountCents, cents(9_500) - cents(4_963.42));
+    const capped = planBucketAction({ ...base, needCents: cents(35_000), mainAvailableCents: cents(40_000) });
+    assert.strictEqual(capped.targetCents, cents(35_500));
+    assert.strictEqual(capped.clamp, 'max_transfer', 'Navy-size need: ceiling headroom 10.7k, per-transfer cap $10k binds first');
+    assert.strictEqual(capped.amountCents, cents(10_000));
+    const ceil = planBucketAction({
+      ...base, needCents: cents(35_000), mainAvailableCents: cents(40_000), bucketPortfolioCents: cents(14_000),
+    });
+    assert.strictEqual(ceil.clamp, 'ceiling', 'with more locked in open positions the $22k ceiling binds');
+    assert.strictEqual(ceil.amountCents, cents(22_000) - cents(4_963.42) - cents(14_000));
+    const floored = planBucketAction({ ...base, needCents: cents(20_000), mainAvailableCents: cents(4_000) });
+    assert.strictEqual(floored.clamp, 'floor');
+    assert.strictEqual(floored.amountCents, cents(2_000), 'only cash above the $2k floor');
+    const daily = planBucketAction({ ...base, needCents: cents(20_000), mainAvailableCents: cents(40_000), dailyTopupCents: cents(14_850) });
+    assert.strictEqual(daily.clamp, 'daily_cap');
+    assert.strictEqual(daily.amountCents, cents(150));
+    const none = planBucketAction({ ...base, needCents: cents(20_000), mainAvailableCents: cents(40_000), dailyTopupCents: cents(14_950) });
+    assert.strictEqual(none.action, 'blocked', 'under $100 of daily room: no transfer');
+    assert.strictEqual(none.block, 'daily_cap');
+    assert.strictEqual(none.amountCents, 0);
+  }
+
+  // Rejection -> immediate check tops up toward the rejected cost + $500, confirms via #113 logic.
+  {
+    const book = fakeBook({
+      main: cents(30_000), bucket: cents(4_963.42), bucketPortfolio: cents(6_343.43),
+    });
+    const app = fakeAppAlerts();
+    const alerts = [];
+    const logs = [];
+    const mgr = createBucketManager({
+      env: { KALSHI_BUCKET_AUTO: '1', KALSHI_BUCKET_TARGET_DEFAULT: '3000' },
+      now: () => at('2026-10-02T14:00:00.000Z'), // Fri 10:00 AM EDT, default target
+      alert(t) { alerts.push(t); }, log(l) { logs.push(String(l)); },
+      sleep: async () => {}, client: book.client, readPolyCash: null, appAlerts: app,
+    });
+    // $9,000 rejected quote: need 9,000 + 500 = 9,500 > target $3,000.
+    const out = await mgr.onInsufficientBalance('kalshi', { costDollars: 9_000 });
+    assert.strictEqual(out.decision.targetCents, cents(9_500));
+    assert.strictEqual(out.decision.action, 'topup');
+    assert.strictEqual(out.decision.amountCents, cents(9_500) - cents(4_963.42));
+    assert.strictEqual(out.confirmed, true);
+    assert.ok(out.transferId);
+    assert.strictEqual(book.transfers.length, 1);
+    assert.strictEqual(book.state.bucket.availableCents, cents(9_500));
+    assert.ok(logs.some((l) => /needs \$9,000\.00/.test(l)));
+    const row = app.rows.find((r) => r.kind === 'combo_insufficient_funds');
+    assert.ok(/needed about \$9,000\.00/.test(row.body));
+    // A later interval check keeps the need for a while, but nothing more to move.
+    const later = await mgr.check('interval');
+    assert.strictEqual(later.decision.action, 'hold');
+    assert.strictEqual(book.transfers.length, 1);
+  }
+
+  // Without a cost (polymarket, unknown) behavior is unchanged: normal plan only.
+  {
+    const book = fakeBook({ main: cents(30_000), bucket: cents(4_963.42) });
+    const mgr = createBucketManager({
+      env: { KALSHI_BUCKET_AUTO: '1', KALSHI_BUCKET_TARGET_DEFAULT: '3000' },
+      now: () => at('2026-10-02T14:00:00.000Z'), alert() {}, log() {},
+      sleep: async () => {}, client: book.client, readPolyCash: null,
+    });
+    const out = await mgr.onInsufficientBalance('kalshi');
+    assert.strictEqual(out.decision.targetCents, cents(3_000));
+    assert.strictEqual(out.decision.action, 'hold');
+    const poly = await mgr.onInsufficientBalance('polymarket', { costDollars: 99_999 });
+    assert.ok(poly.skipped === 'coalesced' || poly.decision.targetCents === cents(3_000), 'polymarket cost never lifts the Kalshi target');
+    assert.strictEqual(book.transfers.length, 0);
+  }
+
+  // A second, larger rejection inside the coalesce window is not swallowed.
+  {
+    const book = fakeBook({ main: cents(40_000), bucket: cents(4_000) });
+    const mgr = createBucketManager({
+      env: { KALSHI_BUCKET_AUTO: '1', KALSHI_BUCKET_TARGET_DEFAULT: '3000' },
+      now: () => at('2026-10-02T14:00:00.000Z'), alert() {}, log() {},
+      sleep: async () => {}, client: book.client, readPolyCash: null,
+    });
+    const first = await mgr.onInsufficientBalance('kalshi', { costDollars: 5_000 });
+    assert.strictEqual(first.decision.targetCents, cents(5_500));
+    assert.strictEqual(first.confirmed, true);
+    const second = await mgr.onInsufficientBalance('kalshi', { costDollars: 8_000 });
+    assert.notStrictEqual(second.skipped, 'coalesced');
+    assert.strictEqual(second.decision.targetCents, cents(8_500));
+    assert.strictEqual(book.state.bucket.availableCents, cents(8_500));
+    const third = await mgr.onInsufficientBalance('kalshi', { costDollars: 4_000 });
+    assert.strictEqual(third.skipped, 'coalesced', 'a smaller repeat inside 15s is still coalesced');
+  }
+
+  // While a transfer is pending, a rejection records the need but sends nothing new.
+  {
+    const book = fakeBook({
+      main: cents(40_000), bucket: cents(4_000), applyTransfer: false, recordStatus: 'processing',
+    });
+    const mgr = createBucketManager({
+      env: { KALSHI_BUCKET_AUTO: '1', KALSHI_BUCKET_TARGET_DEFAULT: '3000' },
+      now: () => at('2026-10-02T14:00:00.000Z'), alert() {}, log() {},
+      sleep: async () => {}, client: book.client, readPolyCash: null,
+    });
+    const first = await mgr.onInsufficientBalance('kalshi', { costDollars: 6_000 });
+    assert.strictEqual(first.confirmed, false);
+    assert.strictEqual(book.transfers.length, 1);
+    const second = await mgr.onInsufficientBalance('kalshi', { costDollars: 9_000 });
+    assert.ok(second.held || second.skipped);
+    assert.strictEqual(book.transfers.length, 1, 'pending transfer holds further sends (#113)');
   }
 
   console.log('bucket-manager.test.js ok');

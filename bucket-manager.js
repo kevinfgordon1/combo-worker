@@ -28,9 +28,9 @@
 //
 // Schedule (America/New_York, DST-aware). A window is { start, end }
 // with dow 0=Sunday .. 6=Saturday and time "HH:MM". The end minute is
-// included. A window that wraps the week (Saturday through Monday) has
+// included. A window that wraps the week (Friday through Monday) has
 // start > end.
-//   Saturday 00:00 through Monday 23:59
+//   Friday 12:00 through Monday 23:59 (Friday playoff + college locks, weekend)
 //   Thursday 12:00 through Friday 03:00 (NFL Thursday night)
 'use strict';
 
@@ -56,6 +56,8 @@ const LOW_REPEAT_MS = 60 * 60 * 1000;
 const BLOCKED_ALERT_MS = 60 * 60 * 1000;
 const INSUFFICIENT_IN_APP_MS = 5 * 60 * 1000;
 const CHECK_COALESCE_MS = 15_000;
+// A rejected quote's cost keeps lifting the top-up target for this long.
+const NEED_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_SETTLE_MS = 180_000;
 // Pause between the transfer POST and the first confirm, so the first read is
 // not the (known to lag) immediate balance re-read.
@@ -71,7 +73,7 @@ const DOW = Object.freeze({
 });
 
 const DEFAULT_GAMEDAY_WINDOWS = Object.freeze([
-  { id: 'weekend', start: { dow: 6, time: '00:00' }, end: { dow: 1, time: '23:59' } },
+  { id: 'weekend', start: { dow: 5, time: '12:00' }, end: { dow: 1, time: '23:59' } },
   { id: 'thursday-night', start: { dow: 4, time: '12:00' }, end: { dow: 5, time: '03:00' } },
 ]);
 
@@ -182,13 +184,15 @@ function loadBucketConfig(env = process.env) {
   return {
     auto: envOn(env, 'KALSHI_BUCKET_AUTO'),
     sweep: envOn(env, 'KALSHI_BUCKET_SWEEP'),
-    ceilingCents: envDollarsToCents(env, 'KALSHI_BUCKET_CEILING', 15_000),
+    ceilingCents: envDollarsToCents(env, 'KALSHI_BUCKET_CEILING', 22_000),
     floorCents: envDollarsToCents(env, 'KALSHI_MAIN_FLOOR', 2_000),
     maxTransferCents: envDollarsToCents(env, 'KALSHI_BUCKET_MAX_TRANSFER', 10_000),
     dailyCapCents: envDollarsToCents(env, 'KALSHI_BUCKET_DAILY_CAP', 15_000),
     minTransferCents: envDollarsToCents(env, 'KALSHI_BUCKET_MIN_TRANSFER', 100),
-    targetGamedayCents: envDollarsToCents(env, 'KALSHI_BUCKET_TARGET_GAMEDAY', 10_000),
-    targetDefaultCents: envDollarsToCents(env, 'KALSHI_BUCKET_TARGET_DEFAULT', 5_000),
+    // Extra cash kept above a rejected quote's cost when topping up after an insufficient_balance.
+    insufficientBufferCents: envDollarsToCents(env, 'KALSHI_BUCKET_INSUFFICIENT_BUFFER', 500),
+    targetGamedayCents: envDollarsToCents(env, 'KALSHI_BUCKET_TARGET_GAMEDAY', 12_000),
+    targetDefaultCents: envDollarsToCents(env, 'KALSHI_BUCKET_TARGET_DEFAULT', 8_000),
     lowAlertCents: envDollarsToCents(env, 'KALSHI_BUCKET_LOW_ALERT', 1_500),
     comboLowCashCents: envDollarsToCents(env, 'COMBO_LOW_CASH_ALERT_USD', 1_000),
     polyLowAlertCents: envDollarsToCents(env, 'POLY_LOW_ALERT', 1_500),
@@ -255,13 +259,22 @@ function planBucketAction({
   sweepEnabled,
   flat,
   dailyTopupCents,
+  needCents,
   config,
 }) {
-  const targetCents = gameday ? config.targetGamedayCents : config.targetDefaultCents;
+  const baseTargetCents = gameday ? config.targetGamedayCents : config.targetDefaultCents;
+  // A recently rejected quote (insufficient_balance) lifts the target to its
+  // cost plus the buffer. Every limit below (floor, ceiling, daily cap,
+  // per-transfer cap, minimum) still applies to the resulting amount.
+  const needTargetCents = needCents > 0
+    ? Math.floor(needCents) + (config.insufficientBufferCents || 0)
+    : 0;
+  const targetCents = Math.max(baseTargetCents, needTargetCents);
   const totalCents = bucketAvailableCents + (bucketPortfolioCents || 0);
   const gap = targetCents - bucketAvailableCents;
   const base = {
     targetCents,
+    needTargetCents,
     gameday: !!gameday,
     totalCents,
     gapCents: gap,
@@ -616,6 +629,9 @@ function createBucketManager({
   let pending = null;
   let cooldownUntil = 0;
   let lastCheckAt = 0;
+  let needCents = 0;
+  let needAt = 0;
+  let lastNeedUsed = 0;
   let inflight = null;
   let timer = null;
   let balanceErrorAt = 0;
@@ -882,10 +898,15 @@ function createBucketManager({
   async function evaluateInner(reason) {
     const date = clock();
     const t = date.getTime();
-    if (reason === 'insufficient_balance' && lastCheckAt && t - lastCheckAt < CHECK_COALESCE_MS) {
+    if (needAt && t - needAt >= NEED_TTL_MS) { needCents = 0; needAt = 0; }
+    if (
+      reason === 'insufficient_balance' && lastCheckAt && t - lastCheckAt < CHECK_COALESCE_MS &&
+      !(needCents > lastNeedUsed)
+    ) {
       return { skipped: 'coalesced' };
     }
     lastCheckAt = t;
+    lastNeedUsed = needCents;
     if (!kalshi) {
       log('[BUCKET] no Kalshi client — skipping balance check');
       return { skipped: 'no_client' };
@@ -997,7 +1018,11 @@ function createBucketManager({
     }
 
     const gameday = isGameday(date, config.windows);
-    const targetCents = gameday ? config.targetGamedayCents : config.targetDefaultCents;
+    const baseTarget = gameday ? config.targetGamedayCents : config.targetDefaultCents;
+    const targetCents = Math.max(
+      baseTarget,
+      needCents > 0 ? Math.floor(needCents) + (config.insufficientBufferCents || 0) : 0,
+    );
     const excessCents = shards.bucket.availableCents - targetCents;
     let flat = null;
     if (config.sweep && !gameday && excessCents >= config.minTransferCents) {
@@ -1017,6 +1042,7 @@ function createBucketManager({
       sweepEnabled: config.sweep,
       flat,
       dailyTopupCents: dailySpent(date),
+      needCents,
       config,
     });
 
@@ -1192,10 +1218,23 @@ function createBucketManager({
     return inflight;
   }
 
-  async function onInsufficientBalance(venue) {
+  // info.costDollars / info.costCents: what the rejected quote needed in cash.
+  async function onInsufficientBalance(venue, info = null) {
     const name = String(venue || '').toLowerCase() === 'polymarket' ? 'polymarket' : 'kalshi';
     const t = clock().getTime();
     const last = venueAlertAt.get(name) || 0;
+    let costCents = 0;
+    if (name === 'kalshi' && info) {
+      const c = info.costCents != null ? Number(info.costCents) : Number(info.costDollars) * 100;
+      if (Number.isFinite(c) && c > 0) costCents = Math.ceil(c);
+    }
+    if (costCents > 0) {
+      if (!needAt || t - needAt >= NEED_TTL_MS) needCents = 0;
+      needCents = Math.max(needCents, costCents);
+      needAt = t;
+      log(`[BUCKET] insufficient_balance: rejected quote needs ${formatDollarsFromCents(costCents)} ` +
+        `(+${formatDollarsFromCents(config.insufficientBufferCents || 0)} buffer)`);
+    }
     if (name === 'kalshi' && t - insufficientInAppAt >= INSUFFICIENT_IN_APP_MS) {
       insufficientInAppAt = t;
       const cash = lastBucketCents != null
@@ -1206,9 +1245,10 @@ function createBucketManager({
         severity: 'error',
         title: 'Combo Locks skipped: Kalshi insufficient funds',
         body: `A Kalshi combo quote was rejected for insufficient balance. ${cash}` +
+          (costCents > 0 ? `It needed about ${formatDollarsFromCents(costCents)}. ` : '') +
           `The bucket manager is re-checking both shards now.`,
         dedupeKey: 'combo_insufficient_funds',
-        meta: { availableCents: lastBucketCents },
+        meta: { availableCents: lastBucketCents, needCents: costCents || null },
       });
     }
     if (t - last >= VENUE_ALERT_MS) {
