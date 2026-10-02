@@ -239,18 +239,54 @@ function quotedSizesByLock(submissions, pendingQuotes) {
   return map;
 }
 
+// Poly takers repeatedly send identical $10 cash RFQs, so two genuine fills on
+// the same lock routinely have the SAME contract count (e.g. 91.61 @ 0.099 at
+// 15:45Z and again at 17:46Z). Size alone therefore cannot prove a twin.
+//  - Two distinct activity trades (distinct poly-act:<tradeId>) are never twins.
+//  - An activity trade only matches a non-activity row (poly-recon / poly-pos /
+//    WS row) of the same size when the two are close in time.
+const TWIN_WINDOW_MS = Number(process.env.POLY_TWIN_WINDOW_MS) > 0
+  ? Number(process.env.POLY_TWIN_WINDOW_MS) : 300000;
+
+function timeMsOf(v) {
+  if (v == null || v === '') return null;
+  const t = v instanceof Date ? v.getTime() : Date.parse(String(v));
+  return Number.isFinite(t) ? t : null;
+}
+
+// Booked-row timestamp (booking time is within seconds of the trade for
+// activity/recon rows). Null when unknown -> caller keeps the old size-only match.
+function bookedRowTimeMs(row) {
+  if (!row) return null;
+  return timeMsOf(
+    row.kalshi_created_time ?? row.recorded_at ?? row.created_at
+    ?? row.createTime ?? row.create_time ?? row.tradeTime
+  );
+}
+
+// Set<string> of size keys that also remembers who booked each key and when.
+class SizeKeySet extends Set {
+  constructor() { super(); this.meta = new Map(); }
+  addEntry(key, info) {
+    this.add(key);
+    let list = this.meta.get(key);
+    if (!list) { list = []; this.meta.set(key, list); }
+    list.push(info);
+  }
+}
+
 function bookedPolySizeKeys({ bookedFills, seenFillIds, include } = {}) {
   const want = include || {
     activity: true, reconcile: true, position: true, other: true,
   };
-  const keys = new Set();
-  const add = (parlayId, slug, qty) => {
+  const keys = new SizeKeySet();
+  const add = (parlayId, slug, qty, info) => {
     const n = parsePositive(qty);
     if (!(n > 0)) return;
     const sk = sizeKey(n);
-    if (parlayId) keys.add(`${parlayId}:${sk}`);
-    if (slug) keys.add(`${slug}:${sk}`);
-    if (parlayId && slug) keys.add(`${parlayId}:${slug}:${sk}`);
+    if (parlayId) keys.addEntry(`${parlayId}:${sk}`, info);
+    if (slug) keys.addEntry(`${slug}:${sk}`, info);
+    if (parlayId && slug) keys.addEntry(`${parlayId}:${slug}:${sk}`, info);
   };
   for (const row of bookedFills || []) {
     if (!isPolyFillRecord(row)) continue;
@@ -264,7 +300,8 @@ function bookedPolySizeKeys({ bookedFills, seenFillIds, include } = {}) {
     add(
       parlayIdOfRecord(row),
       slugOfRecord(row) || normalizeMarketSlug(row.marketTicker || row.ticker || row.market_ticker),
-      polyFillQty(row)
+      polyFillQty(row),
+      { activity: isActivityFillRecord(row), ts: bookedRowTimeMs(row) }
     );
   }
   if (seenFillIds && typeof seenFillIds.forEach === 'function') {
@@ -300,17 +337,35 @@ function bookedActivityKeys({ bookedFills, seenFillIds } = {}) {
   });
 }
 
-function alreadyBookedSameSize(trade, lock, bookedKeys) {
+function alreadyBookedSameSize(trade, lock, bookedKeys, opts = {}) {
   if (!trade || !bookedKeys || typeof bookedKeys.has !== 'function') return false;
   const qty = sizeKey(trade.qty ?? trade.contracts ?? trade.count);
   if (!(qty > 0)) return false;
   const parlayId = (lock && lock.id) || trade.parlayId || trade.parlay_id || '';
-  if (parlayId && bookedKeys.has(`${parlayId}:${qty}`)) return true;
   const slug = normalizeMarketSlug(
     trade.marketSlug || trade.marketTicker || trade.ticker || trade.market_ticker
   );
-  if (slug && bookedKeys.has(`${slug}:${qty}`)) return true;
-  if (parlayId && slug && bookedKeys.has(`${parlayId}:${slug}:${qty}`)) return true;
+  const keys = [];
+  if (parlayId) keys.push(`${parlayId}:${qty}`);
+  if (slug) keys.push(`${slug}:${qty}`);
+  if (parlayId && slug) keys.push(`${parlayId}:${slug}:${qty}`);
+  // Time-aware matching only for an incoming ACTIVITY trade (it has a unique
+  // trade id and a trade time). Everything else keeps the size-only match.
+  const timed = !!(opts && opts.activity) && bookedKeys.meta instanceof Map;
+  if (timed) {
+    const tradeTs = timeMsOf(opts.tradeTs ?? trade.createTime ?? trade.tradeTime);
+    for (const k of keys) {
+      const list = bookedKeys.meta.get(k);
+      if (!list) continue;
+      for (const e of list) {
+        if (e.activity) continue; // distinct activity trade, not a twin
+        if (e.ts == null || tradeTs == null || Math.abs(e.ts - tradeTs) <= TWIN_WINDOW_MS) return true;
+      }
+    }
+    // `:size` keys come from seenFillIds (poly-recon/poly-pos ids, no time).
+    return bookedKeys.has(`:${qty}`);
+  }
+  for (const k of keys) if (bookedKeys.has(k)) return true;
   return bookedKeys.has(`:${qty}`);
 }
 
@@ -323,7 +378,7 @@ function bookedAnyPolyKeys({ bookedFills, seenFillIds } = {}) {
 }
 
 function activityAlreadyReconciled(trade, lock, bookedKeys) {
-  return alreadyBookedSameSize(trade, lock, bookedKeys);
+  return alreadyBookedSameSize(trade, lock, bookedKeys, { activity: true, tradeTs: trade && trade.createTime });
 }
 
 // Same lock + caoc + size already booked under a different fill_id
@@ -337,10 +392,18 @@ function findPolyEconomicTwin(trade, lock, bookedFills) {
     trade && (trade.marketSlug || trade.marketTicker || trade.ticker || trade.market_ticker)
   );
   const selfId = fillIdOf(trade);
+  const incomingActivity = String(selfId || '').startsWith('poly-act:');
+  const tradeTs = timeMsOf(trade && (trade.tradeTime ?? trade.createTime));
   for (const row of bookedFills || []) {
     if (!isPolyFillRecord(row)) continue;
     if (selfId && fillIdOf(row) === selfId) continue;
     if (sizeKey(polyFillQty(row)) !== qty) continue;
+    if (incomingActivity) {
+      // A different poly-act:<tradeId> is a different trade, whatever its size.
+      if (isActivityFillRecord(row)) continue;
+      const rowTs = bookedRowTimeMs(row);
+      if (rowTs != null && tradeTs != null && Math.abs(rowTs - tradeTs) > TWIN_WINDOW_MS) continue;
+    }
     const rowPid = parlayIdOfRecord(row);
     const rowSlug = slugOfRecord(row);
     if (parlayId && rowPid && rowPid !== parlayId) continue;
@@ -1143,6 +1206,7 @@ function activityFillEvent({ trade, lock, source }) {
     label: lock.label || null,
     parlayId: lock.id,
     source: kind,
+    tradeTime: trade.createTime || null,
     pending: {
       parlayId: lock.id,
       userId: lock.user_id || lock.userId || null,

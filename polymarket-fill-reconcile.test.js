@@ -352,9 +352,90 @@ function emptyTitleCaocTrade(id, cost, { aggressor = true } = {}) {
       slugMap: ravensMap,
       bookedFills: priorAct,
     }).length,
-    0,
-    'prior activity of the same economic size blocks a second activity insert'
+    1,
+    'a DIFFERENT activity trade id of the same size is a distinct fill and must book (91.61 twice bug)'
   );
+  // ...but the SAME trade id is never booked twice.
+  assert.strictEqual(
+    matchActivitiesToLocks([{
+      type: 'ACTIVITY_TYPE_TRADE',
+      trade: {
+        id: 'CJDEG0BFCVAY',
+        marketSlug: ravensSlug,
+        qtyDecimal: '629.82',
+        isAggressor: false,
+        state: 'TRADE_STATE_CLEARED',
+        marketMetadata: { title: '', slug: ravensSlug },
+      },
+    }], [ravensLock], {
+      slugMap: ravensMap,
+      bookedFills: priorAct,
+      seenFillIds: new Set(['poly-act:CJDEG0BFCVAY']),
+    }).length,
+    0,
+    'same trade id must not rebook'
+  );
+  // Time-aware twin rules vs non-activity rows.
+  {
+    const mk = (id, iso) => ({
+      type: 'ACTIVITY_TYPE_TRADE',
+      trade: {
+        id, marketSlug: ravensSlug, qtyDecimal: '629.82', isAggressor: false,
+        state: 'TRADE_STATE_CLEARED', createTime: iso,
+        marketMetadata: { title: '', slug: ravensSlug },
+      },
+    });
+    const recon = (iso) => [{
+      parlay_id: ravensLock.id, ticker: ravensSlug, count: 629.82,
+      fill_id: 'poly-recon:Q1:629.82', source: 'poly-reconcile', kalshi_created_time: iso,
+    }];
+    assert.strictEqual(
+      matchActivitiesToLocks([mk('T-near', '2026-10-02T17:46:29.840Z')], [ravensLock], {
+        slugMap: ravensMap, bookedFills: recon('2026-10-02T17:46:35.000Z'),
+      }).length,
+      0,
+      'activity within the twin window of a same-size recon row is the same fill'
+    );
+    assert.strictEqual(
+      matchActivitiesToLocks([mk('T-far', '2026-10-02T17:46:29.840Z')], [ravensLock], {
+        slugMap: ravensMap, bookedFills: recon('2026-10-02T15:45:47.000Z'),
+      }).length,
+      1,
+      'same-size recon row booked 2h earlier is a different fill'
+    );
+    assert.strictEqual(
+      matchActivitiesToLocks([mk('T-untimed', '2026-10-02T17:46:29.840Z')], [ravensLock], {
+        slugMap: ravensMap, bookedFills: recon(null),
+      }).length,
+      0,
+      'untimed recon row keeps the conservative size-only match'
+    );
+    // persist-time twin lookup
+    const act1545 = [{
+      parlay_id: ravensLock.id, ticker: ravensSlug, count: 629.82,
+      fill_id: 'poly-act:OLD', source: 'poly-activity', kalshi_created_time: '2026-10-02T15:45:47.000Z',
+    }];
+    assert.strictEqual(
+      findPolyEconomicTwin(
+        { qty: 629.82, marketSlug: ravensSlug, fill_id: 'poly-act:NEW', tradeTime: '2026-10-02T17:46:29.840Z' },
+        ravensLock, act1545
+      ),
+      null,
+      'a second poly-act with a different trade id is never a persist-time twin'
+    );
+    assert.ok(findPolyEconomicTwin(
+      { qty: 629.82, marketSlug: ravensSlug, fill_id: 'poly-act:NEW', tradeTime: '2026-10-02T17:46:29.840Z' },
+      ravensLock, recon('2026-10-02T17:46:40.000Z')
+    ), 'recon row seconds away is a twin');
+    assert.strictEqual(
+      findPolyEconomicTwin(
+        { qty: 629.82, marketSlug: ravensSlug, fill_id: 'poly-act:NEW', tradeTime: '2026-10-02T17:46:29.840Z' },
+        ravensLock, recon('2026-10-02T15:45:47.000Z')
+      ),
+      null,
+      'recon row 2h away is not a twin'
+    );
+  }
   assert.ok(alreadyBookedSameSize(
     { qty: 629.82, marketSlug: ravensSlug },
     ravensLock,
