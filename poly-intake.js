@@ -178,6 +178,7 @@ function formatPolyHeartbeat(snap) {
     (s.ws_silent_s != null ? ` ws_silent_s=${s.ws_silent_s}` : '') +
     (s.ws_stalls != null ? ` ws_stalls=${s.ws_stalls} ws_reconnects=${s.ws_reconnects || 0}` : '') +
     (s.rest_429 != null ? ` rest_429=${s.rest_429}` : '') +
+    (s.rest_429_paths ? ` rest_429_paths=${s.rest_429_paths}` : '') +
     (reasons ? ` reasons=${reasons}` : '')
   );
 }

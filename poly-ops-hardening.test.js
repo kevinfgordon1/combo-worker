@@ -204,8 +204,37 @@ async function testShallowCrawlWhenWsHealthy() {
   loop.stop();
 }
 
+async function testSlugScanPacing() {
+  const fr = require('./polymarket-fill-reconcile');
+  fr._resetSlugScanForTest();
+  const seen = [];
+  const http = { async listActivities(q) { seen.push(q.marketSlug); return { activities: [], eof: true }; } };
+  const slugs = Array.from({ length: 30 }, (_, i) => `caoc-${String(i).padStart(16, '0')}`);
+  await fr.listActivitiesForMarketSlugs(http, slugs);
+  assert.strictEqual(seen.length, 30, 'first call after boot scans every slug once');
+  seen.length = 0;
+  await fr.listActivitiesForMarketSlugs(http, slugs);
+  assert.strictEqual(seen.length, 8, 'later calls rotate through a bounded slice');
+  const first = seen.slice();
+  seen.length = 0;
+  await fr.listActivitiesForMarketSlugs(http, slugs);
+  assert.strictEqual(seen.length, 8);
+  assert.ok(first.every((x) => !seen.includes(x)), 'rotation advances');
+  // 429 stops the per-slug pass
+  seen.length = 0;
+  const h429 = { async listActivities(q) { seen.push(q.marketSlug); const e = new Error('429'); e.statusCode = 429; throw e; } };
+  await fr.listActivitiesForMarketSlugs(h429, slugs);
+  assert.strictEqual(seen.length, 1, 'stops on first 429');
+  // partial pages are kept when a later page is rate limited
+  let n = 0;
+  const hp = { async listActivities() { n += 1; if (n === 2) { const e = new Error('429'); e.statusCode = 429; throw e; } return { activities: [{ id: 'a' }], nextCursor: 'c' }; } };
+  const rows = await fr.listActivitiesForMarketSlugs(hp, [slugs[0]], { full: true });
+  assert.ok(rows.length >= 1);
+}
+
 (async () => {
   await test429Breaker();
+  await testSlugScanPacing();
   await testShallowCrawlWhenWsHealthy();
   await testWsWatchdog();
   await testDeleteRetry();
