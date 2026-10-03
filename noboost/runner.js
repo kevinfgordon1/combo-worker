@@ -10,7 +10,7 @@
 //   rfqs     GET /communications/rfqs?status=open&min_ts=…           every NOBOOST_RFQ_POLL_MS     (1000)
 //   trades   GET /markets/trades?min_ts=…&mve_filter=only  every NOBOOST_TRADES_POLL_MS  (2000)
 //   settle   GET /markets/{leg}  (result)                  every 300s
-//   odds     Supabase odds_cache (Pinnacle ref)            every 60s
+//   odds     Supabase odds_cache (Pinnacle ref + PROMO trusted books) every 60s
 // Two shadow quoters share one book: PRIMARY = env config (service: 10% over mid,
 // lock guardrail off) and LOCKCF = same with the lock guardrail ON (counterfactual).
 'use strict';
@@ -21,6 +21,7 @@ const { createPaperRun } = require('./paper');
 const { createStore } = require('./store');
 const { isNoBoostShadow, isNoBoostLive, configFromEnv } = require('./quote');
 const { teamCode, etDate } = require('../mm-paper-odds');
+const { gameEntries } = require('./odds-ingest');
 
 const ORIGIN = 'https://api.elections.kalshi.com';
 const P = '/trade-api/v2';
@@ -71,14 +72,17 @@ async function main(env = process.env) {
   const logger = (l) => console.log(l);
   const primary = createNoBoostShadow({ book, env, log: logger, label: 'PRIMARY' });
   const lockcf = createNoBoostShadow({ book, env: { ...env, NOBOOST_GUARDRAIL: 'lock' }, log: logger, label: 'LOCKCF' });
+  // PROMO variant (flag-gated, shadow-only): trusted-book consensus fair, fed by the BACKGROUND odds refresher
+  const promoOn = ['1', 'true', 'on', 'yes'].includes(String(env.NOBOOST_PROMO || '').toLowerCase());
+  const promo = promoOn ? createNoBoostShadow({ book, env: { ...env, NOBOOST_FAIR_METHOD: 'promo', NOBOOST_GUARDRAIL: 'off' }, log: logger, label: 'PROMO' }) : null;
   const store = createStore({ url: env.SUPABASE_URL, key: env.SUPABASE_SERVICE_KEY, log: logger });
   const run = createPaperRun({
-    book, primary, lockcf, margin: primary.cfg.margin,
+    book, primary, lockcf, promo, margin: primary.cfg.margin,
     persist: store.persist, persistStats: store.persistStats,
     samplePct: Number(env.NOBOOST_SAMPLE_PCT) || 2,
   });
   const cfg = primary.cfg;
-  console.log(`[NOBOOST] paper run start: margin=${cfg.margin} mode=${cfg.marginMode} fair=${cfg.fairMethod} guardrail=${cfg.guardrail} (+LOCKCF guardrail=lock) maxLegs=${cfg.maxLegs} — GET-only, no WS, no orders`);
+  console.log(`[NOBOOST] paper run start: margin=${cfg.margin} mode=${cfg.marginMode} fair=${cfg.fairMethod} guardrail=${cfg.guardrail} (+LOCKCF guardrail=lock)${promo ? ' (+PROMO trusted-book consensus fair)' : ''} maxLegs=${cfg.maxLegs} — GET-only, no WS, no orders`);
 
   const guard = (fn, name) => async () => { try { await fn(); } catch (e) { console.log(`[NOBOOST] ${name} error: ${e.message}`); } };
   let busy = {};
@@ -97,11 +101,15 @@ async function main(env = process.env) {
     }
   }
   async function refreshOdds() {
-    const r = await fetch(`${env.SUPABASE_URL}/rest/v1/odds_cache?sport=eq.americanfootball_nfl&select=data&order=fetched_at.desc&limit=1`,
+    const r = await fetch(`${env.SUPABASE_URL}/rest/v1/odds_cache?sport=eq.americanfootball_nfl&select=data,fetched_at&order=fetched_at.desc&limit=1`,
       { headers: { apikey: env.SUPABASE_SERVICE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}` } });
     if (!r.ok) throw new Error(`odds_cache ${r.status}`);
     const j = await r.json();
     applyPinnacle(book, j[0] && j[0].data);
+    if (promoOn) {
+      const nGames = book.setBooks(gameEntries(j[0] && j[0].data), j[0] && j[0].fetched_at ? Date.parse(j[0].fetched_at) : Date.now());
+      if (!refreshOdds.logged || Date.now() - refreshOdds.logged > 600000) { refreshOdds.logged = Date.now(); console.log(`[NOBOOST] promo books ingested for ${nGames} games (odds_cache fetched_at=${j[0] && j[0].fetched_at})`); }
+    }
   }
 
   let rfqWm = Math.floor(Date.now() / 1000) - 3;
@@ -171,7 +179,8 @@ async function main(env = process.env) {
       if (!cls.ok) continue;
       if (row.primary_fill && run.restoreFill('primary', row, cls.legs)) n += 1;
       if (row.lock_fill && run.restoreFill('lockcf', row, cls.legs)) n += 1;
-      run.openFills.push({ rfq_id: row.rfq_id, legs: row.legs, primary: { fill: !!row.primary_fill }, lockcf: { fill: !!row.lock_fill } });
+      if (promo && row.promo_fill && run.restoreFill('promo', row, cls.legs)) n += 1;
+      run.openFills.push({ rfq_id: row.rfq_id, legs: row.legs, primary: { fill: !!row.primary_fill }, lockcf: { fill: !!row.lock_fill }, ...(promo ? { promo: { fill: !!row.promo_fill } } : {}) });
     }
     console.log(`[NOBOOST] restored ${n} open paper fills`);
   } catch (e) { console.log(`[NOBOOST] restore error: ${e.message}`); }
@@ -188,7 +197,7 @@ async function main(env = process.env) {
   setInterval(() => { try { run.sweep(); run.expire(); } catch (e) { console.log(`[NOBOOST] sweep error: ${e.message}`); } }, 1000);
   setInterval(() => {
     const s = run.flushStats();
-    console.log(`[NOBOOST] SUMMARY seen=${s.seen} oos=${s.out_of_scope} dec_ms p50<=${s.dec_ms_p50} p99<=${s.dec_ms_p99} legAge_ms p50<=${s.leg_age_ms_p50} p99<=${s.leg_age_ms_p99} detect_ms p50<=${s.detect_lag_ms_p50} p99<=${s.detect_lag_ms_p99} pending=${s.pending} openFills=${s.open_fills} primary_total_maxloss=$${Math.round(s.positions.primary.totalLoss)} lockcf=$${Math.round(s.positions.lockcf.totalLoss)}`);
+    console.log(`[NOBOOST] SUMMARY seen=${s.seen} oos=${s.out_of_scope} dec_ms p50<=${s.dec_ms_p50} p99<=${s.dec_ms_p99} legAge_ms p50<=${s.leg_age_ms_p50} p99<=${s.leg_age_ms_p99} detect_ms p50<=${s.detect_lag_ms_p50} p99<=${s.detect_lag_ms_p99} pending=${s.pending} openFills=${s.open_fills} primary_total_maxloss=$${Math.round(s.positions.primary.totalLoss)} lockcf=$${Math.round(s.positions.lockcf.totalLoss)}${s.positions.promo ? ` promo=$${Math.round(s.positions.promo.totalLoss)}` : ''}`);
   }, 60000);
   process.on('SIGTERM', async () => { try { run.flushStats(); await store.flush(); } finally { process.exit(0); } });
 }

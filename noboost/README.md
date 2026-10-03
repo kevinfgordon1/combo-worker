@@ -56,3 +56,18 @@ See the PR description and `noboost/backtest-output*.txt` (raw output). Data is 
 ## Paper service (Railway `noboost-paper`)
 Env: `NOBOOST_SHADOW=1`, `NOBOOST_FAIR_METHOD=mid`, `NOBOOST_GUARDRAIL=off`, `NOBOOST_MARGIN=0.10` (+ the shared `KALSHI_KEY_ID`/`Kalshi_combo_key` for REST GETs and `SUPABASE_URL`/`SUPABASE_SERVICE_KEY`). `NOBOOST_LIVE` must never be set (the service refuses to start). Start: `node noboost/start.js`.
 Read results: `railway run -s noboost-paper -- node noboost/summary.js [--since ISO] [--json]`, or query `noboost_paper_rfqs` / `noboost_paper_stats` in Supabase (migration `migrations/20261001_noboost_paper.sql`).
+
+## PROMO variant (third shadow quoter; `NOBOOST_PROMO=1`, default OFF)
+Promo-Builder-style *trusted-book* pricing, run beside PRIMARY and LOCKCF on the same RFQs (shadow/paper only).
+- **Fair** = product over legs of a per-leg *consensus*: each trusted sportsbook's two-way price is de-vigged, exchange prices
+  (Kalshi live book, Polymarket, Novig, ProphetX) join the blend, weights favor Pinnacle (3) / exchanges (1.5–2) / mainstream books (1);
+  outliers (>0.06 from the median), incoherent two-ways and stale quotes are dropped; needs >=3 components incl. >=1 sportsbook, else the combo is *not priced*.
+  Fliff and Courtside are excluded; Betstamp is not used. Also logged: `promoBest` = the literal Promo "best opposing price" true probability (high estimate).
+- **Margin** 10% over that fair in price mode, lock guardrail OFF (same as PRIMARY). Everything is American odds in logs/DB (`promoFair=`, `promoBest=`, `books=`).
+- **No I/O on the RFQ path**: `odds-ingest.js` parses the `odds_cache` row in the *background* refresher (every 60s) into `book.setBooks`, which precomputes the per-leg consensus; the RFQ decision is lookup + multiply. Sportsbook data older than 12 min makes PROMO refuse to price.
+- Not available from our feeds (never appear): Bet105, BetCris, Prime, BookMaker, Circa, bet365. The ask-ladder VWAP blend (`blendAskLadderToPayout`) is ported but needs a depth refresher; `odds_cache` only has top-of-book size.
+- Migration: `migrations/20261001_noboost_paper_promo.sql`. Report: `node noboost/summary.js` prints a side-by-side table across the variants.
+
+## Optional separate-key WebSocket intake (NOT started)
+`ws-intake.js` can receive `rfq_created` over Kalshi's communications WS to cut detect lag (polling: median ~1–2.5s) to ~ms. Kalshi allows one such WS per key,
+so it **requires a new, separate Kalshi key** (`NOBOOST_KALSHI_KEY_ID` / `NOBOOST_KALSHI_PRIVATE_KEY`) and `NOBOOST_WS=1`; it refuses to run on combo-worker's key. Not wired into `runner.js`.

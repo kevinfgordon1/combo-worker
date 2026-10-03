@@ -140,7 +140,7 @@ function createNoBoostShadow({
       + `fair=${fmtAm(priced.fair_american)} lock=${fmtAm(priced.lock_american)} `
       + `quote=${fmtAm(priced.quote_american)}${priced.binding ? '(lock-bound)' : ''} `
       + `contracts=${contracts} maxloss=$${chk.loss.toFixed(2)} util=${util.toFixed(2)} `
-      + `mid=${fmtAm(priced.fair_mid_american)} maxLegAgeMs=${Math.round(priced.maxLegAgeMs || 0)}`
+      + `mid=${fmtAm(priced.fair_mid_american)}${priced.fair_promo_american != null ? ` promoFair=${fmtAm(priced.fair_promo_american)} promoBest=${fmtAm(priced.fair_promo_best_american)} books=${(priced.promoBooks || []).join('/')}` : ''} maxLegAgeMs=${Math.round(priced.maxLegAgeMs || 0)}`
     );
     return { action: 'would_quote', priced, contracts, legs: cls.legs, risk: chk };
   }

@@ -1,7 +1,8 @@
 // Paper run bookkeeping for the no-boost quoter — PURE state machine, no I/O.
-// Two shadow quoters share ONE in-memory book:
+// Three shadow quoters share ONE in-memory book:
 //   primary  = env config (service: margin 10% over fairMethod=mid, lock guardrail OFF)
 //   lockcf   = same config but lock guardrail ON (the counterfactual)
+//   promo    = Promo-Builder-style trusted-book consensus fair (optional; NOBOOST_PROMO=1)
 // For every in-scope RFQ we keep a record; when the combo market prints a taker
 // trade after the RFQ we decide whether each variant's quote would have won
 // (strictly cheaper than the print, not pulled before it) and simulate the
@@ -26,7 +27,7 @@ function bump(o, k, d = 1) { o[k] = (o[k] || 0) + d; }
 function hash100(s) { let h = 0; for (let i = 0; i < s.length; i += 1) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h % 100; }
 
 function createPaperRun({
-  book, primary, lockcf, now = () => Date.now(), persist = () => {}, persistStats = () => {},
+  book, primary, lockcf, promo = null, now = () => Date.now(), persist = () => {}, persistStats = () => {},
   samplePct = 2, pendingMs = 10 * 60 * 1000, margin = null,
 } = {}) {
   const byTicker = new Map(); // market_ticker -> [rec]
@@ -34,7 +35,8 @@ function createPaperRun({
   const openFills = []; // recs with a simulated fill awaiting settlement
   const seenTrades = new Set();
   let delta = emptyDelta();
-  const variants = { primary, lockcf };
+  const variants = promo ? { primary, lockcf, promo } : { primary, lockcf };
+  const col = (name) => (name === 'lockcf' ? 'lock' : name);
 
   function lb(rec) { return delta.by_legs[legBucket(rec.n_legs)] || (delta.by_legs[legBucket(rec.n_legs)] = {}); }
 
@@ -63,7 +65,9 @@ function createPaperRun({
       return null;
     }
     const d2 = lockcf.onRfq(rfq, { venue: 'kalshi' });
-    const P = decisionOf(d1); const L = decisionOf(d2);
+    const d3 = promo ? promo.onRfq(rfq, { venue: 'kalshi' }) : null;
+    const P = decisionOf(d1); const L = decisionOf(d2); const M = d3 ? decisionOf(d3) : null;
+    const pp = d3 && d3.priced && d3.priced.ok ? d3.priced : null;
     const pr = (d1.priced && d1.priced.ok) ? d1.priced : (d2.priced && d2.priced.ok ? d2.priced : null);
     const rec = {
       rfq_id: rfq.rfqId, market_ticker: rfq.marketTicker || null, legs: rfq.legKeys, n_legs: rfq.legKeys.length,
@@ -71,7 +75,12 @@ function createPaperRun({
       detect_lag_ms: rfq.createdMs ? Math.max(0, seenAt - rfq.createdMs) : null,
       contracts: d1.contracts || d2.contracts || rfq.contracts || null,
       margin,
-      primary: P, lockcf: L,
+      primary: P, lockcf: L, ...(M ? { promo: M } : {}),
+      fair_promo_american: pp && pp.fair_promo_american != null ? Math.round(pp.fair_promo_american) : null,
+      fair_promo_best_american: pp && pp.fair_promo_best_american != null ? Math.round(pp.fair_promo_best_american) : null,
+      fairPromo: pp ? pp.fairPromo : null,
+      promo_n_books: pp ? pp.promoBooks : null,
+      promo_max_age_ms: pp ? Math.round(pp.promoAgeMs || 0) : null,
       fair_mid_american: pr && pr.fair_mid_american != null ? Math.round(pr.fair_mid_american) : null,
       fair_inverse_american: pr && pr.fair_inverse_american != null ? Math.round(pr.fair_inverse_american) : null,
       fair_ref_american: pr && pr.ref_american != null ? Math.round(pr.ref_american) : null,
@@ -92,6 +101,7 @@ function createPaperRun({
     if (P.action === 'would_quote') bump(b, 'primary_wq');
     else if (P.reason && /^risk:/.test(P.reason)) bump(b, 'primary_risk_blocked');
     if (L.action === 'would_quote') bump(b, 'lockcf_wq');
+    if (M && M.action === 'would_quote') bump(b, 'promo_wq');
     byId.set(rec.rfq_id, rec);
     if (rec.market_ticker) {
       if (!byTicker.has(rec.market_ticker)) byTicker.set(rec.market_ticker, []);
@@ -125,6 +135,7 @@ function createPaperRun({
       contracts, price: v.quoteYes, premium: +(contracts * v.quoteYes).toFixed(2),
       max_loss: +(contracts * (1 - v.quoteYes)).toFixed(2),
       ev_vs_mid: rec.fairMid ? +(contracts * (v.quoteYes - rec.fairMid)).toFixed(2) : null,
+      ev_vs_promo: rec.fairPromo ? +(contracts * (v.quoteYes - rec.fairPromo)).toFixed(2) : null,
       caps_ok: chk.ok, reason: chk.ok ? null : chk.reason,
     };
     if (chk.ok) {
@@ -160,7 +171,7 @@ function createPaperRun({
       if (r.beat === 'win') { bump(b, `${name}_win`); rec[name].fill = !!r.fill; rec[name].position = r.pos; if (r.fill) bump(b, `${name}_fill`); }
       else if (r.beat === 'tie') bump(b, `${name}_tie`);
     }
-    if ((rec.primary.fill) || (rec.lockcf.fill)) openFills.push(rec);
+    if (Object.keys(variants).some((n) => rec[n] && rec[n].fill)) openFills.push(rec);
     finalize(rec);
     return rec;
   }
@@ -205,7 +216,7 @@ function createPaperRun({
       for (const name of Object.keys(variants)) {
         if (rec[name].fill) {
           const pnl = variants[name].risk.settle(rec.rfq_id, hit);
-          out[`${name === 'primary' ? 'primary' : 'lock'}_pnl`] = pnl == null ? null : +pnl.toFixed(2);
+          out[`${col(name)}_pnl`] = pnl == null ? null : +pnl.toFixed(2);
         }
       }
       persist(out, 'patch');
@@ -216,7 +227,7 @@ function createPaperRun({
 
   // restore open simulated fills after a restart: rows from the table.
   function restoreFill(name, row, legs) {
-    const pos = row[`${name === 'primary' ? 'primary' : 'lock'}_position`];
+    const pos = row[`${col(name)}_position`];
     if (!pos || !pos.caps_ok) return false;
     variants[name].onPaperFill(row.rfq_id, legs, pos.price, pos.contracts);
     return true;
@@ -234,7 +245,7 @@ function createPaperRun({
       dec_ms_p50: pct(d.dec_ms, 0.5), dec_ms_p99: pct(d.dec_ms, 0.99),
       leg_age_ms_p50: pct(d.leg_age_ms, 0.5), leg_age_ms_p99: pct(d.leg_age_ms, 0.99),
       detect_lag_ms_p50: pct(d.detect_lag_ms, 0.5), detect_lag_ms_p99: pct(d.detect_lag_ms, 0.99),
-      positions: { primary: primary.risk.snapshot(), lockcf: lockcf.risk.snapshot() },
+      positions: Object.fromEntries(Object.entries(variants).map(([n, v]) => [n, v.risk.snapshot()])),
       pending: [...byId.values()].filter((r) => r.outcome === 'pending').length,
       open_fills: openFills.length,
     };
@@ -248,7 +259,7 @@ function createPaperRun({
 // DB row from a record (all odds American; *_yes are dollar prices per $1 payout)
 function toRow(rec) {
   const iso = (ms) => (ms ? new Date(ms).toISOString() : null);
-  const P = rec.primary; const L = rec.lockcf;
+  const P = rec.primary; const L = rec.lockcf; const M = rec.promo || null;
   const american = (y) => (y == null ? null : y);
   return {
     rfq_id: rec.rfq_id,
@@ -269,6 +280,13 @@ function toRow(rec) {
     primary_beat: P.beat || null, lock_beat: L.beat || null,
     primary_fill: !!P.fill, primary_position: P.position || null,
     lock_fill: !!L.fill, lock_position: L.position || null,
+    fair_promo_american: rec.fair_promo_american == null ? null : rec.fair_promo_american,
+    fair_promo_best_american: rec.fair_promo_best_american == null ? null : rec.fair_promo_best_american,
+    promo_n_books: rec.promo_n_books || null, promo_max_age_ms: rec.promo_max_age_ms == null ? null : rec.promo_max_age_ms,
+    ...(M ? {
+      quote_promo_american: M.quote_american, quote_promo_yes: M.quoteYes, promo_action: M.action, promo_reason: M.reason,
+      promo_pulled: M.pulled ? M.pulled.reason : null, promo_beat: M.beat || null, promo_fill: !!M.fill, promo_position: M.position || null,
+    } : {}),
   };
 }
 

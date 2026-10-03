@@ -60,31 +60,39 @@ const med = (a) => pct(a, 0.5);
 
   // per-variant results on traded RFQs (taker bought YES, after our RFQ)
   const traded = rows.filter((r) => r.outcome === 'traded');
-  for (const [name, beat, fill, pos, act] of [['primary (10% over mid, lock OFF)', 'primary_beat', 'primary_fill', 'primary_position', 'primary_action'], ['counterfactual (lock ON)', 'lock_beat', 'lock_fill', 'lock_position', 'lock_action']]) {
-    const v = { traded: traded.length, quoted: 0, wins: 0, ties: 0, fills: 0, cap_blocked: 0, premium: 0, ev_vs_mid: 0, settled: 0, pnl: 0, by_legs: {} };
+  const VARS = [['primary (10% over mid, lock OFF)', 'primary', 'primary'], ['counterfactual (lock ON)', 'lock', 'lock']];
+  if (rows.some((r) => r.promo_action != null)) VARS.push(['PROMO (10% over trusted-book consensus)', 'promo', 'promo']);
+  for (const [name, pre] of VARS.map((x) => [x[0], x[1]])) {
+    const beat = `${pre}_beat`; const fill = `${pre}_fill`; const pos = `${pre}_position`; const act = `${pre}_action`;
+    const v = { traded: traded.length, quoted: 0, wins: 0, ties: 0, fills: 0, cap_blocked: 0, premium: 0, ev_vs_mid: 0, ev_vs_promo: 0, settled: 0, pnl: 0, by_legs: {} };
     for (const r of traded) {
       const b = bucket(r.n_legs); const o = v.by_legs[b] || (v.by_legs[b] = { traded: 0, quoted: 0, wins: 0, fills: 0, ev_vs_mid: 0, pnl: 0, traded_am: [], quote_am: [], mid_am: [], premium_am: [] });
       o.traded += 1;
       const p = r[pos];
-      const qa = act === 'primary_action' ? r.quote_primary_american : r.quote_lock_american;
-      const qy = act === 'primary_action' ? r.quote_primary_yes : r.quote_lock_yes;
+      const qa = r[`quote_${pre}_american`];
+      const qy = r[`quote_${pre}_yes`];
       if (r[act] === 'would_quote') { v.quoted += 1; o.quoted += 1; }
       if (r[beat] === 'win') {
         v.wins += 1; o.wins += 1;
         if (p && p.caps_ok === false) v.cap_blocked += 1;
-        o.traded_am.push(r.traded_american); o.quote_am.push(qa); o.mid_am.push(r.fair_mid_american);
+        o.traded_am.push(r.traded_american); o.quote_am.push(qa); o.mid_am.push(pre === 'promo' && r.fair_promo_american != null ? r.fair_promo_american : r.fair_mid_american);
         if (r.traded_yes && qy) o.premium_am.push(r.traded_yes / qy - 1);
       } else if (r[beat] === 'tie') v.ties += 1;
       if (r[fill]) {
-        v.fills += 1; o.fills += 1; v.premium += p.premium || 0; v.ev_vs_mid += p.ev_vs_mid || 0; o.ev_vs_mid += p.ev_vs_mid || 0;
-        const pl = act === 'primary_action' ? r.primary_pnl : r.lock_pnl;
+        v.fills += 1; o.fills += 1; v.premium += p.premium || 0; v.ev_vs_mid += p.ev_vs_mid || 0; v.ev_vs_promo += p.ev_vs_promo || 0; o.ev_vs_mid += p.ev_vs_mid || 0;
+        const pl = r[`${pre}_pnl`];
         if (pl != null) { v.settled += 1; v.pnl += Number(pl); o.pnl += Number(pl); }
       }
     }
     v.win_rate_of_quoted = v.quoted ? +(v.wins / v.quoted).toFixed(3) : null;
     v.ev_per_fill_vs_mid = v.fills ? +(v.ev_vs_mid / v.fills).toFixed(2) : null;
+    v.ev_per_fill_vs_promo = v.fills ? +(v.ev_vs_promo / v.fills).toFixed(2) : null;
+    v.pre = pre;
     rep.variants[name] = v;
   }
+  // PROMO fair vs mid fair on all persisted rows that have both (American odds)
+  const both = rows.filter((r) => r.fair_promo_american != null && r.fair_mid_american != null);
+  rep.promo_vs_mid = { n: both.length, median_diff_american: both.length ? med(both.map((r) => r.fair_promo_american - r.fair_mid_american)) : null, promo_n_books_median: med(rows.map((r) => (Array.isArray(r.promo_n_books) ? Math.min(...r.promo_n_books) : null)).filter((x) => x != null)), promo_age_ms_p50: med(rows.map((r) => r.promo_max_age_ms).filter((x) => x != null)) };
   // exposure: peak from stats snapshots + from fills' running totals
   const peak = (k) => rows.reduce((a, r) => Math.max(a, (r[k] && r[k].total_after) || 0), 0);
   rep.exposure = {
@@ -92,6 +100,7 @@ const med = (a) => pct(a, 0.5);
     primary_peak_game: rows.reduce((a, r) => Math.max(a, (r.primary_position && r.primary_position.top_game_after) || 0), 0),
     primary_peak_selection: rows.reduce((a, r) => Math.max(a, (r.primary_position && r.primary_position.top_selection_after) || 0), 0),
     primary_cap_blocked_wins: rows.filter((r) => r.primary_position && r.primary_position.caps_ok === false).length,
+    promo_peak_total_max_loss: peak('promo_position'),
   };
 
   if (AS_JSON) { console.log(JSON.stringify(rep, null, 1)); return; }
@@ -115,6 +124,13 @@ const med = (a) => pct(a, 0.5);
       console.log(`${b} | ${o.traded} | ${o.quoted} | ${o.wins} | ${o.fills} | ${am(med(o.traded_am))} | ${am(med(o.quote_am))} | ${am(med(o.mid_am))} | ${o.premium_am.length ? `${(med(o.premium_am) * 100).toFixed(0)}% of price` : '-'} | ${money(o.ev_vs_mid)} | ${money(o.pnl)}`);
     }
   }
+  console.log(`\n== SIDE BY SIDE (traded combos ${traded.length}) ==`);
+  console.log('variant | quoted | wins | win% of quoted | fills | premium | EV vs mid | EV vs own fair | settled | realized P&L');
+  for (const [name, v] of Object.entries(rep.variants)) {
+    const ownEv = v.pre === 'promo' ? v.ev_vs_promo : v.ev_vs_mid;
+    console.log(`${name} | ${v.quoted} | ${v.wins} | ${v.win_rate_of_quoted == null ? '-' : `${(v.win_rate_of_quoted * 100).toFixed(1)}%`} | ${v.fills} | ${money(v.premium)} | ${money(v.ev_vs_mid)} | ${money(ownEv)} | ${v.settled} | ${money(v.pnl)}`);
+  }
+  if (rep.promo_vs_mid.n) console.log(`PROMO fair vs no-vig exchange mid (median across ${rep.promo_vs_mid.n} rows): ${rep.promo_vs_mid.median_diff_american > 0 ? '+' : ''}${rep.promo_vs_mid.median_diff_american} American points; median min-books/leg ${rep.promo_vs_mid.promo_n_books_median}; sportsbook-feed age p50 ${rep.promo_vs_mid.promo_age_ms_p50} ms`);
   console.log(`\n== Exposure (simulated, primary) vs caps ==`);
   console.log(`peak total max-loss ${money(rep.exposure.primary_peak_total_max_loss)} | peak per-game ${money(rep.exposure.primary_peak_game)} | peak per-team ${money(rep.exposure.primary_peak_selection)} | wins blocked by caps ${rep.exposure.primary_cap_blocked_wins}`);
   if (rep.last_positions) console.log(`latest snapshot: ${JSON.stringify(rep.last_positions)}`);
