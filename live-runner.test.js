@@ -221,6 +221,27 @@ assert.ok(
   'costDollars is a one-shot hint, never a combo_submissions column'
 );
 assert.ok(
+  /splitPaused\(parlays\)/.test(liveSrc) && /notePausedIds\(split\.pausedIds\)/.test(liveSrc) &&
+    /parlays = split\.live/.test(liveSrc),
+  'refresh drops paused locks (combo_parlays.paused) from the lock list both venues read'
+);
+assert.ok(
+  /getParlays:\s*\(\) => parlays/.test(liveSrc),
+  'Polymarket reads the same filtered lock list as Kalshi, so a paused lock stops on both'
+);
+assert.ok(
+  /cancelPausedLock/.test(liveSrc) && /polyLoop\.cancelOpenQuotesForParlay\(parlayId, \{ kind: 'paused' \}\)/.test(liveSrc),
+  'pausing a lock cancels its open Kalshi and Polymarket quotes'
+);
+assert.ok(
+  /pollPaused\(\)/.test(liveSrc) && /, 5000\);/.test(liveSrc),
+  'a pause toggle is picked up by the 5s poll, not only the 30s refresh'
+);
+assert.ok(
+  !/\.select\('[^']*paused/.test(liveSrc.replace(/createPausePoller[\s\S]*$/, '')),
+  'the main lock query stays select(*) so a missing paused column cannot break refresh'
+);
+assert.ok(
   /persistQuoteSkip\(quoteId, skipReason/.test(liveSrc),
   'underfunded Kalshi confirm must stamp skip_reason on the quoted row'
 );

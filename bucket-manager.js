@@ -631,6 +631,8 @@ function createBucketManager({
   let lastCheckAt = 0;
   let needCents = 0;
   let needAt = 0;
+  // Last balances this manager read, for the heartbeat / Combo Locks readout.
+  let snap = null;
   let lastNeedUsed = 0;
   let inflight = null;
   let timer = null;
@@ -788,6 +790,16 @@ function createBucketManager({
     const bucket = await kalshi.getShard(BUCKET_SHARD);
     lastBucketCents = bucket.availableCents;
     seenBucketThisRun = bucket.availableCents;
+    snap = {
+      main_cents: main.availableCents,
+      combo_cash_cents: bucket.availableCents,
+      combo_positions_cents: bucket.portfolioCents || 0,
+      ceiling_cents: config.ceilingCents,
+      floor_cents: config.floorCents,
+      target_cents: (snap && snap.target_cents) || null,
+      gameday: snap ? snap.gameday : null,
+      at: clock().toISOString(),
+    };
     return { main, bucket };
   }
 
@@ -1023,6 +1035,7 @@ function createBucketManager({
       baseTarget,
       needCents > 0 ? Math.floor(needCents) + (config.insufficientBufferCents || 0) : 0,
     );
+    if (snap) { snap.target_cents = targetCents; snap.gameday = !!gameday; }
     const excessCents = shards.bucket.availableCents - targetCents;
     let flat = null;
     if (config.sweep && !gameday && excessCents >= config.minTransferCents) {
@@ -1298,6 +1311,8 @@ function createBucketManager({
     check: requestCheck,
     onInsufficientBalance,
     evaluate: requestCheck,
+    // Read-only copy of the latest balances (cents) for observability.
+    snapshot() { return snap ? { ...snap } : null; },
   };
 }
 
