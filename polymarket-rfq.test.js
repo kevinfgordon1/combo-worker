@@ -1,4 +1,7 @@
 'use strict';
+// These cases pin the legacy floor-to-tick price (POLY_EXACT_TARGET=0). The exact-target default is covered
+// in poly-exact-target.test.js.
+process.env.POLY_EXACT_TARGET = '0';
 const assert = require('assert');
 const crypto = require('crypto');
 const fs = require('fs');

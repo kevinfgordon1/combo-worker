@@ -279,7 +279,7 @@ function freeBetRiskfreeMissingCap({ hedgeMode, maxContracts, isFreeBet }) {
   return !(maxContracts != null && maxContracts !== '' && Number.isFinite(max) && max > 0);
 }
 
-function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican = null, rfqContracts, hedgeMode = '1x', maxContracts = null, filledSoFar = 0, outstanding = 0, allowPartial = false, isFreeBet = false, subcent = false }) {
+function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican = null, rfqContracts, hedgeMode = '1x', maxContracts = null, filledSoFar = 0, outstanding = 0, allowPartial = false, isFreeBet = false, subcent = false, polyQuote = null }) {
   if (!(parlayStake > 0) || !parlayAmerican || !fillAmerican || !(rfqContracts > 0)) return { ok: false, reason: 'bad_inputs' };
   if (freeBetRiskfreeMissingCap({ hedgeMode, maxContracts, isFreeBet })) {
     return { ok: false, reason: 'no_cap', cap: 0, totalLimit: 0, filledSoFar: filledSoFar > 0 ? filledSoFar : 0, outstanding: outstanding > 0 ? outstanding : 0, remaining: 0 };
@@ -307,6 +307,33 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
   if (!(N > 0)) return { ok: false, reason: 'zero_cap', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved, remaining: remainingBefore };
   const s = impliedProb(fillAmerican); // already net of your maker fee
   const hit = bookHit + N * s - N, miss = bookMiss + N * s, worst = Math.min(hit, miss);
+  // Polymarket US branch (polyQuote = { buyPrice, credit, enforce }). The venue price is the YES price the
+  // taker pays (we SELL YES), so the quote is never run through the Kalshi NO-bid / maker-fee view. We net
+  // buyPrice + the credited maker rebate per contract. With enforce (POLY_EXACT_TARGET) that net must be
+  // >= the target or the quote is refused; hit/miss/worst are computed at the price actually sent.
+  if (polyQuote) {
+    const px = parseFloat(polyQuote.buyPrice);
+    const credit = Number(polyQuote.credit) > 0 ? Number(polyQuote.credit) : 0;
+    const sQ = px + credit;
+    if (!(px >= 0.001 && px <= 0.999) || (polyQuote.enforce && !(sQ + 1e-12 >= s))) {
+      return {
+        ok: false, reason: 'quote_below_target', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved,
+        remaining: remainingBefore, rfqContracts, quotedBuyPrice: polyQuote.buyPrice,
+      };
+    }
+    const hitP = bookHit + N * sQ - N, missP = bookMiss + N * sQ, worstP = Math.min(hitP, missP);
+    const remAfter = remainingBefore - N;
+    return {
+      ok: true, locks: worst >= 0, hit: r2(hit), miss: r2(miss), worst: r2(worst),
+      partial: false, trimmedByLimit: false, cap, hedgeMode,
+      totalLimit, filledSoFar: alreadyFilled, outstanding: reserved, remaining: remAfter, limitReached: remAfter <= 0,
+      competitive: fairAmerican == null ? null : fillAmerican >= fairAmerican, fillAmerican,
+      effTakerOdds: americanFromProb(px), rfqContracts,
+      quotedEffAmerican: americanFromProb(sQ), worstAtQuote: r2(worstP), hitAtQuote: r2(hitP), missAtQuote: r2(missP),
+      subcent: false, venue: 'polymarket', quotedBuyPrice: polyQuote.buyPrice, rebateCredit: credit,
+      quote: { buy_price: polyQuote.buyPrice, rest_remainder: false }, contracts: N,
+    };
+  }
   const v = fillView(fillAmerican, { subcent });
   // Exact-price recheck. The quote sits on the grid at or below the target no_bid, so the
   // premium we collect (net of maker fee) can only be >= the target fill. Prove it instead of

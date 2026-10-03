@@ -3,7 +3,7 @@
 // Do not POST from callers that have POLYMARKET_RFQ_LIVE off — this module
 // only transports. Never log key material.
 'use strict';
-const { Client } = require('undici');
+const { Pool } = require('undici');
 const WebSocket = require('ws');
 const {
   authHeaders,
@@ -14,6 +14,31 @@ const {
 const DEFAULT_BASE = 'https://api.polymarket.us';
 const DEFAULT_WS = 'wss://api.polymarket.us/v1/ws/private';
 const WS_SIGN_PATH = '/v1/ws/private';
+
+// undici Client has ONE socket and pipelining=1, so a quote POST queued behind every background GET
+// (positions, activities, RFQ crawl, hydrate). Reads get a small Pool; quote mutations (POST/PUT/DELETE)
+// get their own warm Pool so a burst of RFQs never waits on a GET. Same fix Kalshi got in #110.
+const READ_CONNECTIONS = 4;
+const QUOTE_CONNECTIONS = 3;
+const QUOTE_WARM_PATH = '/v1/rfqs/user-id';
+const CONNECT_TIMEOUT_MS = 2_500;
+const HEADERS_TIMEOUT_MS = 8_000;
+const BODY_TIMEOUT_MS = 8_000;
+
+const READ_HEADERS_TIMEOUT_MS = 20_000; // bulk GETs (activities, crawl pages) are slower than a quote POST
+const READ_BODY_TIMEOUT_MS = 20_000;
+
+function polyPoolOptions(connections, { headersTimeout = HEADERS_TIMEOUT_MS, bodyTimeout = BODY_TIMEOUT_MS } = {}) {
+  return {
+    keepAliveTimeout: 60_000,
+    keepAliveMaxTimeout: 600_000,
+    pipelining: 1,
+    connections,
+    connectTimeout: CONNECT_TIMEOUT_MS,
+    headersTimeout,
+    bodyTimeout,
+  };
+}
 
 function queryString(query) {
   if (!query || typeof query !== 'object') return '';
@@ -55,14 +80,23 @@ function createPolymarketHttp({
   secretKey,
   baseUrl = DEFAULT_BASE,
   requestFn,
+  poolFactory,
 } = {}) {
   const origin = String(baseUrl || DEFAULT_BASE).replace(/\/$/, '');
   const accessKey = normalizeCred(keyId);
   const secret = normalizeCred(secretKey);
-  const http = requestFn ? null : new Client(origin, {
-    keepAliveTimeout: 60_000,
-    keepAliveMaxTimeout: 600_000,
-  });
+  const makePool = poolFactory || ((o, opts) => new Pool(o, opts));
+  const http = requestFn ? null : makePool(origin, polyPoolOptions(READ_CONNECTIONS, { headersTimeout: READ_HEADERS_TIMEOUT_MS, bodyTimeout: READ_BODY_TIMEOUT_MS }));
+  // Quote mutations: separate sockets, created lazily so read-only users (bucket manager, mm-paper) open none.
+  let quotePool = null;
+  function dispatcherFor(method, forceQuote) {
+    if (!http) return null;
+    if (forceQuote || (method && method !== 'GET')) {
+      if (!quotePool) quotePool = makePool(origin, polyPoolOptions(QUOTE_CONNECTIONS));
+      return quotePool;
+    }
+    return http;
+  }
   // Official Retail docs sign pathname only. Some gateways verify RequestURI
   // (path + query). Auto: try pathname, then one path+query retry on 401.
   let signModeLatched = null;
@@ -97,7 +131,7 @@ function createPolymarketHttp({
     return wait;
   }
 
-  async function requestOnce(method, path, { query, body, ts, signMode = 'path' } = {}) {
+  async function requestOnce(method, path, { query, body, ts, signMode = 'path', forceQuotePool = false } = {}) {
     const qs = queryString(query);
     const fullPath = `${path}${qs}`;
     const includeQuery = signMode === 'path+query';
@@ -134,7 +168,7 @@ function createPolymarketHttp({
       };
     }
 
-    const { statusCode, headers: resHeaders, body: resBody } = await http.request({
+    const { statusCode, headers: resHeaders, body: resBody } = await dispatcherFor(method, forceQuotePool).request({
       path: fullPath,
       method,
       headers,
@@ -279,9 +313,28 @@ function createPolymarketHttp({
       return { statusCode: res.statusCode, json: res.json };
     },
     getSignMode: () => signModeLatched,
+    // Keep every quote-pool socket hot (LB idle-kill otherwise costs a TLS handshake on the next burst POST).
+    // Fires QUOTE_CONNECTIONS concurrent GETs so a Pool opens/refreshes all sockets. Never throws.
+    async warmQuotePool(fanout = QUOTE_CONNECTIONS) {
+      if (!http) return { ok: false, sockets: 0, reason: 'no_http' };
+      if (isBackedOff(QUOTE_WARM_PATH)) return { ok: false, sockets: 0, reason: 'backoff' };
+      const t0 = nowMs();
+      try {
+        const results = await Promise.all(
+          Array.from({ length: Math.max(1, fanout) }, () => requestOnce('GET', QUOTE_WARM_PATH, {
+            signMode: signModeLatched || 'path', forceQuotePool: true,
+          }))
+        );
+        return { ok: results.every((r) => r.statusCode >= 200 && r.statusCode < 300), sockets: results.length, ms: nowMs() - t0, statusCode: results[0].statusCode };
+      } catch (e) {
+        return { ok: false, sockets: 0, ms: nowMs() - t0, error: e.message };
+      }
+    },
     close() {
-      if (http) {
-        try { http.close(); } catch (_) {}
+      for (const d of [http, quotePool]) {
+        if (d) {
+          try { d.close(); } catch (_) {}
+        }
       }
     },
   };
@@ -541,6 +594,9 @@ function createPolymarketRfqWs({
 }
 
 module.exports = {
+  READ_CONNECTIONS,
+  QUOTE_CONNECTIONS,
+  polyPoolOptions,
   DEFAULT_BASE,
   DEFAULT_WS,
   queryString,

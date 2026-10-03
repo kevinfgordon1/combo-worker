@@ -1,4 +1,6 @@
 'use strict';
+// Legacy floor-to-tick pricing (POLY_EXACT_TARGET=0). Exact-target coverage: poly-exact-target.test.js.
+process.env.POLY_EXACT_TARGET = '0';
 const assert = require('assert');
 const { impliedProb } = require('./engine');
 const {
