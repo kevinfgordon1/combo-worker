@@ -136,6 +136,7 @@ const {
 const {
   capAtConfirmEnabled,
   createCapBook,
+  createHoldResolver,
   confirmAgainstCap,
   releaseConfirmedFill,
   overfillOf,
@@ -261,7 +262,17 @@ async function kalshiSigned(method, signPath, opts = {}) {
 const cancelingQuotes = new Set();
 const cancelledQuotes = new Set();
 const confirmingQuotes = new Set(); // de-dupe accept + skip 20s TTL during confirm
-const capBook = createCapBook({ enabled: capAtConfirmEnabled(process.env) });
+const capBook = createCapBook({
+  enabled: capAtConfirmEnabled(process.env),
+  // Hard-TTL exit only: a hold the venue could not be asked about for 30 min.
+  onForced: (info) => {
+    const msg = `[${MODE}] HOLD FORCE-RELEASED after ${Math.round(info.ageMs / 1000)}s unresolved ` +
+      `quote_id=${info.quoteId} lock=${info.parlayId} size=${info.size} ` +
+      `label=${(info.meta && info.meta.label) || '(unknown)'}`;
+    console.error(msg);
+    sendAlert(`⚠️ ${msg}`).catch(() => {});
+  },
+});
 let reserveSeq = 0;
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -509,6 +520,35 @@ async function refresh() {
   } catch (e) {
     console.error(`[${MODE}] refresh failed`, e.message);
   }
+}
+
+// DB-fresh filled for one lock, same rule as refresh(): every non-stub maker
+// combo fill. Null on error so a failed read never lowers the count.
+async function freshFilledFor(parlayId) {
+  if (!parlayId) return null;
+  try {
+    const { data, error } = await supabase
+      .from('combo_fills')
+      .select('parlay_id,count,fill_id,order_id,raw')
+      .eq('is_combo', true)
+      .eq('is_taker', false)
+      .eq('parlay_id', parlayId);
+    if (error) {
+      console.error(`[${MODE}] last-look fills read`, error.message);
+      return null;
+    }
+    return (data || []).filter(countsTowardCap).reduce((n, r) => n + (Number(r.count) || 0), 0);
+  } catch (e) {
+    console.error(`[${MODE}] last-look fills read`, e && e.message);
+    return null;
+  }
+}
+
+// Last look before any confirm: the in-memory count can lag the books.
+async function lastLookFilledFor(parlayId) {
+  try { await resolveHolds(parlayId); } catch (_) { /* best effort */ }
+  const fresh = await freshFilledFor(parlayId);
+  return fresh == null ? 0 : fresh;
 }
 
 // Use the larger of DB fills vs session fills so a restart can't under-count,
@@ -1249,6 +1289,14 @@ async function onQuoteAccepted(evt) {
       maxContracts,
       size: pending.contracts,
       getFilled: () => filledSoFarFor(pending.parlayId),
+      lastLook: () => withBudget(lastLookFilledFor(pending.parlayId), 900),
+      onLastLookRaise: (info) => console.warn(
+        `[${MODE}] LAST LOOK raised filled ${info.memory} -> ${info.fresh} lock=${pending.parlayId} quote_id=${quoteId}`
+      ),
+      meta: {
+        venue: 'kalshi', rfqId, label: pending.label, contracts: pending.contracts,
+        maxContracts, userId: pending.userId,
+      },
       getOpenHeld: () => openOutstanding(pending.parlayId, quoteId),
       confirm: () => confirmQuote(rfqId, quoteId),
       onExceed: async (info) => {
@@ -1347,6 +1395,7 @@ async function persistExecutedFill(pending, evt) {
         },
         { id: pending.parlayId },
         booked || [],
+        { live: !!evt.live },
       );
       if (twin && (twin.fill_id || twin.fillId) !== evt.fillId) {
         skipFill = true;
@@ -1718,6 +1767,118 @@ async function bookConfirmedKalshiFills(pending, evt) {
   return { contracts: booked.contracts, newContracts: added, reason: 'confirmed', partial };
 }
 
+function withBudget(promise, ms) {
+  let t;
+  const timeout = new Promise((resolve) => { t = setTimeout(() => resolve(0), ms); if (t.unref) t.unref(); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
+
+const KALSHI_WATCH_MS = [3000, 10000, 25000, 60000, 120000];
+function startKalshiFillWatch(pending, quoteId, orderId) {
+  if (!capBook.enabled || !pending || !pending.parlayId || !quoteId) return;
+  KALSHI_WATCH_MS.forEach((ms) => {
+    const t = setTimeout(async () => {
+      try {
+        if (!capBook.has(pending.parlayId, quoteId)) return;
+        const confirmed = await bookConfirmedKalshiFills(pending, { quoteId, orderId, contracts: pending.contracts });
+        if (confirmed.newContracts > 0) {
+          console.log(`[${MODE}] WATCHDOG booked kalshi quote_id=${quoteId} contracts=${confirmed.newContracts} after ${ms}ms`);
+          sessionFilledByParlay[pending.parlayId] = (sessionFilledByParlay[pending.parlayId] || 0) + confirmed.newContracts;
+          filledByParlay[pending.parlayId] = (filledByParlay[pending.parlayId] || 0) + confirmed.newContracts;
+          releaseConfirmedFill(capBook, {
+            parlayId: pending.parlayId, quoteId, partial: confirmed.partial, contracts: confirmed.newContracts,
+          });
+        }
+      } catch (e) {
+        console.error(`[${MODE}] kalshi fill watchdog`, e && e.message);
+      }
+    }, ms);
+    if (t.unref) t.unref();
+  });
+}
+
+// Resolver check for a Kalshi confirm hold.
+async function checkKalshiHold(row) {
+  let sub = null;
+  try {
+    const { data } = await supabase
+      .from('combo_submissions')
+      .select('order_id,status')
+      .eq('quote_id', row.quoteId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    sub = data || null;
+  } catch (_) { sub = null; }
+  let orderId = sub && sub.order_id;
+  if (!orderId) {
+    try {
+      const { statusCode, json } = await kalshiGet(`/trade-api/v2/communications/quotes/${row.quoteId}`);
+      if (statusCode === 404 || !json) return { state: 'unknown' };
+      const q = json.quote || json;
+      const st = String(q.status || '').toLowerCase();
+      if (st === 'cancelled' || st === 'canceled' || st === 'expired' || st === 'deleted') return { state: 'cancelled' };
+      orderId = q.creator_order_id || q.creatorOrderId || null;
+      if (!orderId) return { state: 'open' };
+    } catch (e) { return { state: 'unknown', error: e && e.message }; }
+  }
+  let fills;
+  try { fills = await fetchKalshiFillsForOrder(orderId); } catch (e) { return { state: 'unknown', error: e && e.message }; }
+  if (fills.length) {
+    let unbooked = 0;
+    for (const f of fills) {
+      const id = f.fill_id || f.trade_id;
+      const existing = await findComboFill(id);
+      if (!existing) unbooked += Number(f.count_fp != null ? f.count_fp : f.count) || 0;
+    }
+    return unbooked > 0
+      ? { state: 'filled_unbooked', contracts: unbooked, orderId }
+      : { state: 'booked' };
+  }
+  try {
+    const { statusCode, json } = await kalshiGet(`/trade-api/v2/portfolio/orders/${orderId}`);
+    if (statusCode === 404 || !json) return { state: 'unknown', orderId };
+    const o = json.order || json;
+    const st = String(o.status || '').toLowerCase();
+    if (st === 'canceled' || st === 'cancelled') return { state: 'cancelled' };
+    if (st === 'executed') return { state: 'booked' };
+    return { state: 'open', orderId };
+  } catch (e) { return { state: 'unknown', error: e && e.message }; }
+}
+
+async function rebookKalshiHold(row, res) {
+  const pending = {
+    parlayId: row.parlayId, quoteId: row.quoteId, rfqId: row.meta && row.meta.rfqId,
+    label: row.meta && row.meta.label, contracts: row.meta && row.meta.contracts,
+    userId: row.meta && row.meta.userId,
+  };
+  const confirmed = await bookConfirmedKalshiFills(pending, {
+    quoteId: row.quoteId, orderId: res && res.orderId, contracts: pending.contracts,
+  });
+  if (confirmed.newContracts > 0) {
+    sessionFilledByParlay[row.parlayId] = (sessionFilledByParlay[row.parlayId] || 0) + confirmed.newContracts;
+    filledByParlay[row.parlayId] = (filledByParlay[row.parlayId] || 0) + confirmed.newContracts;
+    releaseConfirmedFill(capBook, {
+      parlayId: row.parlayId, quoteId: row.quoteId, partial: confirmed.partial, contracts: confirmed.newContracts,
+    });
+  }
+}
+
+const holdResolver = createHoldResolver({
+  book: capBook,
+  check: (row) => (row.meta && row.meta.venue === 'polymarket'
+    ? (polyLoop && polyLoop.checkHold ? polyLoop.checkHold(row) : { state: 'unknown' })
+    : checkKalshiHold(row)),
+  onFilledUnbooked: (row, res) => (row.meta && row.meta.venue === 'polymarket'
+    ? (polyLoop && polyLoop.rebookHold ? polyLoop.rebookHold(row, res) : null)
+    : rebookKalshiHold(row, res)),
+  log: (m) => console.log(`[${MODE}] ${m}`),
+});
+
+function resolveHolds(parlayId) {
+  return holdResolver.resolveParlay(parlayId);
+}
+
 async function onQuoteExecuted(evt) {
   if (!evt) return;
   const looked = resolveFillLookup(evt);
@@ -1770,6 +1931,9 @@ async function onQuoteExecuted(evt) {
         `[${MODE}] quote_executed no portfolio fill quote_id=${quoteId} order_id=${orderId || '?'} ` +
         `quoted=${evt.contracts != null ? evt.contracts : pending.contracts} reason=${confirmed.reason}`
       );
+      // The confirm hold stays (the order may still fill). Re-check on a short
+      // ladder; a hold is only released once the fill is booked or the order is dead.
+      startKalshiFillWatch(pending, quoteId, orderId);
       return;
     }
     contracts = confirmed.newContracts;
@@ -2313,6 +2477,10 @@ async function main() {
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start tick`, e.message));
     cancelStragglersForPaused();
   }), 2000);
+  // Confirm holds are never dropped on a timer: verify the stale ones against the venue.
+  setInterval(() => {
+    holdResolver.tick().catch((e) => console.error(`[${MODE}] hold resolver`, e && e.message));
+  }, 15000);
   setInterval(unlessQuoteHot(() => {
     pollPaused().catch((e) => console.error(`[${MODE}] pause poll`, e.message));
   }), 5000);
@@ -2369,6 +2537,8 @@ async function main() {
     getOutstanding: outstandingFor,
     getParlays: () => parlays,
     filledSoFarFor,
+    freshFilledFor,
+    resolveHolds,
     killEngagedFor,
     startedFor: startedForParlay,
     logAsync: (p, rfq, d, status, extra = {}) =>

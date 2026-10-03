@@ -98,6 +98,14 @@ function isFilledOrderState(state) {
   return s === 'ORDER_STATE_FILLED' || s === 'FILLED' || isPartialOrderState(s);
 }
 
+// Order is finished without (further) fills: safe to release a confirm hold.
+function isDeadOrderState(state) {
+  const s = normalizeStatus(state);
+  return s === 'ORDER_STATE_CANCELED' || s === 'ORDER_STATE_CANCELLED' || s === 'CANCELED'
+    || s === 'CANCELLED' || s === 'ORDER_STATE_REJECTED' || s === 'REJECTED'
+    || s === 'ORDER_STATE_EXPIRED' || s === 'EXPIRED';
+}
+
 function cumQuantityOf(order) {
   if (!order || typeof order !== 'object') return 0;
   return parsePositive(
@@ -384,7 +392,20 @@ function activityAlreadyReconciled(trade, lock, bookedKeys) {
 // Same lock + caoc + size already booked under a different fill_id
 // (poly-act vs poly-recon). Used at persist time so a restart with an
 // empty seenFillIds / stale slug cache cannot insert the 06:41 twin.
-function findPolyEconomicTwin(trade, lock, bookedFills) {
+//
+// opts.live: the incoming fill is a LIVE execution (WS orderExecution / the
+// quoteExecuted order check), not a restart replay. Equal-size $10 cash RFQs
+// make equal-size genuine fills routine (91.61 at 11:45 AM and again at
+// 1:46 PM ET), so a live fill is a twin only of a same-size row booked within
+// TWIN_WINDOW_MS of it (the same fill arriving by a second path), never of
+// hours-old rows. Booking time prefers recorded_at: kalshi_created_time was
+// overwritten by the 2026-10-02 3:29 PM replay on 36 rows.
+function bookedRowRecordedMs(row) {
+  if (!row) return null;
+  return timeMsOf(row.recorded_at ?? row.created_at ?? row.kalshi_created_time ?? row.tradeTime);
+}
+
+function findPolyEconomicTwin(trade, lock, bookedFills, opts = {}) {
   const qty = sizeKey(trade && (trade.qty ?? trade.contracts ?? trade.count));
   if (!(qty > 0)) return null;
   const parlayId = (lock && lock.id) || (trade && (trade.parlayId || trade.parlay_id)) || '';
@@ -394,6 +415,8 @@ function findPolyEconomicTwin(trade, lock, bookedFills) {
   const selfId = fillIdOf(trade);
   const incomingActivity = String(selfId || '').startsWith('poly-act:');
   const tradeTs = timeMsOf(trade && (trade.tradeTime ?? trade.createTime));
+  const live = !!(opts && opts.live);
+  const refTs = tradeTs != null ? tradeTs : (live ? ((opts && opts.nowMs) || Date.now()) : null);
   for (const row of bookedFills || []) {
     if (!isPolyFillRecord(row)) continue;
     if (selfId && fillIdOf(row) === selfId) continue;
@@ -403,6 +426,9 @@ function findPolyEconomicTwin(trade, lock, bookedFills) {
       if (isActivityFillRecord(row)) continue;
       const rowTs = bookedRowTimeMs(row);
       if (rowTs != null && tradeTs != null && Math.abs(rowTs - tradeTs) > TWIN_WINDOW_MS) continue;
+    } else if (live) {
+      const rowTs = bookedRowRecordedMs(row);
+      if (rowTs != null && refTs != null && Math.abs(rowTs - refTs) > TWIN_WINDOW_MS) continue;
     }
     const rowPid = parlayIdOfRecord(row);
     const rowSlug = slugOfRecord(row);
@@ -411,6 +437,24 @@ function findPolyEconomicTwin(trade, lock, bookedFills) {
     if ((parlayId && rowPid === parlayId) || (slug && rowSlug === slug)) return row;
   }
   return null;
+}
+
+// Live quote-path fill (confirmQuoteFill / watchdog): already booked?
+function quoteFillAlreadyBooked(evt, lock, bookedFills, opts = {}) {
+  if (!evt) return false;
+  const twin = findPolyEconomicTwin(
+    {
+      qty: evt.contracts,
+      marketSlug: evt.marketTicker || evt.marketSlug || evt.ticker || null,
+      parlay_id: evt.parlayId || (lock && lock.id) || null,
+      fill_id: evt.fillId || null,
+      tradeTime: evt.tradeTime || null,
+    },
+    lock,
+    bookedFills,
+    { live: true, nowMs: opts.nowMs },
+  );
+  return !!twin;
 }
 
 // Position fallback: any poly contracts already on this lock's caoc ticker.
@@ -1527,6 +1571,7 @@ module.exports = {
   orderStateOf,
   isFilledOrderState,
   isPartialOrderState,
+  isDeadOrderState,
   cumQuantityOf,
   contractsFromQuote,
   firstPositiveAmount,
@@ -1550,6 +1595,8 @@ module.exports = {
   alreadyBookedSameSize,
   activityAlreadyReconciled,
   findPolyEconomicTwin,
+  quoteFillAlreadyBooked,
+  bookedRowRecordedMs,
   lockHasPolyContractsForCaoc,
   selectDuplicatePolyFillsToDrop,
   slugMakerSizeAllowed,

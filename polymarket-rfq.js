@@ -126,6 +126,13 @@ const {
   reconcileLockActivityEvents,
   alreadyBookedSameSize,
   bookedActivityKeys,
+  quoteFillAlreadyBooked,
+  orderStateOf,
+  isFilledOrderState,
+  isDeadOrderState,
+  cumQuantityOf,
+  polyFillQty,
+  bookedRowRecordedMs,
 } = require('./polymarket-fill-reconcile');
 
 const MODE = 'POLY';
@@ -1560,6 +1567,96 @@ function startPolymarketRfqLoop(ctx = {}) {
     return typeof ctx.filledSoFarFor === 'function' ? ctx.filledSoFarFor(id) : 0;
   }
 
+  // Last look before a confirm: DB-fresh filled for the lock, after giving the
+  // venue a bounded chance to settle any unresolved holds on it. Never throws;
+  // a slow venue must not eat the ~3s confirm window.
+  async function lastLookFilled(parlayId) {
+    const budgetMs = ctx.lastLookBudgetMs > 0 ? ctx.lastLookBudgetMs : 900;
+    const work = (async () => {
+      if (typeof ctx.resolveHolds === 'function') {
+        try { await ctx.resolveHolds(parlayId); } catch (_) { /* best effort */ }
+      }
+      return typeof ctx.freshFilledFor === 'function' ? await ctx.freshFilledFor(parlayId) : 0;
+    })();
+    const timeout = new Promise((resolve) => {
+      const t = setTimeout(() => resolve(0), budgetMs);
+      if (t.unref) t.unref();
+    });
+    const fresh = await Promise.race([work, timeout]);
+    return Math.max(Number(fresh) || 0, filledSoFarFor(parlayId));
+  }
+
+  // Resolver check for a Polymarket confirm hold: is the fill booked, is the
+  // order dead, or did it fill at the venue without being booked?
+  async function checkHold(row) {
+    const quoteId = row.quoteId;
+    const pending = pendingQuotes.get(quoteId) || closedContext.get(quoteId) || null;
+    if (pending && pending.filledContracts > 0) return { state: 'booked' };
+    const orderId = (pending && (pending.creatorOrderId || pending.orderId))
+      || (row.meta && row.meta.orderId) || null;
+    if (!http || !orderId || typeof http.getOrder !== 'function') return { state: 'unknown' };
+    let order;
+    try { order = await http.getOrder(orderId); } catch (e) { return { state: 'unknown', error: e && e.message }; }
+    order = (order && order.order) || order;
+    if (!order) return { state: 'unknown' };
+    const cum = cumQuantityOf(order);
+    if (cum > 0 || isFilledOrderState(orderStateOf(order))) {
+      let booked = [];
+      if (typeof ctx.loadPolySlugRecords === 'function') {
+        try { booked = (await ctx.loadPolySlugRecords()) || []; } catch (_) { booked = []; }
+      }
+      const since = (row.at != null ? row.at : 0) - 120000;
+      const hit = booked.some((b) => {
+        if (b.parlay_id && b.parlay_id !== row.parlayId) return false;
+        const qty = polyFillQty(b);
+        if (!(qty > 0) || !(cum > 0) || Math.abs(qty - cum) > Math.max(0.02, cum * 0.005)) return false;
+        const at = bookedRowRecordedMs(b);
+        return at == null || at >= since;
+      });
+      return hit ? { state: 'booked', contracts: cum } : { state: 'filled_unbooked', contracts: cum, orderId };
+    }
+    if (isDeadOrderState(orderStateOf(order))) return { state: 'cancelled' };
+    return { state: 'open' };
+  }
+
+  // Resolver action: book a fill the venue reports but we never booked.
+  async function rebookHold(row, res) {
+    const pending = pendingQuotes.get(row.quoteId) || closedContext.get(row.quoteId)
+      || {
+        parlayId: row.parlayId, quoteId: row.quoteId, rfqId: row.meta && row.meta.rfqId,
+        label: row.meta && row.meta.label, contracts: row.meta && row.meta.contracts,
+        maxContracts: row.meta && row.meta.maxContracts, userId: row.meta && row.meta.userId,
+        creatorOrderId: res && res.orderId,
+      };
+    return confirmQuoteFill(
+      { id: row.quoteId, quoteId: row.quoteId, rfqId: pending.rfqId, creatorOrderId: pending.creatorOrderId || (res && res.orderId) },
+      pending,
+      row.quoteId,
+      { live: true },
+    );
+  }
+
+  // Fast watchdog: a quoteExecuted order can show FILLED a beat after the event.
+  // Re-check on a short ladder instead of waiting for the 20s activity reconcile.
+  const FAST_WATCH_MS = Array.isArray(ctx.fastWatchMs) ? ctx.fastWatchMs : [3000, 10000, 25000, 60000, 120000];
+  function startFillWatch(quote, pending, quoteId) {
+    if (!quoteId || !http || ctx.fastWatch === false) return;
+    FAST_WATCH_MS.forEach((ms) => {
+      const t = setTimeout(() => {
+        if (stopped) return;
+        const p = pendingQuotes.get(quoteId) || pending;
+        if (p && p.filledContracts > 0) return;
+        if (!capBook.has(p && p.parlayId, quoteId) && !pendingQuotes.has(quoteId)) return;
+        confirmQuoteFill(quote, p, quoteId, { live: true }).then((evt) => {
+          if (evt && evt.contracts > 0) {
+            console.log(`[${MODE}] WATCHDOG booked quote_id=${quoteId} contracts=${evt.contracts} after ${ms}ms`);
+          }
+        }).catch((e) => console.error(`[${MODE}] fill watchdog`, e && e.message));
+      }, ms);
+      if (t.unref) t.unref();
+    });
+  }
+
   function startedFor(p, rfq) {
     if (typeof ctx.startedFor === 'function') return ctx.startedFor(p, rfq);
     return findStartedEvent(rfq, p);
@@ -1947,6 +2044,14 @@ function startPolymarketRfqLoop(ctx = {}) {
         maxContracts: pending.maxContracts,
         size: want,
         getFilled: () => filledSoFarFor(pending.parlayId),
+        lastLook: () => lastLookFilled(pending.parlayId),
+        onLastLookRaise: (info) => console.warn(
+          `[${MODE}] LAST LOOK raised filled ${info.memory} -> ${info.fresh} lock=${pending.parlayId} quote_id=${quoteId}`
+        ),
+        meta: {
+          venue: 'polymarket', rfqId, label: pending.label, contracts: pending.contracts,
+          maxContracts: pending.maxContracts, userId: pending.userId,
+        },
         getOpenHeld: () => outstandingFor(pending.parlayId, quoteId),
         confirm: () => http.confirmQuote(rfqId, quoteId),
         onExceed: async (info) => {
@@ -2062,14 +2167,15 @@ function startPolymarketRfqLoop(ctx = {}) {
       `quote_id=${quoteId || '?'} rfq=${q.rfqId || (pending && pending.rfqId) || '?'} ` +
       `creatorOrderId=${q.creatorOrderId || q.creator_order_id || '?'}`
     );
-    confirmQuoteFill(q, pending, quoteId).catch((e) => {
+    confirmQuoteFill(q, pending, quoteId, { live: true }).catch((e) => {
       console.error(`[${MODE}] quoteExecuted fill-check`, e && e.message);
     });
+    startFillWatch(q, pending, quoteId);
   }
 
   const seenReconciledQuotes = new Set();
 
-  async function confirmQuoteFill(quote, pending, pendingId) {
+  async function confirmQuoteFill(quote, pending, pendingId, opts = {}) {
     if (!http) return null;
     const already = pending && pending.filledContracts ? pending.filledContracts : 0;
     let fromDb = 0;
@@ -2089,13 +2195,15 @@ function startPolymarketRfqLoop(ctx = {}) {
     if (typeof ctx.loadPolySlugRecords === 'function') {
       try { bookedPrior = bookedPrior.concat((await ctx.loadPolySlugRecords()) || []); } catch (_) { /* keep prior */ }
     }
-    if (alreadyBookedSameSize(
-      evt,
-      { id: evt.parlayId || (pending && pending.parlayId) },
-      bookedActivityKeys({ bookedFills: bookedPrior })
-    )) {
-      return null;
-    }
+    const lockRef = { id: evt.parlayId || (pending && pending.parlayId) };
+    // Live fills are a twin only of a same-size row booked within the twin
+    // window (the same fill via another path). Same size alone is routine for
+    // repeated $10 cash RFQs and must never drop a genuine fill.
+    const isTwin = opts.live
+      ? quoteFillAlreadyBooked(evt, lockRef, bookedPrior)
+      : alreadyBookedSameSize(evt, lockRef, bookedActivityKeys({ bookedFills: bookedPrior }));
+    if (isTwin) return null;
+    if (opts.live) evt.live = true;
     if (pending && evt.contracts > 0) {
       pending.filledContracts = (pending.filledContracts || 0) + evt.contracts;
     }
@@ -2235,6 +2343,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         pending.filledContracts = (pending.filledContracts || 0) + evt.contracts;
       }
       if (!pending && !(evt.contracts > 0)) evt.contracts = null;
+      evt.live = true;
       emitOrderFill(evt);
       if (typ === 'EXECUTION_TYPE_FILL' && pendingId) pendingQuotes.delete(pendingId);
       console.log(
@@ -2636,6 +2745,9 @@ function startPolymarketRfqLoop(ctx = {}) {
     handleQuoteExecuted,
     handleOrderExecution,
     confirmQuoteFill,
+    checkHold,
+    rebookHold,
+    lastLookFilled,
     reconcileLockFills,
     onWsEvent,
     cancelStartedQuotes,
