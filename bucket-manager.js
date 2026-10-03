@@ -14,7 +14,9 @@
 // balance_dollars as the exact fixed-point string. portfolio_value is
 // integer cents on the requested exchange_index.
 // https://docs.kalshi.com/api-reference/portfolio/get-balance
-// Shard total for the ceiling is available + portfolio_value.
+// The ceiling is measured on shard 1 available cash only. Open-position value
+// (portfolio_value) is shown in status/alerts but does not count toward it, so
+// locked positions never block a top-up.
 //
 // KALSHI_BUCKET_AUTO defaults to off: log the decision, do not POST.
 // KALSHI_BUCKET_SWEEP defaults to off.
@@ -281,10 +283,8 @@ function planBucketAction({
   };
 
   if (gap > 0) {
-    const headroom = Math.min(
-      config.ceilingCents - totalCents,
-      config.ceilingCents - bucketAvailableCents,
-    );
+    // Ceiling on available cash only (open positions do not count).
+    const headroom = config.ceilingCents - bucketAvailableCents;
     const spare = mainAvailableCents - config.floorCents;
     const dailyLeft = config.dailyCapCents - (dailyTopupCents || 0);
     let amount = gap;
@@ -1075,7 +1075,7 @@ function createBucketManager({
         const blockedWhy = {
           floor: `Main (shard 0) is at or under the ${formatDollarsFromCents(config.floorCents)} floor`,
           daily_cap: `Today's auto-transfers hit the ${formatDollarsFromCents(config.dailyCapCents)} daily cap`,
-          ceiling: `Shard 1 is at the ${formatDollarsFromCents(config.ceilingCents)} ceiling`,
+          ceiling: `Shard 1 is at the ${formatDollarsFromCents(config.ceilingCents)} ceiling on available cash`,
         }[reason] || reason;
         const ok = await inApp({
           kind: 'bucket_blocked',
@@ -1099,8 +1099,8 @@ function createBucketManager({
           `shard 1 available ${formatDollarsFromCents(shards.bucket.availableCents)}, ` +
           `target ${formatDollarsFromCents(decision.targetCents)}, ` +
           `need ${formatDollarsFromCents(Math.max(0, decision.gapCents))}\n` +
-          `shard 1 total ${formatDollarsFromCents(decision.totalCents)}, ` +
-          `ceiling ${formatDollarsFromCents(config.ceilingCents)}\n` +
+          `shard 1 open positions ${formatDollarsFromCents(Math.max(0, decision.totalCents - shards.bucket.availableCents))}, ` +
+          `ceiling on available cash ${formatDollarsFromCents(config.ceilingCents)}\n` +
           `shard 0 available ${formatDollarsFromCents(shards.main.availableCents)}, ` +
           `floor ${formatDollarsFromCents(config.floorCents)}\n` +
           `daily auto-transferred ${formatDollarsFromCents(dailySpent(date))} ` +
@@ -1272,7 +1272,7 @@ function createBucketManager({
       `interval=${config.intervalMin}m ` +
       `target gameday=${formatDollarsFromCents(config.targetGamedayCents)} ` +
       `default=${formatDollarsFromCents(config.targetDefaultCents)} ` +
-      `ceiling=${formatDollarsFromCents(config.ceilingCents)} ` +
+      `ceiling=${formatDollarsFromCents(config.ceilingCents)}(available cash) ` +
       `floor=${formatDollarsFromCents(config.floorCents)} ` +
       `max=${formatDollarsFromCents(config.maxTransferCents)} ` +
       `daily=${formatDollarsFromCents(config.dailyCapCents)} ` +
