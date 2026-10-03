@@ -43,7 +43,8 @@
 // (default off) is what stops open quotes from reserving; these checks stay on.
 'use strict';
 const { matchParlay } = require('./rfq');
-const { decideAtFill, isFreeBetRow, quoteFailureSkipReason } = require('./engine');
+const { decideAtFill, isFreeBetRow, quoteFailureSkipReason, isRfqClosedFailure } = require('./engine');
+const { createLatencyStats } = require('./latency-stats');
 const { findStartedEvent } = require('./started');
 const {
   RESERVE_TTL_MS,
@@ -705,6 +706,7 @@ function evaluatePolymarketRfq({
   startedFor,
   killEngaged,
   markets,
+  exactTarget,
 } = {}) {
   const rfq = raw && raw.map ? raw : normalizePolymarketRfq(raw);
   if (!rfq || !rfq.rfqId) return { action: 'skip', reason: 'bad_rfq' };
@@ -759,6 +761,7 @@ function evaluatePolymarketRfq({
     fillAmerican: parlay.fill_american,
     cashOrderQty: rfq.cashOrderQty,
     qtyDecimal: rfq.qtyDecimal,
+    exact: exactTarget,
   });
   if (!shouldPostPolymarketQuote(quote)) {
     return { action: 'skip', reason: 'bad_size', rfq, parlay, quote };
@@ -782,6 +785,9 @@ function evaluatePolymarketRfq({
     // (size > min(remaining, per-fill cap)) are declined as rfq_too_large.
     allowPartial: false,
     isFreeBet: isFreeBetRow(parlay),
+    // Price actually sent + credited maker rebate: hit/miss/worst are computed at it, and with
+    // POLY_EXACT_TARGET the quote is refused unless price + rebate >= the lock target.
+    polyQuote: { buyPrice: quote.buyPrice, credit: quote.rebateCredit, enforce: quote.exact },
   });
   if (!decision.ok) {
     return {
@@ -1683,15 +1689,22 @@ function startPolymarketRfqLoop(ctx = {}) {
 
   const intake = ctx.intakeStats || createPolyIntakeStats();
   const wsSeen = createWsSeenSet();
+  // Quote-path latency (same histograms as Kalshi): RFQ age when a lock-matched RFQ reaches us (intake_ms),
+  // match -> POST done (quote_ms), RFQ age when the POST returned (posted_age_ms), late/failed/stale counts.
+  const latency = ctx.latencyStats || createLatencyStats();
+  // WS-delivered RFQs older than this are late deliveries (reconnect gap / backlog): skip instead of quoting a
+  // dead auction. REST-crawled RFQs are exempt (an open RFQ found by a crawl is still quotable). 0 = off.
+  const staleRfqMs = ctx.staleRfqMs != null ? ctx.staleRfqMs : envIntLocal('POLY_STALE_RFQ_MS', 30000);
 
   // Every RFQ the Poly path handles is tallied (seen / source / reason).
   async function handleRfq(raw, src) {
-    const out = await handleRfqCore(raw);
+    const out = await handleRfqCore(raw, src);
     try { intake.recordOutcome(out, src); } catch (_) { /* observability only */ }
     return out;
   }
 
-  async function handleRfqCore(raw) {
+  async function handleRfqCore(raw, src) {
+    const tMatch0 = Date.now();
     const locks = parlays();
     let rfq = normalizePolymarketRfq(raw);
     if (!rfq || !rfq.rfqId) return { action: 'skip', reason: 'bad_rfq' };
@@ -1740,6 +1753,20 @@ function startPolymarketRfqLoop(ctx = {}) {
       killEngaged: killEngagedFor,
     });
 
+    let intakeAgeMs = null;
+    if (evaluation.parlay) intakeAgeMs = latency.noteIntake(rfq.createdTime);
+    if (
+      evaluation.action === 'quoteable' && src === 'ws' && staleRfqMs > 0
+      && intakeAgeMs != null && intakeAgeMs > staleRfqMs
+    ) {
+      latency.noteStaleSkip();
+      const n = latency.staleSkipsTotal();
+      if (n <= 5 || n % 50 === 0) {
+        console.log(`[${MODE}] STALE RFQ skipped rfq=${rfq.rfqId} age=${Math.round(intakeAgeMs)}ms (> ${staleRfqMs}ms) n=${n}`);
+      }
+      return { action: 'skip', reason: 'stale_rfq', rfq, parlay: evaluation.parlay };
+    }
+
     if (evaluation.action !== 'quoteable') {
       logSkip(evaluation);
       if (
@@ -1787,6 +1814,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     pendingQuotes.set(reserveKey, pendingEntry(p, rfq, d.contracts, sizeMeta));
     try {
       const posted = await http.createQuote(quoteBodyFromEval(evaluation));
+      latency.notePost({ totalMs: Date.now() - tMatch0, createdTs: rfq.createdTime, ok: true });
       const quoteId = posted && (posted.quoteId || posted.id);
       pendingQuotes.delete(reserveKey);
       if (quoteId) {
@@ -1796,7 +1824,9 @@ function startPolymarketRfqLoop(ctx = {}) {
       console.log(
         `[${MODE}] QUOTED ${p.label} rfq=${rfq.rfqId} quote_id=${quoteId || '?'} ` +
         `buy=${q.buyPrice} sell=${q.sellPrice} contracts=${d.contracts} ` +
-        `${exposureBit(outstandingFor(p.id))}/${d.totalLimit}`
+        `${exposureBit(outstandingFor(p.id))}/${d.totalLimit} ` +
+        `fill=${p.fill_american} eff=${d.quotedEffAmerican} rebate_c=${(((d.rebateCredit || 0) * 100)).toFixed(3)} ` +
+        `exact=${q.exact ? 1 : 0} ms=${Date.now() - tMatch0}`
       );
       persistLockTape(evaluation, 'quoted', {
         quote_id: quoteId, is_live: true, contracts: d.contracts,
@@ -1813,6 +1843,10 @@ function startPolymarketRfqLoop(ctx = {}) {
       return { ...evaluation, post: true, quoteId };
     } catch (e) {
       pendingQuotes.delete(reserveKey);
+      latency.notePost({
+        totalMs: Date.now() - tMatch0, createdTs: rfq.createdTime, ok: false,
+        rfqClosed: isRfqClosedFailure(e && e.message) || /closed|not[_ ]?open|expired/i.test(String((e && e.message) || '')),
+      });
       console.error(`[${MODE}] POST FAILED ${p.label} rfq=${rfq.rfqId}`, e.message);
       const skipReason = quoteFailureSkipReason(e.message);
       if (skipReason) {
@@ -2675,6 +2709,16 @@ function startPolymarketRfqLoop(ctx = {}) {
       if (top.length) snap.rest_429_paths = top.map(([k, x]) => `${k}:${x.hits}`).join('|');
     }
     console.log(formatPolyHeartbeat(snap));
+    try {
+      snap.latency = latency.rollInterval();
+      const L = snap.latency;
+      console.log(
+        `[POLY-LATENCY] interval=${L.interval_s}s posted=${L.posted} failed=${L.post_failed} rfq_closed=${L.rfq_closed} ` +
+        `late_posts=${L.late_posts}(>${L.late_post_ms}ms) quote_ms p50=${L.quote_ms.p50} p99=${L.quote_ms.p99} max=${L.quote_ms.max} ` +
+        `intake_age_ms p50=${L.intake_ms.p50} p99=${L.intake_ms.p99} max=${L.intake_ms.max} n=${L.intake_ms.n}` +
+        (L.stale_skipped ? ` stale_skipped=${L.stale_skipped}` : '')
+      );
+    } catch (_) { /* observability only */ }
     if (typeof ctx.onPolyHeartbeat === 'function') {
       try { ctx.onPolyHeartbeat(snap); } catch (_) { /* observability only */ }
     }
@@ -2693,6 +2737,43 @@ function startPolymarketRfqLoop(ctx = {}) {
       crawlAllOpenRfqs().catch((e) => console.error(`[${MODE}] crawl`, e.message));
     }, crawlMs);
     if (crawlTimer.unref) crawlTimer.unref();
+  }
+  // Keep the quote Pool's sockets hot, and keep line/prop leg market metadata cached, so the first RFQ in a
+  // burst pays neither a TLS handshake nor a market GET.
+  let warmTimer = null;
+  let prewarmTimer = null;
+  const warmMs = ctx.quoteWarmMs != null ? ctx.quoteWarmMs : envIntLocal('POLY_QUOTE_WARM_MS', 15000);
+  if (live && http && typeof http.warmQuotePool === 'function' && warmMs > 0 && ctx.startWs !== false) {
+    const warmOnce = () => http.warmQuotePool().then((r) => {
+      if (r && !r.ok && r.reason !== 'backoff') console.warn(`[${MODE}] quote warm failed ${r.error || r.statusCode || r.reason || ''}`);
+    }).catch(() => {});
+    warmOnce();
+    warmTimer = setInterval(warmOnce, warmMs);
+    if (warmTimer.unref) warmTimer.unref();
+  }
+  async function prewarmMarkets() {
+    if (stopped || !http) return 0;
+    const seen = new Set();
+    for (const p of parlays() || []) {
+      for (const leg of (p && p.legs) || []) {
+        const sym = polymarketLegSymbol(leg);
+        if (sym) seen.add(sym);
+      }
+    }
+    let n = 0;
+    for (const sym of seen) {
+      if (stopped) break;
+      if (marketCache.peek(sym) && marketCache.peek(sym).market) continue;
+      try { await marketCache.get(sym); n += 1; } catch (_) { /* cache stores the miss */ }
+      await new Promise((r) => setTimeout(r, 250)); // gentle on the REST limiter
+    }
+    return n;
+  }
+  if (enableLocks && ctx.startWs !== false && ctx.prewarmMarkets !== false) {
+    const first = setTimeout(() => { prewarmMarkets().catch(() => {}); }, 8000);
+    if (first.unref) first.unref();
+    prewarmTimer = setInterval(() => { prewarmMarkets().catch(() => {}); }, 5 * 60 * 1000);
+    if (prewarmTimer.unref) prewarmTimer.unref();
   }
   const heartbeatTimer = heartbeatMs > 0 ? setInterval(emitPolyHeartbeat, heartbeatMs) : null;
   if (heartbeatTimer && heartbeatTimer.unref) heartbeatTimer.unref();
@@ -2729,6 +2810,8 @@ function startPolymarketRfqLoop(ctx = {}) {
       clearInterval(reconcileTimer);
       if (crawlTimer) clearInterval(crawlTimer);
       if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (warmTimer) clearInterval(warmTimer);
+      if (prewarmTimer) clearInterval(prewarmTimer);
       clearInterval(ttlTimer);
       clearInterval(fillReconcileTimer);
       if (fillTimer) clearInterval(fillTimer);
@@ -2739,6 +2822,8 @@ function startPolymarketRfqLoop(ctx = {}) {
     crawlAllOpenRfqs,
     emitPolyHeartbeat,
     intake,
+    latency,
+    prewarmMarkets,
     wsSeen,
     handleQuoteAccepted,
     handleRfqClosed,

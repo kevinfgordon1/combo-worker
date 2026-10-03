@@ -265,7 +265,15 @@ const W2 = 'astatc-nfl-pit-cle-2026-10-01-td-deswat-gte2';
     assert.ok(ev.polyStartMs != null);
     const q = ev.quote;
     assert.strictEqual(q.sellPrice, '0');
-    assert.ok(Number(q.buyPrice) > 0 && Number(q.buyPrice) <= 1 / (1 + lock.fill_american / 100) + 1e-9 + 0.0005, `never worse than lock ${q.buyPrice}`);
+    {
+      // POLY_EXACT_TARGET (default on): price + maker rebate never nets below the lock target, and is never
+      // more than the rebate (theta/4) below it or one tick above it.
+      const target = 1 / (1 + lock.fill_american / 100);
+      const px = Number(q.buyPrice);
+      assert.ok(px > 0 && px <= 1, `price ${q.buyPrice}`);
+      assert.ok(px + (ev.quote.rebateCredit || 0) + 1e-9 >= target, `never worse than lock ${q.buyPrice} vs ${target}`);
+      assert.ok(px <= target + 0.001 + 1e-9 && px >= target - 0.0032, `within a tick of lock ${q.buyPrice} vs ${target}`);
+    }
     // leg order irrelevant
     assert.ok(matchOf(mkRfq(legs.slice().reverse()), [lock]).parlay);
     // flip every leg's side (BUY->SELL): never matches

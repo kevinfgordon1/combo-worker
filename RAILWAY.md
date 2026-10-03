@@ -183,6 +183,15 @@ npm test
 - Poly REST crawl pauses (bounded) while a Kalshi quote POST/confirm is in flight.
 - Heartbeat: `[LATENCY]` log line + `combo_worker_stats.latency` jsonb (migration `20261002_combo_worker_stats_latency.sql`): `quote_ms`, `intake_ms` (RFQ age at our handler), `posted_age_ms` histograms, `late_posts` (>1s), `rfq_closed`, `stale_skipped`, reconnects by reason, `resubscribe_gap_max_ms`, `loop_lag_ms`.
 
+## Polymarket exact-target pricing and burst-latency knobs
+
+- `POLY_EXACT_TARGET` (default on; `0`/`false`/`off`/`no` restores the old floor-to-tick price) — Polymarket `buyPrice` is the lowest 0.001 tick where `price + guaranteed maker rebate >= lock target` (`ceil(target)` when the rebate cannot be credited). Rebate = `theta*p*(1-p)` per contract (theta `POLY_MAKER_REBATE_THETA`, default `0.0125`), credited only on fills of at least `POLY_REBATE_MIN_CONTRACTS` (default `40`) and net of half a cent of per-fill rounding. The engine refuses a quote whose net is below target (`quote_below_target`) and computes hit/miss/worst at the price sent. Read per RFQ, so a flip needs no restart for new quotes after a redeploy of env.
+- `POLY_STALE_RFQ_MS` (default `30000`, `0` disables) — WS-delivered RFQs older than this are skipped, not quoted (REST-crawled RFQs are exempt).
+- `POLY_QUOTE_WARM_MS` (default `15000`) — warm all quote-pool sockets this often.
+- Polymarket HTTP uses an undici `Pool` of 4 sockets for reads and a separate lazily-created `Pool` of 3 for quote POST/PUT/DELETE (was a single-socket `Client`); connect 2.5s, headers/body 8s on the quote pool.
+- Active lock leg market metadata is prefetched every 5 min so the first line/prop RFQ in a burst pays no market GET.
+- Heartbeat: `[POLY-LATENCY]` log line and `latency` inside the `combo_worker_stats.poly` jsonb (same histograms as Kalshi: `quote_ms`, `intake_ms`, `posted_age_ms`, `late_posts`, `rfq_closed`, `stale_skipped`). The `[POLY] QUOTED` line now carries `fill`, `eff`, `rebate_c`, `exact`, `ms`.
+
 ## Success checks after you deploy
 
 - Combo Locks logs: `WORKER_MODE=combo` and `Unhedged /markets, fill ticks, and shadow miss are off`.
