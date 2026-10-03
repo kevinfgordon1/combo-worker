@@ -2643,7 +2643,12 @@ function startPolymarketRfqLoop(ctx = {}) {
         lastWsStallAt = Date.now();
         console.error(
           `[${MODE}] WS STALL no message for ${Math.round(info.silentMs / 1000)}s ` +
-          `(stalls=${info.stalls}) - terminating socket and reconnecting`
+          `(stalls=${info.stalls}) - terminating socket and reconnecting | cause: ` +
+          `lastMsg=${info.lastMessageType || 'none'} msSinceLastMsg=${info.silentMs} ` +
+          `msgsOnSocket=${info.messagesThisConn} socketAgeMs=${info.socketAgeMs} ` +
+          `readyState=${info.readyState} ping=${info.ping ? info.ping.state : 'n/a'} ` +
+          `pings=${info.ping ? info.ping.sent : 0}/pongs=${info.ping ? info.ping.pongs : 0} ` +
+          `msSinceLastPong=${info.ping && info.ping.msSinceLastPong != null ? info.ping.msSinceLastPong : 'n/a'}`
         );
         if (typeof ctx.onWsStall === 'function') {
           try { Promise.resolve(ctx.onWsStall(info)).catch(() => {}); } catch (_) { /* observability only */ }

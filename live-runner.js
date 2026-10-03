@@ -190,6 +190,7 @@ const { formatAlertStatus } = require('./venue-alert');
 const { createBucketManager } = require('./bucket-manager');
 const { splitPaused, diffPaused, createPausePoller } = require('./lock-pause');
 const { createAppAlerts } = require('./app-alerts');
+const { createPolyStallAlerts } = require('./poly-stall-alert');
 const { createPartialQuoteDryRun, isPartialQuoteFlagOn } = require('./partial-quote');
 
 const MODE = 'LIVE';
@@ -2530,6 +2531,8 @@ async function main() {
   );
 
   const polyAppAlerts = createAppAlerts({ client: supabase });
+  const polyStallAlerts = createPolyStallAlerts({ appAlerts: polyAppAlerts, log: console.log });
+  { const t = setInterval(() => { polyStallAlerts.tick().catch(() => {}); }, 30000); if (t.unref) t.unref(); }
   const poly = startPolymarketRfqLoop({
     pendingQuotes: polyPendingQuotes,
     kalshiPendingQuotes: pendingQuotes,
@@ -2555,17 +2558,10 @@ async function main() {
     sendAlert,
     onPolyHeartbeat: (snap) => { polyHeartbeatSnap = snap; },
     // Silent Poly WS stall (socket open, no messages): the client terminates +
-    // reconnects; here we leave an in-app alert row (one unresolved row max).
-    onWsStall: (info) => polyAppAlerts.raise({
-      kind: 'poly_ws_stall',
-      severity: 'warn',
-      title: 'Polymarket RFQ WebSocket stalled - reconnecting',
-      body: `No Polymarket WS message for ${Math.round((info.silentMs || 0) / 1000)}s while RFQ flow is expected. ` +
-        'Socket terminated and reconnected; REST crawl is covering intake meanwhile.',
-      dedupeKey: 'poly_ws_stall',
-      meta: { silent_ms: info.silentMs, stalls: info.stalls, reconnects: info.reconnects, service: 'combo-worker' },
-    }),
-    onWsRecovered: () => polyAppAlerts.resolve(['poly_ws_stall']),
+    // reconnects. A self-healed stall is an INFO row resolved on recovery (hidden
+    // from the banner); 3+ stalls/hour or an unrecovered one escalates to WARN.
+    onWsStall: (info) => polyStallAlerts.onStall(info),
+    onWsRecovered: () => polyStallAlerts.onRecovered(),
     // Poly REST crawl pages wait while a Kalshi quote POST/confirm is in flight.
     shouldPause: () => quoteHot.inFlight,
     counts,
