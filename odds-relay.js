@@ -2085,7 +2085,7 @@ const novigFeed = (() => {
   // live is a reserved lane: in-game hot polls go first. Every LIVE_RUN_MAX
   // live grants one waiting non-live request is served, so catalog refreshes
   // and main-line searches still progress (>= 1 in LIVE_RUN_MAX + 1 slots).
-  const LIVE_RUN_MAX = 3;
+  const LIVE_RUN_MAX = 4;
 
   function createLimiter({ rps = 1.8, concurrency = 2, now = () => Date.now(), liveRunMax = LIVE_RUN_MAX } = {}) {
     let tokens = Math.max(1, rps);
@@ -2094,7 +2094,10 @@ const novigFeed = (() => {
     let pausedUntil = 0;
     let rate = rps;
     let slowUntil = 0;
-    const queues = { live: [], high: [], mid: [], low: [] };
+    // live = in-game moneylines; liveSide = in-game spreads / totals. Both are
+    // the reserved live lane; moneylines go first, so on a heavy night the
+    // side markets slow down and the moneyline keeps its ~2s cadence.
+    const queues = { live: [], liveSide: [], high: [], mid: [], low: [] };
     let liveRun = 0;
     // Weighted round robin 4:2:1: hot polls, main-line searches, then everything else.
     const pattern = ['high', 'high', 'mid', 'high', 'low', 'high', 'mid'];
@@ -2111,11 +2114,12 @@ const novigFeed = (() => {
       refill();
       const t = now();
       const others = () => queues.high.length + queues.mid.length + queues.low.length;
-      const waiting = () => queues.live.length + others();
+      const liveWaiting = () => queues.live.length + queues.liveSide.length;
+      const waiting = () => liveWaiting() + others();
       while (waiting() && active < concurrency && tokens >= 1 && t >= pausedUntil) {
         let q = null;
-        if (queues.live.length && (liveRun < liveRunMax || !others())) {
-          q = queues.live;
+        if (liveWaiting() && (liveRun < liveRunMax || !others())) {
+          q = queues.live.length ? queues.live : queues.liveSide;
           liveRun += 1;
         } else {
           liveRun = 0;
@@ -2156,10 +2160,11 @@ const novigFeed = (() => {
         slowUntil = t + 120_000;
       },
       stats() {
-        return { rps: rate, queued: { live: queues.live.length, high: queues.high.length, mid: queues.mid.length, low: queues.low.length }, active, pausedUntil };
+        return { rps: rate, queued: { live: queues.live.length, liveSide: queues.liveSide.length, high: queues.high.length, mid: queues.mid.length, low: queues.low.length }, active, pausedUntil };
       },
       clear() {
         queues.live.length = 0;
+        queues.liveSide.length = 0;
         queues.high.length = 0;
         queues.mid.length = 0;
         queues.low.length = 0;
@@ -2192,6 +2197,12 @@ const novigFeed = (() => {
     const cfg = {
       hotMs: Number(env.NOVIG_HOT_POLL_MS) || opts.hotMs || 2000,
       hotSideMs: Number(env.NOVIG_HOT_SIDE_POLL_MS) || opts.hotSideMs || 4000,
+      // An in-game market whose moneyline is already decided (a side at 3 cents
+      // or less) cannot move much: poll it slowly so the budget goes to games
+      // that are still being played. It speeds back up the moment the price
+      // comes off the extreme.
+      decidedMs: Number(env.NOVIG_DECIDED_POLL_MS) || opts.decidedMs || 12000,
+      decidedProb: Number(env.NOVIG_DECIDED_PROB) || opts.decidedProb || 0.03,
       replicaSkewMs: Number(env.NOVIG_REPLICA_SKEW_MS) || opts.replicaSkewMs || 3000,
       // Pregame within 6h: the book moves slowly, so leave the budget to live games.
       nearMs: Number(env.NOVIG_NEAR_POLL_MS) || opts.nearMs || 6000,
@@ -2507,17 +2518,37 @@ const novigFeed = (() => {
       return true;
     }
 
+    // In-game and the moneyline fair price is at an extreme: nothing left to win.
+    function eventDecided(cat, ev) {
+      if (!ev || ev.status !== 'OPEN_INGAME') return false;
+      const mlId = mains.get(`${ev.id}|MONEY`);
+      const list = mlId && cat.groups.get(`${ev.id}|MONEY`);
+      const ml = list && list.find((row) => row.id === mlId);
+      const book = ml && books.get(ml.id);
+      if (!ml || !book || !ml.outcomes || ml.outcomes.length !== 2) return false;
+      // Both sides must be quoted, or a thin opening book would read as decided.
+      if (!bestBid(book, ml.outcomes[0].id) || !bestBid(book, ml.outcomes[1].id)) return false;
+      const p = fairProb0(book, ml);
+      return p != null && (p <= cfg.decidedProb || p >= 1 - cfg.decidedProb);
+    }
+
     function hotMarkets() {
       const out = [];
       const at = Date.now();
       for (const cat of catalogs.values()) {
+        const decided = new Map();
         for (const [key, id] of mains) {
           const list = cat.groups.get(key);
           if (!list) continue;
           const m = list.find((row) => row.id === id);
           if (!m) continue;
           const ev = cat.events.get(m.eventId);
-          out.push({ cat, key, m, ev, live: !!(ev && ev.status === 'OPEN_INGAME'), pollMs: pollMsFor(ev, at, cfg, m) });
+          let pollMs = pollMsFor(ev, at, cfg, m);
+          if (ev && ev.status === 'OPEN_INGAME') {
+            if (!decided.has(ev.id)) decided.set(ev.id, eventDecided(cat, ev));
+            if (decided.get(ev.id)) pollMs = Math.max(pollMs, cfg.decidedMs);
+          }
+          out.push({ cat, key, m, ev, live: !!(ev && ev.status === 'OPEN_INGAME'), pollMs });
         }
       }
       return out;
@@ -2535,7 +2566,7 @@ const novigFeed = (() => {
           const before = books.get(m.id);
           const beforeSeq = before ? before.seq : -2;
           // First load of a market jumps the slow rotation so a restart fills the board fast.
-          const priority = row.live ? 'live' : (row.pollMs <= cfg.nearMs ? 'high' : (before ? 'low' : 'mid'));
+          const priority = row.live ? (m.type === 'MONEY' ? 'live' : 'liveSide') : (row.pollMs <= cfg.nearMs ? 'high' : (before ? 'low' : 'mid'));
           fetchBook(m, priority).then((book) => {
             if (book && book.seq !== beforeSeq) schedulePublish(cat.league);
           }).catch(() => {});
@@ -2935,6 +2966,10 @@ const betstampRelay = (() => {
   const DEFAULT_BOOK_IDS = TRIAL_BOOK_IDS.filter((id) => id !== 196 && id !== 400);
   const MAX_HUBS = 4;
   const MAX_CLIENTS = 150;
+  // Proxy mode: markets-only polls (one Betstamp GET) every 1.5s. A route
+  // without ?parts= costs three GETs per poll, so it stays at 2.5s.
+  const PROXY_POLL_MS = 1500;
+  const LEGACY_PROXY_POLL_MS = 2500;
   const MAX_CLIENT_BACKLOG = 2 * 1024 * 1024;
 
   function truthy(raw) {
@@ -3054,22 +3089,49 @@ const betstampRelay = (() => {
       };
     }
 
-    async function fetchProxy(league, bookIds) {
+    // Proxy poll through the app's /api/betstamp-markets. The app route takes
+    // ?parts=markets[,fixtures][,teams]: a poll asks for markets alone (1
+    // Betstamp GET) and adds fixtures every ~6s and teams every ~5min, the same
+    // clocks as direct mode. A route that predates ?parts= ignores it and
+    // answers with everything (3 GETs); that is detected from the missing
+    // query.parts echo and polled at the old, slower pace.
+    async function fetchProxy(league, bookIds, cache = {}, at = Date.now()) {
+      const needFixtures = !cache.fixtures || at - cache.fixturesAt >= (cache.fixtureEveryMs || 6000);
+      const needTeams = !cache.teams || at - cache.teamsAt >= 300000;
+      const parts = ['markets'];
+      if (needFixtures) parts.push('fixtures');
+      if (needTeams) parts.push('teams');
       const u = new URL('/api/betstamp-markets', proxy);
       u.searchParams.set('league', league);
       u.searchParams.set('is_live', 'true');
       u.searchParams.set('book_ids', bookIds.join(','));
       u.searchParams.set('refresh', '1');
+      u.searchParams.set('parts', parts.join(','));
       const body = await getJson(u.toString(), {});
       if (!body || body.ok === false || !Array.isArray(body.markets)) {
         const err = new Error('betstamp proxy returned no markets');
         err.status = 502;
         throw err;
       }
+      const partial = !!(body.query && body.query.parts);
+      if (!partial) {
+        // Old route: everything came back every time.
+        cache.legacyRoute = true;
+        return {
+          markets: body.markets,
+          fixtures: Array.isArray(body.fixtures) ? body.fixtures : [],
+          teams: Array.isArray(body.teams) ? body.teams : [],
+          fetchedAt: body.fetchedAt || new Date().toISOString(),
+          pollMs: LEGACY_PROXY_POLL_MS,
+        };
+      }
+      cache.legacyRoute = false;
+      if (needFixtures && Array.isArray(body.fixtures)) { cache.fixtures = body.fixtures; cache.fixturesAt = at; }
+      if (needTeams && Array.isArray(body.teams)) { cache.teams = body.teams; cache.teamsAt = at; }
       return {
         markets: body.markets,
-        fixtures: Array.isArray(body.fixtures) ? body.fixtures : [],
-        teams: Array.isArray(body.teams) ? body.teams : [],
+        fixtures: cache.fixtures || [],
+        teams: cache.teams || [],
         fetchedAt: body.fetchedAt || new Date().toISOString(),
       };
     }
@@ -3078,7 +3140,7 @@ const betstampRelay = (() => {
       mode,
       fetch(league, bookIds, cache = {}, at = Date.now()) {
         if (mode === 'direct') return fetchDirect(league, bookIds, cache, at);
-        if (mode === 'proxy') return fetchProxy(league, bookIds);
+        if (mode === 'proxy') return fetchProxy(league, bookIds, cache, at);
         return Promise.reject(Object.assign(new Error('betstamp upstream not configured'), { status: 503 }));
       },
     };
@@ -3175,7 +3237,7 @@ const betstampRelay = (() => {
           stats.polls += 1;
           stats.lastOkAt = now();
           stats.lastError = null;
-          const base = up.markets && up.markets.length ? pollMs : quietPollMs;
+          const base = up.markets && up.markets.length ? Math.max(pollMs, up.pollMs || 0) : quietPollMs;
           wait = Math.max(base, gapMs());
         } catch (err) {
           errorsInRow += 1;
@@ -3244,7 +3306,7 @@ const betstampRelay = (() => {
   function createRegistry(opts = {}) {
     const env = opts.env || process.env;
     const upstream = opts.upstream || createUpstream({ env, fetchFn: opts.fetchFn });
-    const pollMs = Number(env.BETSTAMP_RELAY_POLL_MS) || opts.pollMs || (upstream.mode === 'proxy' ? 2500 : 2000);
+    const pollMs = Number(env.BETSTAMP_RELAY_POLL_MS) || opts.pollMs || (upstream.mode === 'proxy' ? PROXY_POLL_MS : 2000);
     const hubs = new Map();
     let clientCount = 0;
 
@@ -3339,6 +3401,290 @@ const betstampRelay = (() => {
   };
 })();
 
+// ------------------------------------------------------------------ Underdog
+// Underdog Predict phone prices pushed over SSE (GET /underdog?league=NCAAF).
+// The Pro board used to poll /api/underdog-predict every 10s per tab on top of
+// a 5s server cache, so a repriced line reached the screen 3-15s late. Now ONE
+// shared poller per league (only while a browser is subscribed) asks the app's
+// /api/underdog-predict?live=1&fresh=1&sport=<league> (1s Cloudflare bust
+// bucket, filter ids cached, 3 Underdog GETs per poll) every UNDERDOG_RELAY_POLL_MS
+// (default 2s) and pushes changed games. Needs UNDERDOG_PROXY_URL or
+// BETSTAMP_PROXY_URL (the app origin); neither set: /underdog answers 503 and
+// the board keeps its own poll.
+const underdogRelay = (() => {
+  const RELAY_LEAGUES = new Set(['NFL', 'NCAAF', 'MLB']);
+  const MAX_HUBS = 3;
+  const MAX_CLIENTS = 150;
+  const MAX_CLIENT_BACKLOG = 2 * 1024 * 1024;
+  // A poll that suddenly returns under half the games the hub holds is an
+  // upstream hiccup (the app answers games: [] on a failed Underdog fetch), not
+  // a slate that vanished. It is skipped, and only believed if it repeats.
+  const SHRINK_MIN_GAMES = 6;
+  const SHRINK_STRIKES = 3;
+
+  function gameKey(g) {
+    return String(g && g.matchId != null ? g.matchId : '');
+  }
+
+  function indexGames(list) {
+    const out = new Map();
+    for (const g of list || []) {
+      const k = gameKey(g);
+      if (!k || !g || typeof g !== 'object') continue;
+      out.set(k, { g, fp: JSON.stringify(g) });
+    }
+    return out;
+  }
+
+  function diffGames(prev, next) {
+    const up = [];
+    const rm = [];
+    for (const [k, row] of next) {
+      const old = prev.get(k);
+      if (!old || old.fp !== row.fp) up.push(row.g);
+    }
+    for (const k of prev.keys()) if (!next.has(k)) rm.push(k);
+    return { up, rm };
+  }
+
+  function createUpstream({ env = process.env, fetchFn = (...a) => fetch(...a), timeoutMs = 9000 } = {}) {
+    const proxy = String(env.UNDERDOG_PROXY_URL || env.BETSTAMP_PROXY_URL || '').trim().replace(/\/+$/, '');
+    const mode = proxy ? 'proxy' : 'off';
+    return {
+      mode,
+      async fetch(league) {
+        if (mode === 'off') throw Object.assign(new Error('underdog upstream not configured'), { status: 503 });
+        const u = new URL('/api/underdog-predict', proxy);
+        u.searchParams.set('live', '1');
+        u.searchParams.set('fresh', '1');
+        u.searchParams.set('sport', league);
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+        try {
+          const res = await fetchFn(u.toString(), { signal: ctrl.signal, headers: { accept: 'application/json', 'user-agent': 'aibetbuilder-odds-relay' } });
+          const text = await res.text();
+          let body = null;
+          try { body = text ? JSON.parse(text) : null; } catch (_) { body = null; }
+          if (!res.ok) throw Object.assign(new Error(`underdog proxy ${res.status}`), { status: res.status });
+          if (!body || body.ok === false || !Array.isArray(body.games)) {
+            throw Object.assign(new Error((body && body.error) || 'underdog proxy returned no games'), { status: 502 });
+          }
+          return { games: body.games, fetchedAt: new Date().toISOString() };
+        } finally {
+          clearTimeout(timer);
+        }
+      },
+    };
+  }
+
+  function createHub({
+    league, upstream, pollMs = 2000, idleStopMs = 8000, maxBackoffMs = 15000,
+    now = () => Date.now(), log = () => {}, onEmpty = () => {},
+  }) {
+    const clients = new Set();
+    let games = new Map();
+    let seq = 0;
+    let hasSnapshot = false;
+    let running = false;
+    let stopped = false;
+    let timer = null;
+    let idleTimer = null;
+    let errorsInRow = 0;
+    let shrinks = 0;
+    const stats = { polls: 0, errors: 0, events: 0, lastOkAt: 0, lastError: null, lastPollMs: 0, games: 0, skippedShrinks: 0 };
+
+    const frame = (payload) => `event: ud\ndata: ${JSON.stringify(payload)}\n\n`;
+    const meta = (kind, extra) => ({ v: 1, kind, seq, t: now(), league, ...extra });
+    function send(client, text) {
+      try {
+        client.write(text);
+        if ((client.backlog ? client.backlog() : 0) > MAX_CLIENT_BACKLOG) client.close();
+      } catch (_) { /* gone */ }
+    }
+    function broadcast(payload) {
+      stats.events += 1;
+      const text = frame(payload);
+      for (const c of clients) send(c, text);
+    }
+    const snapshotPayload = () => meta('snapshot', { fetchedAt: stats.lastFetchedAt || null, games: [...games.values()].map((r) => r.g) });
+
+    function apply(up) {
+      const next = indexGames(up.games);
+      stats.lastFetchedAt = up.fetchedAt || null;
+      if (hasSnapshot && games.size >= SHRINK_MIN_GAMES && next.size < games.size / 2) {
+        shrinks += 1;
+        stats.skippedShrinks += 1;
+        if (shrinks < SHRINK_STRIKES) return false;
+      }
+      shrinks = 0;
+      const { up: ups, rm } = diffGames(games, next);
+      games = next;
+      stats.games = next.size;
+      seq += 1;
+      if (!hasSnapshot) {
+        hasSnapshot = true;
+        broadcast(snapshotPayload());
+        return true;
+      }
+      if (!ups.length && !rm.length) {
+        broadcast(meta('tick', { fetchedAt: stats.lastFetchedAt }));
+        return true;
+      }
+      broadcast(meta('delta', { fetchedAt: stats.lastFetchedAt, up: ups, rm }));
+      return true;
+    }
+
+    async function loop() {
+      if (running) return;
+      running = true;
+      while (!stopped && clients.size) {
+        const t0 = now();
+        let wait;
+        try {
+          const up = await upstream.fetch(league);
+          if (stopped) break;
+          if (apply(up)) {
+            errorsInRow = 0;
+            stats.polls += 1;
+            stats.lastOkAt = now();
+            stats.lastError = null;
+            wait = pollMs;
+          } else {
+            // Suspect shrink: stay silent (no tick) so a stalled feed shows as stalled.
+            wait = pollMs;
+          }
+        } catch (err) {
+          errorsInRow += 1;
+          stats.errors += 1;
+          stats.lastError = String((err && err.message) || err).slice(0, 160);
+          log('underdog poll failed', league, stats.lastError);
+          if (clients.size) broadcast(meta('error', { error: stats.lastError, status: err && err.status ? err.status : 0 }));
+          wait = Math.min(maxBackoffMs, pollMs * (2 ** Math.min(errorsInRow, 4)));
+        }
+        stats.lastPollMs = now() - t0;
+        const left = Math.max(0, wait - stats.lastPollMs);
+        await new Promise((resolve) => {
+          timer = setTimeout(resolve, left);
+          if (timer.unref) timer.unref();
+        });
+        timer = null;
+      }
+      running = false;
+    }
+
+    function subscribe(client) {
+      if (stopped) return () => {};
+      clients.add(client);
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+      if (hasSnapshot && now() - stats.lastOkAt > 8000) hasSnapshot = false;
+      if (hasSnapshot) send(client, frame(snapshotPayload()));
+      loop().catch(() => { running = false; });
+      return () => {
+        clients.delete(client);
+        if (!clients.size && !idleTimer) {
+          idleTimer = setTimeout(() => {
+            idleTimer = null;
+            if (!clients.size) {
+              stopped = true;
+              if (timer) clearTimeout(timer);
+              onEmpty();
+            }
+          }, idleStopMs);
+          if (idleTimer.unref) idleTimer.unref();
+        }
+      };
+    }
+
+    return {
+      subscribe,
+      get size() { return clients.size; },
+      stats: () => ({ ...stats, clients: clients.size, seq, errorsInRow }),
+      stop() {
+        stopped = true;
+        if (timer) clearTimeout(timer);
+        if (idleTimer) clearTimeout(idleTimer);
+        for (const c of clients) { try { c.close(); } catch (_) { /* gone */ } }
+        clients.clear();
+      },
+      _apply: apply,
+    };
+  }
+
+  function createRegistry(opts = {}) {
+    const env = opts.env || process.env;
+    const upstream = opts.upstream || createUpstream({ env, fetchFn: opts.fetchFn });
+    const pollMs = Number(env.UNDERDOG_RELAY_POLL_MS) || opts.pollMs || 2000;
+    const hubs = new Map();
+    let clientCount = 0;
+
+    function open(league) {
+      if (upstream.mode === 'off') return { status: 503, error: 'underdog_upstream_not_configured' };
+      if (!RELAY_LEAGUES.has(league)) return { status: 400, error: 'league must be NFL, NCAAF or MLB' };
+      if (clientCount >= MAX_CLIENTS) return { status: 503, error: 'too_many_clients' };
+      let hub = hubs.get(league);
+      if (!hub) {
+        if (hubs.size >= MAX_HUBS) return { status: 503, error: 'too_many_feeds' };
+        hub = createHub({ league, upstream, pollMs, idleStopMs: opts.idleStopMs, log: opts.log, onEmpty: () => { hubs.delete(league); } });
+        hubs.set(league, hub);
+      }
+      return { hub };
+    }
+
+    function handle(req, res, url) {
+      const league = String(url.searchParams.get('league') || 'NFL').trim().toUpperCase();
+      const opened = open(league);
+      if (!opened.hub) {
+        res.writeHead(opened.status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ ok: false, error: opened.error }));
+        return;
+      }
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+        'x-accel-buffering': 'no',
+      });
+      let closed = false;
+      let unsub = () => {};
+      const client = {
+        write: (text) => res.write(text),
+        backlog: () => res.writableLength || 0,
+        close: () => { try { res.end(); } catch (_) { /* gone */ } },
+      };
+      const beat = setInterval(() => {
+        try { res.write(': ping\n\n'); } catch (_) { /* closed */ }
+      }, 15000);
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        clientCount -= 1;
+        clearInterval(beat);
+        unsub();
+      };
+      clientCount += 1;
+      req.on('close', close);
+      res.on('error', close);
+      res.write(': underdog relay\n\n');
+      unsub = opened.hub.subscribe(client);
+    }
+
+    return {
+      mode: upstream.mode,
+      handle,
+      open,
+      health() {
+        return { mode: upstream.mode, clients: clientCount, hubs: [...hubs].map(([key, hub]) => ({ key, ...hub.stats() })) };
+      },
+      stop() {
+        for (const hub of hubs.values()) hub.stop();
+        hubs.clear();
+      },
+    };
+  }
+
+  return { RELAY_LEAGUES, indexGames, diffGames, createUpstream, createHub, createRegistry };
+})();
+
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -3373,6 +3719,15 @@ function handleRequest(req, res, state) {
     state.betstamp.handle(req, res, url);
     return;
   }
+  if (url.pathname === '/underdog') {
+    if (!state.underdog) {
+      res.writeHead(503, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ ok: false, error: 'underdog_relay_off' }));
+      return;
+    }
+    state.underdog.handle(req, res, url);
+    return;
+  }
   if (url.pathname === '/health') {
     const counts = {};
     for (const venue of VENUES) {
@@ -3381,7 +3736,7 @@ function handleRequest(req, res, state) {
     }
     const novig = state.novigFeed ? state.novigFeed.health() : null;
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-    res.end(JSON.stringify({ ok: true, status: state.status, counts, novig, betstamp: state.betstamp ? state.betstamp.health() : null }));
+    res.end(JSON.stringify({ ok: true, status: state.status, counts, novig, betstamp: state.betstamp ? state.betstamp.health() : null, underdog: state.underdog ? state.underdog.health() : null }));
     return;
   }
   if (url.pathname !== '/stream' && url.pathname !== '/board') {
@@ -3447,6 +3802,12 @@ function startOddsRelay(opts = {}) {
     state.betstamp = betstampRelay.createRegistry({ env, fetchFn: opts.betstampFetch, upstream: opts.betstampUpstream, pollMs: opts.betstampPollMs, idleStopMs: opts.betstampIdleStopMs, quietPollMs: opts.betstampQuietPollMs });
     stops.push(() => state.betstamp.stop());
     console.log(`[odds-relay] betstamp live relay mode: ${state.betstamp.mode}`);
+  }
+  if (opts.underdog !== false) {
+    const env = opts.env || process.env;
+    state.underdog = underdogRelay.createRegistry({ env, fetchFn: opts.underdogFetch, upstream: opts.underdogUpstream, pollMs: opts.underdogPollMs, idleStopMs: opts.underdogIdleStopMs });
+    stops.push(() => state.underdog.stop());
+    console.log(`[odds-relay] underdog live relay mode: ${state.underdog.mode}`);
   }
   const server = http.createServer((req, res) => {
     try {
@@ -3518,4 +3879,5 @@ module.exports = {
   startOddsRelay,
   novigFeed,
   betstampRelay,
+  underdogRelay,
 };
