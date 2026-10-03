@@ -438,13 +438,30 @@ function executionsFromOrderUpdate(update) {
   return [];
 }
 
-const DEFAULT_WS_STALL_MS = 60000;
+// RFQ flow never drops below ~55 msg/s, so 30s of silence is already a dead
+// socket (was 60s). Override with POLY_WS_STALL_MS (0 disables).
+const DEFAULT_WS_STALL_MS = 30000;
 const DEFAULT_WS_STALL_CHECK_MS = 5000;
 function envStallMs() {
   const raw = process.env.POLY_WS_STALL_MS;
   if (raw == null || raw === '') return DEFAULT_WS_STALL_MS;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? n : DEFAULT_WS_STALL_MS;
+}
+
+// Best-effort label for a message parsePrivateMessage did not recognize
+// (acks, heartbeats, errors): its first top-level JSON key.
+function messageTypeOf(raw) {
+  try {
+    const m = JSON.parse(raw.toString());
+    if (m && typeof m === 'object') {
+      const k = Object.keys(m)[0];
+      return k ? `other:${k}` : 'other:{}';
+    }
+    return `other:${typeof m}`;
+  } catch (_) {
+    return 'non-json';
+  }
 }
 
 function createPolymarketRfqWs({
@@ -478,6 +495,15 @@ function createPolymarketRfqWs({
   let stalls = 0;
   let reconnects = 0;
   let stalledPending = false; // a stall was declared; waiting for traffic to resume
+  // Cause diagnostics for the stall log: what the last message was and
+  // whether the socket still answers pings (a "zombie" socket keeps ponging).
+  let lastMessageType = null;
+  let messagesThisConn = 0;
+  let pingsSent = 0;
+  let pongsRecv = 0;
+  let lastPingAt = 0;
+  let lastPongAt = 0;
+  let pingsAtLastPong = 0;
   const status = (s, i) => { try { onStatus && onStatus(s, i); } catch (_) {} };
 
   function sendSubscribe() {
@@ -509,7 +535,23 @@ function createPolymarketRfqWs({
     if (silentMs < stallMs) return;
     stalls += 1;
     stalledPending = true;
-    const info = { silentMs, stalls, reconnects, lastMessageAt: lastMessageAt || null };
+    const info = {
+      silentMs, stalls, reconnects, lastMessageAt: lastMessageAt || null,
+      // cause details
+      lastMessageType,
+      messagesThisConn,
+      socketAgeMs: connectedAt ? t - connectedAt : null,
+      readyState: ws && ws.readyState != null ? ws.readyState : null,
+      ping: {
+        sent: pingsSent,
+        pongs: pongsRecv,
+        unansweredPings: Math.max(0, pingsSent - pingsAtLastPong),
+        msSinceLastPing: lastPingAt ? t - lastPingAt : null,
+        msSinceLastPong: lastPongAt ? t - lastPongAt : null,
+        state: !pingsSent ? 'no-pings-sent'
+          : (lastPongAt && t - lastPongAt <= 25000 ? 'pong-ok (socket alive, no data)' : 'pong-missing (socket dead)'),
+      },
+    };
     status('stalled', { message: `no ws message for ${Math.round(silentMs / 1000)}s - reconnecting` });
     try { onStall && onStall(info); } catch (_) {}
     // Reset the clock so a socket that stays dead after reconnect is re-flagged
@@ -527,6 +569,9 @@ function createPolymarketRfqWs({
     status('connecting', { url });
     connectedAt = now();
     lastMessageAt = 0;
+    lastMessageType = null;
+    messagesThisConn = 0;
+    pingsSent = 0; pongsRecv = 0; lastPingAt = 0; lastPongAt = 0; pingsAtLastPong = 0;
     const sock = new WebSocketImpl(url, { headers });
     ws = sock;
 
@@ -537,7 +582,9 @@ function createPolymarketRfqWs({
       sendSubscribe();
       status('subscribed');
       clearInterval(pingTimer);
-      pingTimer = setInterval(() => { try { sock.ping(); } catch (_) {} }, 10000);
+      pingTimer = setInterval(() => {
+        try { sock.ping(); pingsSent += 1; lastPingAt = now(); } catch (_) {}
+      }, 10000);
       clearInterval(stallTimer);
       if (stallMs > 0) {
         stallTimer = setInterval(checkStall, stallCheckMs);
@@ -545,15 +592,26 @@ function createPolymarketRfqWs({
       }
     });
 
+    sock.on('pong', () => {
+      if (ws !== sock) return;
+      pongsRecv += 1;
+      lastPongAt = now();
+      pingsAtLastPong = pingsSent;
+    });
+
     sock.on('message', (d) => {
       if (ws !== sock) return;
       lastMessageAt = now();
+      messagesThisConn += 1;
       if (stalledPending) {
         stalledPending = false;
         try { onRecovered && onRecovered({ stalls, reconnects }); } catch (_) {}
         status('recovered');
       }
       const parsed = parsePrivateMessage(d.toString());
+      lastMessageType = !parsed ? messageTypeOf(d)
+        : (parsed.type === 'other' && parsed.raw && typeof parsed.raw === 'object'
+          ? `other:${Object.keys(parsed.raw)[0] || '{}'}` : parsed.type);
       if (!parsed) return;
       try { onEvent && onEvent(parsed); } catch (e) { console.error('[POLY] ws event', e && e.message); }
     });
