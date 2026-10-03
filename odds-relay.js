@@ -2431,11 +2431,38 @@ const novigFeed = (() => {
       schedulePublish(cat.league);
     }
 
+    // Markets come back newest-first in pages of up to 5000 with a `next`
+    // cursor. One page used to be all we read, so on a big league (NCAAF has ~6600
+    // spread/total rows) the oldest markets, which are the games already in
+    // progress, fell off the end and live games lost their moneyline. MONEY is
+    // fetched on its own (small, always complete) and every page is followed.
+    // A failed page fails the whole refresh so the last good catalog stays.
+    async function fetchMarketItems(league) {
+      const items = [];
+      const seen = new Set();
+      const groups = [BOARD_TYPES.filter((t) => t === 'MONEY'), BOARD_TYPES.filter((t) => t !== 'MONEY')];
+      for (const types of groups) {
+        if (!types.length) continue;
+        let after = '';
+        for (let page = 0; page < 8 && !stopped; page += 1) {
+          const res = await limiter.run(() => getJson(`/v3/public/catalog/markets?league=${encodeURIComponent(league)}&marketType=${types.join(',')}&limit=5000${after}`), 'high');
+          if (!res.ok || !res.body) return null;
+          for (const it of res.body.items || []) {
+            if (it && it.marketId && !seen.has(it.marketId)) { seen.add(it.marketId); items.push(it); }
+          }
+          if (!res.body.next) break;
+          after = `&after=${encodeURIComponent(res.body.next)}`;
+        }
+      }
+      return { items };
+    }
+
     async function refreshCatalog(league) {
-      const [evRes, mkRes] = await Promise.all([
+      const [evRes, mkBody] = await Promise.all([
         limiter.run(() => getJson(`/v3/public/catalog/events?league=${encodeURIComponent(league)}&limit=100`), 'high'),
-        limiter.run(() => getJson(`/v3/public/catalog/markets?league=${encodeURIComponent(league)}&marketType=${BOARD_TYPES.join(',')}&limit=5000`), 'high'),
+        fetchMarketItems(league),
       ]);
+      const mkRes = { ok: !!mkBody, body: mkBody };
       if (!evRes.ok || !mkRes.ok || !evRes.body || !mkRes.body) return false;
       // Events page is capped at 100; follow the cursor for big slates.
       let evBody = evRes.body;
