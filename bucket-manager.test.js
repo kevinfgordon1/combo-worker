@@ -156,6 +156,8 @@ assert.strictEqual(isGameday(at('2026-11-01T06:30:00.000Z')), true);
   assert.strictEqual(top.toShard, 1);
   assert.strictEqual(top.reason, 'top-up');
 
+  // Ceiling is on available cash only: open-position value does not count.
+  const cfgLow = baseConfig({ ceilingCents: cents(9_000) });
   const ceiling = planBucketAction({
     mainAvailableCents: cents(50_000),
     bucketAvailableCents: cents(2_000),
@@ -164,13 +166,13 @@ assert.strictEqual(isGameday(at('2026-11-01T06:30:00.000Z')), true);
     sweepEnabled: false,
     flat: null,
     dailyTopupCents: 0,
-    config: cfg,
+    config: cfgLow,
   });
   assert.strictEqual(ceiling.action, 'topup');
-  assert.strictEqual(ceiling.amountCents, cents(1_000), 'ceiling clamps total at $15,000');
+  assert.strictEqual(ceiling.amountCents, cents(7_000), 'ceiling on available cash: $9,000 - $2,000');
   assert.strictEqual(ceiling.clamp, 'ceiling');
 
-  const ceilingBlock = planBucketAction({
+  const withPositions = planBucketAction({
     mainAvailableCents: cents(50_000),
     bucketAvailableCents: cents(1_000),
     bucketPortfolioCents: cents(14_500),
@@ -179,6 +181,20 @@ assert.strictEqual(isGameday(at('2026-11-01T06:30:00.000Z')), true);
     flat: null,
     dailyTopupCents: 0,
     config: cfg,
+  });
+  assert.strictEqual(withPositions.action, 'topup', 'open positions no longer block a top-up');
+  assert.strictEqual(withPositions.amountCents, cents(4_000));
+  assert.strictEqual(withPositions.clamp, null);
+
+  const ceilingBlock = planBucketAction({
+    mainAvailableCents: cents(50_000),
+    bucketAvailableCents: cents(4_900),
+    bucketPortfolioCents: 0,
+    gameday: false,
+    sweepEnabled: false,
+    flat: null,
+    dailyTopupCents: 0,
+    config: baseConfig({ ceilingCents: cents(4_950) }),
   });
   assert.strictEqual(ceilingBlock.action, 'blocked');
   assert.strictEqual(ceilingBlock.block, 'ceiling');
@@ -382,13 +398,22 @@ async function main() {
       bucket: cents(2_000),
       bucketPortfolio: cents(12_000),
     });
-    const h = harness({ ...LIVE, KALSHI_BUCKET_TARGET_DEFAULT: '10000' }, book);
+    const h = harness({ ...LIVE, KALSHI_BUCKET_TARGET_DEFAULT: '10000', KALSHI_BUCKET_CEILING: '9000' }, book);
     const out = await h.mgr.check('interval');
-    assert.strictEqual(out.decision.amountCents, cents(1_000));
+    assert.strictEqual(out.decision.amountCents, cents(7_000), 'ceiling on available cash: $9,000 - $2,000');
     assert.strictEqual(out.decision.clamp, 'ceiling');
     assert.strictEqual(book.transfers.length, 1);
     assert.ok(!h.alerts.some((t) => /blocked/.test(t)));
   }
+  {
+    const book = fakeBook({ main: cents(50_000), bucket: cents(4_900) });
+    const h = harness({ ...LIVE, KALSHI_BUCKET_CEILING: '4950' }, book);
+    const out = await h.mgr.check('interval');
+    assert.strictEqual(out.decision.block, 'ceiling');
+    assert.strictEqual(book.transfers.length, 0);
+    assert.ok(h.alerts.some((t) => /blocked \(ceiling\)/.test(t) && /ceiling on available cash/.test(t)));
+  }
+  // Large open-position value does not block a top-up.
   {
     const book = fakeBook({
       main: cents(50_000),
@@ -397,9 +422,10 @@ async function main() {
     });
     const h = harness(LIVE, book);
     const out = await h.mgr.check('interval');
-    assert.strictEqual(out.decision.block, 'ceiling');
-    assert.strictEqual(book.transfers.length, 0);
-    assert.ok(h.alerts.some((t) => /blocked \(ceiling\)/.test(t)));
+    assert.strictEqual(out.decision.action, 'topup');
+    assert.strictEqual(out.decision.clamp, null);
+    assert.strictEqual(book.transfers.length, 1);
+    assert.strictEqual(book.state.bucket.availableCents, cents(5_000));
   }
 
   // Main floor clamps, then blocks.
@@ -594,7 +620,7 @@ async function main() {
   // Top-up blocked: at most once per 60 minutes per reason. A new reason alerts now.
   {
     const book = fakeBook({ main: cents(2_000), bucket: 0 });
-    const h = harness(LIVE, book);
+    const h = harness({ ...LIVE, KALSHI_BUCKET_CEILING: '1050' }, book);
     const started = h.now().getTime();
     const floorAlerts = () => h.alerts.filter((t) => /blocked \(floor\)/.test(t)).length;
     const ceilingAlerts = () => h.alerts.filter((t) => /blocked \(ceiling\)/.test(t)).length;
@@ -608,7 +634,6 @@ async function main() {
     assert.ok(h.logs.some((line) => /blocked/.test(line)));
     book.state.main.availableCents = cents(50_000);
     book.state.bucket.availableCents = cents(1_000);
-    book.state.bucket.portfolioCents = cents(14_500);
     h.setNow(new Date(started + 10 * 60 * 1000));
     const ceiling = await h.mgr.check('interval');
     assert.strictEqual(ceiling.decision.block, 'ceiling');
@@ -1165,7 +1190,7 @@ async function main() {
     assert.strictEqual(out.decision.targetCents, cents(12_000));
     assert.strictEqual(out.decision.action, 'topup');
     assert.strictEqual(out.decision.amountCents, 703_658, '$12,000 - $4,963.42');
-    assert.strictEqual(out.decision.clamp, null, 'ceiling $22k: total 11.3k + 7.0k = 18.3k fits');
+    assert.strictEqual(out.decision.clamp, null, 'ceiling $22k on available cash: 12.0k fits');
     assert.strictEqual(out.confirmed, true);
     assert.strictEqual(book.state.bucket.availableCents, cents(12_000));
     assert.ok(book.state.main.availableCents >= cents(2_000));
@@ -1182,15 +1207,21 @@ async function main() {
     assert.strictEqual(plan.amountCents, cents(8_000) - cents(4_963.42));
   }
 
-  // Ceiling is still enforced (on available + open-position value), now at $22k.
+  // Ceiling ($22k) is enforced on available cash only; open positions never count.
   {
     const cfg = loadBucketConfig({});
-    const plan = planBucketAction({
+    const withPositions = planBucketAction({
       mainAvailableCents: cents(50_000), bucketAvailableCents: cents(4_000), bucketPortfolioCents: cents(14_000),
       gameday: true, sweepEnabled: false, flat: null, dailyTopupCents: 0, config: cfg,
     });
-    assert.strictEqual(plan.clamp, 'ceiling');
-    assert.strictEqual(plan.amountCents, cents(4_000), '22,000 - 18,000');
+    assert.strictEqual(withPositions.clamp, null, '$14k of open positions does not clamp');
+    assert.strictEqual(withPositions.amountCents, cents(8_000), '12,000 - 4,000');
+    const nearCeiling = planBucketAction({
+      mainAvailableCents: cents(50_000), bucketAvailableCents: cents(21_900), bucketPortfolioCents: 0,
+      gameday: true, sweepEnabled: false, flat: null, dailyTopupCents: 0, config: cfg, needCents: cents(30_000),
+    });
+    assert.strictEqual(nearCeiling.clamp, 'ceiling');
+    assert.strictEqual(nearCeiling.amountCents, cents(100), '22,000 - 21,900');
   }
 
   // needCents lifts the target to cost + $500 and every clamp still applies.
@@ -1208,13 +1239,13 @@ async function main() {
     assert.strictEqual(big.amountCents, cents(9_500) - cents(4_963.42));
     const capped = planBucketAction({ ...base, needCents: cents(35_000), mainAvailableCents: cents(40_000) });
     assert.strictEqual(capped.targetCents, cents(35_500));
-    assert.strictEqual(capped.clamp, 'max_transfer', 'Navy-size need: ceiling headroom 10.7k, per-transfer cap $10k binds first');
+    assert.strictEqual(capped.clamp, 'max_transfer', 'Navy-size need: ceiling headroom 17.0k, per-transfer cap $10k binds first');
     assert.strictEqual(capped.amountCents, cents(10_000));
     const ceil = planBucketAction({
-      ...base, needCents: cents(35_000), mainAvailableCents: cents(40_000), bucketPortfolioCents: cents(14_000),
+      ...base, needCents: cents(35_000), mainAvailableCents: cents(40_000), bucketAvailableCents: cents(15_000),
     });
-    assert.strictEqual(ceil.clamp, 'ceiling', 'with more locked in open positions the $22k ceiling binds');
-    assert.strictEqual(ceil.amountCents, cents(22_000) - cents(4_963.42) - cents(14_000));
+    assert.strictEqual(ceil.clamp, 'ceiling', 'available cash near the $22k ceiling binds');
+    assert.strictEqual(ceil.amountCents, cents(7_000));
     const floored = planBucketAction({ ...base, needCents: cents(20_000), mainAvailableCents: cents(4_000) });
     assert.strictEqual(floored.clamp, 'floor');
     assert.strictEqual(floored.amountCents, cents(2_000), 'only cash above the $2k floor');
