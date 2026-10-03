@@ -187,6 +187,7 @@ const { startUnhedgedSide } = require('./unhedged-boot');
 const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
 const { formatAlertStatus } = require('./venue-alert');
 const { createBucketManager } = require('./bucket-manager');
+const { splitPaused, diffPaused, createPausePoller } = require('./lock-pause');
 const { createAppAlerts } = require('./app-alerts');
 const { createPartialQuoteDryRun, isPartialQuoteFlagOn } = require('./partial-quote');
 
@@ -362,6 +363,67 @@ const SKIP_TAPE_LOOKBACK_MS = 24 * 3600 * 1000;
 const SKIP_TAPE_TICK_MS = 15000;
 const SKIP_TAPE_MAX_PER_TICK = 5;
 
+// --- per-lock pause -----------------------------------------------------------
+let pausedParlayIds = new Set();
+const pausePoller = createPausePoller({ supabase, log: (m) => console.log(`[${MODE}] ${m.replace(/^\[PAUSE\] /, 'PAUSE ')}`) });
+
+async function cancelPausedLock(parlayId) {
+  try {
+    const rows = (await loadOpenSubmissionQuotes()).filter((r) => r.parlay_id === parlayId);
+    await cancelOpenQuotesForParlay(parlayId, { kind: 'paused' }, rows);
+  } catch (e) {
+    console.error(`[${MODE}] pause cancel (kalshi)`, e.message);
+  }
+  if (polyLoop && typeof polyLoop.cancelOpenQuotesForParlay === 'function') {
+    try {
+      await polyLoop.cancelOpenQuotesForParlay(parlayId, { kind: 'paused' });
+    } catch (e) {
+      console.error(`[${MODE}] pause cancel (poly)`, e.message);
+    }
+  }
+}
+
+// Record the paused set; cancel open quotes for locks that just became paused.
+function notePausedIds(next) {
+  const { pausedNow, resumed } = diffPaused(pausedParlayIds, next);
+  pausedParlayIds = next;
+  for (const id of pausedNow) {
+    console.log(`[${MODE}] PAUSED lock ${id} — no longer quoting (Kalshi + Polymarket); cancelling open quotes`);
+    cancelPausedLock(id);
+  }
+  for (const id of resumed) console.log(`[${MODE}] RESUMED lock ${id} — quoting again`);
+  return { pausedNow, resumed };
+}
+
+// Every 2s: a quote that raced the pause (POST in flight) is cancelled.
+function cancelStragglersForPaused() {
+  if (!pausedParlayIds.size) return;
+  for (const [, pending] of pendingQuotes) {
+    if (pending && pausedParlayIds.has(pending.parlayId)) { cancelPausedLock(pending.parlayId); break; }
+  }
+}
+
+// Fast path (5s): react to a toggle without waiting for the 30s refresh.
+async function pollPaused() {
+  const ids = await pausePoller.poll();
+  if (!ids) return;
+  const { pausedNow, resumed } = diffPaused(pausedParlayIds, ids);
+  if (!pausedNow.length && !resumed.length) return;
+  if (pausedNow.length) {
+    parlays = parlays.filter((x) => !ids.has(x.id));
+    for (const id of pausedNow) delete staged[id];
+    try {
+      const plan = lockNeedlePlan(parlays);
+      if (fastDropDisabled(process.env)) plan.enabled = false;
+      quoteHot.setPlan(plan);
+    } catch (e) {
+      console.error(`[${MODE}] pause needle plan`, e.message);
+    }
+  }
+  notePausedIds(ids);
+  if (resumed.length) refresh();
+}
+
 async function refresh() {
   try {
     const [parlaysQ, settingsQ, fillsQ] = await Promise.all([
@@ -379,6 +441,13 @@ async function refresh() {
     // supabase-js soft-fails as { data: null, error } — do not treat null as [].
     const parlaysFailed = querySoftFailed(parlaysQ);
     parlays = applyRefreshParlays(parlays, parlaysQ, refreshLog);
+    if (!parlaysFailed) {
+      // Paused locks (combo_parlays.paused) stay in the table but are not quoted.
+      // Missing column => no row has paused === true => everything stays enabled.
+      const split = splitPaused(parlays);
+      parlays = split.live;
+      notePausedIds(split.pausedIds);
+    }
     killByUser = applyRefreshKillByUser(killByUser, settingsQ, refreshLog);
     const fillsForCap = querySoftFailed(fillsQ)
       ? fillsQ
@@ -743,6 +812,9 @@ function cancelLogLine(quoteId, pending, reason) {
       rfqBit +
       ` source=${reason.source} at=${reason.at}`
     );
+  }
+  if (reason && reason.kind === 'paused') {
+    return `[${MODE}] CANCEL lock paused ${label} quote_id=${quoteId}` + rfqBit;
   }
   if (reason && reason.kind === 'cap_full') {
     return (
@@ -2239,7 +2311,11 @@ async function main() {
   setInterval(unlessQuoteHot(() => {
     cancelUnacceptedQuotes().catch((e) => console.error(`[${MODE}] cancel-unaccepted tick`, e.message));
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start tick`, e.message));
+    cancelStragglersForPaused();
   }), 2000);
+  setInterval(unlessQuoteHot(() => {
+    pollPaused().catch((e) => console.error(`[${MODE}] pause poll`, e.message));
+  }), 5000);
   setInterval(unlessQuoteHot(() => {
     reconcileSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape tick`, e.message));
   }), SKIP_TAPE_TICK_MS);
@@ -2279,6 +2355,8 @@ async function main() {
         ...(snap ? { poly: snap } : {}),
         partial_quote: partialQuote.statsJson(),
         ...(lat ? { latency: lat } : {}),
+        ...(bucketManager && bucketManager.snapshot && bucketManager.snapshot()
+          ? { bucket: bucketManager.snapshot() } : {}),
       };
     }
   );

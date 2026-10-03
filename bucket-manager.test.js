@@ -1343,6 +1343,27 @@ async function main() {
     assert.strictEqual(book.transfers.length, 1, 'pending transfer holds further sends (#113)');
   }
 
+  // Snapshot for the Combo Locks readout (cents): main cash, combo cash, combo positions, ceiling/target.
+  {
+    const book = fakeBook({ main: cents(4_862), bucket: cents(9_271), bucketPortfolio: cents(12_731) });
+    const mgr = createBucketManager({
+      env: { KALSHI_BUCKET_AUTO: '0' }, now: () => at('2026-10-02T21:20:00.000Z'), alert() {}, log() {},
+      sleep: async () => {}, client: book.client, readPolyCash: null,
+    });
+    assert.strictEqual(mgr.snapshot(), null, 'no snapshot before the first read');
+    await mgr.check('interval');
+    const snap = mgr.snapshot();
+    assert.strictEqual(snap.main_cents, cents(4_862));
+    assert.strictEqual(snap.combo_cash_cents, cents(9_271));
+    assert.strictEqual(snap.combo_positions_cents, cents(12_731));
+    assert.strictEqual(snap.ceiling_cents, cents(22_000));
+    assert.strictEqual(snap.floor_cents, cents(2_000));
+    assert.strictEqual(snap.target_cents, cents(12_000));
+    assert.strictEqual(snap.gameday, true);
+    snap.main_cents = 1;
+    assert.strictEqual(mgr.snapshot().main_cents, cents(4_862), 'snapshot is a copy');
+  }
+
   console.log('bucket-manager.test.js ok');
 }
 
