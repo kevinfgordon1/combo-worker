@@ -41,7 +41,12 @@ const KALSHI_GAME_SERIES = Object.freeze({
 });
 const ESPN_SCOREBOARD = Object.freeze({
   NFL: 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard',
-  NCAAF: 'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard',
+  // College football: the bare scoreboard only lists ~16 featured games, so most Kalshi tickers
+  // never matched and is_live fell back to the (late) Kalshi start time. groups=80 is FBS, 81 is FCS.
+  NCAAF: [
+    'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?groups=80&limit=400',
+    'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?groups=81&limit=400',
+  ],
   MLB: 'https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard',
 });
 const US_SLUG_CAP = 100;
@@ -1385,14 +1390,16 @@ function startClob(state, deps) {
 const espnCache = new Map();
 
 async function espnSchedule(league, fetchFn) {
-  const boardUrl = ESPN_SCOREBOARD[league];
-  if (!boardUrl) return [];
+  const boardUrls = [].concat(ESPN_SCOREBOARD[league] || []);
+  if (!boardUrls.length) return [];
   const hit = espnCache.get(league);
   const now = Date.now();
   if (hit && now - hit.at < 15000) return hit.games;
   try {
-    const sched = await fetchJson(fetchFn, boardUrl, { timeoutMs: 2500 });
-    const games = scheduleFromEspn(sched && sched.body);
+    const results = await Promise.allSettled(boardUrls.map((u) => fetchJson(fetchFn, u, { timeoutMs: 2500 })));
+    const ok = results.filter((r) => r.status === 'fulfilled');
+    if (!ok.length) throw new Error('espn schedule unavailable');
+    const games = ok.flatMap((r) => scheduleFromEspn(r.value && r.value.body));
     espnCache.set(league, { at: now, games });
     return games;
   } catch (_) {
@@ -3880,4 +3887,7 @@ module.exports = {
   novigFeed,
   betstampRelay,
   underdogRelay,
+  espnSchedule,
+  scheduleFromEspn,
+  applyKalshiSchedule,
 };
