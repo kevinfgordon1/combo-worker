@@ -2,7 +2,7 @@
 // DraftKings / FanDuel public-JSON feed on the odds relay (DKFD_FEED=1).
 const assert = require('assert');
 const http = require('http');
-const { dkfdFeed: f, publishDkfd, createDkfdState, dkfdEnabled, dkfdLeagues, startOddsRelay } = require('./odds-relay');
+const { dkfdFeed: f, publishDkfd, createDkfdState, dkfdEnabled, dkfdLeagues, dkfdBooks, startOddsRelay } = require('./odds-relay');
 const fx = require('./fixtures-dkfd.json');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -98,6 +98,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.strictEqual(dkfdEnabled({ DKFD_FEED: 'on' }), true);
   assert.deepStrictEqual(dkfdLeagues({}), ['NFL', 'NCAAF', 'MLB', 'NHL']);
   assert.deepStrictEqual(dkfdLeagues({ DKFD_LEAGUES: 'nfl, ncaaf ,XFL' }), ['NFL', 'NCAAF']);
+  assert.deepStrictEqual(dkfdBooks({}), ['draftkings', 'fanduel']);
+  assert.deepStrictEqual(dkfdBooks({ DKFD_BOOKS: 'FanDuel' }), ['fanduel']);
+  assert.deepStrictEqual(dkfdBooks({ DKFD_BOOKS: 'caesars' }), ['draftkings', 'fanduel']);
 
   // publishDkfd: first full set is a snapshot, then only changes, removal
   // is a fresh snapshot, and a feed heartbeat follows every poll.
@@ -131,8 +134,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       calls += 1;
       return { ok: false, status: 403, text: async () => '<HTML><TITLE>Access Denied</TITLE>', headers: { get: () => null } };
     };
-    const p = f.createDkFdPoller({ books: ['draftkings'], leagues: ['NFL'], fetchFn, pollMs: 3000, blockedBaseMs: 60_000 }).start();
+    const failures = [];
+    const p = f.createDkFdPoller({ books: ['draftkings'], leagues: ['NFL'], fetchFn, pollMs: 3000, blockedBaseMs: 60_000, onFailure: (b, l, hh) => failures.push([b, l, hh.state]) }).start();
     await sleep(80);
+    assert.deepStrictEqual(failures, [['draftkings', 'NFL', 'blocked']], 'failed poll reported for the heartbeat');
     const hh = p.health().draftkings.NFL;
     assert.strictEqual(hh.state, 'blocked');
     assert.strictEqual(hh.blocked, 1);
@@ -206,6 +211,18 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     }));
     assert.strictEqual(health.dkfd.draftkings.NFL.state, 'ok');
     await on.close();
+
+    // DKFD_BOOKS=fanduel: DraftKings is off (503), FanDuel serves.
+    const fdOnly = startOddsRelay({ upstream: false, betstamp: false, underdog: false, env: { DKFD_FEED: '1', DKFD_LEAGUES: 'NFL', DKFD_BOOKS: 'fanduel' }, dkfdFetch: fetchFn, dkfdPollMs: 3000 });
+    const a3 = await fdOnly.listen(0, '127.0.0.1');
+    const dkOff = await new Promise((resolve) => http.get(`http://127.0.0.1:${a3.port}/board?venue=draftkings&league=NFL`, (res) => { res.resume(); resolve(res.statusCode); }));
+    assert.strictEqual(dkOff, 503);
+    await sleep(100);
+    const h3 = await new Promise((resolve) => http.get(`http://127.0.0.1:${a3.port}/health`, (res) => {
+      let b = ''; res.on('data', (c) => { b += c; }); res.on('end', () => resolve(JSON.parse(b)));
+    }));
+    assert.deepStrictEqual(Object.keys(h3.dkfd), ['fanduel']);
+    await fdOnly.close();
   }
 
   console.log('dkfd-relay.test.js ok');

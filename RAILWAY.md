@@ -206,6 +206,7 @@ Off unless `DKFD_FEED=1` on the **odds-relay** service. Kevin approved this feed
 - DraftKings: `sportsbook-nash.draftkings.com/api/sportscontent/dkusnj/v1/leagues/{id}` (NJ), one request per league per poll. Akamai answers 403 without normal browser headers (`Accept-Language`, `Origin`, `Referer`).
 - FanDuel: `sbapi.nj.sportsbook.fanduel.com/api/content-managed-page` (public `_ak`) is the catalog only (CloudFront `max-age=30, stale-while-revalidate=60`, refreshed every 60s). Prices come from `smp.nj.sportsbook.fanduel.com/.../getMarketPrices` (uncached, max 80 market ids per call; in-play / starting-within-6h markets every call, the rest rotate).
 - Cadence: one request per book per league every `DKFD_POLL_MS` (default 4000, min 3000) while a board is watching that league, `DKFD_IDLE_POLL_MS` (default 30000) otherwise. Errors back off exponentially (honours `Retry-After`); a 403 block backs off from 60s up to 15 min.
-- `DKFD_LEAGUES` (default `NFL,NCAAF,MLB,NHL`).
+- `DKFD_LEAGUES` (default `NFL,NCAAF,MLB,NHL`). `DKFD_BOOKS` (default `draftkings,fanduel`).
+- **Railway egress is blocked by DraftKings' Akamai** (403 Access Denied on every request from the odds-relay, Oct 7 2026; the same request works from the agent box). Production runs `DKFD_BOOKS=fanduel` until DraftKings has another egress (residential proxy or Kevin's computer).
 - Routes: `/stream?venue=draftkings|fanduel&league=NFL` (SSE `quote` packets like Novig plus an `event: feed` heartbeat after every poll), `/board?venue=...` (JSON), `/health` → `dkfd`.
 - Code lives inline in `odds-relay.js` (`dkfdFeed`) so the odds-relay watch paths pick up changes.
