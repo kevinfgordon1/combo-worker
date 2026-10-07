@@ -198,3 +198,14 @@ npm test
 - Unhedged logs: `[UNHEDGED] starting — paper/shadow only` and `UNHEDGED_RFQ_LIVE=off`.
 - Combo Locks still posts / confirms lock quotes. Unhedged never logs `QUOTED` / `CONFIRMED` for Combo Locks.
 - `unhedged_rfqs` still receives in-scope unmatched MLB/NFL full-game moneyline paper rows when the Unhedged job is up.
+
+## Odds relay: DraftKings / FanDuel feed (`DKFD_FEED`)
+
+Off unless `DKFD_FEED=1` on the **odds-relay** service. Kevin approved this feed for the New Odds Board (Oct 7 2026).
+
+- DraftKings: `sportsbook-nash.draftkings.com/api/sportscontent/dkusnj/v1/leagues/{id}` (NJ), one request per league per poll. Akamai answers 403 without normal browser headers (`Accept-Language`, `Origin`, `Referer`).
+- FanDuel: `sbapi.nj.sportsbook.fanduel.com/api/content-managed-page` (public `_ak`) is the catalog only (CloudFront `max-age=30, stale-while-revalidate=60`, refreshed every 60s). Prices come from `smp.nj.sportsbook.fanduel.com/.../getMarketPrices` (uncached, max 80 market ids per call; in-play / starting-within-6h markets every call, the rest rotate).
+- Cadence: one request per book per league every `DKFD_POLL_MS` (default 4000, min 3000) while a board is watching that league, `DKFD_IDLE_POLL_MS` (default 30000) otherwise. Errors back off exponentially (honours `Retry-After`); a 403 block backs off from 60s up to 15 min.
+- `DKFD_LEAGUES` (default `NFL,NCAAF,MLB,NHL`).
+- Routes: `/stream?venue=draftkings|fanduel&league=NFL` (SSE `quote` packets like Novig plus an `event: feed` heartbeat after every poll), `/board?venue=...` (JSON), `/health` → `dkfd`.
+- Code lives inline in `odds-relay.js` (`dkfdFeed`) so the odds-relay watch paths pick up changes.

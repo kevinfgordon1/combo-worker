@@ -3692,6 +3692,877 @@ const underdogRelay = (() => {
   return { RELAY_LEAGUES, indexGames, diffGames, createUpstream, createHub, createRegistry };
 })();
 
+// ---------------------------------------------------------------------------
+// DraftKings + FanDuel game lines from the public JSON their own sportsbook
+// sites load (no login, no account). NJ endpoints. Main moneyline, spread
+// and total only, American odds. One request per book per league per poll,
+// with backoff on 403 / 429 / errors. Kevin approved this feed for the New
+// Odds Board (Oct 7 2026).
+const dkfdFeed = (() => {  const BOOKS = Object.freeze({
+    draftkings: { key: 'draftkings', id: 200, label: 'DraftKings' },
+    fanduel: { key: 'fanduel', id: 100, label: 'FanDuel' },
+  });
+
+  const DK_LEAGUE_IDS = Object.freeze({ NFL: '88808', NCAAF: '87637', MLB: '84240', NHL: '42133' });
+  const FD_PAGE_IDS = Object.freeze({ NFL: 'nfl', NCAAF: 'ncaaf', MLB: 'mlb', NHL: 'nhl' });
+  // FanDuel's own web bundle sends this public app key on every sbapi call.
+  const FD_PUBLIC_AK = 'FhMFpcPWXMeyZxOx';
+  const DK_BASE = 'https://sportsbook-nash.draftkings.com/api/sportscontent/dkusnj/v1/leagues/';
+  const FD_BASE = 'https://sbapi.nj.sportsbook.fanduel.com/api/content-managed-page';
+
+  // Plain browser headers, the same ones the sportsbook pages send.
+  const BROWSER_HEADERS = Object.freeze({
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36',
+    accept: 'application/json, text/plain, */*',
+    'accept-language': 'en-US,en;q=0.9',
+  });
+
+  function dkUrl(league) {
+    const id = DK_LEAGUE_IDS[league];
+    return id ? `${DK_BASE}${id}` : null;
+  }
+
+  function fdUrl(league) {
+    const id = FD_PAGE_IDS[league];
+    if (!id) return null;
+    return `${FD_BASE}?page=CUSTOM&customPageId=${id}&pbHorizontal=false&_ak=${FD_PUBLIC_AK}&timezone=America%2FNew_York`;
+  }
+
+  function requestHeaders(book) {
+    if (book === 'draftkings') {
+      return { ...BROWSER_HEADERS, origin: 'https://sportsbook.draftkings.com', referer: 'https://sportsbook.draftkings.com/' };
+    }
+    return { ...BROWSER_HEADERS, origin: 'https://sportsbook.fanduel.com', referer: 'https://sportsbook.fanduel.com/' };
+  }
+
+  function americanInt(raw) {
+    if (raw == null) return null;
+    if (typeof raw === 'number') return Number.isFinite(raw) && Math.abs(raw) >= 100 ? Math.round(raw) : null;
+    const s = String(raw).replace(/\u2212/g, '-').replace(/[^0-9+\-.]/g, '');
+    if (!s) return null;
+    if (/^ev(en)?$/i.test(String(raw).trim())) return 100;
+    const n = Number(s);
+    return Number.isFinite(n) && Math.abs(n) >= 100 ? Math.round(n) : null;
+  }
+
+  function isoOrNull(raw) {
+    const t = Date.parse(String(raw || ''));
+    return Number.isFinite(t) ? new Date(t).toISOString() : null;
+  }
+
+  function betTypeFromName(name) {
+    const n = String(name || '').toLowerCase();
+    if (n === 'moneyline') return 'moneyline';
+    if (n === 'spread' || n === 'run line' || n === 'puck line') return 'spread';
+    if (n === 'total') return 'total';
+    return null;
+  }
+
+  // DK sportscontent league body -> quotes.
+  function quotesFromDraftKings(body, league, opts = {}) {
+    const out = [];
+    if (!body || !Array.isArray(body.events)) return out;
+    const nowMs = opts.nowMs || Date.now();
+    const events = new Map();
+    for (const ev of body.events) {
+      if (!ev || !Array.isArray(ev.participants)) continue;
+      const home = ev.participants.find((p) => p && p.venueRole === 'Home');
+      const away = ev.participants.find((p) => p && p.venueRole === 'Away');
+      if (!home || !away) continue;
+      const status = String(ev.status || '').toUpperCase();
+      if (status === 'FINISHED' || status === 'CLOSED') continue;
+      events.set(String(ev.id), {
+        id: String(ev.id),
+        home: home.name,
+        away: away.name,
+        start: isoOrNull(ev.startEventDate),
+        live: status === 'STARTED' || status === 'LIVE' || status === 'IN_PROGRESS',
+      });
+    }
+    const markets = new Map();
+    for (const m of body.markets || []) {
+      if (!m || !events.has(String(m.eventId))) continue;
+      const betType = betTypeFromName(m.marketType && m.marketType.name) || betTypeFromName(m.name);
+      if (!betType) continue;
+      markets.set(String(m.id), { eventId: String(m.eventId), betType, suspended: m.isSuspended === true });
+    }
+    for (const sel of body.selections || []) {
+      const m = sel && markets.get(String(sel.marketId));
+      if (!m) continue;
+      if (sel.main === false) continue;
+      const ev = events.get(m.eventId);
+      const outcome = String(sel.outcomeType || '');
+      let side;
+      let sideType;
+      if (m.betType === 'total') {
+        if (/^over$/i.test(outcome) || /^over$/i.test(sel.label)) sideType = 'Over';
+        else if (/^under$/i.test(outcome) || /^under$/i.test(sel.label)) sideType = 'Under';
+        side = sideType;
+      } else if (/^away$/i.test(outcome)) {
+        sideType = 'Away';
+        side = ev.away;
+      } else if (/^home$/i.test(outcome)) {
+        sideType = 'Home';
+        side = ev.home;
+      }
+      if (!sideType) continue;
+      const odds = americanInt(sel.displayOdds && sel.displayOdds.american);
+      if (odds == null) continue;
+      const quote = baseQuote('draftkings', league, ev, m.betType, side, sideType, odds, nowMs);
+      quote.event_id = `dk:${ev.id}`;
+      if (m.betType !== 'moneyline') {
+        const line = Number(sel.points);
+        if (!Number.isFinite(line)) continue;
+        quote.line = line;
+      }
+      if (m.suspended) quote.suspended = true;
+      out.push(quote);
+    }
+    return dedupeMain(out);
+  }
+
+  function fdBetType(type) {
+    const t = String(type || '');
+    if (t === 'MONEY_LINE') return 'moneyline';
+    if (t === 'MATCH_HANDICAP_(2-WAY)') return 'spread';
+    if (t === 'TOTAL_POINTS_(OVER/UNDER)') return 'total';
+    return null;
+  }
+
+  // FD MLB names carry the probable pitcher: "Milwaukee Brewers (F Peralta)".
+  function cleanTeam(name) {
+    return String(name || '').replace(/\s*\([^)]*\)\s*$/, '').trim();
+  }
+
+  function splitAt(name) {
+    const parts = String(name || '').split(/\s+@\s+/);
+    if (parts.length !== 2) return null;
+    const away = cleanTeam(parts[0]);
+    const home = cleanTeam(parts[1]);
+    return away && home ? { away, home } : null;
+  }
+
+  // FD content-managed-page body -> quotes.
+  function quotesFromFanDuel(body, league, opts = {}) {
+    const out = [];
+    const att = body && body.attachments;
+    if (!att || !att.markets || !att.events) return out;
+    const nowMs = opts.nowMs || Date.now();
+    for (const m of Object.values(att.markets)) {
+      if (!m) continue;
+      const betType = fdBetType(m.marketType);
+      if (!betType) continue;
+      const rawEv = att.events[String(m.eventId)];
+      const teams = rawEv && splitAt(rawEv.name);
+      if (!teams) continue;
+      const status = String(m.marketStatus || '').toUpperCase();
+      if (status === 'CLOSED') continue;
+      const ev = {
+        id: String(m.eventId),
+        away: teams.away,
+        home: teams.home,
+        start: isoOrNull(rawEv.openDate || m.marketTime),
+        live: m.inPlay === true,
+      };
+      for (const r of m.runners || []) {
+        if (!r || (r.runnerStatus && r.runnerStatus !== 'ACTIVE')) continue;
+        const type = String((r.result && r.result.type) || '').toUpperCase();
+        let side;
+        let sideType;
+        if (betType === 'total') {
+          if (type === 'OVER' || /^over$/i.test(r.runnerName)) sideType = 'Over';
+          else if (type === 'UNDER' || /^under$/i.test(r.runnerName)) sideType = 'Under';
+          side = sideType;
+        } else if (type === 'AWAY') {
+          sideType = 'Away';
+          side = ev.away;
+        } else if (type === 'HOME') {
+          sideType = 'Home';
+          side = ev.home;
+        }
+        if (!sideType) continue;
+        const am = r.winRunnerOdds && r.winRunnerOdds.americanDisplayOdds;
+        const odds = americanInt(am && (am.americanOddsInt != null ? am.americanOddsInt : am.americanOdds));
+        if (odds == null) continue;
+        const quote = baseQuote('fanduel', league, ev, betType, side, sideType, odds, nowMs);
+        quote.event_id = `fd:${ev.id}`;
+        if (betType !== 'moneyline') {
+          const line = Number(r.handicap);
+          if (!Number.isFinite(line)) continue;
+          quote.line = line;
+        }
+        if (status === 'SUSPENDED') quote.suspended = true;
+        out.push(quote);
+      }
+    }
+    return dedupeMain(out);
+  }
+
+  function baseQuote(book, league, ev, betType, side, sideType, odds, nowMs) {
+    const meta = BOOKS[book];
+    return {
+      book: meta.key,
+      book_id: meta.id,
+      league,
+      away: ev.away,
+      home: ev.home,
+      side,
+      side_type: sideType,
+      bet_type: betType,
+      odds,
+      american: odds,
+      is_alt: false,
+      is_live: ev.live === true,
+      start: ev.start,
+      // Stable per game + market + side so a moved main line replaces the old one.
+      token_id: `${book === 'draftkings' ? 'dk' : 'fd'}:${ev.id}:${betType}:${sideType}`,
+      updated_at: new Date(nowMs).toISOString(),
+    };
+  }
+
+  // One main line per game / market / side (first seen wins).
+  function dedupeMain(quotes) {
+    const seen = new Map();
+    for (const q of quotes) if (!seen.has(q.token_id)) seen.set(q.token_id, q);
+    return [...seen.values()];
+  }
+
+  function quoteSig(q) {
+    return `${q.odds}|${q.line == null ? '' : q.line}|${q.is_live ? 1 : 0}|${q.suspended ? 1 : 0}`;
+  }
+
+  // Keep updated_at at the time the price / line last changed, so the board's
+  // per-cell clock tracks the book rather than our poll.
+  function carryChangeTimes(prevByKey, quotes) {
+    const out = [];
+    for (const q of quotes) {
+      const prev = prevByKey && prevByKey.get(q.token_id);
+      if (prev && quoteSig(prev) === quoteSig(q)) out.push({ ...q, updated_at: prev.updated_at });
+      else out.push(q);
+    }
+    return out;
+  }
+
+  const PARSERS = { draftkings: quotesFromDraftKings, fanduel: quotesFromFanDuel };
+  const URLS = { draftkings: dkUrl, fanduel: fdUrl };
+
+  async function fetchBookLeague(book, league, deps = {}) {
+    const fetchFn = deps.fetchFn || globalThis.fetch;
+    const url = URLS[book](league);
+    if (!url) return { ok: false, status: 0, error: 'unsupported_league', quotes: [] };
+    const started = Date.now();
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), deps.timeoutMs || 8000) : null;
+    try {
+      const res = await fetchFn(url, { headers: requestHeaders(book), signal: ctrl ? ctrl.signal : undefined });
+      const ms = Date.now() - started;
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        const blocked = res.status === 403 && /access denied|akamai|cloudflare|attention required/i.test(text);
+        return { ok: false, status: res.status, ms, error: blocked ? 'blocked' : `http_${res.status}`, retryAfter: Number(res.headers && res.headers.get && res.headers.get('retry-after')) || null, quotes: [] };
+      }
+      const body = await res.json();
+      const quotes = PARSERS[book](body, league, { nowMs: Date.now() });
+      return { ok: true, status: res.status, ms, quotes };
+    } catch (err) {
+      return { ok: false, status: 0, ms: Date.now() - started, error: (err && err.name === 'AbortError') ? 'timeout' : String((err && err.message) || err).slice(0, 120), quotes: [] };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  function nextDelayMs(baseMs, failures, retryAfterSec) {
+    if (!failures) return baseMs;
+    const backoff = Math.min(baseMs * 2 ** Math.min(failures, 6), 5 * 60_000);
+    const ra = retryAfterSec ? retryAfterSec * 1000 : 0;
+    return Math.max(backoff, ra);
+  }
+
+
+  // ---------------------------------------------------------------------------
+  // FanDuel prices. The content-managed-page JSON sits behind CloudFront
+  // (max-age=30, stale-while-revalidate=60), so its prices can be ~30-90s old.
+  // It is only the catalog (games, market ids, which runner is home / away).
+  // Prices come from getMarketPrices, the uncached call FanDuel's own page uses
+  // to refresh odds. It takes at most 80 market ids per request.
+  const FD_PRICES_URL = 'https://smp.nj.sportsbook.fanduel.com/api/sports/fixedodds/readonly/v1/getMarketPrices?priceHistory=0';
+  const FD_PRICE_BATCH = 80;
+
+  function fdCatalogFromPage(body, league, nowMs = Date.now()) {
+    const markets = new Map();
+    const att = body && body.attachments;
+    if (!att || !att.markets || !att.events) return { markets, fetchedAt: nowMs };
+    for (const m of Object.values(att.markets)) {
+      if (!m) continue;
+      const betType = fdBetType(m.marketType);
+      if (!betType) continue;
+      const rawEv = att.events[String(m.eventId)];
+      const teams = rawEv && splitAt(rawEv.name);
+      if (!teams) continue;
+      if (String(m.marketStatus || '').toUpperCase() === 'CLOSED') continue;
+      const runners = new Map();
+      for (const r of m.runners || []) {
+        if (!r) continue;
+        const type = String((r.result && r.result.type) || '').toUpperCase();
+        let sideType = null;
+        if (betType === 'total') {
+          if (type === 'OVER' || /^over$/i.test(r.runnerName)) sideType = 'Over';
+          else if (type === 'UNDER' || /^under$/i.test(r.runnerName)) sideType = 'Under';
+        } else if (type === 'AWAY') sideType = 'Away';
+        else if (type === 'HOME') sideType = 'Home';
+        if (!sideType) continue;
+        const am = r.winRunnerOdds && r.winRunnerOdds.americanDisplayOdds;
+        runners.set(String(r.selectionId), {
+          sideType,
+          odds: americanInt(am && (am.americanOddsInt != null ? am.americanOddsInt : am.americanOdds)),
+          handicap: Number(r.handicap),
+          status: r.runnerStatus || 'ACTIVE',
+        });
+      }
+      if (!runners.size) continue;
+      markets.set(String(m.marketId), {
+        marketId: String(m.marketId),
+        eventId: String(m.eventId),
+        betType,
+        away: teams.away,
+        home: teams.home,
+        start: isoOrNull(rawEv.openDate || m.marketTime),
+        inPlay: m.inPlay === true,
+        status: String(m.marketStatus || 'OPEN').toUpperCase(),
+        runners,
+      });
+    }
+    return { markets, fetchedAt: nowMs, league };
+  }
+
+  // getMarketPrices rows -> Map(marketId -> { status, inPlay, runners })
+  function fdPricesFromBody(rows, nowMs = Date.now()) {
+    const out = new Map();
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (!row || row.marketId == null) continue;
+      const runners = new Map();
+      for (const r of row.runnerDetails || []) {
+        if (!r) continue;
+        const am = r.winRunnerOdds && r.winRunnerOdds.americanDisplayOdds;
+        runners.set(String(r.selectionId), {
+          odds: americanInt(am && (am.americanOddsInt != null ? am.americanOddsInt : am.americanOdds)),
+          handicap: Number(r.handicap),
+          status: r.runnerStatus || 'ACTIVE',
+        });
+      }
+      out.set(String(row.marketId), {
+        status: String(row.marketStatus || 'OPEN').toUpperCase(),
+        inPlay: row.inplay === true,
+        runners,
+        at: nowMs,
+      });
+    }
+    return out;
+  }
+
+  const FD_PRICE_TRUST_MS = 5 * 60_000;
+
+  function quotesFromFdState(catalog, prices, league, nowMs = Date.now()) {
+    const out = [];
+    if (!catalog || !catalog.markets) return out;
+    for (const m of catalog.markets.values()) {
+      const live = prices && prices.get(m.marketId);
+      const useLive = live && nowMs - live.at <= FD_PRICE_TRUST_MS;
+      const status = useLive ? live.status : m.status;
+      if (status === 'CLOSED') continue;
+      const inPlay = useLive ? live.inPlay : m.inPlay;
+      const ev = { id: m.eventId, away: m.away, home: m.home, start: m.start, live: inPlay };
+      for (const [selId, meta] of m.runners) {
+        const lr = useLive ? live.runners.get(selId) : null;
+        const odds = lr ? lr.odds : meta.odds;
+        const handicap = lr ? lr.handicap : meta.handicap;
+        const rStatus = lr ? lr.status : meta.status;
+        if (odds == null || (rStatus && rStatus !== 'ACTIVE')) continue;
+        const side = m.betType === 'total' ? meta.sideType : (meta.sideType === 'Away' ? m.away : m.home);
+        const quote = baseQuote('fanduel', league, ev, m.betType, side, meta.sideType, odds, nowMs);
+        quote.event_id = `fd:${m.eventId}`;
+        quote.price_source = useLive ? 'prices' : 'page';
+        if (m.betType !== 'moneyline') {
+          if (!Number.isFinite(handicap)) continue;
+          quote.line = handicap;
+        }
+        if (status === 'SUSPENDED') quote.suspended = true;
+        out.push(quote);
+      }
+    }
+    return dedupeMain(out);
+  }
+
+  // Pick at most FD_PRICE_BATCH market ids: in-play and soon-to-start markets
+  // every tick (moneylines first), the rest round-robin from a cursor.
+  function fdPriceBatch(catalog, cursor = 0, nowMs = Date.now(), soonMs = 6 * 3600_000) {
+    const all = catalog && catalog.markets ? [...catalog.markets.values()] : [];
+    if (all.length <= FD_PRICE_BATCH) return { ids: all.map((m) => m.marketId), cursor: 0 };
+    const rank = { moneyline: 0, spread: 1, total: 2 };
+    const hot = [];
+    const rest = [];
+    for (const m of all) {
+      const t = Date.parse(m.start || '');
+      if (m.inPlay || (Number.isFinite(t) && t - nowMs <= soonMs)) hot.push(m);
+      else rest.push(m);
+    }
+    hot.sort((a, b) => rank[a.betType] - rank[b.betType]);
+    const ids = hot.slice(0, FD_PRICE_BATCH).map((m) => m.marketId);
+    // When more than one batch is hot, the hot set rotates too.
+    const pool = hot.length > FD_PRICE_BATCH ? [...hot.slice(FD_PRICE_BATCH), ...rest] : rest;
+    let next = cursor;
+    if (pool.length) {
+      next = cursor % pool.length;
+      const room = FD_PRICE_BATCH - ids.length;
+      for (let i = 0; i < Math.min(room, pool.length); i += 1) ids.push(pool[(next + i) % pool.length].marketId);
+      next = (next + Math.min(room, pool.length)) % pool.length;
+    }
+    return { ids, cursor: next };
+  }
+
+  async function httpJson(fetchFn, url, init, timeoutMs) {
+    const started = Date.now();
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs || 8000) : null;
+    try {
+      const res = await fetchFn(url, { ...(init || {}), signal: ctrl ? ctrl.signal : undefined });
+      const ms = Date.now() - started;
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        const blocked = res.status === 403 && /access denied|akamai|cloudflare|attention required|request blocked/i.test(text);
+        const ra = res.headers && typeof res.headers.get === 'function' ? Number(res.headers.get('retry-after')) : 0;
+        return { ok: false, status: res.status, ms, error: blocked ? 'blocked' : `http_${res.status}`, retryAfter: Number.isFinite(ra) && ra > 0 ? ra : null };
+      }
+      return { ok: true, status: res.status, ms, body: await res.json() };
+    } catch (err) {
+      return { ok: false, status: 0, ms: Date.now() - started, error: (err && err.name === 'AbortError') ? 'timeout' : String((err && err.message) || err).slice(0, 120) };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  function emptyHealth(book, league) {
+    return {
+      book,
+      league,
+      state: 'starting',
+      last_ok_at: null,
+      last_attempt_at: null,
+      last_change_at: null,
+      last_status: null,
+      last_error: null,
+      last_ms: null,
+      failures: 0,
+      requests: 0,
+      blocked: 0,
+      quotes: 0,
+      catalog_at: null,
+    };
+  }
+
+  // One poll loop per (book, league). onQuotes(book, league, quotes, info)
+  // receives the league's full main-line set after every successful request.
+  // active(book, league) says whether a board is watching: watched leagues poll
+  // every pollMs, others every idlePollMs (keeps health warm, stays gentle).
+  function createDkFdPoller(opts = {}) {
+    const fetchFn = opts.fetchFn || globalThis.fetch;
+    const books = opts.books || ['draftkings', 'fanduel'];
+    const leagues = opts.leagues || ['NFL', 'NCAAF'];
+    const pollMs = Math.max(3000, Number(opts.pollMs) || 4000);
+    const idlePollMs = Math.max(pollMs, Number(opts.idlePollMs) || 30_000);
+    const catalogMs = Math.max(30_000, Number(opts.fdCatalogMs) || 60_000);
+    const blockedBaseMs = Number(opts.blockedBaseMs) || 60_000;
+    const timeoutMs = Number(opts.timeoutMs) || 8000;
+    const onQuotes = typeof opts.onQuotes === 'function' ? opts.onQuotes : () => {};
+    const active = typeof opts.active === 'function' ? opts.active : () => true;
+    const log = typeof opts.log === 'function' ? opts.log : () => {};
+    const health = {};
+    const loops = [];
+    let stopped = false;
+    const sleepers = new Set();
+
+    const loopSleep = new Map();
+    function sleep(ms, key) {
+      return new Promise((resolve) => {
+        if (stopped) { resolve(); return; }
+        const entry = { resolve, key };
+        const done = () => {
+          sleepers.delete(entry);
+          if (key && loopSleep.get(key) === entry) loopSleep.delete(key);
+          resolve();
+        };
+        entry.done = done;
+        entry.t = setTimeout(done, ms);
+        sleepers.add(entry);
+        if (key) loopSleep.set(key, entry);
+      });
+    }
+
+    function delayAfter(h, result, book, league) {
+      const watching = active(book, league);
+      const base = watching ? pollMs : idlePollMs;
+      if (result.ok) return base;
+      if (result.error === 'blocked' || result.status === 403) {
+        return Math.min(blockedBaseMs * 2 ** Math.min(h.failures - 1, 4), 15 * 60_000);
+      }
+      return nextDelayMs(base, h.failures, result.retryAfter);
+    }
+
+    function record(h, result) {
+      h.requests += 1;
+      h.last_attempt_at = Date.now();
+      h.last_status = result.status || null;
+      h.last_ms = result.ms == null ? null : result.ms;
+      if (result.ok) {
+        h.failures = 0;
+        h.last_ok_at = h.last_attempt_at;
+        h.last_error = null;
+        h.state = 'ok';
+      } else {
+        h.failures += 1;
+        h.last_error = result.error || 'error';
+        if (result.error === 'blocked' || result.status === 403) {
+          h.blocked += 1;
+          h.state = 'blocked';
+        } else h.state = 'error';
+        if (h.failures === 1 || h.failures % 10 === 0) log(`[dkfd] ${h.book} ${h.league} ${h.last_error} (status ${h.last_status}, ${h.failures} in a row)`);
+      }
+    }
+
+    function emit(h, book, league, prevByKey, quotes) {
+      const carried = carryChangeTimes(prevByKey, quotes);
+      let changed = false;
+      const next = new Map();
+      for (const q of carried) {
+        next.set(q.token_id, q);
+        const prev = prevByKey.get(q.token_id);
+        if (!prev || quoteSig(prev) !== quoteSig(q)) changed = true;
+      }
+      if (prevByKey.size !== next.size) changed = true;
+      if (changed) h.last_change_at = Date.now();
+      h.quotes = next.size;
+      onQuotes(book, league, carried, { changed, health: { ...h } });
+      return next;
+    }
+
+    async function runDk(league) {
+      const h = health.draftkings[league];
+      let prev = new Map();
+      while (!stopped) {
+        const url = dkUrl(league);
+        const result = await httpJson(fetchFn, url, { headers: requestHeaders('draftkings') }, timeoutMs);
+        if (stopped) return;
+        record(h, result);
+        if (result.ok) prev = emit(h, 'draftkings', league, prev, quotesFromDraftKings(result.body, league, { nowMs: Date.now() }));
+        await sleep(delayAfter(h, result, 'draftkings', league), `draftkings:${league}`);
+      }
+    }
+
+    async function runFd(league) {
+      const h = health.fanduel[league];
+      let prev = new Map();
+      let catalog = null;
+      let prices = new Map();
+      let cursor = 0;
+      while (!stopped) {
+        const now = Date.now();
+        let result;
+        if (!catalog || now - catalog.fetchedAt >= catalogMs) {
+          result = await httpJson(fetchFn, fdUrl(league), { headers: requestHeaders('fanduel') }, timeoutMs);
+          if (result.ok) {
+            catalog = fdCatalogFromPage(result.body, league, Date.now());
+            h.catalog_at = catalog.fetchedAt;
+            for (const id of [...prices.keys()]) if (!catalog.markets.has(id)) prices.delete(id);
+          }
+        } else {
+          const batch = fdPriceBatch(catalog, cursor, now);
+          cursor = batch.cursor;
+          if (!batch.ids.length) {
+            result = { ok: true, status: 204, ms: 0 };
+          } else {
+            result = await httpJson(fetchFn, FD_PRICES_URL, {
+              method: 'POST',
+              headers: { ...requestHeaders('fanduel'), 'content-type': 'application/json' },
+              body: JSON.stringify({ marketIds: batch.ids }),
+            }, timeoutMs);
+            if (result.ok) for (const [id, row] of fdPricesFromBody(result.body, Date.now())) prices.set(id, row);
+          }
+        }
+        if (stopped) return;
+        record(h, result);
+        if (result.ok && catalog) prev = emit(h, 'fanduel', league, prev, quotesFromFdState(catalog, prices, league, Date.now()));
+        await sleep(delayAfter(h, result, 'fanduel', league), `fanduel:${league}`);
+      }
+    }
+
+    return {
+      start() {
+        let i = 0;
+        const n = books.length * leagues.length;
+        for (const book of books) {
+          health[book] = health[book] || {};
+          for (const league of leagues) {
+            health[book][league] = emptyHealth(book, league);
+            const offset = Math.round((i * pollMs) / Math.max(1, n));
+            i += 1;
+            const run = book === 'draftkings' ? runDk : runFd;
+            loops.push(sleep(offset).then(() => (stopped ? null : run(league))).catch((err) => log(`[dkfd] ${book} ${league} loop died: ${err && err.message}`)));
+          }
+        }
+        return this;
+      },
+      // A board just started watching: cut an idle wait short, but never poll
+      // sooner than pollMs after the last request, and never during backoff.
+      poke(book, league) {
+        const h = health[book] && health[book][league];
+        const entry = loopSleep.get(`${book}:${league}`);
+        if (!h || !entry || h.failures > 0) return;
+        const wait = Math.max(0, pollMs - (Date.now() - (h.last_attempt_at || 0)));
+        clearTimeout(entry.t);
+        entry.t = setTimeout(entry.done, wait);
+      },
+      stop() {
+        stopped = true;
+        for (const s of sleepers) { clearTimeout(s.t); s.resolve(); }
+      loopSleep.clear();
+        sleepers.clear();
+      },
+      health() {
+        const out = {};
+        for (const book of Object.keys(health)) {
+          out[book] = {};
+          for (const league of Object.keys(health[book])) out[book][league] = { ...health[book][league] };
+        }
+        return out;
+      },
+    };
+  }
+
+  return {
+    BOOKS,
+    DK_LEAGUE_IDS,
+    FD_PAGE_IDS,
+    dkUrl,
+    fdUrl,
+    requestHeaders,
+    americanInt,
+    quotesFromDraftKings,
+    quotesFromFanDuel,
+    carryChangeTimes,
+    quoteSig,
+    cleanTeam,
+    fetchBookLeague,
+    nextDelayMs,
+    fdCatalogFromPage,
+    fdPricesFromBody,
+    quotesFromFdState,
+    fdPriceBatch,
+    createDkFdPoller,
+    FD_PRICE_BATCH,
+  };
+})();
+
+// DK / FD on the relay. Off unless DKFD_FEED=1. Each (book, league) has a
+// full-snapshot channel like Novig, plus an `event: feed` heartbeat after
+// every poll so the board can tell a quiet market from a dead feed.
+const DKFD_VENUES = Object.freeze(['draftkings', 'fanduel']);
+const DKFD_ALL_LEAGUES = Object.freeze(['NFL', 'NCAAF', 'MLB', 'NHL']);
+
+function dkfdEnabled(env = process.env) {
+  const raw = String((env && env.DKFD_FEED) || '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+function dkfdLeagues(env = process.env) {
+  const raw = String((env && env.DKFD_LEAGUES) || '').trim();
+  if (!raw) return DKFD_ALL_LEAGUES.slice();
+  const want = raw.split(',').map((s) => s.trim().toUpperCase()).filter((l) => DKFD_ALL_LEAGUES.includes(l));
+  return want.length ? want : DKFD_ALL_LEAGUES.slice();
+}
+
+function createDkfdChannel(onWatch) {
+  const base = createChannel();
+  const feedListeners = new Set();
+  let lastFeed = null;
+  let watchers = 0;
+  return {
+    push: base.push,
+    feed(info) {
+      lastFeed = info;
+      for (const fn of feedListeners) {
+        try { fn(info); } catch (_) { /* listener closed */ }
+      }
+    },
+    subscribe(onPacket, onFeed) {
+      watchers += 1;
+      if (watchers === 1 && typeof onWatch === 'function') {
+        try { onWatch(); } catch (_) { /* ignore */ }
+      }
+      const unsub = base.subscribe(onPacket);
+      if (onFeed) {
+        feedListeners.add(onFeed);
+        if (lastFeed) {
+          try { onFeed(lastFeed); } catch (_) { /* ignore */ }
+        }
+      }
+      return () => {
+        watchers = Math.max(0, watchers - 1);
+        unsub();
+        if (onFeed) feedListeners.delete(onFeed);
+      };
+    },
+    watchers() { return watchers; },
+  };
+}
+
+function dkfdFeedInfo(health) {
+  if (!health) return null;
+  return {
+    book: health.book,
+    league: health.league,
+    state: health.state,
+    last_ok_at: health.last_ok_at,
+    last_change_at: health.last_change_at,
+    last_error: health.last_error,
+    failures: health.failures,
+    quotes: health.quotes,
+  };
+}
+
+// Full main-line set for a book + league each poll. Same rules as Novig:
+// a quote that left (game started without a live line, moved main line on a
+// new market) is dropped with a complete snapshot; otherwise only changes.
+function publishDkfd(state, book, league, quotes, info) {
+  const store = state.dkfd;
+  if (!store) return;
+  const bookStore = store.books[book] && store.books[book][league];
+  const channel = store.channels[book] && store.channels[book][league];
+  if (!bookStore || !channel) return;
+  const next = new Map();
+  for (const quote of quotes || []) {
+    if (quote && quote.token_id) next.set(quote.token_id, quote);
+  }
+  let removed = false;
+  for (const key of bookStore.keys()) {
+    if (!next.has(key)) removed = true;
+  }
+  const changed = [];
+  for (const [key, quote] of next) {
+    const prev = bookStore.get(key);
+    if (!prev || dkfdFeed.quoteSig(prev) !== dkfdFeed.quoteSig(quote)) changed.push(quote);
+  }
+  bookStore.clear();
+  for (const [key, quote] of next) bookStore.set(key, quote);
+  const snapKey = `${book}:${league}`;
+  if (removed || (!store.snapshotted.has(snapKey) && next.size)) {
+    store.snapshotted.add(snapKey);
+    channel.push({ quotes: [...next.values()], complete: true, mode: 'snapshot' });
+  } else if (changed.length) {
+    channel.push({ quotes: changed, complete: false, mode: 'rest' });
+  }
+  // Heartbeat after the quotes so a price that moved lands before its clock.
+  channel.feed(dkfdFeedInfo(info && info.health));
+}
+
+function createDkfdState(leagues) {
+  const books = {};
+  const channels = {};
+  for (const book of DKFD_VENUES) {
+    books[book] = {};
+    channels[book] = {};
+    for (const league of leagues) {
+      books[book][league] = new Map();
+      channels[book][league] = createDkfdChannel(() => {
+        const store = channels.__store;
+        if (store && store.poller && typeof store.poller.poke === 'function') store.poller.poke(book, league);
+      });
+    }
+  }
+  const store = { leagues, books, channels, snapshotted: new Set(), poller: null };
+  Object.defineProperty(channels, '__store', { value: store, enumerable: false });
+  return store;
+}
+
+function startDkfd(state, opts = {}, env = process.env) {
+  if (opts.dkfd === false || (!opts.dkfdForce && !dkfdEnabled(env))) {
+    console.log('[odds-relay] dk/fd feed off (DKFD_FEED is not 1)');
+    return () => {};
+  }
+  const leagues = dkfdLeagues(env);
+  state.dkfd = createDkfdState(leagues);
+  const poller = dkfdFeed.createDkFdPoller({
+    leagues,
+    fetchFn: opts.dkfdFetch,
+    pollMs: Number(env.DKFD_POLL_MS) || opts.dkfdPollMs || 4000,
+    idlePollMs: Number(env.DKFD_IDLE_POLL_MS) || opts.dkfdIdlePollMs || 30_000,
+    fdCatalogMs: Number(env.DKFD_FD_CATALOG_MS) || 60_000,
+    active: (book, league) => {
+      const ch = state.dkfd.channels[book] && state.dkfd.channels[book][league];
+      return !!ch && ch.watchers() > 0;
+    },
+    onQuotes: (book, league, quotes, info) => publishDkfd(state, book, league, quotes, info),
+    log: (msg) => console.log(msg),
+  });
+  state.dkfd.poller = poller.start();
+  console.log(`[odds-relay] dk/fd feed on: ${leagues.join(',')}`);
+  return () => poller.stop();
+}
+
+function handleDkfdRequest(req, res, url, state, venue) {
+  if (!state.dkfd) {
+    res.writeHead(503, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    res.end(JSON.stringify({ ok: false, error: 'dkfd_feed_off' }));
+    return;
+  }
+  const league = String(url.searchParams.get('league') || 'NFL').trim().toUpperCase();
+  const channel = state.dkfd.channels[venue] && state.dkfd.channels[venue][league];
+  if (!channel) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'league not on the dk/fd feed' }));
+    return;
+  }
+  if (url.pathname === '/board') {
+    const health = state.dkfd.poller ? state.dkfd.poller.health() : {};
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    res.end(JSON.stringify({
+      ok: true,
+      league,
+      venue,
+      feed: dkfdFeedInfo(health[venue] && health[venue][league]),
+      quotes: [...state.dkfd.books[venue][league].values()],
+    }));
+    return;
+  }
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+    'x-accel-buffering': 'no',
+  });
+  const writePacket = (packet) => {
+    if (!packet) return;
+    res.write(formatQuoteSse(packet.quotes, new Date().toISOString(), {
+      source: venue,
+      complete: packet.complete,
+      mode: packet.mode,
+    }));
+  };
+  const writeFeed = (info) => {
+    if (!info) return;
+    res.write(`event: feed\ndata: ${JSON.stringify({ ingest_ts: new Date().toISOString(), payload: { source: venue, feed: info } })}\n\n`);
+  };
+  const unsub = channel.subscribe(writePacket, writeFeed);
+  const beat = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch (_) { /* closed */ }
+  }, 15000);
+  const close = () => {
+    clearInterval(beat);
+    unsub();
+  };
+  req.on('close', close);
+  res.on('error', close);
+}
+
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -3743,7 +4614,8 @@ function handleRequest(req, res, state) {
     }
     const novig = state.novigFeed ? state.novigFeed.health() : null;
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-    res.end(JSON.stringify({ ok: true, status: state.status, counts, novig, betstamp: state.betstamp ? state.betstamp.health() : null, underdog: state.underdog ? state.underdog.health() : null }));
+    const dkfd = state.dkfd && state.dkfd.poller ? state.dkfd.poller.health() : null;
+    res.end(JSON.stringify({ ok: true, status: state.status, counts, novig, betstamp: state.betstamp ? state.betstamp.health() : null, underdog: state.underdog ? state.underdog.health() : null, dkfd }));
     return;
   }
   if (url.pathname !== '/stream' && url.pathname !== '/board') {
@@ -3752,6 +4624,10 @@ function handleRequest(req, res, state) {
     return;
   }
   const venue = String(url.searchParams.get('venue') || '');
+  if (DKFD_VENUES.includes(venue)) {
+    handleDkfdRequest(req, res, url, state, venue);
+    return;
+  }
   const league = parseLeague(url.searchParams.get('league') || 'NFL');
   if (!VENUES.includes(venue) || !league) {
     res.writeHead(400, { 'content-type': 'application/json' });
@@ -3803,6 +4679,10 @@ function startOddsRelay(opts = {}) {
     stops.push(startNovig(state, opts, env));
   } else {
     state.status = { us: 'off', clob: 'off', kalshi: 'off', novig: 'off' };
+  }
+  {
+    const env = opts.env || process.env;
+    stops.push(startDkfd(state, opts, env));
   }
   if (opts.betstamp !== false) {
     const env = opts.env || process.env;
@@ -3887,6 +4767,11 @@ module.exports = {
   novigFeed,
   betstampRelay,
   underdogRelay,
+  dkfdFeed,
+  publishDkfd,
+  createDkfdState,
+  dkfdEnabled,
+  dkfdLeagues,
   espnSchedule,
   scheduleFromEspn,
   applyKalshiSchedule,
