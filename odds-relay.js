@@ -4174,6 +4174,7 @@ const dkfdFeed = (() => {  const BOOKS = Object.freeze({
     const blockedBaseMs = Number(opts.blockedBaseMs) || 60_000;
     const timeoutMs = Number(opts.timeoutMs) || 8000;
     const onQuotes = typeof opts.onQuotes === 'function' ? opts.onQuotes : () => {};
+    const onFailure = typeof opts.onFailure === 'function' ? opts.onFailure : () => {};
     const active = typeof opts.active === 'function' ? opts.active : () => true;
     const log = typeof opts.log === 'function' ? opts.log : () => {};
     const health = {};
@@ -4254,6 +4255,7 @@ const dkfdFeed = (() => {  const BOOKS = Object.freeze({
         if (stopped) return;
         record(h, result);
         if (result.ok) prev = emit(h, 'draftkings', league, prev, quotesFromDraftKings(result.body, league, { nowMs: Date.now() }));
+        else onFailure('draftkings', league, { ...h });
         await sleep(delayAfter(h, result, 'draftkings', league), `draftkings:${league}`);
       }
     }
@@ -4291,6 +4293,7 @@ const dkfdFeed = (() => {  const BOOKS = Object.freeze({
         if (stopped) return;
         record(h, result);
         if (result.ok && catalog) prev = emit(h, 'fanduel', league, prev, quotesFromFdState(catalog, prices, league, Date.now()));
+        else if (!result.ok) onFailure('fanduel', league, { ...h });
         await sleep(delayAfter(h, result, 'fanduel', league), `fanduel:${league}`);
       }
     }
@@ -4371,6 +4374,15 @@ const DKFD_ALL_LEAGUES = Object.freeze(['NFL', 'NCAAF', 'MLB', 'NHL']);
 function dkfdEnabled(env = process.env) {
   const raw = String((env && env.DKFD_FEED) || '').trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+// DKFD_BOOKS=fanduel (or draftkings) runs one book only. Railway's egress is
+// Akamai-blocked for DraftKings (403 from the first request, Oct 7 2026).
+function dkfdBooks(env = process.env) {
+  const raw = String((env && env.DKFD_BOOKS) || '').trim();
+  if (!raw) return DKFD_VENUES.slice();
+  const want = raw.split(',').map((s) => s.trim().toLowerCase()).filter((b) => DKFD_VENUES.includes(b));
+  return want.length ? want : DKFD_VENUES.slice();
 }
 
 function dkfdLeagues(env = process.env) {
@@ -4464,10 +4476,10 @@ function publishDkfd(state, book, league, quotes, info) {
   channel.feed(dkfdFeedInfo(info && info.health));
 }
 
-function createDkfdState(leagues) {
+function createDkfdState(leagues, activeBooks = DKFD_VENUES) {
   const books = {};
   const channels = {};
-  for (const book of DKFD_VENUES) {
+  for (const book of activeBooks) {
     books[book] = {};
     channels[book] = {};
     for (const league of leagues) {
@@ -4489,8 +4501,10 @@ function startDkfd(state, opts = {}, env = process.env) {
     return () => {};
   }
   const leagues = dkfdLeagues(env);
-  state.dkfd = createDkfdState(leagues);
+  const books = dkfdBooks(env);
+  state.dkfd = createDkfdState(leagues, books);
   const poller = dkfdFeed.createDkFdPoller({
+    books,
     leagues,
     fetchFn: opts.dkfdFetch,
     pollMs: Number(env.DKFD_POLL_MS) || opts.dkfdPollMs || 4000,
@@ -4501,10 +4515,15 @@ function startDkfd(state, opts = {}, env = process.env) {
       return !!ch && ch.watchers() > 0;
     },
     onQuotes: (book, league, quotes, info) => publishDkfd(state, book, league, quotes, info),
+    // Failed polls still send the heartbeat so a board can say "blocked".
+    onFailure: (book, league, health) => {
+      const ch = state.dkfd.channels[book] && state.dkfd.channels[book][league];
+      if (ch) ch.feed(dkfdFeedInfo(health));
+    },
     log: (msg) => console.log(msg),
   });
   state.dkfd.poller = poller.start();
-  console.log(`[odds-relay] dk/fd feed on: ${leagues.join(',')}`);
+  console.log(`[odds-relay] dk/fd feed on: ${books.join(',')} ${leagues.join(',')}`);
   return () => poller.stop();
 }
 
@@ -4515,7 +4534,12 @@ function handleDkfdRequest(req, res, url, state, venue) {
     return;
   }
   const league = String(url.searchParams.get('league') || 'NFL').trim().toUpperCase();
-  const channel = state.dkfd.channels[venue] && state.dkfd.channels[venue][league];
+  if (!state.dkfd.channels[venue]) {
+    res.writeHead(503, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    res.end(JSON.stringify({ ok: false, error: 'dkfd_book_off' }));
+    return;
+  }
+  const channel = state.dkfd.channels[venue][league];
   if (!channel) {
     res.writeHead(400, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: false, error: 'league not on the dk/fd feed' }));
@@ -4772,6 +4796,7 @@ module.exports = {
   createDkfdState,
   dkfdEnabled,
   dkfdLeagues,
+  dkfdBooks,
   espnSchedule,
   scheduleFromEspn,
   applyKalshiSchedule,
