@@ -51,6 +51,8 @@ const DEFAULTS = Object.freeze({
   skew: 1,
   twoSided: false,
   refMaxDev: 0,
+  // never quote at/near the exchange minimum tick: a $0.001 price is noise, not a market (env NOBOOST_MIN_QUOTE_YES)
+  minQuoteYes: 0.005,
 });
 
 function num(raw, fb, lo = -Infinity, hi = Infinity) {
@@ -93,6 +95,7 @@ function configFromEnv(env = process.env) {
     skew: num(e.NOBOOST_SKEW, DEFAULTS.skew, 0, 10),
     twoSided: flag(e.NOBOOST_TWO_SIDED, DEFAULTS.twoSided),
     refMaxDev: num(e.NOBOOST_REF_MAX_DEV, DEFAULTS.refMaxDev, 0, 0.5),
+    minQuoteYes: num(e.NOBOOST_MIN_QUOTE_YES, DEFAULTS.minQuoteYes, 0, 0.5),
   };
 }
 
@@ -222,6 +225,7 @@ function priceCombo(legs, source, opts = {}) {
   const tick = tickFor(y, cfg);
   const yq = r4(ceilTo(y, tick));
   if (!(yq >= tick && yq <= 0.99)) return { ok: false, reason: 'price_out_of_range', y: yq };
+  if (cfg.minQuoteYes > 0 && yq < cfg.minQuoteYes - 1e-12) return { ok: false, reason: 'below_min_quote', y: yq };
 
   // Buy-side bid (optional): we BUY the parlay from a taker who sells it. EV = P − yb.
   let yBid = null;

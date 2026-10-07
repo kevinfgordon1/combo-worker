@@ -9,7 +9,8 @@
 //   • 2..maxLegs legs, every leg a full-game NFL MONEYLINE (Kalshi KXNFLGAME-… /
 //     Polymarket aec-nfl-…),
 //   • each leg in a DIFFERENT game (uncorrelated) — same game twice ⇒ skip,
-//   • pregame only (kickoff from the book, ticker has no clock for NFL),
+//   • pregame only (kickoff from ESPN / odds_cache commence_time pushed into the book;
+//     Kalshi occurrence−3h only as a last-resort fallback; ESPN in/post ⇒ started),
 //   • priceable from fresh venue prices (never invents a price).
 'use strict';
 const { parseKalshiUnhedgedTicker, parsePmUnhedgedSlug } = require('../unhedged-rfq');
@@ -92,7 +93,7 @@ function createNoBoostShadow({
   const rk = risk || createRiskBook(riskConfigFromEnv(env), { now });
   const counts = {
     rfqs: 0, combo: 0, scope: 0, priceable: 0, would_quote: 0, risk_blocked: 0,
-    pulled: 0, started: 0, flag_off: 0,
+    pulled: 0, evicted: 0, started: 0, flag_off: 0,
   };
   const skips = new Map();
   const decisionMs = [];
@@ -107,14 +108,16 @@ function createNoBoostShadow({
     counts.scope += 1;
     const nowMs = now();
     for (const l of cls.legs) {
+      // real kickoff (ESPN / odds_cache commence_time) when known; ESPN in/post state => started regardless of clock
       const ko = book.kickoffMs(l.gameId);
-      if (ko == null) { bumpSkip('no_kickoff'); return { action: 'skip', reason: 'no_kickoff' }; }
-      if (ko <= nowMs) { counts.started += 1; bumpSkip('game_started'); return { action: 'skip', reason: 'game_started' }; }
+      if (ko == null) { bumpSkip('no_kickoff'); return { action: 'skip', reason: 'no_kickoff', legs: cls.legs }; }
+      const started = typeof book.hasStarted === 'function' ? book.hasStarted(l.gameId, nowMs) : ko <= nowMs;
+      if (started) { counts.started += 1; bumpSkip('game_started'); return { action: 'skip', reason: 'game_started', legs: cls.legs }; }
     }
     const legsForPrice = cls.legs.map((l) => ({ ...l }));
     const util = rk.utilization(cls.legs);
     const priced = priceCombo(legsForPrice, book.source, { cfg, util, venue });
-    if (!priced.ok) { bumpSkip(`price:${priced.reason}`); return { action: 'skip', reason: `price:${priced.reason}`, priced }; }
+    if (!priced.ok) { bumpSkip(`price:${priced.reason}`); return { action: 'skip', reason: `price:${priced.reason}`, priced, legs: cls.legs }; }
     counts.priceable += 1;
 
     const contracts = contractsFor({
@@ -128,7 +131,7 @@ function createNoBoostShadow({
       counts.risk_blocked += 1;
       bumpSkip(`risk:${chk.reason}`);
       pending = (`[NOBOOST]${tag} SKIP rfq=${rfqId} ${venue} legs=${cls.legs.length} risk=${chk.reason} fair=${fmtAm(priced.fair_american)} would=${fmtAm(priced.quote_american)}`);
-      return { action: 'skip', reason: `risk:${chk.reason}`, priced, contracts, risk: chk };
+      return { action: 'skip', reason: `risk:${chk.reason}`, priced, contracts, risk: chk, legs: cls.legs };
     }
     counts.would_quote += 1;
     rk.registerQuote(rfqId, {
@@ -166,6 +169,7 @@ function createNoBoostShadow({
     });
     for (const p of pulled) {
       counts.pulled += 1;
+      if (p.reason === 'evicted') counts.evicted = (counts.evicted || 0) + 1;
       log(`[NOBOOST]${tag} PULL rfq=${p.rfqId} reason=${p.reason} was=${fmtAm(require('../engine').americanFromProb(p.quote.quoteYes))}`);
     }
     return pulled;

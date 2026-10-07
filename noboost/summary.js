@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Report on the no-boost PAPER run from Supabase (noboost_paper_rfqs / noboost_paper_stats).
-//   node noboost/summary.js [--since 2026-10-01T00:00:00Z] [--json]
+//   node noboost/summary.js [--run v2-20261007|all] [--since 2026-10-01T00:00:00Z] [--json]
+//   --run defaults to the runner's current DEFAULT_RUN_ID (rows from older runs are excluded; --run all = everything)
 //   (env: SUPABASE_URL, SUPABASE_SERVICE_KEY — e.g. `railway run -s noboost-paper -- node noboost/summary.js`)
 // All prices are AMERICAN odds. Money is dollars. Ratios/counts are counts.
 'use strict';
@@ -8,6 +9,8 @@ const args = process.argv.slice(2);
 const arg = (k, d) => { const i = args.indexOf(`--${k}`); return i >= 0 ? args[i + 1] : d; };
 const SINCE = arg('since', null);
 const AS_JSON = args.includes('--json');
+const RUN = arg('run', require('./runner').DEFAULT_RUN_ID);
+const RUNQ = RUN && RUN !== 'all' ? `&run_id=eq.${encodeURIComponent(RUN)}` : '';
 const url = process.env.SUPABASE_URL; const key = process.env.SUPABASE_SERVICE_KEY;
 if (!url || !key) { console.error('need SUPABASE_URL and SUPABASE_SERVICE_KEY'); process.exit(1); }
 const H = { apikey: key, Authorization: `Bearer ${key}` };
@@ -29,10 +32,10 @@ const money = (n) => `${n < 0 ? '-' : ''}$${Math.abs(n).toLocaleString('en-US', 
 const med = (a) => pct(a, 0.5);
 
 (async () => {
-  const q = `noboost_paper_rfqs?select=*&order=rfq_created_ts.asc${SINCE ? `&rfq_created_ts=gte.${SINCE}` : ''}`;
+  const q = `noboost_paper_rfqs?select=*&order=rfq_created_ts.asc${RUNQ}${SINCE ? `&rfq_created_ts=gte.${SINCE}` : ''}`;
   const rows = await fetchAll(q);
-  const statsRows = await fetchAll(`noboost_paper_stats?select=created_at,payload${SINCE ? `&created_at=gte.${SINCE}` : ''}&order=created_at.asc`);
-  const rep = { rows: rows.length, since: SINCE, by_legs: {}, variants: {} };
+  const statsRows = await fetchAll(`noboost_paper_stats?select=created_at,payload${RUNQ}${SINCE ? `&created_at=gte.${SINCE}` : ''}&order=created_at.asc`);
+  const rep = { rows: rows.length, run_id: RUN, since: SINCE, by_legs: {}, variants: {} };
 
   // latency / staleness (per-RFQ rows are persisted only for traded + sampled RFQs; the stats histograms cover ALL)
   const dec = rows.map((r) => Number(r.decision_ms)).filter(Number.isFinite);
@@ -104,7 +107,7 @@ const med = (a) => pct(a, 0.5);
   };
 
   if (AS_JSON) { console.log(JSON.stringify(rep, null, 1)); return; }
-  console.log(`=== NO-BOOST PAPER RUN${SINCE ? ` since ${SINCE}` : ''} — ${rows.length} persisted RFQ rows (traded + 2% sample of untraded) ===`);
+  console.log(`=== NO-BOOST PAPER RUN run_id=${RUN}${SINCE ? ` since ${SINCE}` : ''} — ${rows.length} persisted RFQ rows (traded + 2% sample of untraded) ===`);
   if (rep.seen != null) console.log(`RFQs seen ${rep.seen}, out of scope ${rep.out_of_scope}; in-scope by legs: ${JSON.stringify(rep.counts_by_legs)}`);
   const L = rep.latency;
   console.log(`\n-- Decision latency (RFQ in -> would-quote out; in-memory lookup + multiply + caps) --`);

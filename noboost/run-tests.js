@@ -3,7 +3,7 @@
 'use strict';
 const { spawnSync } = require('child_process');
 let bad = 0;
-for (const f of ['quote', 'risk', 'book', 'shadow', 'paper', 'promo-fair']) {
+for (const f of ['quote', 'risk', 'book', 'shadow', 'paper', 'promo-fair', 'matching']) {
   const r = spawnSync(process.execPath, [`${__dirname}/${f}.test.js`], { stdio: 'inherit' });
   if (r.status !== 0) { bad += 1; console.error(`FAILED noboost/${f}.test.js`); }
 }
