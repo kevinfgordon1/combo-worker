@@ -56,3 +56,31 @@ See the PR description and `noboost/backtest-output*.txt` (raw output). Data is 
 ## Paper service (Railway `noboost-paper`)
 Env: `NOBOOST_SHADOW=1`, `NOBOOST_FAIR_METHOD=mid`, `NOBOOST_GUARDRAIL=off`, `NOBOOST_MARGIN=0.10` (+ the shared `KALSHI_KEY_ID`/`Kalshi_combo_key` for REST GETs and `SUPABASE_URL`/`SUPABASE_SERVICE_KEY`). `NOBOOST_LIVE` must never be set (the service refuses to start). Start: `node noboost/start.js`.
 Read results: `railway run -s noboost-paper -- node noboost/summary.js [--since ISO] [--json]`, or query `noboost_paper_rfqs` / `noboost_paper_stats` in Supabase (migration `migrations/20261001_noboost_paper.sql`).
+
+## PROMO variant (third shadow quoter; `NOBOOST_PROMO=1`, default OFF)
+Promo-Builder-style *trusted-book* pricing, run beside PRIMARY and LOCKCF on the same RFQs (shadow/paper only).
+- **Fair** = product over legs of a per-leg *consensus*: each trusted sportsbook's two-way price is de-vigged, exchange prices
+  (Kalshi live book, Polymarket, Novig, ProphetX) join the blend, weights favor Pinnacle (3) / exchanges (1.5–2) / mainstream books (1);
+  outliers (>0.06 from the median), incoherent two-ways and stale quotes are dropped; needs >=3 components incl. >=1 sportsbook, else the combo is *not priced*.
+  Fliff and Courtside are excluded; Betstamp is not used. Also logged: `promoBest` = the literal Promo "best opposing price" true probability (high estimate).
+- **Margin** 10% over that fair in price mode, lock guardrail OFF (same as PRIMARY). Everything is American odds in logs/DB (`promoFair=`, `promoBest=`, `books=`).
+- **No I/O on the RFQ path**: `odds-ingest.js` parses the `odds_cache` row in the *background* refresher (every 60s) into `book.setBooks`, which precomputes the per-leg consensus; the RFQ decision is lookup + multiply. Sportsbook data older than 12 min makes PROMO refuse to price.
+- Not available from our feeds (never appear): Bet105, BetCris, Prime, BookMaker, Circa, bet365. The ask-ladder VWAP blend (`blendAskLadderToPayout`) is ported but needs a depth refresher; `odds_cache` only has top-of-book size.
+- Migration: `migrations/20261001_noboost_paper_promo.sql`. Report: `node noboost/summary.js` prints a side-by-side table across the variants.
+
+## Optional separate-key WebSocket intake (NOT started)
+`ws-intake.js` can receive `rfq_created` over Kalshi's communications WS to cut detect lag (polling: median ~1–2.5s) to ~ms. Kalshi allows one such WS per key,
+so it **requires a new, separate Kalshi key** (`NOBOOST_KALSHI_KEY_ID` / `NOBOOST_KALSHI_PRIVATE_KEY`) and `NOBOOST_WS=1`; it refuses to run on combo-worker's key. Not wired into `runner.js`.
+
+## Run v2 (2026-10-07): matching / expiry fixes, clean run tag
+
+Every row and stats payload carries `run_id` (`NOBOOST_RUN_ID`, default `v2-20261007` in `runner.js`). Legacy rows have `run_id IS NULL` and are kept. A new run restores only its own open fills, so the paper risk books start empty. `node noboost/summary.js` defaults to the current run; `--run all` shows everything.
+
+- **Seen-set:** a two-generation TTL set (`ttl-set.js`, ≥180s) replaces clear-at-400k. RFQs created more than 120s before we first see them count as stale and are skipped, so no RFQ is ever processed twice. Re-delivery of an id still in memory is ignored.
+- **Match window:** a print matches an RFQ only when `seen < trade ≤ seen + ttl(20s) + grace(2s)`. A fill is credited only when `trade ≤ quote_expires_at` (seen + 20s) and the quote wasn't pulled or evicted first. Pending RFQs finalize as `no_trade` at window end + 15s of trade-feed lag, then leave memory.
+- **Size:** the trade feed has no RFQ id. The print must therefore match the RFQ size: contract RFQs within ±2%, dollar RFQs with notional count·price within −15%/+2% of target cost. Prints of the wrong size never match. When several in-window candidates exist, the most recent one is taken and the row is flagged `match_ambiguous` (`match_candidates` = n).
+- **Prints at $0.001 are ignored.** Quotes are floored at `NOBOOST_MIN_QUOTE_YES` (default $0.005).
+- **Open-quote cap:** eviction marks the quote PULLED (`evicted`, at eviction time). TTL pulls are timed at the exact expiry.
+- **PROMO:** classified legs are kept for every in-scope RFQ. A PROMO-only fill therefore still runs the per-game and per-team caps and books that exposure.
+- **Kickoff:** comes from the ESPN scoreboard (with pre/in/post state) or odds_cache `commence_time`. Kalshi occurrence−3h is only a fallback. ESPN `in`/`post` ⇒ the game counts as started.
+- **Settlement:** void legs are dropped. If every leg is void the combo is a push (P&L 0). Rows record `void_legs` and `push`.

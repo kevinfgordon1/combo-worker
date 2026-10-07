@@ -51,6 +51,8 @@ const DEFAULTS = Object.freeze({
   skew: 1,
   twoSided: false,
   refMaxDev: 0,
+  // never quote at/near the exchange minimum tick: a $0.001 price is noise, not a market (env NOBOOST_MIN_QUOTE_YES)
+  minQuoteYes: 0.005,
 });
 
 function num(raw, fb, lo = -Infinity, hi = Infinity) {
@@ -84,7 +86,7 @@ function configFromEnv(env = process.env) {
   return {
     margin: num(e.NOBOOST_MARGIN, DEFAULTS.margin, 0, 5),
     marginMode: pick(e.NOBOOST_MARGIN_MODE, ['price', 'capital'], DEFAULTS.marginMode),
-    fairMethod: pick(e.NOBOOST_FAIR_METHOD, ['inverse', 'mid'], DEFAULTS.fairMethod),
+    fairMethod: pick(e.NOBOOST_FAIR_METHOD, ['inverse', 'mid', 'promo'], DEFAULTS.fairMethod),
     guardrail: pick(e.NOBOOST_GUARDRAIL, ['lock', 'off'], DEFAULTS.guardrail),
     minLegs: Math.floor(num(e.NOBOOST_MIN_LEGS, DEFAULTS.minLegs, 2, 40)),
     maxLegs: Math.floor(num(e.NOBOOST_MAX_LEGS, DEFAULTS.maxLegs, 2, 40)),
@@ -93,6 +95,7 @@ function configFromEnv(env = process.env) {
     skew: num(e.NOBOOST_SKEW, DEFAULTS.skew, 0, 10),
     twoSided: flag(e.NOBOOST_TWO_SIDED, DEFAULTS.twoSided),
     refMaxDev: num(e.NOBOOST_REF_MAX_DEV, DEFAULTS.refMaxDev, 0, 0.5),
+    minQuoteYes: num(e.NOBOOST_MIN_QUOTE_YES, DEFAULTS.minQuoteYes, 0, 0.5),
   };
 }
 
@@ -184,14 +187,22 @@ function priceCombo(legs, source, opts = {}) {
   for (const leg of legs) {
     const p = priceLeg(leg, source);
     if (!p) return { ok: false, reason: 'unpriceable_leg', leg: leg && (leg.ticker || leg.symbol) };
+    // promo method needs the trusted-book consensus; the exchange-only methods need a fresh exchange book
+    if (cfg.fairMethod === 'promo' ? !(p.promo && p.promo.consensus != null) : p.inverse == null) {
+      return { ok: false, reason: cfg.fairMethod === 'promo' ? 'no_promo_consensus' : 'unpriceable_leg', leg: leg && (leg.ticker || leg.symbol) };
+    }
     per.push(p);
   }
-  const fairInverse = productFair(per.map((p) => p.inverse));
+  const fairInverse = per.every((p) => p.inverse != null) ? productFair(per.map((p) => p.inverse)) : null;
   const fairMid = per.every((p) => p.mid != null) ? productFair(per.map((p) => p.mid)) : null;
   const lockProbs = per.map((p) => p.lockCost);
-  const yLock = lockProbs.every((x) => x != null) ? productFair(lockProbs) : null;
+  const yLock = lockProbs.every((x) => x != null && x !== undefined) ? productFair(lockProbs) : null;
   const fairRef = per.every((p) => p.reference != null) ? productFair(per.map((p) => p.reference)) : null;
-  const fair = cfg.fairMethod === 'mid' ? fairMid : fairInverse;
+  // PROMO: Promo-Builder-style trusted-book + exchange consensus (noboost/promo-fair.js), precomputed
+  // in the book by a background refresher; legs without a fresh consensus make the combo unpriceable.
+  const fairPromo = per.every((p) => p.promo && p.promo.consensus != null) ? productFair(per.map((p) => p.promo.consensus)) : null;
+  const fairPromoBest = per.every((p) => p.promo && p.promo.promoBest != null) ? productFair(per.map((p) => p.promo.promoBest)) : null;
+  const fair = cfg.fairMethod === 'mid' ? fairMid : (cfg.fairMethod === 'promo' ? fairPromo : fairInverse);
   if (fair == null) return { ok: false, reason: 'no_fair' };
 
   if (cfg.refMaxDev > 0 && fairRef != null && Math.abs(fair - fairRef) / fairRef > cfg.refMaxDev) {
@@ -214,6 +225,7 @@ function priceCombo(legs, source, opts = {}) {
   const tick = tickFor(y, cfg);
   const yq = r4(ceilTo(y, tick));
   if (!(yq >= tick && yq <= 0.99)) return { ok: false, reason: 'price_out_of_range', y: yq };
+  if (cfg.minQuoteYes > 0 && yq < cfg.minQuoteYes - 1e-12) return { ok: false, reason: 'below_min_quote', y: yq };
 
   // Buy-side bid (optional): we BUY the parlay from a taker who sells it. EV = P − yb.
   let yBid = null;
@@ -230,9 +242,9 @@ function priceCombo(legs, source, opts = {}) {
   return {
     ok: true,
     legs: per.length,
-    fair, fairMid, fairRef, yLock, yTarget, mEff, binding,
+    fair, fairMid, fairPromo, fairPromoBest, fairRef, yLock, yTarget, mEff, binding,
     legAgesMs: per.map((p) => (p.ageMs == null ? null : Math.round(p.ageMs))),
-    maxLegAgeMs: per.reduce((a, p) => (p.ageMs != null && p.ageMs > a ? p.ageMs : a), 0),
+    maxLegAgeMs: per.reduce((a, p) => { const g = cfg.fairMethod === 'promo' ? (p.promo && p.promo.ageMs) : p.ageMs; return g != null && g > a ? g : a; }, 0),
     quoteYes: yq,
     noBid: r4(1 - yq),
     yesBid: yBid,
@@ -240,8 +252,12 @@ function priceCombo(legs, source, opts = {}) {
     evPerContract: yq - fair,
     // American odds (never percentages) — the only odds fields the logger prints.
     fair_american: americanFromProb(fair),
-    fair_inverse_american: americanFromProb(fairInverse),
+    fair_inverse_american: fairInverse == null ? null : americanFromProb(fairInverse),
     fair_mid_american: fairMid == null ? null : americanFromProb(fairMid),
+    fair_promo_american: fairPromo == null ? null : americanFromProb(fairPromo),
+    fair_promo_best_american: fairPromoBest == null ? null : americanFromProb(fairPromoBest),
+    promoAgeMs: per.reduce((a, p) => (p.promo && p.promo.ageMs != null && p.promo.ageMs > a ? p.promo.ageMs : a), 0),
+    promoBooks: per.map((p) => (p.promo ? p.promo.n : 0)),
     ref_american: fairRef == null ? null : americanFromProb(fairRef),
     lock_american: yLock == null ? null : americanFromProb(yLock),
     target_american: americanFromProb(yTarget),

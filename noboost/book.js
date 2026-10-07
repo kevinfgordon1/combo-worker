@@ -1,8 +1,10 @@
 // NFL moneyline price book for the no-boost shadow quoter. In-memory, sync reads.
 // Kalshi: GET /markets?series_ticker=KXNFLGAME (yes_ask/yes_bid + occurrence_datetime).
 // Polymarket: getMarketBySlug(aec-nfl-…) per-team YES ask/bid (pmTeamYesProbs).
-// Kickoff = Kalshi occurrence_datetime − 3h (verified vs Poly gameStartTime on
-// 2026-10-01: PIT@CLE occ 03:15Z, Poly start 00:15Z; TEN@BAL occ 20:00Z, start 17:00Z).
+// Kickoff: a REAL schedule pushed in the background via setKickoffs() — ESPN scoreboard
+// (date + pre/in/post state) and odds_cache commence_time. The old guess, Kalshi
+// occurrence_datetime − 3h, is only a last-resort fallback (it is wrong for e.g. London
+// 9:30 ET games and any schedule change).
 // Never invents a price: a missing ask/bid is null and the leg is unpriceable.
 'use strict';
 const { parseKalshiUnhedgedTicker, parsePmUnhedgedSlug } = require('../unhedged-rfq');
@@ -24,7 +26,7 @@ function validAsk(v) {
   return p != null && p > 0 && p < 1 ? p : null;
 }
 
-function createNflBook({ now = () => Date.now(), staleMs = DEFAULT_STALE_MS } = {}) {
+function createNflBook({ now = () => Date.now(), staleMs = DEFAULT_STALE_MS, promoMaxAgeMs = 12 * 60 * 1000 } = {}) {
   // key `${gameId}:${team}` -> { kalshi:{ask,bid,at,ticker}, polymarket:{ask,bid,at,key} }
   const teams = new Map();
   const games = new Map(); // gameId -> { kickoffMs, teams:[a,b], date }
@@ -101,6 +103,8 @@ function createNflBook({ now = () => Date.now(), staleMs = DEFAULT_STALE_MS } = 
   // Recomputed ONLY when a price in that game is (re)ingested, i.e. on line
   // moves — never on the RFQ path. Entry: { inverse, lockCost, mid, reference,
   // at (oldest component timestamp), oppAmerican, lockVenue }.
+  const bookRaw = new Map(); // `${gameId}:${team}` -> { quotes:[{book,american,oppAmerican,at}], fetchedAt }
+  const { legFair } = require('./promo-fair');
   const legCache = new Map(); // `${gameId}:${team}` -> stats|null
   const listeners = new Set();
   const { priceLegFromQuotes } = require('./quote');
@@ -122,7 +126,15 @@ function createNflBook({ now = () => Date.now(), staleMs = DEFAULT_STALE_MS } = 
       const oq = quotesFor(gameId, opp);
       const st = priceLegFromQuotes(oq, own, null);
       const comps = [...own, ...oq];
-      legCache.set(`${gameId}:${team}`, st && comps.length ? { ...st, at: stampOf(comps) } : null);
+      const br = bookRaw.get(`${gameId}:${team}`);
+      let promo = null;
+      if (br && now() - br.fetchedAt <= promoMaxAgeMs) {
+        const live = st && st.mid != null && comps.length ? { mid: st.mid, at: stampOf(comps) } : null;
+        const f = legFair(br.quotes, live, { now: now(), liveOppProb: st ? 1 - st.inverse : null });
+        if (f) promo = { ...f, ageMs: now() - br.fetchedAt };
+      }
+      if (!st && !promo) { legCache.set(`${gameId}:${team}`, null); continue; }
+      legCache.set(`${gameId}:${team}`, { ...(st || {}), promo, at: comps.length ? stampOf(comps) : now() - (promo ? promo.ageMs : 0), kalshiOk: !!st });
     }
   }
   // Cached leg stats or null when missing/stale (caller must skip the RFQ). ageMs = oldest input age.
@@ -130,10 +142,21 @@ function createNflBook({ now = () => Date.now(), staleMs = DEFAULT_STALE_MS } = 
     const st = legCache.get(`${leg.gameId}:${leg.team}`);
     if (!st) return null;
     const age = now() - st.at;
-    if (age > staleMs) return null;
+    if (!st.kalshiOk || age > staleMs) {
+      // exchange book stale/missing: only a promo-only view is available (inverse/mid/lock become unpriceable)
+      return st.promo ? { promo: st.promo, ageMs: age } : null;
+    }
     const r = refs.get(`${leg.gameId}:${leg.team}`);
     const reference = r && (now() - r.at) < 10 * 60 * 1000 ? r.p : null;
     return { ...st, reference, ageMs: age };
+  }
+  // Background push of trusted-book h2h quotes (from odds_cache). NEVER called on the RFQ path.
+  // entries: [{ gameId, team, quotes:[{book, american, oppAmerican, at}] }]
+  function setBooks(entries, fetchedAt = now()) {
+    const touched = new Set();
+    for (const e of entries || []) { bookRaw.set(`${e.gameId}:${e.team}`, { quotes: e.quotes, fetchedAt }); touched.add(e.gameId); }
+    for (const gid of touched) recomputeGame(gid);
+    return touched.size;
   }
   function onMove(cb) { listeners.add(cb); return () => listeners.delete(cb); }
   function emitMoves(ids) { if (ids.size) for (const cb of listeners) { try { cb([...ids]); } catch (_) { /* listener errors never break ingest */ } } }
@@ -180,16 +203,48 @@ function createNflBook({ now = () => Date.now(), staleMs = DEFAULT_STALE_MS } = 
     return r && (now() - r.at) < 10 * 60 * 1000 ? r.p : null;
   }
 
+  // Real kickoff sources (background push; NEVER fetched on the RFQ path).
+  // entries: [{ gameId, kickoffMs, state?: 'pre'|'in'|'post', source: 'espn'|'odds_cache' }]
+  // ESPN wins over odds_cache (it also carries live state); both win over the Kalshi guess.
+  const kicks = new Map(); // gameId -> { kickoffMs, state, source, at }
+  const RANK = { espn: 2, odds_cache: 1 };
+  function setKickoffs(entries) {
+    let n = 0;
+    for (const e of entries || []) {
+      if (!e || !e.gameId || !Number.isFinite(e.kickoffMs)) continue;
+      const prev = kicks.get(e.gameId);
+      if (prev && (RANK[prev.source] || 0) > (RANK[e.source] || 0) && now() - prev.at < 30 * 60 * 1000) continue;
+      kicks.set(e.gameId, { kickoffMs: e.kickoffMs, state: e.state || null, source: e.source || 'unknown', at: now() });
+      n += 1;
+    }
+    return n;
+  }
   function kickoffMs(gameId) {
+    const k = kicks.get(gameId);
+    if (k) return k.kickoffMs;
     const g = games.get(gameId);
     return g && Number.isFinite(g.kickoffMs) ? g.kickoffMs : null;
+  }
+  function kickoffSource(gameId) {
+    const k = kicks.get(gameId);
+    if (k) return k.source;
+    const g = games.get(gameId);
+    return g && Number.isFinite(g.kickoffMs) ? 'kalshi_occ_minus_3h' : null;
+  }
+  // Started = live state from ESPN ('in'/'post'), or kickoff time reached.
+  function hasStarted(gameId, t = now()) {
+    const k = kicks.get(gameId);
+    if (k && (k.state === 'in' || k.state === 'post')) return true;
+    const ko = kickoffMs(gameId);
+    return ko == null ? true : ko <= t;
   }
 
   // The price source handed to noboost-quote.priceCombo
   const source = { opponentQuotes, ownQuotes, reference, legStats };
 
   return {
-    ingestKalshiMarkets, ingestPolyMarket, legStats, onMove, expire, opponentQuotes, ownQuotes, kickoffMs,
+    ingestKalshiMarkets, ingestPolyMarket, setBooks, legStats, onMove, expire, opponentQuotes, ownQuotes, kickoffMs,
+    setKickoffs, kickoffSource, hasStarted, _kicks: kicks,
     setReference, source, takerThetaForVenue, pmMlSlugsFromKalshiLeg,
     games: () => [...games.entries()],
     _teams: teams, _games: games,

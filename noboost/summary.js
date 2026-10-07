@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Report on the no-boost PAPER run from Supabase (noboost_paper_rfqs / noboost_paper_stats).
-//   node noboost/summary.js [--since 2026-10-01T00:00:00Z] [--json]
+//   node noboost/summary.js [--run v2-20261007|all] [--since 2026-10-01T00:00:00Z] [--json]
+//   --run defaults to the runner's current DEFAULT_RUN_ID (rows from older runs are excluded; --run all = everything)
 //   (env: SUPABASE_URL, SUPABASE_SERVICE_KEY — e.g. `railway run -s noboost-paper -- node noboost/summary.js`)
 // All prices are AMERICAN odds. Money is dollars. Ratios/counts are counts.
 'use strict';
@@ -8,6 +9,8 @@ const args = process.argv.slice(2);
 const arg = (k, d) => { const i = args.indexOf(`--${k}`); return i >= 0 ? args[i + 1] : d; };
 const SINCE = arg('since', null);
 const AS_JSON = args.includes('--json');
+const RUN = arg('run', require('./runner').DEFAULT_RUN_ID);
+const RUNQ = RUN && RUN !== 'all' ? `&run_id=eq.${encodeURIComponent(RUN)}` : '';
 const url = process.env.SUPABASE_URL; const key = process.env.SUPABASE_SERVICE_KEY;
 if (!url || !key) { console.error('need SUPABASE_URL and SUPABASE_SERVICE_KEY'); process.exit(1); }
 const H = { apikey: key, Authorization: `Bearer ${key}` };
@@ -29,10 +32,10 @@ const money = (n) => `${n < 0 ? '-' : ''}$${Math.abs(n).toLocaleString('en-US', 
 const med = (a) => pct(a, 0.5);
 
 (async () => {
-  const q = `noboost_paper_rfqs?select=*&order=rfq_created_ts.asc${SINCE ? `&rfq_created_ts=gte.${SINCE}` : ''}`;
+  const q = `noboost_paper_rfqs?select=*&order=rfq_created_ts.asc${RUNQ}${SINCE ? `&rfq_created_ts=gte.${SINCE}` : ''}`;
   const rows = await fetchAll(q);
-  const statsRows = await fetchAll(`noboost_paper_stats?select=created_at,payload${SINCE ? `&created_at=gte.${SINCE}` : ''}&order=created_at.asc`);
-  const rep = { rows: rows.length, since: SINCE, by_legs: {}, variants: {} };
+  const statsRows = await fetchAll(`noboost_paper_stats?select=created_at,payload${RUNQ}${SINCE ? `&created_at=gte.${SINCE}` : ''}&order=created_at.asc`);
+  const rep = { rows: rows.length, run_id: RUN, since: SINCE, by_legs: {}, variants: {} };
 
   // latency / staleness (per-RFQ rows are persisted only for traded + sampled RFQs; the stats histograms cover ALL)
   const dec = rows.map((r) => Number(r.decision_ms)).filter(Number.isFinite);
@@ -60,31 +63,39 @@ const med = (a) => pct(a, 0.5);
 
   // per-variant results on traded RFQs (taker bought YES, after our RFQ)
   const traded = rows.filter((r) => r.outcome === 'traded');
-  for (const [name, beat, fill, pos, act] of [['primary (10% over mid, lock OFF)', 'primary_beat', 'primary_fill', 'primary_position', 'primary_action'], ['counterfactual (lock ON)', 'lock_beat', 'lock_fill', 'lock_position', 'lock_action']]) {
-    const v = { traded: traded.length, quoted: 0, wins: 0, ties: 0, fills: 0, cap_blocked: 0, premium: 0, ev_vs_mid: 0, settled: 0, pnl: 0, by_legs: {} };
+  const VARS = [['primary (10% over mid, lock OFF)', 'primary', 'primary'], ['counterfactual (lock ON)', 'lock', 'lock']];
+  if (rows.some((r) => r.promo_action != null)) VARS.push(['PROMO (10% over trusted-book consensus)', 'promo', 'promo']);
+  for (const [name, pre] of VARS.map((x) => [x[0], x[1]])) {
+    const beat = `${pre}_beat`; const fill = `${pre}_fill`; const pos = `${pre}_position`; const act = `${pre}_action`;
+    const v = { traded: traded.length, quoted: 0, wins: 0, ties: 0, fills: 0, cap_blocked: 0, premium: 0, ev_vs_mid: 0, ev_vs_promo: 0, settled: 0, pnl: 0, by_legs: {} };
     for (const r of traded) {
       const b = bucket(r.n_legs); const o = v.by_legs[b] || (v.by_legs[b] = { traded: 0, quoted: 0, wins: 0, fills: 0, ev_vs_mid: 0, pnl: 0, traded_am: [], quote_am: [], mid_am: [], premium_am: [] });
       o.traded += 1;
       const p = r[pos];
-      const qa = act === 'primary_action' ? r.quote_primary_american : r.quote_lock_american;
-      const qy = act === 'primary_action' ? r.quote_primary_yes : r.quote_lock_yes;
+      const qa = r[`quote_${pre}_american`];
+      const qy = r[`quote_${pre}_yes`];
       if (r[act] === 'would_quote') { v.quoted += 1; o.quoted += 1; }
       if (r[beat] === 'win') {
         v.wins += 1; o.wins += 1;
         if (p && p.caps_ok === false) v.cap_blocked += 1;
-        o.traded_am.push(r.traded_american); o.quote_am.push(qa); o.mid_am.push(r.fair_mid_american);
+        o.traded_am.push(r.traded_american); o.quote_am.push(qa); o.mid_am.push(pre === 'promo' && r.fair_promo_american != null ? r.fair_promo_american : r.fair_mid_american);
         if (r.traded_yes && qy) o.premium_am.push(r.traded_yes / qy - 1);
       } else if (r[beat] === 'tie') v.ties += 1;
       if (r[fill]) {
-        v.fills += 1; o.fills += 1; v.premium += p.premium || 0; v.ev_vs_mid += p.ev_vs_mid || 0; o.ev_vs_mid += p.ev_vs_mid || 0;
-        const pl = act === 'primary_action' ? r.primary_pnl : r.lock_pnl;
+        v.fills += 1; o.fills += 1; v.premium += p.premium || 0; v.ev_vs_mid += p.ev_vs_mid || 0; v.ev_vs_promo += p.ev_vs_promo || 0; o.ev_vs_mid += p.ev_vs_mid || 0;
+        const pl = r[`${pre}_pnl`];
         if (pl != null) { v.settled += 1; v.pnl += Number(pl); o.pnl += Number(pl); }
       }
     }
     v.win_rate_of_quoted = v.quoted ? +(v.wins / v.quoted).toFixed(3) : null;
     v.ev_per_fill_vs_mid = v.fills ? +(v.ev_vs_mid / v.fills).toFixed(2) : null;
+    v.ev_per_fill_vs_promo = v.fills ? +(v.ev_vs_promo / v.fills).toFixed(2) : null;
+    v.pre = pre;
     rep.variants[name] = v;
   }
+  // PROMO fair vs mid fair on all persisted rows that have both (American odds)
+  const both = rows.filter((r) => r.fair_promo_american != null && r.fair_mid_american != null);
+  rep.promo_vs_mid = { n: both.length, median_diff_american: both.length ? med(both.map((r) => r.fair_promo_american - r.fair_mid_american)) : null, promo_n_books_median: med(rows.map((r) => (Array.isArray(r.promo_n_books) ? Math.min(...r.promo_n_books) : null)).filter((x) => x != null)), promo_age_ms_p50: med(rows.map((r) => r.promo_max_age_ms).filter((x) => x != null)) };
   // exposure: peak from stats snapshots + from fills' running totals
   const peak = (k) => rows.reduce((a, r) => Math.max(a, (r[k] && r[k].total_after) || 0), 0);
   rep.exposure = {
@@ -92,10 +103,11 @@ const med = (a) => pct(a, 0.5);
     primary_peak_game: rows.reduce((a, r) => Math.max(a, (r.primary_position && r.primary_position.top_game_after) || 0), 0),
     primary_peak_selection: rows.reduce((a, r) => Math.max(a, (r.primary_position && r.primary_position.top_selection_after) || 0), 0),
     primary_cap_blocked_wins: rows.filter((r) => r.primary_position && r.primary_position.caps_ok === false).length,
+    promo_peak_total_max_loss: peak('promo_position'),
   };
 
   if (AS_JSON) { console.log(JSON.stringify(rep, null, 1)); return; }
-  console.log(`=== NO-BOOST PAPER RUN${SINCE ? ` since ${SINCE}` : ''} — ${rows.length} persisted RFQ rows (traded + 2% sample of untraded) ===`);
+  console.log(`=== NO-BOOST PAPER RUN run_id=${RUN}${SINCE ? ` since ${SINCE}` : ''} — ${rows.length} persisted RFQ rows (traded + 2% sample of untraded) ===`);
   if (rep.seen != null) console.log(`RFQs seen ${rep.seen}, out of scope ${rep.out_of_scope}; in-scope by legs: ${JSON.stringify(rep.counts_by_legs)}`);
   const L = rep.latency;
   console.log(`\n-- Decision latency (RFQ in -> would-quote out; in-memory lookup + multiply + caps) --`);
@@ -115,6 +127,13 @@ const med = (a) => pct(a, 0.5);
       console.log(`${b} | ${o.traded} | ${o.quoted} | ${o.wins} | ${o.fills} | ${am(med(o.traded_am))} | ${am(med(o.quote_am))} | ${am(med(o.mid_am))} | ${o.premium_am.length ? `${(med(o.premium_am) * 100).toFixed(0)}% of price` : '-'} | ${money(o.ev_vs_mid)} | ${money(o.pnl)}`);
     }
   }
+  console.log(`\n== SIDE BY SIDE (traded combos ${traded.length}) ==`);
+  console.log('variant | quoted | wins | win% of quoted | fills | premium | EV vs mid | EV vs own fair | settled | realized P&L');
+  for (const [name, v] of Object.entries(rep.variants)) {
+    const ownEv = v.pre === 'promo' ? v.ev_vs_promo : v.ev_vs_mid;
+    console.log(`${name} | ${v.quoted} | ${v.wins} | ${v.win_rate_of_quoted == null ? '-' : `${(v.win_rate_of_quoted * 100).toFixed(1)}%`} | ${v.fills} | ${money(v.premium)} | ${money(v.ev_vs_mid)} | ${money(ownEv)} | ${v.settled} | ${money(v.pnl)}`);
+  }
+  if (rep.promo_vs_mid.n) console.log(`PROMO fair vs no-vig exchange mid (median across ${rep.promo_vs_mid.n} rows): ${rep.promo_vs_mid.median_diff_american > 0 ? '+' : ''}${rep.promo_vs_mid.median_diff_american} American points; median min-books/leg ${rep.promo_vs_mid.promo_n_books_median}; sportsbook-feed age p50 ${rep.promo_vs_mid.promo_age_ms_p50} ms`);
   console.log(`\n== Exposure (simulated, primary) vs caps ==`);
   console.log(`peak total max-loss ${money(rep.exposure.primary_peak_total_max_loss)} | peak per-game ${money(rep.exposure.primary_peak_game)} | peak per-team ${money(rep.exposure.primary_peak_selection)} | wins blocked by caps ${rep.exposure.primary_cap_blocked_wins}`);
   if (rep.last_positions) console.log(`latest snapshot: ${JSON.stringify(rep.last_positions)}`);

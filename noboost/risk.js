@@ -14,6 +14,8 @@
 //   quote pull      : open paper quotes are re-priced on every price tick; pulled
 //                     when edge vs the NEW fair < pullMinEdge, or the lock
 //                     guardrail is breached, or the quote is older than ttlMs.
+//                     A quote evicted by the maxOpenQuotes cap is reported as pulled
+//                     (reason 'evicted'), never dropped silently.
 'use strict';
 
 const RISK_DEFAULTS = Object.freeze({
@@ -119,7 +121,8 @@ function createRiskBook(cfgIn = {}, { now = () => Date.now() } = {}) {
   }
 
   // hit=true → combo paid $1/contract (we lose), false → we keep premium.
-  function settle(id, hit) {
+  // push=true (every leg voided) → stake refunded, P&L 0; exposure released either way.
+  function settle(id, hit, { push = false } = {}) {
     const f = open.get(id);
     if (!f) return null;
     open.delete(id);
@@ -127,31 +130,49 @@ function createRiskBook(cfgIn = {}, { now = () => Date.now() } = {}) {
     for (const g of f.games) bump(gameLoss, g, -f.loss);
     for (const s of f.sels) bump(selLoss, s, -f.loss);
     if (totalLoss < 1e-9) totalLoss = 0;
-    const pnl = hit ? f.gain - f.contracts : f.gain;
+    const pnl = push ? 0 : (hit ? f.gain - f.contracts : f.gain);
     rollDay();
     dayPnl.pnl += pnl;
     return pnl;
   }
 
   // ── paper quotes (fast pull) ───────────────────────────────────────────
-  function registerQuote(rfqId, q) {
-    if (quotes.size >= cfg.maxOpenQuotes) {
-      const oldest = quotes.keys().next().value;
-      quotes.delete(oldest);
+  // Quotes removed outside a sweep (TTL expiry found at register time, cap eviction) are
+  // queued here and handed out by the next sweepQuotes() so the caller marks them PULLED
+  // (with the exact time they stopped being live) instead of losing them silently.
+  const pendingPulls = [];
+  let evictions = 0;
+  function expireQuotes(t) {
+    for (const [id, q] of quotes) {
+      if (t - q.at > cfg.ttlMs) { quotes.delete(id); pendingPulls.push({ rfqId: id, reason: 'ttl', quote: q, at: q.at + cfg.ttlMs }); }
     }
-    quotes.set(rfqId, { ...q, rfqId, at: now() });
+  }
+  // Returns the quotes evicted to make room ([] normally).
+  function registerQuote(rfqId, q) {
+    const t = now();
+    const evicted = [];
+    if (quotes.size >= cfg.maxOpenQuotes) expireQuotes(t); // first drop anything already past its lifetime
+    while (quotes.size >= cfg.maxOpenQuotes) {
+      const [oldest, oq] = quotes.entries().next().value;
+      quotes.delete(oldest);
+      const p = { rfqId: oldest, reason: 'evicted', quote: oq, at: t };
+      pendingPulls.push(p); evicted.push(p); evictions += 1;
+    }
+    quotes.set(rfqId, { ...q, rfqId, at: t, expiresAt: t + cfg.ttlMs });
+    return evicted;
   }
   function dropQuote(rfqId) { return quotes.delete(rfqId); }
+  function getQuote(rfqId) { return quotes.get(rfqId) || null; }
 
   // reprice(q) -> { fair, yLock } with CURRENT prices, or null if unpriceable.
-  // Returns [{rfqId, reason, ...}] for quotes that must be pulled.
+  // Returns [{rfqId, reason, at, ...}] for quotes that must be pulled (at = when the quote stopped being live).
   function sweepQuotes(reprice) {
-    const pulled = [];
+    const pulled = pendingPulls.splice(0, pendingPulls.length);
     const t = now();
     for (const [id, q] of [...quotes]) {
       let reason = null;
       let detail = {};
-      if (t - q.at > cfg.ttlMs) reason = 'ttl';
+      if (t - q.at > cfg.ttlMs) { reason = 'ttl'; detail = { at: q.at + cfg.ttlMs }; }
       else {
         const cur = reprice(q);
         if (!cur || cur.fair == null) reason = 'unpriceable';
@@ -162,7 +183,7 @@ function createRiskBook(cfgIn = {}, { now = () => Date.now() } = {}) {
           else if (q.guardrail && cur.yLock != null && q.quoteYes < cur.yLock - 1e-9) reason = 'below_lock';
         }
       }
-      if (reason) { quotes.delete(id); pulled.push({ rfqId: id, reason, quote: q, ...detail }); }
+      if (reason) { quotes.delete(id); pulled.push({ rfqId: id, reason, quote: q, at: t, ...detail }); }
     }
     return pulled;
   }
@@ -170,7 +191,7 @@ function createRiskBook(cfgIn = {}, { now = () => Date.now() } = {}) {
   function snapshot() {
     rollDay();
     return {
-      totalLoss, openFills: open.size, openQuotes: quotes.size,
+      totalLoss, openFills: open.size, openQuotes: quotes.size, evictions,
       dayPnl: dayPnl.pnl, halted: dailyHalted(),
       topGame: [...gameLoss].sort((a, b) => b[1] - a[1]).slice(0, 3),
       topSelection: [...selLoss].sort((a, b) => b[1] - a[1]).slice(0, 3),
@@ -179,7 +200,7 @@ function createRiskBook(cfgIn = {}, { now = () => Date.now() } = {}) {
 
   return {
     cfg, check, addFill, settle, utilization, dailyHalted,
-    registerQuote, dropQuote, sweepQuotes, snapshot,
+    registerQuote, dropQuote, getQuote, sweepQuotes, snapshot,
     _open: open, _gameLoss: gameLoss, _selLoss: selLoss, _quotes: quotes,
     total: () => totalLoss,
   };

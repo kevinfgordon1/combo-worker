@@ -10,9 +10,13 @@
 //   rfqs     GET /communications/rfqs?status=open&min_ts=…           every NOBOOST_RFQ_POLL_MS     (1000)
 //   trades   GET /markets/trades?min_ts=…&mve_filter=only  every NOBOOST_TRADES_POLL_MS  (2000)
 //   settle   GET /markets/{leg}  (result)                  every 300s
-//   odds     Supabase odds_cache (Pinnacle ref)            every 60s
+//   odds     Supabase odds_cache (Pinnacle ref + PROMO trusted books) every 60s
+//   kickoff  ESPN NFL scoreboard (date + pre/in/post)       every 60s  (+ odds_cache commence_time)
 // Two shadow quoters share one book: PRIMARY = env config (service: 10% over mid,
 // lock guardrail off) and LOCKCF = same with the lock guardrail ON (counterfactual).
+//
+// RUN TAG: every row / stats payload carries run_id (NOBOOST_RUN_ID, default DEFAULT_RUN_ID).
+// A new run_id starts with EMPTY paper risk books (only that run's open fills are restored).
 'use strict';
 const { normalizePem, authHeaders } = require('../kalshi-auth');
 const { createNflBook } = require('./book');
@@ -21,6 +25,13 @@ const { createPaperRun } = require('./paper');
 const { createStore } = require('./store');
 const { isNoBoostShadow, isNoBoostLive, configFromEnv } = require('./quote');
 const { teamCode, etDate } = require('../mm-paper-odds');
+const { gameEntries } = require('./odds-ingest');
+const { createTtlSet } = require('./ttl-set');
+const { espnKickoffs, oddsKickoffs } = require('./kickoffs');
+
+// v2 = matching-window / TTL seen-set / eviction / real-kickoff fixes (2026-10-07). Bump for a clean run.
+const DEFAULT_RUN_ID = 'v2-20261007';
+const ESPN_NFL = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard';
 
 const ORIGIN = 'https://api.elections.kalshi.com';
 const P = '/trade-api/v2';
@@ -71,14 +82,21 @@ async function main(env = process.env) {
   const logger = (l) => console.log(l);
   const primary = createNoBoostShadow({ book, env, log: logger, label: 'PRIMARY' });
   const lockcf = createNoBoostShadow({ book, env: { ...env, NOBOOST_GUARDRAIL: 'lock' }, log: logger, label: 'LOCKCF' });
-  const store = createStore({ url: env.SUPABASE_URL, key: env.SUPABASE_SERVICE_KEY, log: logger });
+  // PROMO variant (flag-gated, shadow-only): trusted-book consensus fair, fed by the BACKGROUND odds refresher
+  const promoOn = ['1', 'true', 'on', 'yes'].includes(String(env.NOBOOST_PROMO || '').toLowerCase());
+  const promo = promoOn ? createNoBoostShadow({ book, env: { ...env, NOBOOST_FAIR_METHOD: 'promo', NOBOOST_GUARDRAIL: 'off' }, log: logger, label: 'PROMO' }) : null;
+  const runId = String(env.NOBOOST_RUN_ID || DEFAULT_RUN_ID).trim() || DEFAULT_RUN_ID;
+  const store = createStore({ url: env.SUPABASE_URL, key: env.SUPABASE_SERVICE_KEY, log: logger, runId });
   const run = createPaperRun({
-    book, primary, lockcf, margin: primary.cfg.margin,
+    book, primary, lockcf, promo, margin: primary.cfg.margin, runId,
     persist: store.persist, persistStats: store.persistStats,
     samplePct: Number(env.NOBOOST_SAMPLE_PCT) || 2,
+    graceMs: env.NOBOOST_MATCH_GRACE_MS != null && env.NOBOOST_MATCH_GRACE_MS !== '' ? Number(env.NOBOOST_MATCH_GRACE_MS) : 2000,
+    tradeLagMs: Number(env.NOBOOST_TRADE_LAG_MS) || 15000,
   });
   const cfg = primary.cfg;
-  console.log(`[NOBOOST] paper run start: margin=${cfg.margin} mode=${cfg.marginMode} fair=${cfg.fairMethod} guardrail=${cfg.guardrail} (+LOCKCF guardrail=lock) maxLegs=${cfg.maxLegs} — GET-only, no WS, no orders`);
+  const commit = String(env.RAILWAY_GIT_COMMIT_SHA || '').slice(0, 7) || 'local';
+  console.log(`[NOBOOST] paper run start: run_id=${runId} commit=${commit} margin=${cfg.margin} mode=${cfg.marginMode} fair=${cfg.fairMethod} guardrail=${cfg.guardrail} (+LOCKCF guardrail=lock)${promo ? ' (+PROMO trusted-book consensus fair)' : ''} maxLegs=${cfg.maxLegs} minQuoteYes=${cfg.minQuoteYes} quoteTtlMs=${run.ttlMs} maxOpenQuotes=${primary.risk.cfg.maxOpenQuotes} — GET-only, no WS, no orders`);
 
   const guard = (fn, name) => async () => { try { await fn(); } catch (e) { console.log(`[NOBOOST] ${name} error: ${e.message}`); } };
   let busy = {};
@@ -97,25 +115,43 @@ async function main(env = process.env) {
     }
   }
   async function refreshOdds() {
-    const r = await fetch(`${env.SUPABASE_URL}/rest/v1/odds_cache?sport=eq.americanfootball_nfl&select=data&order=fetched_at.desc&limit=1`,
+    const r = await fetch(`${env.SUPABASE_URL}/rest/v1/odds_cache?sport=eq.americanfootball_nfl&select=data,fetched_at&order=fetched_at.desc&limit=1`,
       { headers: { apikey: env.SUPABASE_SERVICE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}` } });
     if (!r.ok) throw new Error(`odds_cache ${r.status}`);
     const j = await r.json();
     applyPinnacle(book, j[0] && j[0].data);
+    book.setKickoffs(oddsKickoffs(j[0] && j[0].data)); // real commence_time (ESPN overrides when it has the game)
+    if (promoOn) {
+      const nGames = book.setBooks(gameEntries(j[0] && j[0].data), j[0] && j[0].fetched_at ? Date.parse(j[0].fetched_at) : Date.now());
+      if (!refreshOdds.logged || Date.now() - refreshOdds.logged > 600000) { refreshOdds.logged = Date.now(); console.log(`[NOBOOST] promo books ingested for ${nGames} games (odds_cache fetched_at=${j[0] && j[0].fetched_at})`); }
+    }
   }
 
+  async function refreshKickoffs() {
+    const r = await fetch(ESPN_NFL, { headers: { accept: 'application/json' } });
+    if (!r.ok) throw new Error(`espn scoreboard ${r.status}`);
+    const n = book.setKickoffs(espnKickoffs(await r.json()));
+    if (!refreshKickoffs.logged || Date.now() - refreshKickoffs.logged > 3600000) { refreshKickoffs.logged = Date.now(); console.log(`[NOBOOST] ESPN kickoffs ingested for ${n} games`); }
+  }
+
+  // Seen-set with TIME expiry (no more clear-at-400k => no reprocessing / orphaned RFQs).
+  // An id is remembered >= SEEN_TTL; RFQs created more than MAX_RFQ_AGE ago (< SEEN_TTL) are never
+  // treated as new, so an RFQ can be processed at most once no matter how long it stays open.
+  const SEEN_TTL_MS = 180000; const MAX_RFQ_AGE_MS = 120000;
   let rfqWm = Math.floor(Date.now() / 1000) - 3;
-  const seen = new Set();
+  const seen = createTtlSet({ ttlMs: SEEN_TTL_MS, maxPerGen: 2000000 });
+  const rfqStats = { stale_skipped: 0 };
   async function pollRfqs() {
     const minTs = rfqWm - 1;
     let cursor = ''; let maxCr = rfqWm;
     for (let pg = 0; pg < 8; pg += 1) {
       const j = await get(`${P}/communications/rfqs?status=open&limit=1000&min_ts=${minTs}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`);
+      const nowMs = Date.now();
       for (const r of j.rfqs || []) {
         const createdMs = Date.parse(r.created_ts);
         if (Number.isFinite(createdMs)) maxCr = Math.max(maxCr, Math.floor(createdMs / 1000));
-        if (!r.id || seen.has(r.id)) continue;
-        seen.add(r.id);
+        if (!r.id || !seen.addIfNew(r.id)) continue;
+        if (Number.isFinite(createdMs) && nowMs - createdMs > MAX_RFQ_AGE_MS) { rfqStats.stale_skipped += 1; continue; }
         const legs = r.mve_selected_legs || [];
         if (!legs.length) continue;
         const keys = legs.map((l) => `${String(l.market_ticker).toUpperCase()}:${l.side || 'yes'}`);
@@ -128,7 +164,6 @@ async function main(env = process.env) {
       cursor = j.cursor || '';
       if (!cursor) break;
     }
-    if (seen.size > 400000) seen.clear();
     rfqWm = maxCr;
   }
 
@@ -142,10 +177,14 @@ async function main(env = process.env) {
         const ms = Date.parse(t.created_time);
         if (Number.isFinite(ms)) maxT = Math.max(maxT, Math.floor(ms / 1000));
         if (t.is_block_trade) continue;
-        run.onTrade({
+        const rec = run.onTrade({
           id: t.trade_id, ticker: t.ticker, yes: Number(t.yes_price_dollars), count: Number(t.count_fp),
-          takerSide: t.taker_side, ms,
+          takerSide: t.taker_outcome_side || t.taker_side, ms, // taker_side is deprecated upstream
         });
+        const filled = rec ? Object.keys(run.variants).filter((n) => rec[n] && rec[n].fill) : [];
+        if (filled.length) {
+          console.log(`[NOBOOST] PAPER_FILL run_id=${runId} rfq=${rec.rfq_id} variants=${filled.join(',')} trade_after_seen_ms=${rec.traded_ms - rec.seen_ms} quote_ttl_ms=${run.ttlMs} traded_yes=${rec.traded_yes} contracts=${rec.traded_contracts} size_ratio=${rec.size_ratio} candidates=${rec.match_candidates}${rec.match_ambiguous ? ' AMBIGUOUS' : ''}`);
+        }
       }
       cursor = j.cursor || '';
       if (!cursor) break;
@@ -157,7 +196,11 @@ async function main(env = process.env) {
   async function legResult(ticker) {
     if (resCache.has(ticker)) return resCache.get(ticker);
     const j = await get(`${P}/markets/${ticker}`);
-    const res = j.market && (j.market.result === 'yes' || j.market.result === 'no') ? j.market.result : null;
+    const m = j.market || {};
+    const result = String(m.result || '').toLowerCase(); const status = String(m.status || '').toLowerCase();
+    let res = null;
+    if (result === 'yes' || result === 'no') res = result;
+    else if (/void|cancel/.test(result) || /void|cancel/.test(status)) res = 'void'; // push / voided leg
     if (res) resCache.set(ticker, res);
     return res;
   }
@@ -171,27 +214,35 @@ async function main(env = process.env) {
       if (!cls.ok) continue;
       if (row.primary_fill && run.restoreFill('primary', row, cls.legs)) n += 1;
       if (row.lock_fill && run.restoreFill('lockcf', row, cls.legs)) n += 1;
-      run.openFills.push({ rfq_id: row.rfq_id, legs: row.legs, primary: { fill: !!row.primary_fill }, lockcf: { fill: !!row.lock_fill } });
+      if (promo && row.promo_fill && run.restoreFill('promo', row, cls.legs)) n += 1;
+      run.openFills.push({ rfq_id: row.rfq_id, legs: row.legs, primary: { fill: !!row.primary_fill }, lockcf: { fill: !!row.lock_fill }, ...(promo ? { promo: { fill: !!row.promo_fill } } : {}) });
     }
     console.log(`[NOBOOST] restored ${n} open paper fills`);
   } catch (e) { console.log(`[NOBOOST] restore error: ${e.message}`); }
 
   await guard(refreshMarkets, 'markets')();
   await guard(refreshOdds, 'odds')();
+  await guard(refreshKickoffs, 'kickoffs')();
   store.start();
   book.onMove(() => { try { run.sweep(); } catch (e) { console.log(`[NOBOOST] sweep error: ${e.message}`); } });
   loop(refreshMarkets, 'markets', Number(env.NOBOOST_MARKETS_POLL_MS) || 2000);
   loop(pollRfqs, 'rfqs', Number(env.NOBOOST_RFQ_POLL_MS) || 1000);
   loop(pollTrades, 'trades', Number(env.NOBOOST_TRADES_POLL_MS) || 2000);
   loop(refreshOdds, 'odds', 60000);
+  loop(refreshKickoffs, 'kickoffs', 60000);
   loop(() => run.settle(legResult), 'settle', 300000);
   setInterval(() => { try { run.sweep(); run.expire(); } catch (e) { console.log(`[NOBOOST] sweep error: ${e.message}`); } }, 1000);
   setInterval(() => {
     const s = run.flushStats();
-    console.log(`[NOBOOST] SUMMARY seen=${s.seen} oos=${s.out_of_scope} dec_ms p50<=${s.dec_ms_p50} p99<=${s.dec_ms_p99} legAge_ms p50<=${s.leg_age_ms_p50} p99<=${s.leg_age_ms_p99} detect_ms p50<=${s.detect_lag_ms_p50} p99<=${s.detect_lag_ms_p99} pending=${s.pending} openFills=${s.open_fills} primary_total_maxloss=$${Math.round(s.positions.primary.totalLoss)} lockcf=$${Math.round(s.positions.lockcf.totalLoss)}`);
+    const tr = s.trades || {};
+    const wq = Object.values(s.by_legs || {}).reduce((a, b) => ({ p: a.p + (b.primary_wq || 0), l: a.l + (b.lockcf_wq || 0), m: a.m + (b.promo_wq || 0), f: a.f + (b.primary_fill || 0) + (b.lockcf_fill || 0) + (b.promo_fill || 0), t: a.t + (b.traded || 0) }), { p: 0, l: 0, m: 0, f: 0, t: 0 });
+    const ev = Object.fromEntries(Object.entries(s.positions).map(([k, v]) => [k, v.evictions || 0]));
+    console.log(`[NOBOOST] SUMMARY run_id=${runId} seen=${s.seen} oos=${s.out_of_scope} wq(primary/lock/promo)=${wq.p}/${wq.l}/${wq.m} traded=${wq.t} fills=${wq.f} trades: seen=${tr.trades_seen || 0} matched=${tr.matched || 0} ambiguous=${tr.ambiguous || 0} size_mismatch=${tr.size_mismatch || 0} no_candidate=${tr.no_candidate || 0} min_price=${tr.min_price_print || 0} stale_rfq=${rfqStats.stale_skipped} evicted=${JSON.stringify(ev)} mem: recs=${s.in_memory} seenRfq=${seen.size()} seenTrades=${s.seen_trades} rssMB=${Math.round(process.memoryUsage().rss / 1048576)}`);
+    rfqStats.stale_skipped = 0;
+    console.log(`[NOBOOST] SUMMARY-LAT dec_ms p50<=${s.dec_ms_p50} p99<=${s.dec_ms_p99} legAge_ms p50<=${s.leg_age_ms_p50} p99<=${s.leg_age_ms_p99} detect_ms p50<=${s.detect_lag_ms_p50} p99<=${s.detect_lag_ms_p99} pending=${s.pending} openFills=${s.open_fills} primary_total_maxloss=$${Math.round(s.positions.primary.totalLoss)} lockcf=$${Math.round(s.positions.lockcf.totalLoss)}${s.positions.promo ? ` promo=$${Math.round(s.positions.promo.totalLoss)}` : ''}`);
   }, 60000);
   process.on('SIGTERM', async () => { try { run.flushStats(); await store.flush(); } finally { process.exit(0); } });
 }
 
 if (require.main === module) main();
-module.exports = { main, createGetter, applyPinnacle };
+module.exports = { main, createGetter, applyPinnacle, DEFAULT_RUN_ID };
