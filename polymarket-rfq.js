@@ -800,7 +800,7 @@ function evaluatePolymarketRfq({
     };
   }
 
-  const kill = typeof killEngaged === 'function' ? !!killEngaged(parlay.user_id) : false;
+  const kill = typeof killEngaged === 'function' ? !!killEngaged(parlay.user_id, parlay) : false;
   return {
     action: 'quoteable',
     reason: kill ? 'kill' : null,
@@ -1668,8 +1668,8 @@ function startPolymarketRfqLoop(ctx = {}) {
     return findStartedEvent(rfq, p);
   }
 
-  function killEngagedFor(userId) {
-    return typeof ctx.killEngagedFor === 'function' ? ctx.killEngagedFor(userId) : false;
+  function killEngagedFor(userId, lock) {
+    return typeof ctx.killEngagedFor === 'function' ? ctx.killEngagedFor(userId, lock) : false;
   }
 
   function bump(key) {

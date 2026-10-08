@@ -190,6 +190,8 @@ const { formatAlertStatus } = require('./venue-alert');
 const { createBucketManager } = require('./bucket-manager');
 const { splitPaused, diffPaused, createPausePoller } = require('./lock-pause');
 const { createLiveUserGate } = require('./live-users');
+const { resolveWorkerScope, scopeLabel } = require('./worker-scope');
+const { createUserCaps } = require('./user-caps');
 const { createAppAlerts } = require('./app-alerts');
 const { createPolyStallAlerts } = require('./poly-stall-alert');
 const { createPartialQuoteDryRun, isPartialQuoteFlagOn } = require('./partial-quote');
@@ -378,8 +380,20 @@ const SKIP_TAPE_MAX_PER_TICK = 5;
 
 // --- per-lock pause -----------------------------------------------------------
 let pausedParlayIds = new Set();
-const liveUsers = createLiveUserGate({ env: process.env, log: (m) => console.log(`[${MODE}] ${m}`) });
-console.log(`[${MODE}] ${liveUsers.summary()}`);
+// Whose keys this process holds (Kevin's main worker, or one tester child).
+const SCOPE = resolveWorkerScope(process.env);
+// Rows written by a tester child carry its user id; the main worker leaves
+// user_id to the DB defaults exactly as before.
+const withScopeUser = (row) => (SCOPE.writeUserId ? { ...row, user_id: SCOPE.writeUserId } : row);
+const liveUsers = createLiveUserGate({ env: process.env, scope: SCOPE, log: (m) => console.log(`[${MODE}] ${m}`) });
+console.log(`[${MODE}] ${scopeLabel(SCOPE)}; ${liveUsers.summary()}`);
+// Per-user $ caps (testers). Uncapped users (Kevin) pass straight through.
+const userCaps = createUserCaps({
+  gate: liveUsers,
+  costFor: (row) => parseFloat(fillView(row.fill_american, { subcent: SUBCENT }).noBid),
+  countsTowardCap,
+  log: (m) => console.log(`[${MODE}] ${m}`),
+});
 
 const pausePoller = createPausePoller({ supabase, log: (m) => console.log(`[${MODE}] ${m.replace(/^\[PAUSE\] /, 'PAUSE ')}`) });
 
@@ -442,7 +456,7 @@ async function pollPaused() {
 
 async function refresh() {
   try {
-    const [parlaysQ, settingsQ, fillsQ] = await Promise.all([
+    const [parlaysQ, settingsQ, fillsQ, usersQ] = await Promise.all([
       supabase.from('combo_parlays').select('*').eq('active', true),
       supabase.from('combo_settings').select('user_id,kill_switch'),
       // Confirmed contracts only. Quote-execution stubs (source=live-runner)
@@ -452,7 +466,10 @@ async function refresh() {
         .eq('is_combo', true)
         .eq('is_taker', false)
         .not('parlay_id', 'is', null),
+      // Who may trade (combo_live_users): can_trade, paused, caps.
+      liveUsers.query(supabase),
     ]);
+    liveUsers.apply(usersQ);
     const refreshLog = { error: (msg) => console.error(`[${MODE}] ${msg}`) };
     // supabase-js soft-fails as { data: null, error } — do not treat null as [].
     const parlaysFailed = querySoftFailed(parlaysQ);
@@ -466,11 +483,14 @@ async function refresh() {
       parlays = split.live;
       notePausedIds(split.pausedIds);
     }
+    // Per-user per-lock $ cap clamps max_contracts in memory (no-op for Kevin).
+    parlays = userCaps.applyLockCaps(parlays);
     killByUser = liveUsers.filterKillByUser(applyRefreshKillByUser(killByUser, settingsQ, refreshLog));
     const fillsForCap = querySoftFailed(fillsQ)
       ? fillsQ
       : { data: (fillsQ.data || []).filter(countsTowardCap), error: null };
     filledByParlay = applyRefreshFilledByParlay(filledByParlay, fillsForCap, 'count', refreshLog);
+    userCaps.refreshDay({ supabase, parlays, filledSoFarFor }).catch(() => {});
 
     // Pre-stage prices (Step 3). Soft-fail keeps previous staged with the locks.
     if (!parlaysFailed) {
@@ -562,7 +582,9 @@ async function lastLookFilledFor(parlayId) {
 // and we don't double-count the same contracts from both sources.
 const filledSoFarFor = (id) => Math.max(filledByParlay[id] || 0, sessionFilledByParlay[id] || 0);
 // Not allowlisted => always engaged, whatever combo_settings says.
-const killEngagedFor = (userId) => !liveUsers.isAllowed(userId) || killByUser[userId] !== false;
+const killEngagedFor = (userId, lock = null) => !liveUsers.isAllowed(userId)
+  || killByUser[userId] !== false
+  || userCaps.dayBlocked(userId, { parlays, filledSoFarFor, outstandingFor: (id) => outstandingFor(id), lock });
 
 // DB check constraint allows: shadow | filled | unfilled | declined.
 // Live quotes: status=filled + is_live + no order_id → Combo Locks shows "quoted (awaiting)".
@@ -810,6 +832,7 @@ async function loadOpenSubmissionQuotes() {
     const { data, error } = await supabase
       .from('combo_submissions')
       .select('quote_id,parlay_id,label,rfq_id,contracts,user_id,created_at')
+      .in('user_id', SCOPE.userIds)
       .eq('is_live', true)
       .is('order_id', null)
       .not('quote_id', 'is', null)
@@ -831,6 +854,7 @@ async function clearStaleLiveSubmissions() {
     const { data, error } = await supabase
       .from('combo_submissions')
       .update({ is_live: false })
+      .in('user_id', SCOPE.userIds)
       .eq('is_live', true)
       .is('order_id', null)
       .not('quote_id', 'is', null)
@@ -1426,7 +1450,7 @@ async function persistExecutedFill(pending, evt) {
     }
     if (!skipFill) {
       const { error: fillErr } = await supabase.from('combo_fills').upsert(
-        liveRunnerFillRow({
+        withScopeUser(liveRunnerFillRow({
           quoteId,
           orderId,
           fillId: evt.fillId,
@@ -1437,7 +1461,7 @@ async function persistExecutedFill(pending, evt) {
           label: pending.label,
           venue,
           source: evt.source || 'live-runner',
-        }),
+        })),
         { onConflict: 'fill_id' },
       );
       if (fillErr) console.error(`[${MODE}] combo_fills upsert failed`, fillErr.message);
@@ -1482,6 +1506,7 @@ async function pendingFromSubmission({ quoteId, orderId } = {}) {
     let query = supabase
       .from('combo_submissions')
       .select('quote_id,parlay_id,label,rfq_id,contracts,user_id,order_id,status')
+      .in('user_id', SCOPE.userIds)
       .order('created_at', { ascending: false })
       .limit(1);
     if (quoteId) query = query.eq('quote_id', quoteId);
@@ -1515,6 +1540,7 @@ async function loadUnfilledPolyQuotes() {
     const { data, error } = await supabase
       .from('combo_submissions')
       .select('id,quote_id,order_id,rfq_id,parlay_id,label,contracts,user_id,status,created_at,market_ticker')
+      .in('user_id', SCOPE.userIds)
       .eq('venue', 'polymarket')
       .not('quote_id', 'is', null)
       .neq('status', 'filled')
@@ -1572,6 +1598,7 @@ async function loadRecentLocks() {
       supabase
         .from('combo_submissions')
         .select('parlay_id')
+        .in('user_id', SCOPE.userIds)
         .eq('venue', 'polymarket')
         .not('quote_id', 'is', null)
         .gte('created_at', cutoff)
@@ -1581,7 +1608,7 @@ async function loadRecentLocks() {
       console.error(`[${MODE}] load recent locks`, locksQ.error.message);
       return parlays.slice();
     }
-    const recent = liveUsers.filterParlays(locksQ.data || []);
+    const recent = liveUsers.filterByScope(locksQ.data || []);
     const have = new Set(recent.map((p) => p && p.id).filter(Boolean));
     const missing = [];
     for (const row of quotedQ.data || []) {
@@ -1599,7 +1626,7 @@ async function loadRecentLocks() {
       console.error(`[${MODE}] load quoted locks`, extraQ.error.message);
       return recent.length ? recent : parlays.slice();
     }
-    return recent.concat(liveUsers.filterParlays(extraQ.data || []));
+    return recent.concat(liveUsers.filterByScope(extraQ.data || []));
   } catch (e) {
     console.error(`[${MODE}] load recent locks`, e && e.message);
     return parlays.slice();
@@ -1613,12 +1640,14 @@ async function loadPolySlugRecordsUncached() {
       supabase
         .from('combo_fills')
         .select('ticker,parlay_id,raw,count,fill_id,recorded_at,kalshi_created_time')
+        .in('user_id', SCOPE.userIds)
         .eq('is_combo', true)
         .gte('recorded_at', cutoff)
         .limit(1000),
       supabase
         .from('combo_submissions')
         .select('quote_id,parlay_id,market_ticker,contracts')
+        .in('user_id', SCOPE.userIds)
         .eq('venue', 'polymarket')
         .not('quote_id', 'is', null)
         .gte('created_at', cutoff)
@@ -1739,11 +1768,11 @@ async function bookConfirmedKalshiFills(pending, evt) {
   for (const row of booked.book) {
     seenFillIds.add(row.fill_id);
     const existing = await findComboFill(row.fill_id);
-    const stored = {
+    const stored = withScopeUser({
       ...row,
       parlay_id: (pending && pending.parlayId) || null,
       is_combo: true,
-    };
+    });
     try {
       const { error } = await supabase.from('combo_fills').upsert(stored, { onConflict: 'fill_id' });
       if (error) {
@@ -2152,7 +2181,7 @@ async function onRfq(rfq, env) {
     return;
   }
 
-  const engaged = killEngagedFor(p.user_id);
+  const engaged = killEngagedFor(p.user_id, p);
   const filledSoFar = filledSoFarFor(p.id);
   const outstanding = outstandingFor(p.id);
   const st = staged[p.id];
@@ -2425,6 +2454,10 @@ async function onRfq(rfq, env) {
 }
 
 async function main() {
+  if (workerMode === 'testers') {
+    console.error(`[${MODE}] WORKER_MODE=testers — the supervisor (start-testers.js) starts per-tester children`);
+    process.exit(1);
+  }
   if (workerMode === 'unhedged') {
     console.error(
       `[${MODE}] WORKER_MODE=unhedged — use start-unhedged.js / npm run start:unhedged`
@@ -2437,13 +2470,19 @@ async function main() {
     );
     process.exit(1);
   }
+  if (SCOPE.invalid) {
+    console.error(`[${MODE}] COMBO_WORKER_USER_ID is not a uuid — refusing to start`);
+    process.exit(1);
+  }
   bucketManager = createBucketManager({
     env: process.env,
     alert: (text) => sendAlert(text),
-    appAlerts: createAppAlerts({ client: supabase }),
+    // Kevin's in-app alerts and sub-account bucket only; a tester child never
+    // moves money or writes Kevin's alerts.
+    appAlerts: createAppAlerts({ client: SCOPE.isTester ? null : supabase }),
     signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
   });
-  bucketManager.start();
+  if (!SCOPE.isTester) bucketManager.start();
 
   console.log(
     `[${MODE}] starting — latency-optimized. POST first, dedicated quote HTTP, ` +
@@ -2537,7 +2576,7 @@ async function main() {
     }
   );
 
-  const polyAppAlerts = createAppAlerts({ client: supabase });
+  const polyAppAlerts = createAppAlerts({ client: SCOPE.isTester ? null : supabase });
   const polyStallAlerts = createPolyStallAlerts({ appAlerts: polyAppAlerts, log: console.log });
   { const t = setInterval(() => { polyStallAlerts.tick().catch(() => {}); }, 30000); if (t.unref) t.unref(); }
   const poly = startPolymarketRfqLoop({
