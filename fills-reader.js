@@ -44,6 +44,9 @@ const {
 const { normalizeKalshiFill } = require('./kalshi-fill-confirm');
 
 const MODE = 'FILLS';
+const { createLiveUserGate } = require('./live-users');
+// Fills on Kevin's exchange account only attribute to allowlisted users' locks.
+const liveUsers = createLiveUserGate({ env: process.env, log: (m) => console.log(`[${MODE}] ${m}`) });
 const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -69,9 +72,9 @@ let activeParlays = [];
 async function loadParlays() {
   const { data } = await supabase
     .from('combo_parlays')
-    .select('id,label,mve_collection,active,max_contracts,fill_american')
+    .select('id,user_id,label,mve_collection,active,max_contracts,fill_american')
     .is('archived_at', null);
-  activeParlays = data || [];
+  activeParlays = liveUsers.filterParlays(data || []);
 }
 
 // Ground-truth filled contracts for a parlay (includes the row just upserted).

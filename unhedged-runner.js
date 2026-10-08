@@ -34,6 +34,9 @@ const {
 const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
 
 const MODE = 'UNHEDGED';
+const { createLiveUserGate } = require('./live-users');
+// Only allowlisted users' locks count (COMBO_LIVE_USER_IDS, default Kevin).
+const liveUsers = createLiveUserGate({ env: process.env, log: (m) => console.log(`[${MODE}] ${m}`) });
 const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
 const supabase = createUnhedgedSupabaseClient({
@@ -99,7 +102,7 @@ async function refresh() {
     const parlaysQ = await supabase.from('combo_parlays').select('*').eq('active', true);
     const refreshLog = { error: (msg) => console.error(`[${MODE}] ${msg}`) };
     const parlaysFailed = querySoftFailed(parlaysQ);
-    parlays = applyRefreshParlays(parlays, parlaysQ, refreshLog);
+    parlays = liveUsers.filterParlays(applyRefreshParlays(parlays, parlaysQ, refreshLog));
     if (parlaysFailed) {
       console.log(
         `[${MODE}] refreshed — ${parlays.length} active parlay(s) RETAINED after soft-fail`
