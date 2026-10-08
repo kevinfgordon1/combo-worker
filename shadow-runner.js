@@ -29,6 +29,9 @@ const {
 } = require('./refresh-state');
 
 const MODE = 'SHADOW';
+const { createLiveUserGate } = require('./live-users');
+// Only allowlisted users' locks count (COMBO_LIVE_USER_IDS, default Kevin).
+const liveUsers = createLiveUserGate({ env: process.env, log: (m) => console.log(`[${MODE}] ${m}`) });
 // Demo read-check: if DEMO_KALSHI_* are present, use them (point KALSHI_WS_URL at the demo WS).
 // Non-destructive — production KALSHI_KEY_ID / Kalshi_combo_key are left untouched.
 const DEMO = !!process.env.DEMO_KALSHI_KEY_ID;
@@ -89,8 +92,8 @@ async function refresh() {
     const refreshLog = { error: (msg) => console.error(`[${MODE}] ${msg}`) };
     // supabase-js soft-fails as { data: null, error } — do not treat null as [].
     const parlaysFailed = querySoftFailed(parlaysQ);
-    parlays = applyRefreshParlays(parlays, parlaysQ, refreshLog);
-    killByUser = applyRefreshKillByUser(killByUser, settingsQ, refreshLog);
+    parlays = liveUsers.filterParlays(applyRefreshParlays(parlays, parlaysQ, refreshLog));
+    killByUser = liveUsers.filterKillByUser(applyRefreshKillByUser(killByUser, settingsQ, refreshLog));
     filledByParlay = applyRefreshFilledByParlay(filledByParlay, fillsQ, 'contracts', refreshLog);
     if (parlaysFailed) {
       const kept = parlays.map((row) => row.label || row.id).join(', ') || 'none';
@@ -104,7 +107,7 @@ async function refresh() {
 }
 // Contracts counted against a parlay's ceiling: real booked fills (DB) + would-be fills this session.
 const filledSoFarFor = (id) => (filledByParlay[id] || 0) + (simFilledByParlay[id] || 0);
-const killEngagedFor = (userId) => killByUser[userId] !== false; // default engaged (safe)
+const killEngagedFor = (userId) => !liveUsers.isAllowed(userId) || killByUser[userId] !== false; // default engaged (safe)
 
 async function log(p, rfq, d, status) {
   try {

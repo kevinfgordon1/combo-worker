@@ -189,6 +189,7 @@ const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
 const { formatAlertStatus } = require('./venue-alert');
 const { createBucketManager } = require('./bucket-manager');
 const { splitPaused, diffPaused, createPausePoller } = require('./lock-pause');
+const { createLiveUserGate } = require('./live-users');
 const { createAppAlerts } = require('./app-alerts');
 const { createPolyStallAlerts } = require('./poly-stall-alert');
 const { createPartialQuoteDryRun, isPartialQuoteFlagOn } = require('./partial-quote');
@@ -377,6 +378,9 @@ const SKIP_TAPE_MAX_PER_TICK = 5;
 
 // --- per-lock pause -----------------------------------------------------------
 let pausedParlayIds = new Set();
+const liveUsers = createLiveUserGate({ env: process.env, log: (m) => console.log(`[${MODE}] ${m}`) });
+console.log(`[${MODE}] ${liveUsers.summary()}`);
+
 const pausePoller = createPausePoller({ supabase, log: (m) => console.log(`[${MODE}] ${m.replace(/^\[PAUSE\] /, 'PAUSE ')}`) });
 
 async function cancelPausedLock(parlayId) {
@@ -452,7 +456,9 @@ async function refresh() {
     const refreshLog = { error: (msg) => console.error(`[${MODE}] ${msg}`) };
     // supabase-js soft-fails as { data: null, error } — do not treat null as [].
     const parlaysFailed = querySoftFailed(parlaysQ);
-    parlays = applyRefreshParlays(parlays, parlaysQ, refreshLog);
+    // Only allowlisted users' locks are ever loaded (Kalshi AND Polymarket read
+    // this same list). Everyone else's rows are dropped here, logged once.
+    parlays = liveUsers.filterParlays(applyRefreshParlays(parlays, parlaysQ, refreshLog));
     if (!parlaysFailed) {
       // Paused locks (combo_parlays.paused) stay in the table but are not quoted.
       // Missing column => no row has paused === true => everything stays enabled.
@@ -460,7 +466,7 @@ async function refresh() {
       parlays = split.live;
       notePausedIds(split.pausedIds);
     }
-    killByUser = applyRefreshKillByUser(killByUser, settingsQ, refreshLog);
+    killByUser = liveUsers.filterKillByUser(applyRefreshKillByUser(killByUser, settingsQ, refreshLog));
     const fillsForCap = querySoftFailed(fillsQ)
       ? fillsQ
       : { data: (fillsQ.data || []).filter(countsTowardCap), error: null };
@@ -555,7 +561,8 @@ async function lastLookFilledFor(parlayId) {
 // Use the larger of DB fills vs session fills so a restart can't under-count,
 // and we don't double-count the same contracts from both sources.
 const filledSoFarFor = (id) => Math.max(filledByParlay[id] || 0, sessionFilledByParlay[id] || 0);
-const killEngagedFor = (userId) => killByUser[userId] !== false;
+// Not allowlisted => always engaged, whatever combo_settings says.
+const killEngagedFor = (userId) => !liveUsers.isAllowed(userId) || killByUser[userId] !== false;
 
 // DB check constraint allows: shadow | filled | unfilled | declined.
 // Live quotes: status=filled + is_live + no order_id → Combo Locks shows "quoted (awaiting)".
@@ -1574,7 +1581,7 @@ async function loadRecentLocks() {
       console.error(`[${MODE}] load recent locks`, locksQ.error.message);
       return parlays.slice();
     }
-    const recent = locksQ.data || [];
+    const recent = liveUsers.filterParlays(locksQ.data || []);
     const have = new Set(recent.map((p) => p && p.id).filter(Boolean));
     const missing = [];
     for (const row of quotedQ.data || []) {
@@ -1592,7 +1599,7 @@ async function loadRecentLocks() {
       console.error(`[${MODE}] load quoted locks`, extraQ.error.message);
       return recent.length ? recent : parlays.slice();
     }
-    return recent.concat(extraQ.data || []);
+    return recent.concat(liveUsers.filterParlays(extraQ.data || []));
   } catch (e) {
     console.error(`[${MODE}] load recent locks`, e && e.message);
     return parlays.slice();
