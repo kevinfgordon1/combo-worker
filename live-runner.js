@@ -188,6 +188,7 @@ const { startUnhedgedSide } = require('./unhedged-boot');
 const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
 const { formatAlertStatus } = require('./venue-alert');
 const { createBucketManager } = require('./bucket-manager');
+const { startBalanceReporter } = require('./balance-reporter');
 const { splitPaused, diffPaused, createPausePoller } = require('./lock-pause');
 const { createLiveUserGate } = require('./live-users');
 const { resolveWorkerScope, scopeLabel } = require('./worker-scope');
@@ -2483,6 +2484,19 @@ async function main() {
     signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
   });
   if (!SCOPE.isTester) bucketManager.start();
+  // Read-only "Available to trade" for the Combo Locks page (public.combo_balances).
+  try {
+    startBalanceReporter({
+      supabase,
+      scope: SCOPE,
+      env: process.env,
+      signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
+      wrap: unlessQuoteHot,
+      log: (m) => console.log(`[${MODE}] ${m}`),
+    });
+  } catch (e) {
+    console.error(`[${MODE}] balance reporter not started: ${e && e.message}`);
+  }
 
   console.log(
     `[${MODE}] starting — latency-optimized. POST first, dedicated quote HTTP, ` +
