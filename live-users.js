@@ -1,24 +1,30 @@
-// Server-side allowlist of users whose Combo Locks the worker may quote.
+// Who may trade through THIS worker process.
 //
-// The worker trades on ONE set of exchange keys (Kevin's Kalshi + Polymarket).
-// combo_parlays / combo_settings are user-writable through the app (RLS "own
-// rows"), so without this gate any signed-in user could create a lock, disarm
-// their own kill switch, and have it quoted with Kevin's money.
+// A lock is loaded/quoted only when its user_id is:
+//   1. in this process's scope (worker-scope.js: Kevin's ids for the main
+//      worker, exactly one tester id for a per-tester child), AND
+//   2. in public.combo_live_users with can_trade and not paused (polled with
+//      every refresh, service role), AND
+//   3. in COMBO_LIVE_USER_IDS when that env is set (extra global allowlist).
 //
-// COMBO_LIVE_USER_IDS = comma/space separated auth.users ids. Unset, blank, or
-// with no valid uuid => Kevin's own accounts only (DEFAULT_LIVE_USER_IDS).
-// Every combo_parlays / combo_settings loader that can lead to a quote runs its
-// rows through this gate. Skipped locks are logged once per lock id.
+// Until combo_live_users has been read once (or if the read keeps failing),
+// the main worker keeps Kevin's scope so his path never depends on the new
+// table; a tester child fails closed (quotes nothing).
+//
+// Per-user caps (max_per_lock_usd / max_per_day_usd) come from the same rows;
+// see user-caps.js. Skipped locks are logged once per lock id.
 'use strict';
 
-// Kevin: kev120909@gmail.com (primary aibetbuilder account) and
-// kevin.f.gordon1@gmail.com. Looked up from auth.users.
+// Kevin: kev120909@gmail.com (owner) and kevin.f.gordon1@gmail.com.
 const DEFAULT_LIVE_USER_IDS = Object.freeze([
   '79ae1610-097e-4b46-a622-1e952f18e936',
   '968efed8-54db-48a6-808b-194a7a03a4cb',
 ]);
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+const USERS_COLUMNS = 'user_id,can_trade,paused,max_per_lock_usd,max_per_day_usd';
+const USERS_COLUMNS_BASE = 'user_id,can_trade';
 
 function parseLiveUserIds(raw) {
   if (raw == null) return [];
@@ -28,30 +34,96 @@ function parseLiveUserIds(raw) {
     .filter((s) => UUID_RE.test(s));
 }
 
-// { ids: Set<string>, source: 'env' | 'default', invalid: boolean }
-function resolveLiveUserIds(env = process.env) {
+// Extra env allowlist. null = not set (no extra restriction). Set but with no
+// valid uuid => Kevin only (never "everyone").
+function resolveEnvAllowlist(env = process.env) {
   const raw = env && env.COMBO_LIVE_USER_IDS;
-  const blank = raw == null || String(raw).trim() === '';
-  const parsed = blank ? [] : parseLiveUserIds(raw);
-  if (parsed.length) return { ids: new Set(parsed), source: 'env', invalid: false };
-  return { ids: new Set(DEFAULT_LIVE_USER_IDS), source: 'default', invalid: !blank };
+  if (raw == null || String(raw).trim() === '') return { ids: null, invalid: false };
+  const parsed = parseLiveUserIds(raw);
+  if (parsed.length) return { ids: new Set(parsed), invalid: false };
+  return { ids: new Set(DEFAULT_LIVE_USER_IDS), invalid: true };
 }
 
 function normId(v) {
   return v == null ? '' : String(v).trim().toLowerCase();
 }
 
-function createLiveUserGate({ env = process.env, log = console.log } = {}) {
-  const { ids, source, invalid } = resolveLiveUserIds(env);
+function numOrNull(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+function createLiveUserGate({ env = process.env, scope = null, log = console.log } = {}) {
+  const sc = scope || require('./worker-scope').resolveWorkerScope(env);
+  const scopeIds = new Set((sc.userIds || []).map(normId));
+  const envAllow = resolveEnvAllowlist(env);
+  let dbUsers = null; // Map<user_id, row> once combo_live_users has been read
+  let baseColumnsOnly = false;
+  let lastAllowedKey = null;
   const skippedLogged = new Set();
+
+  function inScope(userId) {
+    const id = normId(userId);
+    return !!id && scopeIds.has(id);
+  }
 
   function isAllowed(userId) {
     const id = normId(userId);
-    return !!id && ids.has(id);
+    if (!id || !scopeIds.has(id)) return false;
+    if (envAllow.ids && !envAllow.ids.has(id)) return false;
+    if (dbUsers) {
+      const row = dbUsers.get(id);
+      return !!row && row.can_trade !== false && row.paused !== true;
+    }
+    return !sc.isTester;
   }
 
-  // Keep only locks owned by an allowlisted user. Non-array input (a soft-failed
-  // query) is returned as-is so the caller's soft-fail handling still applies.
+  // { perLockUsd, perDayUsd } (either may be null) or null when uncapped.
+  function capsFor(userId) {
+    if (!dbUsers) return sc.isTester ? { perLockUsd: 0, perDayUsd: 0 } : null;
+    const row = dbUsers.get(normId(userId));
+    if (!row) return null;
+    const perLockUsd = numOrNull(row.max_per_lock_usd);
+    const perDayUsd = numOrNull(row.max_per_day_usd);
+    if (perLockUsd == null && perDayUsd == null) return null;
+    return { perLockUsd, perDayUsd };
+  }
+
+  function query(supabase) {
+    if (!supabase) return Promise.resolve(null);
+    return supabase.from('combo_live_users').select(baseColumnsOnly ? USERS_COLUMNS_BASE : USERS_COLUMNS);
+  }
+
+  // Apply a combo_live_users read. Soft-fail keeps the previous snapshot.
+  function apply(result) {
+    if (!result || result.error || !Array.isArray(result.data)) {
+      const msg = result && result.error ? String(result.error.message || result.error) : 'no data';
+      if (!baseColumnsOnly && /column|schema cache|does not exist|Could not find/i.test(msg)) {
+        baseColumnsOnly = true;
+        log('[LIVE-USERS] combo_live_users caps/pause columns missing — reading user_id,can_trade only');
+      } else {
+        log(`[LIVE-USERS] combo_live_users read failed (${msg}) — keeping ${dbUsers ? 'last snapshot' : (sc.isTester ? 'nothing (tester fails closed)' : 'Kevin scope')}`);
+      }
+      return false;
+    }
+    const next = new Map();
+    for (const r of result.data) if (r && r.user_id) next.set(normId(r.user_id), r);
+    dbUsers = next;
+    const allowedNow = [...scopeIds].filter((id) => isAllowed(id)).sort();
+    const key = allowedNow.join(',');
+    if (key !== lastAllowedKey) {
+      lastAllowedKey = key;
+      skippedLogged.clear();
+      log(`[LIVE-USERS] trading for ${allowedNow.length} user(s) of ${scopeIds.size} in scope`);
+    }
+    return true;
+  }
+
+  async function poll(supabase) {
+    try { return apply(await query(supabase)); } catch (e) { return apply({ error: e }); }
+  }
+
   function filterParlays(rows) {
     if (!Array.isArray(rows)) return rows;
     const out = [];
@@ -65,14 +137,19 @@ function createLiveUserGate({ env = process.env, log = console.log } = {}) {
       skippedLogged.add(key);
       log(
         `[LIVE-USERS] skipping lock ${row && row.id} (${(row && row.label) || 'no label'}) ` +
-        `user=${row && row.user_id} — not in COMBO_LIVE_USER_IDS; never loaded or quoted`
+        `user=${row && row.user_id} — not a live user of this worker; never loaded or quoted`
       );
     }
     return out;
   }
 
-  // Kill-switch map { user_id: kill_switch } limited to allowlisted users. Anyone
-  // else is absent, which every killEngagedFor treats as engaged.
+  // Fill attribution: scope only (a paused user's late fills still book to
+  // their own locks), never another user's locks.
+  function filterByScope(rows) {
+    if (!Array.isArray(rows)) return rows;
+    return rows.filter((row) => row && inScope(row.user_id));
+  }
+
   function filterKillByUser(map) {
     if (!map || typeof map !== 'object') return map;
     const out = {};
@@ -81,11 +158,19 @@ function createLiveUserGate({ env = process.env, log = console.log } = {}) {
   }
 
   function summary() {
-    return `[LIVE-USERS] ${ids.size} live user(s) from ${source === 'env' ? 'COMBO_LIVE_USER_IDS' : 'default (Kevin only)'}` +
-      (invalid ? ' — COMBO_LIVE_USER_IDS had no valid uuid, using default' : '');
+    const env = envAllow.ids ? ` ∩ COMBO_LIVE_USER_IDS(${envAllow.ids.size})` : '';
+    return `[LIVE-USERS] scope ${scopeIds.size} user(s)${env} ∩ combo_live_users` +
+      (envAllow.invalid ? ' — COMBO_LIVE_USER_IDS had no valid uuid, using Kevin only' : '');
   }
 
-  return { ids, source, invalid, isAllowed, filterParlays, filterKillByUser, summary };
+  return {
+    scope: sc,
+    get loaded() { return !!dbUsers; },
+    isAllowed, inScope, capsFor, query, apply, poll,
+    filterParlays, filterByScope, filterKillByUser, summary,
+  };
 }
 
-module.exports = { DEFAULT_LIVE_USER_IDS, parseLiveUserIds, resolveLiveUserIds, createLiveUserGate };
+module.exports = {
+  DEFAULT_LIVE_USER_IDS, parseLiveUserIds, resolveEnvAllowlist, createLiveUserGate,
+};

@@ -46,7 +46,10 @@ const { normalizeKalshiFill } = require('./kalshi-fill-confirm');
 const MODE = 'FILLS';
 const { createLiveUserGate } = require('./live-users');
 // Fills on Kevin's exchange account only attribute to allowlisted users' locks.
-const liveUsers = createLiveUserGate({ env: process.env, log: (m) => console.log(`[${MODE}] ${m}`) });
+const { resolveWorkerScope } = require('./worker-scope');
+// Whose Kalshi account this reader polls (Kevin's main worker, or one tester).
+const SCOPE = resolveWorkerScope(process.env);
+const liveUsers = createLiveUserGate({ env: process.env, scope: SCOPE, log: (m) => console.log(`[${MODE}] ${m}`) });
 const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -74,7 +77,7 @@ async function loadParlays() {
     .from('combo_parlays')
     .select('id,user_id,label,mve_collection,active,max_contracts,fill_american')
     .is('archived_at', null);
-  activeParlays = liveUsers.filterParlays(data || []);
+  activeParlays = liveUsers.filterByScope(data || []);
 }
 
 // Ground-truth filled contracts for a parlay (includes the row just upserted).
@@ -96,6 +99,7 @@ async function loadRecentSubmissions() {
   const { data, error } = await supabase
     .from('combo_submissions')
     .select('id,parlay_id,quote_id,order_id,contracts,status,created_at,label')
+    .in('user_id', SCOPE.userIds)
     .or('quote_id.not.is.null,order_id.not.is.null')
     .gte('created_at', cutoff)
     .limit(500);
@@ -211,7 +215,8 @@ async function poll() {
 
       const existing = await findExistingFill(row.fill_id);
       if (!existing) {
-        const { error } = await supabase.from('combo_fills').insert(row);
+        // A tester's account fills belong to that tester even when unattributed.
+        const { error } = await supabase.from('combo_fills').insert(SCOPE.writeUserId ? { ...row, user_id: SCOPE.writeUserId } : row);
         if (error) { console.error(`[${MODE}] insert failed`, error.message); continue; }
         if (row.is_combo && !row.is_taker) {
           console.log(`[${MODE}] NEW REAL FILL ${row.ticker} count=${row.count} ${parlay ? '→ ' + parlay.label : '(unattributed)'}`);
@@ -253,6 +258,10 @@ async function poll() {
 }
 
 async function main() {
+  if (SCOPE.invalid) {
+    console.error(`[${MODE}] COMBO_WORKER_USER_ID is not a uuid — refusing to start`);
+    process.exit(1);
+  }
   if (!KEY_ID || !PEM || !process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
     console.error(`[${MODE}] missing env: need KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY`);
     process.exit(1);
