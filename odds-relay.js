@@ -1818,7 +1818,11 @@ const novigFeed = (() => {
         const price = priceNum(d.price);
         const qty = Number(d.qty);
         if (price == null || !(qty > 0)) continue;
-        book.orders.set(id, { outcome: String(d.outcome || ''), price, qty });
+        // The live wire sends outcomeId (docs show outcome). Without it an add
+        // lands on no side, so live books thin out to stale far levels.
+        const outcome = String(d.outcomeId || d.outcome || '');
+        if (!outcome) continue;
+        book.orders.set(id, { outcome, price, qty });
       } else if (d.kind === 'remove') {
         book.orders.delete(id);
       }
