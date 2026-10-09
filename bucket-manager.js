@@ -675,16 +675,26 @@ function createBucketManager({
     }
   }
 
-  // Kevin asked for in-app alerts, not Telegram, for routine bucket activity:
-  // a completed transfer and a blocked top-up. With the in-app writer wired
-  // those are log-only on Telegram unless KALSHI_BUCKET_TELEGRAM=1. Failures,
-  // unconfirmed transfers, balance-read errors, low-cash and INSUFFICIENT
-  // BALANCE keep their existing Telegram alerts (plus an in-app row).
+  // Kevin asked for in-app alerts, not Telegram, for a blocked top-up. With
+  // the in-app writer wired that is log-only on Telegram unless
+  // KALSHI_BUCKET_TELEGRAM=1. Failures, unconfirmed transfers, balance-read
+  // errors, low-cash and INSUFFICIENT BALANCE keep their existing Telegram
+  // alerts (plus an in-app row).
+  //
+  // A successful routine transfer (shard 0 <-> shard 1) does not alert at
+  // all: no Telegram, no banner, no bell badge. It is logged here and written
+  // to app_alerts as an already-read, resolved row (quiet) for the record.
   const bucketTelegram = !(appAlerts && appAlerts.enabled) || envOn(env, 'KALSHI_BUCKET_TELEGRAM');
   async function emitBucket(text) {
     if (bucketTelegram) return emit(text);
     log(`[BUCKET] ALERT (in-app only): ${String(text).replace(/\n/g, ' | ')}`);
     return undefined;
+  }
+
+  // Successful transfers: log only, never Telegram (even with
+  // KALSHI_BUCKET_TELEGRAM=1).
+  function logTransfer(text) {
+    log(`[BUCKET] transfer logged (no alert): ${String(text).replace(/\n/g, ' | ')}`);
   }
 
   // In-app alert for Kevin (app_alerts). Never throws, never blocks trading.
@@ -737,6 +747,7 @@ function createBucketManager({
     await inApp({
       kind: 'bucket_transfer',
       severity: 'info',
+      quiet: true,
       title: `Kalshi bucket moved ${formatDollarsFromCents(decision.amountCents)}`,
       body: `${transferText(decision)} (${decision.reason}${state === 'accepted' ? ', confirmation pending' : ''}). ` +
         (balances ? `${balances}. ` : '') + `transfer_id ${transferId || '?'}.`,
@@ -967,7 +978,7 @@ function createBucketManager({
           `[BUCKET] transfer ${p.transferId || '?'} confirmed via ${v.via}` +
           (v.after ? ` ${formatBalances(v.after.main, v.after.bucket)}` : '')
         );
-        await emitBucket(
+        logTransfer(
           `Kalshi bucket transfer\n` +
           `${formatDollarsFromCents(p.decision.amountCents)} ` +
           `${shardLabel(p.decision.fromShard)} → ${shardLabel(p.decision.toShard)}\n` +
@@ -1189,7 +1200,7 @@ function createBucketManager({
       }
       pending = null;
       await inAppTransfer(decision, sent.transferId, v.after || null, 'confirmed');
-      await emitBucket(
+      logTransfer(
         `Kalshi bucket transfer\n` +
         `${amountText} ${shardLabel(decision.fromShard)} → ${shardLabel(decision.toShard)}\n` +
         `reason: ${decision.reason}\n` +

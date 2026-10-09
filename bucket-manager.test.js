@@ -385,7 +385,8 @@ async function main() {
     assert.strictEqual(book.state.bucket.availableCents, cents(5_000));
     assert.strictEqual(book.state.main.availableCents, cents(17_000));
     assert.ok(book.calls.getShard >= 4, 're-read both shards after the transfer');
-    assert.ok(h.alerts.some((t) => t.includes('$3,000.00') && t.includes('shard 0 (main)') && t.includes('shard 1 (combo)')));
+    assert.ok(!h.alerts.some((t) => /bucket transfer/.test(t)), 'a successful transfer never alerts Telegram');
+    assert.ok(h.logs.some((t) => /transfer logged \(no alert\)/.test(t) && t.includes('$3,000.00') && t.includes('shard 0 (main)') && t.includes('shard 1 (combo)')));
     const again = await h.mgr.check('interval');
     assert.strictEqual(again.decision.action, 'hold');
     assert.strictEqual(book.transfers.length, 1);
@@ -750,11 +751,12 @@ async function main() {
     };
     const client = createKalshiBucketClient(signed);
     const alerts = [];
+    const logs = [];
     const mgr = createBucketManager({
       env: LIVE,
       now: () => WED,
       alert(text) { alerts.push(text); },
-      log() {},
+      log(line) { logs.push(String(line)); },
       sleep: async () => {},
       client,
       readPolyCash: null,
@@ -773,7 +775,8 @@ async function main() {
     assert.ok(seen.some((c) => c.method === 'GET' && c.signPath.endsWith('/balance') && c.signPath.indexOf('?') === -1));
     assert.ok(seen.some((c) => /exchange_index=0/.test(c.path)));
     assert.ok(seen.some((c) => /exchange_index=1/.test(c.path)));
-    assert.ok(alerts.some((t) => t.includes('tr_wire') && t.includes('$5,000.00')));
+    assert.ok(!alerts.some((t) => /bucket transfer/.test(t)), 'success is log-only');
+    assert.ok(logs.some((t) => t.includes('tr_wire') && t.includes('$5,000.00')));
   }
 
   {
@@ -836,9 +839,20 @@ async function main() {
     assert.ok(rows[0].title.includes('$3,000.00'));
     assert.ok(rows[0].body.includes('shard 0 (main)') && rows[0].body.includes('shard 1 (combo)'));
     assert.ok(!h.alerts.some((t) => /bucket transfer/.test(t)), 'no Telegram for a completed transfer');
+    assert.strictEqual(rows[0].quiet, true, 'recorded quietly: no banner, no bell badge');
     await h.mgr.check('interval');
     assert.strictEqual(app.rows.filter((r) => r.kind === 'bucket_transfer').length, 1, 'hold writes nothing');
     assert.ok(!app.rows.some((r) => r.kind === 'combo_low_cash'), 'top-up to $5,000 is not low cash');
+  }
+
+  // Even with KALSHI_BUCKET_TELEGRAM=1 a successful transfer stays off Telegram.
+  {
+    const book = fakeBook({ main: cents(20_000), bucket: cents(2_000) });
+    const app = fakeAppAlerts();
+    const h = harnessApp({ ...LIVE, KALSHI_BUCKET_TELEGRAM: '1' }, book, WED, app);
+    const out = await h.mgr.check('interval');
+    assert.strictEqual(out.confirmed, true);
+    assert.ok(!h.alerts.some((t) => /bucket transfer/.test(t)));
   }
 
   // Dry run writes no transfer rows.
