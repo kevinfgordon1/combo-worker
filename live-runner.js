@@ -117,6 +117,9 @@
 //        In-app alerts for Kevin (public.app_alerts, sql/app_alerts.sql):
 //        transfers, blocked top-ups, low shard 1 cash, insufficient funds.
 //        COMBO_LOW_CASH_ALERT_USD (default 1000) = shard 1 low-cash level.
+//      Per-user low-cash site alerts (public.combo_user_alerts): user-low-cash.js.
+//        Raised from logAsync / persistQuoteSkip on insufficient_balance for the
+//        lock's owner; resolved by a 60s tick once combo_balances covers it.
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
@@ -195,6 +198,7 @@ const { createLiveUserGate } = require('./live-users');
 const { resolveWorkerScope, scopeLabel } = require('./worker-scope');
 const { createUserCaps } = require('./user-caps');
 const { createAppAlerts } = require('./app-alerts');
+const { createUserLowCash } = require('./user-low-cash');
 const { createPolyStallAlerts } = require('./poly-stall-alert');
 const { createPartialQuoteDryRun, isPartialQuoteFlagOn } = require('./partial-quote');
 
@@ -222,6 +226,15 @@ function takeCostHint() {
   const h = costHint;
   costHint = null;
   return h;
+}
+
+// Per-user low-cash alerts on the site (user-low-cash.js). Never throws.
+const userLowCash = createUserLowCash({
+  client: createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY),
+  log: (m) => console.log(`[LIVE] ${m}`),
+});
+function noteUserLowCash(info) {
+  Promise.resolve(userLowCash.onRejected(info)).catch(() => {});
 }
 
 function noteInsufficientBalance(venue, info = null) {
@@ -621,7 +634,12 @@ function logAsync(p, rfq, d, status, extra = {}) {
         : rfq.contracts != null ? rfq.contracts : null;
   const venueExtra = withVenue(extra);
   if (venueExtra.skip_reason === 'insufficient_balance') {
-    noteInsufficientBalance(venueExtra.venue || 'kalshi', takeCostHint());
+    const hint = takeCostHint();
+    noteInsufficientBalance(venueExtra.venue || 'kalshi', hint);
+    // Per-user site alert (combo_user_alerts): the lock owner sees it.
+    noteUserLowCash({ userId: p.user_id, parlayId: p.id, label: p.label, venue: venueExtra.venue, costDollars: hint && hint.costDollars });
+  } else if (status === 'quoted' && p && p.user_id) {
+    Promise.resolve(userLowCash.onQuoted({ userId: p.user_id, parlayId: p.id, venue: venueExtra.venue })).catch(() => {});
   }
   const body = stripUnknown({
     user_id: p.user_id,
@@ -713,7 +731,14 @@ function persistQuoteSkip(quoteId, skipReason, fallback, venue, info = null) {
     return Promise.resolve(fallback());
   };
   if (!quoteId || isReserveKey(quoteId)) return insertFallback();
-  return supabase.from('combo_submissions').update(body).eq('quote_id', quoteId).select('id')
+  // Row found => alert its owner here (the fallback insert alerts via logAsync).
+  const alertRow = (r) => {
+    if (skipReason === 'insufficient_balance' && r && r.user_id) {
+      noteUserLowCash({ userId: r.user_id, parlayId: r.parlay_id, label: r.label, venue: venue || 'kalshi', costDollars: info && info.costDollars });
+    }
+    return r;
+  };
+  return supabase.from('combo_submissions').update(body).eq('quote_id', quoteId).select('id,user_id,parlay_id,label')
     .then(({ data, error }) => {
       if (error) {
         const m = String(error.message || '').match(COL_ERR);
@@ -722,20 +747,20 @@ function persistQuoteSkip(quoteId, skipReason, fallback, venue, info = null) {
           console.warn(`[${MODE}] combo_submissions missing column ${m[1]} — degrading`);
           const retry = { ...body };
           delete retry[m[1]];
-          return supabase.from('combo_submissions').update(retry).eq('quote_id', quoteId).select('id')
+          return supabase.from('combo_submissions').update(retry).eq('quote_id', quoteId).select('id,user_id,parlay_id,label')
             .then(({ data: d2, error: e2 }) => {
               if (e2) {
                 console.error(`[${MODE}] quote skip persist`, e2.message);
                 return insertFallback();
               }
-              if (d2 && d2.length) return d2[0];
+              if (d2 && d2.length) return alertRow(d2[0]);
               return insertFallback();
             });
         }
         console.error(`[${MODE}] quote skip persist`, error.message);
         return insertFallback();
       }
-      if (data && data.length) return data[0];
+      if (data && data.length) return alertRow(data[0]);
       return insertFallback();
     })
     .catch((e) => {
@@ -2520,6 +2545,8 @@ async function main() {
   } catch (e) {
     console.error(`[${MODE}] balance reporter not started: ${e && e.message}`);
   }
+  // Low-cash site alerts clear themselves once this scope's cash covers them.
+  { const t = setInterval(() => { userLowCash.tick(SCOPE.userIds).catch(() => {}); }, 60_000); if (t.unref) t.unref(); }
 
   console.log(
     `[${MODE}] starting — latency-optimized. POST first, dedicated quote HTTP, ` +
