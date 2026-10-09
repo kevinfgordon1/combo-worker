@@ -129,6 +129,19 @@ applyBookDeltas(mlBook, [
 assert.deepStrictEqual(askFor(mlBook, ml, 'nyg'), { odds: 0.48, size: 50 });
 assert.deepStrictEqual(askFor(mlBook, ml, 'ari'), { odds: 0.52, size: 1 });
 
+// Live wire shape: delta adds carry outcomeId and orderId (not outcome/order).
+{
+  const live = bookFromSnapshot({ seq: 10, orders: { nyg: [{ orderId: 'x1', price: '0.020', qty: 100 }], ari: [{ orderId: 'x2', price: '0.020', qty: 100 }] } });
+  applyBookDeltas(live, [
+    { kind: 'add', orderId: 'x3', outcomeId: 'nyg', price: '0.455', qty: 61400 },
+    { kind: 'add', orderId: 'x4', outcomeId: 'ari', price: '0.530', qty: 150000 },
+    { kind: 'add', orderId: 'x5', price: '0.990', qty: 1 },
+  ]);
+  assert.deepStrictEqual(askFor(live, ml, 'ari'), { odds: 0.545, size: 614 });
+  assert.deepStrictEqual(askFor(live, ml, 'nyg'), { odds: 0.47, size: 1500 });
+  assert.ok(![...live.orders.values()].some((o) => !o.outcome), 'an add with no outcome is skipped');
+}
+
 // Main spread: most balanced two-sided line wins.
 {
   const books = new Map();
