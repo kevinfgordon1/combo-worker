@@ -2688,6 +2688,7 @@ const novigFeed = (() => {
     let lastRefill = Date.now();
     let attempt = 0;
     let retargetTimer = null;
+    let reconnectTimer = null;
     const subscribed = new Set();
     const pending = new Set();
     const books = new Map();
@@ -2829,6 +2830,7 @@ const novigFeed = (() => {
       status.ws = 'connecting';
       const u = new URL(url);
       let headers;
+      let me = null;
       try {
         headers = signedHeaders(key, { method: 'GET', path: u.pathname, query: u.search });
       } catch (err) {
@@ -2838,6 +2840,7 @@ const novigFeed = (() => {
       }
       try {
         socket = new WS(url, { headers, handshakeTimeout: 10_000 });
+        me = socket;
       } catch (err) {
         status.ws = 'error:open';
         reconnect();
@@ -2856,15 +2859,24 @@ const novigFeed = (() => {
         syncSubscriptions();
       });
       socket.on('message', (data) => onMessage(data));
-      socket.on('unexpected-response', (_req, res) => {
-        status.ws = `error:http_${res && res.statusCode}`;
-        log('websocket refused', res && res.statusCode);
+      socket.on('unexpected-response', (req, res) => {
+        // With this listener set, ws neither errors nor closes on a refused
+        // upgrade, so reconnect here or the feed stays on REST for good.
+        const code = res && res.statusCode;
+        status.ws = `error:http_${code}`;
+        const retryAfter = Number(res && res.headers && res.headers['retry-after']);
+        log('websocket refused', code, retryAfter > 0 ? `retry-after ${retryAfter}s` : '');
+        try { if (req && req.destroy) req.destroy(); } catch (_) { /* gone */ }
+        try { if (res && res.resume) res.resume(); } catch (_) { /* gone */ }
+        socket = null;
+        reconnect(retryAfter > 0 ? retryAfter * 1000 : 0);
       });
       socket.on('error', (err) => {
         if (!String(status.ws).startsWith('error:')) status.ws = 'error';
         log('websocket error', err && err.message);
       });
       socket.on('close', (code, reason) => {
+        if (socket !== me) return;
         if (status.ws === 'up') status.ws = `closed:${code}`;
         log('websocket closed', code, String(reason || ''));
         subscribed.clear();
@@ -2876,12 +2888,12 @@ const novigFeed = (() => {
       });
     }
 
-    function reconnect() {
-      if (stopped) return;
+    function reconnect(minWaitMs = 0) {
+      if (stopped || reconnectTimer) return;
       attempt += 1;
-      const wait = Math.min(60_000, 1000 * 2 ** Math.min(attempt, 6));
-      const t = setTimeout(connect, wait);
-      if (t.unref) t.unref();
+      const wait = Math.max(Number(minWaitMs) || 0, Math.min(60_000, 1000 * 2 ** Math.min(attempt, 6)));
+      reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, wait);
+      if (reconnectTimer.unref) reconnectTimer.unref();
     }
 
     connect();
@@ -2890,6 +2902,7 @@ const novigFeed = (() => {
       stop() {
         stopped = true;
         if (retargetTimer) clearTimeout(retargetTimer);
+        if (reconnectTimer) clearTimeout(reconnectTimer);
         try { if (socket) socket.close(); } catch (_) { /* closed */ }
       },
       _state: { subscribed, pending, books, gapped },

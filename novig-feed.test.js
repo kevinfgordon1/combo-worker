@@ -242,6 +242,37 @@ assert.deepStrictEqual(askFor(mlBook, ml, 'ari'), { odds: 0.52, size: 1 });
   conn.stop();
 }
 
+// A refused upgrade (429) reconnects once, after Retry-After. ws does not
+// close or error on its own when an unexpected-response listener is set.
+{
+  const made = [];
+  class RefusedWs {
+    constructor(url, opts) { this.handlers = {}; this.readyState = 0; made.push(this); }
+    on(name, fn) { this.handlers[name] = fn; }
+    send() {}
+    close() { this.readyState = 3; }
+  }
+  const key = novigKey({ NOVIG_KEY_ID: 'kid', NOVIG_PRIVATE_KEY: vectors.keypairs['ed25519-test-1'].private_key_pkcs8_pem });
+  const status = {};
+  const logs = [];
+  const conn = startNovigWs({
+    key, base: 'https://api.novig.com', WebSocket: RefusedWs, status, log: (...a) => logs.push(a.join(' ')),
+    desired: () => [], onBook: () => {}, onOwned: () => {}, onLifecycle: () => {},
+  });
+  let destroyed = false;
+  made[0].handlers['unexpected-response']({ destroy() { destroyed = true; } }, { statusCode: 429, headers: { 'retry-after': '1' }, resume() {} });
+  // A late close from the refused socket must not schedule a second reconnect.
+  if (made[0].handlers.close) made[0].handlers.close(1006, '');
+  assert.strictEqual(status.ws, 'error:http_429');
+  assert.ok(destroyed, 'refused request is destroyed');
+  assert.ok(logs.some((l) => /refused 429 retry-after 1s/.test(l)));
+  setTimeout(() => {
+    assert.strictEqual(made.length, 2, 'exactly one reconnect after a refused upgrade');
+    conn.stop();
+    console.log('novig ws refused-upgrade reconnect ok');
+  }, 2300);
+}
+
 // /stream?venue=novig is accepted and replays the last snapshot.
 (async () => {
   const relay = startOddsRelay({ upstream: false });
