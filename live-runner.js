@@ -188,6 +188,7 @@ const { startUnhedgedSide } = require('./unhedged-boot');
 const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
 const { formatAlertStatus } = require('./venue-alert');
 const { createBucketManager } = require('./bucket-manager');
+const { createTesterFunder, logOwnKeyScopes } = require('./tester-funder');
 const { startBalanceReporter } = require('./balance-reporter');
 const { splitPaused, diffPaused, createPausePoller } = require('./lock-pause');
 const { createLiveUserGate } = require('./live-users');
@@ -199,6 +200,9 @@ const { createPartialQuoteDryRun, isPartialQuoteFlagOn } = require('./partial-qu
 
 const MODE = 'LIVE';
 let bucketManager = null;
+// Tester children only: moves the tester's own Kalshi Default -> Combos money
+// (tester-funder.js). Never created in Kevin's worker.
+let testerFunder = null;
 
 // Cash a NO quote ties up on shard 1: contracts x NO price (dollars). null when unknown.
 function quoteCostDollars(contracts, noBid) {
@@ -221,6 +225,9 @@ function takeCostHint() {
 }
 
 function noteInsufficientBalance(venue, info = null) {
+  if (testerFunder && String(venue || '').toLowerCase() !== 'polymarket') {
+    Promise.resolve(testerFunder.check('insufficient_balance')).catch(() => {});
+  }
   if (!bucketManager) return;
   Promise.resolve(bucketManager.onInsufficientBalance(venue, info)).catch((e) => {
     console.error(`[${MODE}] bucket notify`, e && e.message);
@@ -2484,6 +2491,22 @@ async function main() {
     signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
   });
   if (!SCOPE.isTester) bucketManager.start();
+  // Read-only: log which scopes this process's Kalshi key has (names only).
+  logOwnKeyScopes({
+    signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
+    keyId: KEY_ID,
+    log: (m) => console.log(`[${MODE}] ${m}`),
+  }).catch(() => {});
+  if (SCOPE.isTester && SCOPE.writeUserId) {
+    testerFunder = createTesterFunder({
+      userId: SCOPE.writeUserId,
+      supabase,
+      signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
+      env: process.env,
+      log: (m) => console.log(`[${MODE}] ${m}`),
+    });
+    testerFunder.start();
+  }
   // Read-only "Available to trade" for the Combo Locks page (public.combo_balances).
   try {
     startBalanceReporter({

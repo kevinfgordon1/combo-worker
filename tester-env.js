@@ -29,6 +29,9 @@ function buildTesterEnv(base, { userId, kalshi, poly } = {}) {
   env.Kalshi_combo_key = kalshi.secret;
   // Open quotes reserve against the lock + day caps (strict for tester money).
   env.COMBO_CAP_AT_CONFIRM = '0';
+  // Kevin's bucket manager stays off in tester children. Tester auto-funding
+  // is tester-funder.js (own Default -> own Combos only), controlled by
+  // TESTER_AUTOFUND / TESTER_FUND_* inherited from the supervisor.
   env.KALSHI_BUCKET_AUTO = '0';
   env.KALSHI_BUCKET_SWEEP = '0';
   if (poly && poly.keyId && poly.secret) {

@@ -210,3 +210,26 @@ Off unless `DKFD_FEED=1` on the **odds-relay** service. Kevin approved this feed
 - **Railway egress is blocked by DraftKings' Akamai** (403 Access Denied on every request from the odds-relay, Oct 7 2026; the same request works from the agent box). Production runs `DKFD_BOOKS=fanduel` until DraftKings has another egress (residential proxy or Kevin's computer).
 - Routes: `/stream?venue=draftkings|fanduel&league=NFL` (SSE `quote` packets like Novig plus an `event: feed` heartbeat after every poll), `/board?venue=...` (JSON), `/health` → `dkfd`.
 - Code lives inline in `odds-relay.js` (`dkfdFeed`) so the odds-relay watch paths pick up changes.
+
+## Tester auto-funding (combo-testers service)
+
+Each tester child keeps that tester's Kalshi Combos balance (Exchange 1) topped
+up from their own Default balance (Exchange 0) with their own key
+(`tester-funder.js`). Only Default -> Combos on the tester's own account; never
+subaccounts, other users, or Kevin's money. Needs the tester key to have Full
+access (`write`) or Transfers (`write::transfer`); the Supabase table
+`combo_fund_moves` (aibetbuilder `sql/20261009_combo_fund_moves.sql`) must
+exist, otherwise nothing moves (fail closed).
+
+| Var (on combo-testers) | Default | Meaning |
+| --- | --- | --- |
+| `TESTER_AUTOFUND` | on | `0` = global kill switch, no tester moves at all |
+| `TESTER_FUND_MAX_MOVE_USD` | 100 | per-move limit |
+| `TESTER_FUND_DAILY_USD` | 250 | per-tester daily limit (ET day, from the log) |
+| `TESTER_FUND_MIN_MOVE_USD` | 5 | smallest move |
+| `TESTER_FUND_MAIN_FLOOR_USD` | 0 | Default balance always kept |
+| `TESTER_FUND_INTERVAL_MIN` | 5 | check interval |
+
+Cap: Combos available cash + unconfirmed moves never exceed the tester's
+`combo_live_users.max_per_day_usd`. Per-tester off switches: the tester's kill
+switch, owner Pause, `can_trade=false`, or a key without Transfers.
