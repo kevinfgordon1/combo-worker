@@ -14,6 +14,7 @@ const {
   DATE_NOISE_MS,
   privateKeyObject,
   sign,
+  normalizePem,
 } = require('./kalshi-auth');
 
 const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -97,6 +98,23 @@ function dateUtc(ms) {
     Buffer.from(sig, 'base64')
   );
   assert.ok(ok, 'cached KeyObject must produce a valid RSA-PSS signature');
+}
+
+// Ed25519 keys (Kalshi's default) sign with plain Ed25519; armored or bare body.
+{
+  const { privateKey: edPriv, publicKey: edPub } = crypto.generateKeyPairSync('ed25519');
+  const edPem = edPriv.export({ type: 'pkcs8', format: 'pem' });
+  const ts = 1_700_000_000_000;
+  const path = '/trade-api/v2/communications/quotes';
+  const msg = Buffer.from(String(ts) + 'POST' + path, 'utf8');
+  const sig = sign(edPem, ts, 'POST', path);
+  assert.ok(crypto.verify(null, msg, edPub, Buffer.from(sig, 'base64')), 'Ed25519 signature must verify');
+  const bare = edPem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+  const norm = normalizePem(bare);
+  assert.ok(/^-----BEGIN PRIVATE KEY-----/.test(norm), 'bare Ed25519 body is armored as PKCS#8');
+  assert.ok(crypto.verify(null, msg, edPub, Buffer.from(sign(norm, ts, 'POST', path), 'base64')));
+  const h = authHeaders({ keyId: 'kid', pem: edPem, method: 'GET', signPath: '/trade-api/v2/portfolio/balance', ts });
+  assert.ok(crypto.verify(null, Buffer.from(String(ts) + 'GET/trade-api/v2/portfolio/balance'), edPub, Buffer.from(h['KALSHI-ACCESS-SIGNATURE'], 'base64')));
 }
 
 async function runAsync() {
