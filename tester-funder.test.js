@@ -185,6 +185,42 @@ const mk = (db, k, extra = {}) => createTesterFunder({ userId: T, supabase: db, 
     assert.match(db.moves.find((m) => m.id === 's').error, /^unconfirmed/);
     assert.equal(r.moved, 5000);
   }
+  // Tester's own cap ($120) wins when below the daily limit; never above it.
+  {
+    const s1 = base(); s1.settings = { kill_switch: false, autofund_cap_usd: 120 };
+    const db = fakeDb(s1); const k = fakeKalshi({ combo: 5000 });
+    assert.equal((await mk(db, k).check()).moved, 7000, '$50 in Combos, cap $120 -> $70');
+    assert.equal(db.inserts[0].cap_usd, 120);
+    const s2 = base(); s2.settings = { kill_switch: false, autofund_cap_usd: 900 };
+    const db2 = fakeDb(s2); const k2 = fakeKalshi({ combo: 20000 });
+    assert.equal((await mk(db2, k2).check()).moved, 5000, 'cap above the $250 daily limit is clamped to it');
+    const s3 = base(); s3.settings = { kill_switch: false, autofund_cap_usd: 0 };
+    const db3 = fakeDb(s3); const k3 = fakeKalshi();
+    await mk(db3, k3).check();
+    assert.equal(k3.transfers.length, 0, 'cap $0 = auto-funding off');
+  }
+  // Sweep: Combos cash above the cap goes back to Default (own account only).
+  {
+    const s1 = base(); s1.settings = { kill_switch: false, autofund_cap_usd: 100 };
+    const db = fakeDb(s1); const k = fakeKalshi({ combo: 16000 });
+    const r = await mk(db, k).check();
+    assert.equal(r.swept, 6000);
+    assert.deepEqual(k.transfers, [{ amountCenticents: 600_000, fromShard: 1, toShard: 0 }]);
+    assert.equal(db.inserts[0].from_shard, 1); assert.equal(db.inserts[0].to_shard, 0);
+    assert.equal(db.moves[0].status, 'confirmed');
+  }
+  // Sweeps do not use up the daily top-up limit.
+  {
+    const s1 = base(); s1.moves = [{ id: 'sw', amount_usd: 200, status: 'confirmed', from_shard: 1, to_shard: 0, created_at: '2026-10-09T15:00:00Z' }];
+    const db = fakeDb(s1); const k = fakeKalshi();
+    assert.equal((await mk(db, k).check()).moved, 10000);
+  }
+  // Hard guard on the money call.
+  {
+    const f = mk(fakeDb(base()), fakeKalshi());
+    await assert.rejects(f._moveBetweenOwnBalances(100, 0, 0), /only Default <-> Combos/);
+    await assert.rejects(f._moveBetweenOwnBalances(100, 0, 2), /only Default <-> Combos/);
+  }
   // Hard guard on the money call.
   {
     const f = mk(fakeDb(base()), fakeKalshi());

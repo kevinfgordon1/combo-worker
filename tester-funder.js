@@ -7,15 +7,20 @@
 // it (his bucket-manager.js is unchanged).
 //
 // The only money-moving call is POST /portfolio/intra_exchange_instance_transfer
-// with source/destination event_contract, source_exchange_shard 0 and
-// destination_exchange_shard 1 (hard-coded below). No subaccount field is ever
-// sent, nothing moves 1 -> 0, nothing goes to another user (Kalshi's public API
-// has no such endpoint).
+// with source/destination event_contract between the tester's own shard 0
+// (Default) and shard 1 (Combos): top-ups 0 -> 1, sweeps 1 -> 0 of Combos cash
+// above the cap. No subaccount field is ever sent and nothing goes to another
+// user (Kalshi's public API has no such endpoint).
 //   https://docs.kalshi.com/api-reference/portfolio/intra-account-transfer
 //
 // Limits, checked before every move (all must pass; amounts in cents):
 //   cap        Combos available cash + moves not yet confirmed never exceed the
-//              tester's max_per_day_usd (combo_live_users; Kevin sets it).
+//              tester's cap: combo_settings.autofund_cap_usd (the tester sets it
+//              on the Combo Locks card), never above their daily limit
+//              combo_live_users.max_per_day_usd (Kevin sets it). No cap set =
+//              the daily limit.
+//   sweep      Combos cash above the cap (cap lowered, winnings settled) goes
+//              back to Default, per-move limit applies, not the daily limit.
 //   per move   TESTER_FUND_MAX_MOVE_USD (default $100)
 //   per day    TESTER_FUND_DAILY_USD (default $250), ET day, counted from
 //              combo_fund_moves (persisted, so a restart does not reset it)
@@ -153,9 +158,9 @@ function createTesterFunder({
     const one = (q) => (typeof q.maybeSingle === 'function' ? q.maybeSingle() : q);
     const [liveQ, setQ, keyQ, movesQ] = await Promise.all([
       one(supabase.from('combo_live_users').select('user_id,is_owner,can_trade,paused,max_per_day_usd').eq('user_id', uid)),
-      one(supabase.from('combo_settings').select('kill_switch').eq('user_id', uid)),
+      one(supabase.from('combo_settings').select('kill_switch,autofund_cap_usd').eq('user_id', uid)),
       one(supabase.from('combo_exchange_keys').select('scopes,scope_status').eq('user_id', uid).eq('venue', 'kalshi')),
-      supabase.from(TABLE).select('id,amount_usd,status,transfer_id,error,created_at').eq('user_id', uid).gte('created_at', since).order('created_at', { ascending: false }).limit(200),
+      supabase.from(TABLE).select('id,amount_usd,status,transfer_id,error,from_shard,to_shard,created_at').eq('user_id', uid).gte('created_at', since).order('created_at', { ascending: false }).limit(200),
     ]);
     const err = liveQ.error || setQ.error || keyQ.error || movesQ.error;
     if (err) throw new Error(`state read: ${err.message || err}`);
@@ -171,9 +176,18 @@ function createTesterFunder({
     if (s.live.paused) return 'off: paused by owner';
     if (!s.settings || s.settings.kill_switch !== false) return 'off: kill switch engaged';
     if (!s.key || s.key.scope_status !== 'ok' || !canTransfer(s.key.scopes)) return 'off: key has no Transfers / Full access';
-    const cap = usdToCents(s.live.max_per_day_usd);
-    if (cap == null || cap <= 0) return 'off: no daily limit set';
+    if (capFor(s) == null) return 'off: no cap or daily limit set';
     return null;
+  }
+
+  // Tester's own cap, never above the owner's daily limit.
+  function capFor(s) {
+    const daily = usdToCents(s.live && s.live.max_per_day_usd);
+    if (daily == null || daily <= 0) return null;
+    const own = usdToCents(s.settings && s.settings.autofund_cap_usd);
+    if (own == null) return daily;
+    if (own <= 0) return null;
+    return Math.min(own, daily);
   }
 
   async function update(id, patch) {
@@ -208,12 +222,15 @@ function createTesterFunder({
     return still;
   }
 
-  // The one money-moving call: tester's own Default (0) -> own Combos (1).
-  async function moveDefaultToCombos(amountCents) {
+  // The only money-moving calls: tester's own Default (0) <-> own Combos (1).
+  async function moveBetweenOwnBalances(amountCents, fromShard, toShard) {
     const cents = Math.trunc(Number(amountCents));
     if (!(cents > 0) || cents > config.maxMoveCents) throw new Error('move amount outside limits');
-    return kalshi.transfer({ amountCenticents: cents * CENTICENTS_PER_CENT, fromShard: DEFAULT_SHARD, toShard: COMBOS_SHARD });
+    const ok = (fromShard === DEFAULT_SHARD && toShard === COMBOS_SHARD) || (fromShard === COMBOS_SHARD && toShard === DEFAULT_SHARD);
+    if (!ok) throw new Error('only Default <-> Combos moves are allowed');
+    return kalshi.transfer({ amountCenticents: cents * CENTICENTS_PER_CENT, fromShard, toShard });
   }
+  const moveDefaultToCombos = (c) => moveBetweenOwnBalances(c, DEFAULT_SHARD, COMBOS_SHARD);
 
   async function run(trigger) {
     const date = now();
@@ -233,40 +250,53 @@ function createTesterFunder({
       combo = await kalshi.getShard(COMBOS_SHARD);
     } catch (e) { note('hold: balance read failed', shortErr(e)); return { skipped: 'balance_read_failed' }; }
     const dayStart = etDayStartMs(date);
-    const todayCents = s.moves.filter((r) => countsToday(r) && new Date(r.created_at).getTime() >= dayStart)
+    const todayCents = s.moves.filter((r) => countsToday(r) && Number(r.to_shard ?? 1) === COMBOS_SHARD && new Date(r.created_at).getTime() >= dayStart)
       .reduce((a, r) => a + (usdToCents(r.amount_usd) || 0), 0);
-    const capCents = usdToCents(s.live.max_per_day_usd);
+    const capCents = capFor(s);
     const plan = planFund({ gate: null, comboCents: combo.availableCents, mainCents: main.availableCents, capCents, pendingCents: 0, todayCents, config });
+    // Combos cash above the cap goes back to Default.
+    const excess = combo.availableCents - capCents;
+    if (excess >= config.minMoveCents) {
+      const amount = Math.min(excess, config.maxMoveCents);
+      return send({ amountCents: amount, fromShard: COMBOS_SHARD, toShard: DEFAULT_SHARD, reason: 'sweep above cap', trigger, combo, main, capCents, todayCents, date });
+    }
     if (plan.action !== 'move') {
       note(`hold: ${plan.reason}`, `combos=${fmt(combo.availableCents)} default=${fmt(main.availableCents)} cap=${fmt(capCents)} today=${fmt(todayCents)}`);
       return { plan };
     }
+    return send({ amountCents: plan.amountCents, fromShard: DEFAULT_SHARD, toShard: COMBOS_SHARD, reason: plan.reason, trigger, combo, main, capCents, todayCents, date });
+  }
+
+  async function send({ amountCents, fromShard, toShard, reason, trigger, combo, main, capCents, todayCents, date }) {
+    const label = fromShard === DEFAULT_SHARD ? 'Default -> Combos' : 'Combos -> Default';
     // Log first; no row, no move.
     const row = {
-      user_id: uid, venue: 'kalshi', from_shard: DEFAULT_SHARD, to_shard: COMBOS_SHARD,
-      amount_usd: centsToUsd(plan.amountCents), status: 'sending',
+      user_id: uid, venue: 'kalshi', from_shard: fromShard, to_shard: toShard,
+      amount_usd: centsToUsd(amountCents), status: 'sending',
       combo_before_usd: centsToUsd(combo.availableCents), default_before_usd: centsToUsd(main.availableCents),
-      cap_usd: centsToUsd(capCents), reason: `${plan.reason} (${trigger || 'check'})`.slice(0, 80),
+      cap_usd: centsToUsd(capCents), reason: `${reason} (${trigger || 'check'})`.slice(0, 80),
     };
     const ins = await supabase.from(TABLE).insert(row).select('id').single();
     if (ins.error || !ins.data || !ins.data.id) { note('hold: could not write the move log', String((ins.error && ins.error.message) || '')); return { skipped: 'log_failed' }; }
     const id = ins.data.id;
     let sent;
     try {
-      sent = await moveDefaultToCombos(plan.amountCents);
+      sent = await moveBetweenOwnBalances(amountCents, fromShard, toShard);
     } catch (e) {
       const code = e && e.statusCode;
       if (code === 401 || code === 403) refused = `HTTP ${code}`;
       await update(id, { status: 'failed', error: shortErr(e).slice(0, 120) });
-      log(`[FUND] move ${fmt(plan.amountCents)} Default -> Combos failed ${shortErr(e)}`);
-      return { plan, failed: true };
+      log(`[FUND] move ${fmt(amountCents)} ${label} failed ${shortErr(e)}`);
+      return { failed: true };
     }
     await update(id, { status: 'accepted', transfer_id: sent && sent.transferId ? String(sent.transferId) : null });
-    log(`[FUND] moved ${fmt(plan.amountCents)} Default -> Combos (combos was ${fmt(combo.availableCents)}, cap ${fmt(capCents)}, today ${fmt(todayCents + plan.amountCents)})`);
+    log(`[FUND] moved ${fmt(amountCents)} ${label} (combos was ${fmt(combo.availableCents)}, cap ${fmt(capCents)}, today ${fmt(todayCents + (toShard === COMBOS_SHARD ? amountCents : 0))})`);
     lastReason = '';
     if (config.confirmDelayMs > 0) await sleep(config.confirmDelayMs);
     await settlePending([{ id, status: 'accepted', transfer_id: sent && sent.transferId, created_at: date.toISOString() }], now().getTime());
-    return { plan, moved: plan.amountCents, transferId: sent && sent.transferId };
+    return toShard === COMBOS_SHARD
+      ? { moved: amountCents, transferId: sent && sent.transferId }
+      : { swept: amountCents, transferId: sent && sent.transferId };
   }
 
   function check(trigger = 'check') {
@@ -280,7 +310,7 @@ function createTesterFunder({
   function start() {
     log(`[FUND] tester auto-funding ${config.enabled ? 'on' : 'OFF (TESTER_AUTOFUND=0)'}: Default -> Combos only, ` +
       `per move ${fmt(config.maxMoveCents)}, per day ${fmt(config.dailyCents)}, min ${fmt(config.minMoveCents)}, ` +
-      `cap = tester daily limit, every ${Math.round(config.intervalMs / 60000)}m`);
+      `cap = tester's own cap (<= daily limit), sweeps above cap back, every ${Math.round(config.intervalMs / 60000)}m`);
     if (timer) clearInterval(timer);
     timer = setInterval(() => { check('interval'); }, config.intervalMs);
     if (timer.unref) timer.unref();
@@ -289,7 +319,7 @@ function createTesterFunder({
   }
   function stop() { if (timer) clearInterval(timer); timer = null; }
 
-  return { config, check, start, stop, _moveDefaultToCombos: moveDefaultToCombos };
+  return { config, check, start, stop, _moveDefaultToCombos: moveDefaultToCombos, _moveBetweenOwnBalances: moveBetweenOwnBalances };
 }
 
 // Read-only boot line: which scopes THIS process's own Kalshi key has

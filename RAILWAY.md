@@ -215,7 +215,8 @@ Off unless `DKFD_FEED=1` on the **odds-relay** service. Kevin approved this feed
 
 Each tester child keeps that tester's Kalshi Combos balance (Exchange 1) topped
 up from their own Default balance (Exchange 0) with their own key
-(`tester-funder.js`). Only Default -> Combos on the tester's own account; never
+(`tester-funder.js`), and sweeps Combos cash above the cap back to Default.
+Only Default <-> Combos on the tester's own account; never
 subaccounts, other users, or Kevin's money. Needs the tester key to have Full
 access (`write`) or Transfers (`write::transfer`); the Supabase table
 `combo_fund_moves` (aibetbuilder `sql/20261009_combo_fund_moves.sql`) must
@@ -230,6 +231,8 @@ exist, otherwise nothing moves (fail closed).
 | `TESTER_FUND_MAIN_FLOOR_USD` | 0 | Default balance always kept |
 | `TESTER_FUND_INTERVAL_MIN` | 5 | check interval |
 
-Cap: Combos available cash + unconfirmed moves never exceed the tester's
-`combo_live_users.max_per_day_usd`. Per-tester off switches: the tester's kill
+Cap: Combos available cash + unconfirmed moves never exceed the tester's own
+cap (`combo_settings.autofund_cap_usd`, set on the Combo Locks card), clamped
+to their `combo_live_users.max_per_day_usd`; no cap set = the daily limit.
+Successful moves are logged quietly (log table only, no banner or Telegram). Per-tester off switches: the tester's kill
 switch, owner Pause, `can_trade=false`, or a key without Transfers.
