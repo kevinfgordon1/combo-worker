@@ -21,7 +21,9 @@
 //              the daily limit.
 //   sweep      Combos cash above the cap (cap lowered, winnings settled) goes
 //              back to Default, per-move limit applies, not the daily limit.
-//   per move   TESTER_FUND_MAX_MOVE_USD (default $100)
+//   per move   TESTER_FUND_MAX_MOVE_USD (default $100); lifted for a tester
+//              with combo_live_users.fund_unlimited (daily too; cap = their
+//              own Amount to keep for combos only, blank = no moves)
 //   per day    TESTER_FUND_DAILY_USD (default $250), ET day, counted from
 //              combo_fund_moves (persisted, so a restart does not reset it)
 //   minimum    TESTER_FUND_MIN_MOVE_USD (default $5)
@@ -157,7 +159,7 @@ function createTesterFunder({
     const since = new Date(t - LOOKBACK_MS).toISOString();
     const one = (q) => (typeof q.maybeSingle === 'function' ? q.maybeSingle() : q);
     const [liveQ, setQ, keyQ, movesQ] = await Promise.all([
-      one(supabase.from('combo_live_users').select('user_id,is_owner,can_trade,paused,max_per_day_usd').eq('user_id', uid)),
+      one(supabase.from('combo_live_users').select('user_id,is_owner,can_trade,paused,max_per_day_usd,fund_unlimited').eq('user_id', uid)),
       one(supabase.from('combo_settings').select('kill_switch,autofund_cap_usd').eq('user_id', uid)),
       one(supabase.from('combo_exchange_keys').select('scopes,scope_status').eq('user_id', uid).eq('venue', 'kalshi')),
       supabase.from(TABLE).select('id,amount_usd,status,transfer_id,error,from_shard,to_shard,created_at').eq('user_id', uid).gte('created_at', since).order('created_at', { ascending: false }).limit(200),
@@ -176,12 +178,25 @@ function createTesterFunder({
     if (s.live.paused) return 'off: paused by owner';
     if (!s.settings || s.settings.kill_switch !== false) return 'off: kill switch engaged';
     if (!s.key || s.key.scope_status !== 'ok' || !canTransfer(s.key.scopes)) return 'off: key has no Transfers / Full access';
-    if (capFor(s) == null) return 'off: no cap or daily limit set';
+    if (capFor(s) == null) return unlimited(s) ? 'off: no Amount to keep for combos set' : 'off: no cap or daily limit set';
     return null;
   }
 
   // Tester's own cap, never above the owner's daily limit.
+  function unlimited(s) { return !!(s && s.live && s.live.fund_unlimited === true); }
+
+  // fund_unlimited (set per tester by Kevin in combo_live_users): the cap is
+  // ONLY the tester's own Amount to keep for combos; blank/0 = no moves. The
+  // per-move and daily move limits are lifted for that tester only.
+  function configFor(s) {
+    return unlimited(s) ? { ...config, maxMoveCents: Infinity, dailyCents: Infinity } : config;
+  }
+
   function capFor(s) {
+    if (unlimited(s)) {
+      const own = usdToCents(s.settings && s.settings.autofund_cap_usd);
+      return own != null && own > 0 ? own : null;
+    }
     const daily = usdToCents(s.live && s.live.max_per_day_usd);
     if (daily == null || daily <= 0) return null;
     const own = usdToCents(s.settings && s.settings.autofund_cap_usd);
@@ -223,9 +238,9 @@ function createTesterFunder({
   }
 
   // The only money-moving calls: tester's own Default (0) <-> own Combos (1).
-  async function moveBetweenOwnBalances(amountCents, fromShard, toShard) {
+  async function moveBetweenOwnBalances(amountCents, fromShard, toShard, maxMoveCents = config.maxMoveCents) {
     const cents = Math.trunc(Number(amountCents));
-    if (!(cents > 0) || cents > config.maxMoveCents) throw new Error('move amount outside limits');
+    if (!(cents > 0) || cents > maxMoveCents) throw new Error('move amount outside limits');
     const ok = (fromShard === DEFAULT_SHARD && toShard === COMBOS_SHARD) || (fromShard === COMBOS_SHARD && toShard === DEFAULT_SHARD);
     if (!ok) throw new Error('only Default <-> Combos moves are allowed');
     return kalshi.transfer({ amountCenticents: cents * CENTICENTS_PER_CENT, fromShard, toShard });
@@ -253,21 +268,21 @@ function createTesterFunder({
     const todayCents = s.moves.filter((r) => countsToday(r) && Number(r.to_shard ?? 1) === COMBOS_SHARD && new Date(r.created_at).getTime() >= dayStart)
       .reduce((a, r) => a + (usdToCents(r.amount_usd) || 0), 0);
     const capCents = capFor(s);
-    const plan = planFund({ gate: null, comboCents: combo.availableCents, mainCents: main.availableCents, capCents, pendingCents: 0, todayCents, config });
+    const plan = planFund({ gate: null, comboCents: combo.availableCents, mainCents: main.availableCents, capCents, pendingCents: 0, todayCents, config: configFor(s) });
     // Combos cash above the cap goes back to Default.
     const excess = combo.availableCents - capCents;
     if (excess >= config.minMoveCents) {
-      const amount = Math.min(excess, config.maxMoveCents);
-      return send({ amountCents: amount, fromShard: COMBOS_SHARD, toShard: DEFAULT_SHARD, reason: 'sweep above cap', trigger, combo, main, capCents, todayCents, date });
+      const amount = Math.min(excess, configFor(s).maxMoveCents);
+      return send({ maxMoveCents: configFor(s).maxMoveCents, amountCents: amount, fromShard: COMBOS_SHARD, toShard: DEFAULT_SHARD, reason: 'sweep above cap', trigger, combo, main, capCents, todayCents, date });
     }
     if (plan.action !== 'move') {
       note(`hold: ${plan.reason}`, `combos=${fmt(combo.availableCents)} default=${fmt(main.availableCents)} cap=${fmt(capCents)} today=${fmt(todayCents)}`);
       return { plan };
     }
-    return send({ amountCents: plan.amountCents, fromShard: DEFAULT_SHARD, toShard: COMBOS_SHARD, reason: plan.reason, trigger, combo, main, capCents, todayCents, date });
+    return send({ maxMoveCents: configFor(s).maxMoveCents, amountCents: plan.amountCents, fromShard: DEFAULT_SHARD, toShard: COMBOS_SHARD, reason: plan.reason, trigger, combo, main, capCents, todayCents, date });
   }
 
-  async function send({ amountCents, fromShard, toShard, reason, trigger, combo, main, capCents, todayCents, date }) {
+  async function send({ maxMoveCents, amountCents, fromShard, toShard, reason, trigger, combo, main, capCents, todayCents, date }) {
     const label = fromShard === DEFAULT_SHARD ? 'Default -> Combos' : 'Combos -> Default';
     // Log first; no row, no move.
     const row = {
@@ -281,7 +296,7 @@ function createTesterFunder({
     const id = ins.data.id;
     let sent;
     try {
-      sent = await moveBetweenOwnBalances(amountCents, fromShard, toShard);
+      sent = await moveBetweenOwnBalances(amountCents, fromShard, toShard, maxMoveCents);
     } catch (e) {
       const code = e && e.statusCode;
       if (code === 401 || code === 403) refused = `HTTP ${code}`;

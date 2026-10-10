@@ -23,7 +23,7 @@ const DEFAULT_LIVE_USER_IDS = Object.freeze([
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-const USERS_COLUMNS = 'user_id,can_trade,paused,max_per_lock_usd,max_per_day_usd';
+const USERS_COLUMNS = 'user_id,can_trade,paused,max_per_lock_usd,max_per_day_usd,fund_unlimited';
 const USERS_COLUMNS_BASE = 'user_id,can_trade';
 
 function parseLiveUserIds(raw) {
@@ -74,7 +74,11 @@ function createLiveUserGate({ env = process.env, scope = null, log = console.log
     if (envAllow.ids && !envAllow.ids.has(id)) return false;
     if (dbUsers) {
       const row = dbUsers.get(id);
-      return !!row && row.can_trade !== false && row.paused !== true;
+      if (!row || row.can_trade === false || row.paused === true) return false;
+      // fund_unlimited testers are limited only by their own "Amount to keep
+      // for combos" (combo_settings.autofund_cap_usd). Blank / 0 / unread = no trading.
+      if (row.fund_unlimited === true && !(numOrNull(row._combo_cap_usd) > 0)) return false;
+      return true;
     }
     return !sc.isTester;
   }
@@ -90,9 +94,19 @@ function createLiveUserGate({ env = process.env, scope = null, log = console.log
     return { perLockUsd, perDayUsd };
   }
 
-  function query(supabase) {
-    if (!supabase) return Promise.resolve(null);
-    return supabase.from('combo_live_users').select(baseColumnsOnly ? USERS_COLUMNS_BASE : USERS_COLUMNS);
+  async function query(supabase) {
+    if (!supabase) return null;
+    const res = await supabase.from('combo_live_users').select(baseColumnsOnly ? USERS_COLUMNS_BASE : USERS_COLUMNS);
+    if (!res || res.error || !Array.isArray(res.data)) return res;
+    const ids = res.data.filter((r) => r && r.fund_unlimited === true).map((r) => r.user_id);
+    if (!ids.length) return res;
+    let caps = new Map();
+    try {
+      const sq = await supabase.from('combo_settings').select('user_id,autofund_cap_usd').in('user_id', ids);
+      if (sq && !sq.error && Array.isArray(sq.data)) caps = new Map(sq.data.map((r) => [normId(r.user_id), r.autofund_cap_usd]));
+      else log(`[LIVE-USERS] combo_settings read failed — fund_unlimited users held (no cap known)`);
+    } catch (_) { log('[LIVE-USERS] combo_settings read threw — fund_unlimited users held'); }
+    return { ...res, data: res.data.map((r) => (r && r.fund_unlimited === true ? { ...r, _combo_cap_usd: caps.get(normId(r.user_id)) ?? null } : r)) };
   }
 
   // Apply a combo_live_users read. Soft-fail keeps the previous snapshot.

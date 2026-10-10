@@ -180,4 +180,20 @@ const src = (f) => fs.readFileSync(path.join(__dirname, f), 'utf8');
   }
 }
 
+{
+  const scope = resolveWorkerScope({ COMBO_WORKER_USER_ID: RANDOM });
+  const gate = createLiveUserGate({ env: {}, scope, log: () => {} });
+  const mkSb = (cap, fail) => ({ from(t) { const b = { select() { return b; }, in() { return b; },
+    then(r, j) { const res = t === 'combo_live_users' ? { data: [{ user_id: RANDOM, can_trade: true, paused: false, max_per_lock_usd: null, max_per_day_usd: null, fund_unlimited: true }], error: null }
+      : (fail ? { data: null, error: { message: 'x' } } : { data: cap === undefined ? [] : [{ user_id: RANDOM, autofund_cap_usd: cap }], error: null });
+      return Promise.resolve(res).then(r, j); } }; return b; } });
+  return (async () => {
+    for (const [cap, fail, want] of [[2000, false, true], [null, false, false], [0, false, false], [undefined, false, false], [2000, true, false]]) {
+      gate.apply(await gate.query(mkSb(cap, fail)));
+      assert.strictEqual(gate.isAllowed(RANDOM), want, `fund_unlimited cap=${cap} fail=${fail}`);
+      assert.strictEqual(gate.capsFor(RANDOM), null, 'no fixed per-lock/day caps');
+    }
+    console.log('live-users fund_unlimited ok');
+  })();
+}
 console.log('live-users tests passed');

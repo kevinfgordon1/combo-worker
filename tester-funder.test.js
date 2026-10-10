@@ -244,5 +244,33 @@ const mk = (db, k, extra = {}) => createTesterFunder({ userId: T, supabase: db, 
     assert.equal(env.KALSHI_BUCKET_AUTO, '0');
     assert.equal(env.KALSHI_KEY_ID, 'k');
   }
+  // fund_unlimited tester: only their own Amount to keep for combos limits moves.
+  {
+    const s = base(); s.live = { ...s.live, fund_unlimited: true, max_per_day_usd: null }; s.settings = { kill_switch: false, autofund_cap_usd: 2000 };
+    s.moves = [{ id: 'old', amount_usd: 900, status: 'confirmed', created_at: '2026-10-09T13:00:00Z' }];
+    const db = fakeDb(s); const k = fakeKalshi({ main: 500000, combo: 30000 });
+    const r = await mk(db, k).check();
+    assert.equal(r.moved, 170000, 'no $100 per-move or $250 daily limit; tops up to $2,000');
+    assert.deepEqual(k.transfers, [{ amountCenticents: 170000 * 100, fromShard: 0, toShard: 1 }]);
+    assert.equal(db.inserts[0].cap_usd, 2000);
+  }
+  {
+    const s = base(); s.live = { ...s.live, fund_unlimited: true, max_per_day_usd: null }; s.settings = { kill_switch: false, autofund_cap_usd: 500 };
+    const db = fakeDb(s); const k = fakeKalshi({ combo: 150000 });
+    assert.equal((await mk(db, k).check()).swept, 100000, 'sweep above own cap, no per-move limit');
+    assert.deepEqual(k.transfers[0].fromShard, 1);
+  }
+  for (const cap of [undefined, null, 0]) {
+    const s = base(); s.live = { ...s.live, fund_unlimited: true, max_per_day_usd: null }; s.settings = { kill_switch: false, autofund_cap_usd: cap };
+    const db = fakeDb(s); const k = fakeKalshi();
+    const r = await mk(db, k).check();
+    assert.equal(k.transfers.length, 0, `blank cap (${cap}) never moves`); assert.equal(db.inserts.length, 0);
+    assert.match(String(r.skipped), /no Amount to keep/);
+  }
+  {
+    const s = base(); s.live = { ...s.live, fund_unlimited: true }; s.settings = { kill_switch: true, autofund_cap_usd: 2000 };
+    const db = fakeDb(s); const k = fakeKalshi();
+    await mk(db, k).check(); assert.equal(k.transfers.length, 0, 'kill switch still stops unlimited tester');
+  }
   console.log('tester-funder.test.js ok');
 })().catch((e) => { console.error(e); process.exit(1); });
