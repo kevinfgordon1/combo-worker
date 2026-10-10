@@ -75,9 +75,11 @@ function createLiveUserGate({ env = process.env, scope = null, log = console.log
     if (dbUsers) {
       const row = dbUsers.get(id);
       if (!row || row.can_trade === false || row.paused === true) return false;
-      // fund_unlimited testers are limited only by their own "Amount to keep
-      // for combos" (combo_settings.autofund_cap_usd). Blank / 0 / unread = no trading.
-      if (row.fund_unlimited === true && !(numOrNull(row._combo_cap_usd) > 0)) return false;
+      // "Amount to keep for combos" (combo_settings.autofund_pct, blank = 90%):
+      // 0% = off, nothing trades. fund_unlimited testers also hold when their
+      // settings could not be read (their only limit is that setting).
+      if (row._keep_off === true) return false;
+      if (row.fund_unlimited === true && row._keep_read !== true) return false;
       return true;
     }
     return !sc.isTester;
@@ -98,15 +100,23 @@ function createLiveUserGate({ env = process.env, scope = null, log = console.log
     if (!supabase) return null;
     const res = await supabase.from('combo_live_users').select(baseColumnsOnly ? USERS_COLUMNS_BASE : USERS_COLUMNS);
     if (!res || res.error || !Array.isArray(res.data)) return res;
-    const ids = res.data.filter((r) => r && r.fund_unlimited === true).map((r) => r.user_id);
+    const ids = res.data.filter((r) => r && r.user_id && !DEFAULT_LIVE_USER_IDS.includes(normId(r.user_id))).map((r) => r.user_id);
     if (!ids.length) return res;
-    let caps = new Map();
+    let rows = null;
     try {
-      const sq = await supabase.from('combo_settings').select('user_id,autofund_cap_usd').in('user_id', ids);
-      if (sq && !sq.error && Array.isArray(sq.data)) caps = new Map(sq.data.map((r) => [normId(r.user_id), r.autofund_cap_usd]));
-      else log(`[LIVE-USERS] combo_settings read failed — fund_unlimited users held (no cap known)`);
+      const sq = await supabase.from('combo_settings').select('user_id,autofund_cap_usd,autofund_pct').in('user_id', ids);
+      if (sq && !sq.error && Array.isArray(sq.data)) rows = new Map(sq.data.map((r) => [normId(r.user_id), r]));
+      else log('[LIVE-USERS] combo_settings read failed — fund_unlimited users held (Amount to keep unknown)');
     } catch (_) { log('[LIVE-USERS] combo_settings read threw — fund_unlimited users held'); }
-    return { ...res, data: res.data.map((r) => (r && r.fund_unlimited === true ? { ...r, _combo_cap_usd: caps.get(normId(r.user_id)) ?? null } : r)) };
+    const { keepSetting } = require('./keep-pct');
+    return {
+      ...res,
+      data: res.data.map((r) => {
+        if (!r || !rows || !ids.includes(r.user_id)) return r;
+        const keep = keepSetting(rows.get(normId(r.user_id)) || null);
+        return { ...r, _keep_read: true, _keep_off: keep.mode === 'off' };
+      }),
+    };
   }
 
   // Apply a combo_live_users read. Soft-fail keeps the previous snapshot.

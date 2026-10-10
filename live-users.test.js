@@ -188,7 +188,7 @@ const src = (f) => fs.readFileSync(path.join(__dirname, f), 'utf8');
       : (fail ? { data: null, error: { message: 'x' } } : { data: cap === undefined ? [] : [{ user_id: RANDOM, autofund_cap_usd: cap }], error: null });
       return Promise.resolve(res).then(r, j); } }; return b; } });
   return (async () => {
-    for (const [cap, fail, want] of [[2000, false, true], [null, false, false], [0, false, false], [undefined, false, false], [2000, true, false]]) {
+    for (const [cap, fail, want] of [[2000, false, true], [null, false, true], [0, false, false], [undefined, false, true], [2000, true, false]]) {
       gate.apply(await gate.query(mkSb(cap, fail)));
       assert.strictEqual(gate.isAllowed(RANDOM), want, `fund_unlimited cap=${cap} fail=${fail}`);
       assert.strictEqual(gate.capsFor(RANDOM), null, 'no fixed per-lock/day caps');
