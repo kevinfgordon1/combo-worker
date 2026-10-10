@@ -41,3 +41,14 @@ assert.strictEqual(seriesOfTicker(null), null);
   assert.strictEqual(calls, before); // cached
   console.log('series-fee.test.js ok');
 })().catch((e) => { console.error(e); process.exit(1); });
+
+{
+  const assert = require('assert');
+  const { createSeriesFeeCache, seriesOfTicker } = require('./series-fee');
+  let calls = 0;
+  const c = createSeriesFeeCache({ fetchImpl: async () => { calls++; return { ok: false, status: 404 }; } });
+  assert.strictEqual(seriesOfTicker('caoc-1b70a2b8e7c44c8f'), null);
+  assert.strictEqual(c.rateForTicker('caoc-1b70a2b8e7c44c8f'), 0);
+  assert.strictEqual(calls, 0);
+  console.log('ok caoc → poly maker rate 0, no Kalshi lookup');
+}
