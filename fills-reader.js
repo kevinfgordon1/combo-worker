@@ -53,21 +53,14 @@ const liveUsers = createLiveUserGate({ env: process.env, scope: SCOPE, log: (m) 
 const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TG_CHAT = process.env.TELEGRAM_ALERT_CHAT_ID;
+const { createTelegramGate } = require('./tg-gate');
 const POLL_MS = parseInt(process.env.FILLS_POLL_MS || '20000', 10);
 const LOOKBACK = parseInt(process.env.FILLS_LOOKBACK_SEC || '86400', 10);
 const REST = 'https://external-api.kalshi.com';
 
+const tgGate = createTelegramGate({ env: process.env, tag: MODE });
 async function sendAlert(text) {
-  if (!TG_TOKEN || !TG_CHAT) { console.log(`[${MODE}] (telegram not configured) ${text.replace(/\n/g, ' | ')}`); return; }
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: TG_CHAT, text }),
-    });
-    if (!r.ok) console.error(`[${MODE}] telegram failed`, r.status, await r.text());
-  } catch (e) { console.error(`[${MODE}] telegram error`, e.message); }
+  try { await tgGate.send(text); } catch (e) { console.error(`[${MODE}] telegram error`, e && e.message); }
 }
 
 let activeParlays = [];

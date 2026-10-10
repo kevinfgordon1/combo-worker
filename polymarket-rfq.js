@@ -2823,6 +2823,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       try { ws && ws.stop && ws.stop(); } catch (_) {}
       try { http.close && http.close(); } catch (_) {}
     },
+    http,
     handleRfq,
     crawlAllOpenRfqs,
     emitPolyHeartbeat,
