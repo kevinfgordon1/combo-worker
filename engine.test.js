@@ -2,12 +2,18 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
-const {
+let {
   decideAtFill, hedgeCap, fillView, buildQuoteBody, yesBidForQuote, shouldPostQuote, isSilentQuoteFailure,
   isInsufficientFundsFailure, quoteFailureSkipReason,
   isRfqClosedFailure, quotePostFailReason, formatQuoteLatency,
   YES_DECLINE, impliedYesBid, quoteYesBid, isRealYesBid, shouldConfirmAccept, contractsFromQuoteResponse,
 } = require('./engine');
+// These cases pin the pre-series 0.0175 maker schedule (quadratic_with_maker_fees ×1).
+// series-fee.test.js covers 0 / 0.035 and Kenny's lock.
+const LEGACY_K = 0.0175;
+const _fv = fillView, _dec = decideAtFill;
+fillView = (a, o = {}) => _fv(a, { makerRate: LEGACY_K, ...o });
+decideAtFill = (o) => _dec({ makerRate: LEGACY_K, ...o });
 const { normalizeRfq } = require('./rfq');
 
 assert.strictEqual(YES_DECLINE, '0.00');

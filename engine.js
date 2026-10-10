@@ -3,7 +3,8 @@
 // The fill odds you enter are the odds you SELL at AFTER your maker fee — already baked in.
 // So the lock math uses them directly (no separate fee term). KFEE/TAKER_FEE are only used to
 // recover the nominal exchange price and the taker's matched odds for display.
-const KFEE = 0.0175; // your maker fee (¼ of taker); baked into the fill odds you enter
+// Maker fee is per series (series-fee.js). Default = conservative combo rate when the caller has none.
+const KFEE = 0.035;
 const TAKER_FEE = 0.07; // the taker (other side of your combo) pays this
 const aToDec = (a) => (a > 0 ? 1 + a / 100 : 1 + 100 / Math.abs(a));
 const impliedProb = (a) => (a > 0 ? 100 / (a + 100) : Math.abs(a) / (Math.abs(a) + 100));
@@ -177,13 +178,15 @@ function pennyNoBid(noBid) {
 
 // Your fill is net of your maker fee. Recover the nominal exchange price you'd quote, and from it
 // the taker's matched odds (nominal price + their 7% taker fee — worse than yours).
-function nominalProbFromEff(sEff) {
-  const b = 1 - KFEE; // solve KFEE*sNom^2 + (1-KFEE)*sNom - sEff = 0
-  return (-b + Math.sqrt(b * b + 4 * KFEE * sEff)) / (2 * KFEE);
+function nominalProbFromEff(sEff, k = KFEE) {
+  if (!(k > 0)) return sEff; // no maker fee: nominal == net
+  const b = 1 - k; // solve k*sNom^2 + (1-k)*sNom - sEff = 0
+  return (-b + Math.sqrt(b * b + 4 * k * sEff)) / (2 * k);
 }
 function fillView(fillAfterFeeAmerican, opts = {}) {
   const sEff = impliedProb(fillAfterFeeAmerican);
-  const sNom = nominalProbFromEff(sEff);
+  const k = opts && opts.makerRate != null && Number.isFinite(Number(opts.makerRate)) ? Number(opts.makerRate) : KFEE;
+  const sNom = nominalProbFromEff(sEff, k);
   const takerProb = sNom + TAKER_FEE * sNom * (1 - sNom);
   const subcent = !!(opts && opts.subcent);
   // Grid: floor no_bid so effective sell odds are never worse than fillAfterFeeAmerican.
@@ -200,7 +203,7 @@ function fillView(fillAfterFeeAmerican, opts = {}) {
   const noBid = noBidNum.toFixed(subcent ? 3 : 2);
   // What the quoted price actually nets after the maker fee (prob + American).
   const sNomQuoted = 1 - noBidNum;
-  const sEffQuoted = sNomQuoted - KFEE * sNomQuoted * (1 - sNomQuoted);
+  const sEffQuoted = sNomQuoted - k * sNomQuoted * (1 - sNomQuoted);
   return {
     sEff, sNom, effTaker: americanFromProb(takerProb), noBid,
     subcent, sEffQuoted, effQuoted: americanFromProb(sEffQuoted),
@@ -279,7 +282,7 @@ function freeBetRiskfreeMissingCap({ hedgeMode, maxContracts, isFreeBet }) {
   return !(maxContracts != null && maxContracts !== '' && Number.isFinite(max) && max > 0);
 }
 
-function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican = null, rfqContracts, hedgeMode = '1x', maxContracts = null, filledSoFar = 0, outstanding = 0, allowPartial = false, isFreeBet = false, subcent = false, polyQuote = null }) {
+function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican = null, rfqContracts, hedgeMode = '1x', maxContracts = null, filledSoFar = 0, outstanding = 0, allowPartial = false, isFreeBet = false, subcent = false, polyQuote = null, makerRate = null }) {
   if (!(parlayStake > 0) || !parlayAmerican || !fillAmerican || !(rfqContracts > 0)) return { ok: false, reason: 'bad_inputs' };
   if (freeBetRiskfreeMissingCap({ hedgeMode, maxContracts, isFreeBet })) {
     return { ok: false, reason: 'no_cap', cap: 0, totalLimit: 0, filledSoFar: filledSoFar > 0 ? filledSoFar : 0, outstanding: outstanding > 0 ? outstanding : 0, remaining: 0 };
@@ -334,7 +337,7 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
       quote: { buy_price: polyQuote.buyPrice, rest_remainder: false }, contracts: N,
     };
   }
-  const v = fillView(fillAmerican, { subcent });
+  const v = fillView(fillAmerican, { subcent, makerRate });
   // Exact-price recheck. The quote sits on the grid at or below the target no_bid, so the
   // premium we collect (net of maker fee) can only be >= the target fill. Prove it instead of
   // trusting the rounding, and report the profit at the price we actually send.

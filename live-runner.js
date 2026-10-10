@@ -161,6 +161,9 @@ const {
   CLOSED_LIVE,
   finalizeClosedLive,
 } = require('./skip-tape');
+const { createSeriesFeeCache } = require('./series-fee');
+const seriesFees = createSeriesFeeCache({ log: (m) => console.log(`[${MODE}] ${m}`) });
+const makerRateFor = (row) => seriesFees.rateForTicker(row && (row.combo_ticker || row.market_ticker));
 const {
   isUnhedgedRfqShadow,
   isUnhedgedRfqLive,
@@ -408,7 +411,7 @@ console.log(`[${MODE}] ${scopeLabel(SCOPE)}; ${liveUsers.summary()}`);
 // Per-user $ caps (testers). Uncapped users (Kevin) pass straight through.
 const userCaps = createUserCaps({
   gate: liveUsers,
-  costFor: (row) => parseFloat(fillView(row.fill_american, { subcent: SUBCENT }).noBid),
+  costFor: (row) => parseFloat(fillView(row.fill_american, { subcent: SUBCENT, makerRate: makerRateFor(row) }).noBid),
   countsTowardCap,
   log: (m) => console.log(`[${MODE}] ${m}`),
 });
@@ -568,14 +571,18 @@ async function refresh() {
     // Pre-stage prices (Step 3). Soft-fail keeps previous staged with the locks.
     if (!parlaysFailed) {
       const next = {};
+      // Per-series maker fee (Kalshi fee_type) — cached; a failed lookup prices at the conservative 0.035.
+      await seriesFees.prefetchTickers(parlays.map((r) => r && r.combo_ticker)).catch(() => {});
       for (const row of parlays) {
-        const v = fillView(row.fill_american, { subcent: SUBCENT });
+        const makerRate = makerRateFor(row);
+        const v = fillView(row.fill_american, { subcent: SUBCENT, makerRate });
         next[row.id] = {
           noBid: v.noBid,
           yesBid: YES_DECLINE,
           rest_remainder: false,
           fillAmerican: row.fill_american,
           effTaker: v.effTaker,
+          makerRate,
         };
       }
       staged = next;
@@ -1342,14 +1349,14 @@ async function reconcileSkipTapes() {
   }
 }
 
-function resolveRfqContracts(rfq, fillAmerican, stagedNoBid) {
+function resolveRfqContracts(rfq, fillAmerican, stagedNoBid, makerRate) {
   if (rfq.contracts != null && rfq.contracts > 0) {
     return { contracts: rfq.contracts, source: 'contracts' };
   }
   if (rfq.targetCostDollars != null && rfq.targetCostDollars > 0) {
     const noBid = stagedNoBid != null
       ? parseFloat(stagedNoBid)
-      : parseFloat(fillView(fillAmerican, { subcent: SUBCENT }).noBid);
+      : parseFloat(fillView(fillAmerican, { subcent: SUBCENT, makerRate }).noBid);
     const implied = impliedYesBid(noBid);
     const yesPrice = implied ? parseFloat(implied) : Math.max(0.01, 1 - noBid);
     const estimated = Math.floor(rfq.targetCostDollars / yesPrice);
@@ -2293,7 +2300,7 @@ async function onRfq(rfq, env) {
   const outstanding = outstandingFor(p.id);
   const st = staged[p.id];
 
-  const size = resolveRfqContracts(rfq, p.fill_american, st && st.noBid);
+  const size = resolveRfqContracts(rfq, p.fill_american, st && st.noBid, makerRateFor(p));
   if (!shouldPostQuote(size)) {
     counts.declined++;
     if (size.source === 'dollar' || (size.source === 'none' && rfq.targetCostDollars > 0)) {
@@ -2318,6 +2325,7 @@ async function onRfq(rfq, env) {
     outstanding,
     isFreeBet: isFreeBetRow(p),
     subcent: SUBCENT,
+    makerRate: makerRateFor(p),
   });
 
   if (!d.ok) {
