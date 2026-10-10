@@ -1,5 +1,6 @@
 'use strict';
 const assert = require('node:assert/strict');
+const { keepSetting, targetCents } = require('./keep-pct');
 const { planFund, canTransfer, createTesterFunder, loadFundConfig, etDayStartMs, logOwnKeyScopes } = require('./tester-funder');
 const { buildTesterEnv } = require('./tester-env');
 
@@ -32,6 +33,14 @@ assert.equal(canTransfer(null), false);
   assert.equal(p({ mainCents: 300 }).reason, 'default_balance');
   assert.equal(p({ gate: 'off: x' }).action, 'hold');
 }
+assert.deepEqual(keepSetting(null), { mode: 'pct', pct: 90, defaulted: true });
+assert.deepEqual(keepSetting({ autofund_pct: 0 }), { mode: 'off' });
+assert.deepEqual(keepSetting({ autofund_pct: 150 }), { mode: 'pct', pct: 100 });
+assert.deepEqual(keepSetting({ autofund_cap_usd: 120 }), { mode: 'usd', usd: 120 });
+assert.equal(targetCents({ mode: 'pct', pct: 90 }, 100000), 90000);
+assert.equal(targetCents({ mode: 'usd', usd: 500 }, 20000), 20000, 'never more than exists');
+assert.equal(targetCents({ mode: 'pct', pct: 90 }, 100000, 25000), 25000);
+assert.equal(targetCents({ mode: 'off' }, 100000), null);
 assert.equal(new Date(etDayStartMs(NOW)).toISOString(), '2026-10-09T04:00:00.000Z');
 
 // --- fake Supabase + Kalshi -------------------------------------------------
@@ -260,12 +269,40 @@ const mk = (db, k, extra = {}) => createTesterFunder({ userId: T, supabase: db, 
     assert.equal((await mk(db, k).check()).swept, 100000, 'sweep above own cap, no per-move limit');
     assert.deepEqual(k.transfers[0].fromShard, 1);
   }
-  for (const cap of [undefined, null, 0]) {
-    const s = base(); s.live = { ...s.live, fund_unlimited: true, max_per_day_usd: null }; s.settings = { kill_switch: false, autofund_cap_usd: cap };
+  // Blank = 90% of total Kalshi cash (Default + Combos); 0% / $0 = off.
+  for (const settings of [{ kill_switch: false }, { kill_switch: false, autofund_cap_usd: null, autofund_pct: null }]) {
+    const s = base(); s.live = { ...s.live, fund_unlimited: true, max_per_day_usd: null }; s.settings = settings;
+    const db = fakeDb(s); const k = fakeKalshi({ main: 97000, combo: 3000 });
+    const r = await mk(db, k).check();
+    assert.equal(r.moved, 87000, 'blank = 90% of $1,000 = $900 target, $30 there -> $870');
+    assert.equal(db.inserts[0].cap_usd, 900);
+  }
+  for (const settings of [{ kill_switch: false, autofund_pct: 0 }, { kill_switch: false, autofund_cap_usd: 0 }]) {
+    const s = base(); s.live = { ...s.live, fund_unlimited: true, max_per_day_usd: null }; s.settings = settings;
     const db = fakeDb(s); const k = fakeKalshi();
     const r = await mk(db, k).check();
-    assert.equal(k.transfers.length, 0, `blank cap (${cap}) never moves`); assert.equal(db.inserts.length, 0);
-    assert.match(String(r.skipped), /no Amount to keep/);
+    assert.equal(k.transfers.length, 0, '0 = off'); assert.equal(db.inserts.length, 0);
+    assert.match(String(r.skipped), /0%/);
+  }
+  // pct wins over a legacy dollar cap; target follows total cash every check.
+  {
+    const s = base(); s.live = { ...s.live, fund_unlimited: true, max_per_day_usd: null }; s.settings = { kill_switch: false, autofund_pct: 50, autofund_cap_usd: 5000 };
+    const db = fakeDb(s); const k = fakeKalshi({ main: 20000, combo: 60000 });
+    assert.equal((await mk(db, k).check()).swept, 20000, '50% of $800 = $400; $600 in Combos -> sweep $200');
+  }
+  {
+    const s = base(); s.live = { ...s.live, fund_unlimited: true, max_per_day_usd: null }; s.settings = { kill_switch: false, autofund_pct: 100 };
+    const db = fakeDb(s); const k = fakeKalshi({ main: 12345, combo: 0 });
+    assert.equal((await mk(db, k).check()).moved, 12345, '100% moves all of Default, never more');
+  }
+  // Capped tester (gmoneyvikes): 90% default, still <= $250/day and $100/move.
+  {
+    const s = base(); s.settings = { kill_switch: false };
+    const db = fakeDb(s); const k = fakeKalshi({ main: 10000, combo: 0 });
+    assert.equal((await mk(db, k).check()).moved, 9000, '90% of $100 = $90');
+    const s2 = base(); s2.settings = { kill_switch: false };
+    const k2 = fakeKalshi({ main: 500000, combo: 0 });
+    assert.equal((await mk(fakeDb(s2), k2).check()).moved, 10000, 'per-move $100 still applies');
   }
   {
     const s = base(); s.live = { ...s.live, fund_unlimited: true }; s.settings = { kill_switch: true, autofund_cap_usd: 2000 };

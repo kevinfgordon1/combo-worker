@@ -15,10 +15,14 @@
 //
 // Limits, checked before every move (all must pass; amounts in cents):
 //   cap        Combos available cash + moves not yet confirmed never exceed the
-//              tester's cap: combo_settings.autofund_cap_usd (the tester sets it
-//              on the Combo Locks card), never above their daily limit
-//              combo_live_users.max_per_day_usd (Kevin sets it). No cap set =
-//              the daily limit.
+//              tester's target, recomputed every check:
+//                combo_settings.autofund_pct (0-100, the tester's "Amount to keep
+//                for combos"; blank = DEFAULT_KEEP_PCT 90%) x total Kalshi cash
+//                (Default + Combos available). 0% = off (nothing moves or trades).
+//              Legacy: a row with no pct but a dollar autofund_cap_usd keeps
+//              that dollar amount until the tester saves a percentage.
+//              Testers with a daily limit (combo_live_users.max_per_day_usd)
+//              are never targeted above it.
 //   sweep      Combos cash above the cap (cap lowered, winnings settled) goes
 //              back to Default, per-move limit applies, not the daily limit.
 //   per move   TESTER_FUND_MAX_MOVE_USD (default $100); lifted for a tester
@@ -49,6 +53,7 @@ const PENDING_MAX_MS = 30 * 60 * 1000;
 const SENDING_STALE_MS = 10 * 60 * 1000;
 const COALESCE_MS = 60 * 1000;
 const LOOKBACK_MS = 36 * 60 * 60 * 1000;
+const { DEFAULT_KEEP_PCT, keepSetting, targetCents } = require('./keep-pct');
 
 function envOff(v) { return v != null && /^(0|false|off|no)$/i.test(String(v).trim()); }
 function envUsdCents(env, name, fallback) {
@@ -160,7 +165,7 @@ function createTesterFunder({
     const one = (q) => (typeof q.maybeSingle === 'function' ? q.maybeSingle() : q);
     const [liveQ, setQ, keyQ, movesQ] = await Promise.all([
       one(supabase.from('combo_live_users').select('user_id,is_owner,can_trade,paused,max_per_day_usd,fund_unlimited').eq('user_id', uid)),
-      one(supabase.from('combo_settings').select('kill_switch,autofund_cap_usd').eq('user_id', uid)),
+      one(supabase.from('combo_settings').select('kill_switch,autofund_cap_usd,autofund_pct').eq('user_id', uid)),
       one(supabase.from('combo_exchange_keys').select('scopes,scope_status').eq('user_id', uid).eq('venue', 'kalshi')),
       supabase.from(TABLE).select('id,amount_usd,status,transfer_id,error,from_shard,to_shard,created_at').eq('user_id', uid).gte('created_at', since).order('created_at', { ascending: false }).limit(200),
     ]);
@@ -178,31 +183,28 @@ function createTesterFunder({
     if (s.live.paused) return 'off: paused by owner';
     if (!s.settings || s.settings.kill_switch !== false) return 'off: kill switch engaged';
     if (!s.key || s.key.scope_status !== 'ok' || !canTransfer(s.key.scopes)) return 'off: key has no Transfers / Full access';
-    if (capFor(s) == null) return unlimited(s) ? 'off: no Amount to keep for combos set' : 'off: no cap or daily limit set';
+    if (keepSetting(s.settings).mode === 'off') return 'off: Amount to keep for combos is 0%';
+    if (!unlimited(s) && dailyCapCents(s) == null) return 'off: no daily limit set';
     return null;
   }
 
-  // Tester's own cap, never above the owner's daily limit.
   function unlimited(s) { return !!(s && s.live && s.live.fund_unlimited === true); }
 
-  // fund_unlimited (set per tester by Kevin in combo_live_users): the cap is
-  // ONLY the tester's own Amount to keep for combos; blank/0 = no moves. The
-  // per-move and daily move limits are lifted for that tester only.
+  // fund_unlimited (set per tester by Kevin in combo_live_users): no per-move
+  // or daily move limits and no daily ceiling on the target; only the tester's
+  // own Amount to keep for combos. Other testers keep Kevin's limits.
   function configFor(s) {
     return unlimited(s) ? { ...config, maxMoveCents: Infinity, dailyCents: Infinity } : config;
   }
 
-  function capFor(s) {
-    if (unlimited(s)) {
-      const own = usdToCents(s.settings && s.settings.autofund_cap_usd);
-      return own != null && own > 0 ? own : null;
-    }
+  function dailyCapCents(s) {
     const daily = usdToCents(s.live && s.live.max_per_day_usd);
-    if (daily == null || daily <= 0) return null;
-    const own = usdToCents(s.settings && s.settings.autofund_cap_usd);
-    if (own == null) return daily;
-    if (own <= 0) return null;
-    return Math.min(own, daily);
+    return daily != null && daily > 0 ? daily : null;
+  }
+
+  // Recomputed every check from live balances: pct x (Default + Combos).
+  function capFor(s, totalCents) {
+    return targetCents(keepSetting(s.settings), totalCents, unlimited(s) ? null : dailyCapCents(s));
   }
 
   async function update(id, patch) {
@@ -267,7 +269,8 @@ function createTesterFunder({
     const dayStart = etDayStartMs(date);
     const todayCents = s.moves.filter((r) => countsToday(r) && Number(r.to_shard ?? 1) === COMBOS_SHARD && new Date(r.created_at).getTime() >= dayStart)
       .reduce((a, r) => a + (usdToCents(r.amount_usd) || 0), 0);
-    const capCents = capFor(s);
+    const capCents = capFor(s, main.availableCents + combo.availableCents);
+    if (capCents == null) { note('off: Amount to keep for combos is 0%'); return { skipped: 'off' }; }
     const plan = planFund({ gate: null, comboCents: combo.availableCents, mainCents: main.availableCents, capCents, pendingCents: 0, todayCents, config: configFor(s) });
     // Combos cash above the cap goes back to Default.
     const excess = combo.availableCents - capCents;
@@ -325,7 +328,7 @@ function createTesterFunder({
   function start() {
     log(`[FUND] tester auto-funding ${config.enabled ? 'on' : 'OFF (TESTER_AUTOFUND=0)'}: Default -> Combos only, ` +
       `per move ${fmt(config.maxMoveCents)}, per day ${fmt(config.dailyCents)}, min ${fmt(config.minMoveCents)}, ` +
-      `cap = tester's own cap (<= daily limit), sweeps above cap back, every ${Math.round(config.intervalMs / 60000)}m`);
+      `target = tester's % of total Kalshi cash (blank = ${DEFAULT_KEEP_PCT}%, <= daily limit), sweeps above it back, every ${Math.round(config.intervalMs / 60000)}m`);
     if (timer) clearInterval(timer);
     timer = setInterval(() => { check('interval'); }, config.intervalMs);
     if (timer.unref) timer.unref();
@@ -358,5 +361,5 @@ async function logOwnKeyScopes({ signed, keyId, log = (m) => console.log(m) }) {
 }
 
 module.exports = {
-  TABLE, loadFundConfig, planFund, canTransfer, etDayStartMs, createTesterFunder, logOwnKeyScopes,
+  TABLE, DEFAULT_KEEP_PCT, keepSetting, targetCents, loadFundConfig, planFund, canTransfer, etDayStartMs, createTesterFunder, logOwnKeyScopes,
 };
