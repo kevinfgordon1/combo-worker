@@ -24,9 +24,12 @@ function makerRateFromSeries(feeType, multiplier) {
 }
 
 // "KXMVECROSSCATEGORY0-S2026A0E…-D44B…" → "KXMVECROSSCATEGORY0"
+// Polymarket US combo tickers ("caoc-…") have no Kalshi series; makers pay 0 and get no rebate.
+const isPolyComboTicker = (ticker) => /^caoc-/i.test(String(ticker || '').trim());
+
 function seriesOfTicker(ticker) {
   const t = String(ticker || '').trim().toUpperCase();
-  if (!t) return null;
+  if (!t || isPolyComboTicker(t)) return null;
   const s = t.split('-')[0];
   return s || null;
 }
@@ -71,6 +74,7 @@ function createSeriesFeeCache({ fetchImpl = (typeof fetch === 'function' ? fetch
 
   // Sync read for the hot path. Unknown series → fallback now, fetch in background.
   function rateForTicker(ticker) {
+    if (isPolyComboTicker(ticker)) return 0;
     const series = seriesOfTicker(ticker);
     if (!series) return FALLBACK_MAKER_RATE;
     const hit = cache.get(series);
@@ -86,4 +90,4 @@ function createSeriesFeeCache({ fetchImpl = (typeof fetch === 'function' ? fetch
   return { rateForTicker, prefetch, prefetchTickers, _cache: cache };
 }
 
-module.exports = { FALLBACK_MAKER_RATE, makerRateFromSeries, seriesOfTicker, createSeriesFeeCache };
+module.exports = { isPolyComboTicker, FALLBACK_MAKER_RATE, makerRateFromSeries, seriesOfTicker, createSeriesFeeCache };
