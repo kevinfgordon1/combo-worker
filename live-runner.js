@@ -158,6 +158,8 @@ const {
   withVenue,
   isSkipTapeEligible,
   resolveSkipTape,
+  CLOSED_LIVE,
+  finalizeClosedLive,
 } = require('./skip-tape');
 const {
   isUnhedgedRfqShadow,
@@ -1017,6 +1019,21 @@ function markSubmissionNotLive(quoteId) {
     .catch((e) => console.error(`[${MODE}] clear is_live`, e.message));
 }
 
+// The RFQ closed while our quote was still live: someone else won it (or the buyer walked).
+// Stamp skip_reason=rfq_closed_live; reconcileSkipTapes resolves it to outbid / no_taker
+// and records the winning YES (tape_yes_price) when the public print is found.
+function markClosedWhileLive(quoteId) {
+  if (!quoteId || isReserveKey(quoteId) || unknownCols.has('skip_reason')) return;
+  supabase.from('combo_submissions').update({ skip_reason: CLOSED_LIVE })
+    .eq('quote_id', quoteId).neq('status', 'filled').is('skip_reason', null)
+    .select('id,parlay_id,rfq_id,contracts,remaining,skip_reason,market_ticker,created_at,tape_match')
+    .then(({ data, error }) => {
+      if (error) { console.error(`[${MODE}] closed-live stamp`, error.message); return; }
+      for (const row of data || []) if (row && row.id) pendingSkipTapes.set(row.id, row);
+    })
+    .catch((e) => console.error(`[${MODE}] closed-live stamp`, e.message));
+}
+
 function noteReleased(quoteId, pending, reason) {
   if (quoteId && !isReserveKey(quoteId)) {
     cancelledQuotes.add(quoteId);
@@ -1046,6 +1063,7 @@ function onRfqDeleted(evt, env) {
   const dropped = dropPendingForRfq(pendingQuotes, rfqId, { confirming: confirmingQuotes });
   for (const { id, quote } of dropped) {
     noteReleased(id, quote, 'closed');
+    markClosedWhileLive(id);
   }
   if (unhedgedFills && rfqId) {
     const closedEvt = evt;
@@ -1305,13 +1323,14 @@ async function reconcileSkipTapes() {
         if (out.error) console.error(`[${MODE}] skip-tape`, row.rfq_id, out.error.message);
         continue;
       }
+      if (row.skip_reason === CLOSED_LIVE) out.patch.skip_reason = finalizeClosedLive(out.rfq, out.patch);
       await persistSkipTape(id, out.patch);
       if (out.patch.tape_match === 'matched') counts.tapeMatched++;
       else counts.tapeNone++;
       console.log(
         `[${MODE}] skip-tape ${out.patch.tape_match} rfq=${row.rfq_id} ` +
         `ticker=${out.patch.market_ticker || row.market_ticker || '(none)'} ` +
-        `reason=${row.skip_reason}` +
+        `reason=${out.patch.skip_reason || row.skip_reason}` +
         (out.patch.tape_match === 'matched'
           ? ` yes=${out.patch.tape_yes_price} no=${out.patch.tape_no_price}`
           : '')

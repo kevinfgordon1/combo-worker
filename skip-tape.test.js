@@ -313,6 +313,16 @@ async function testTapeOnSkip() {
   }
 }
 
+// Closed while our quote was live → outbid / no_taker.
+{
+  const { finalizeClosedLive, isSkipTapeEligible: el, CLOSED_LIVE } = require('./skip-tape');
+  assert.strictEqual(el({ skipReason: CLOSED_LIVE, tapeMatch: null, parlayActive: true, started: false, now: 0 }), true);
+  assert.strictEqual(finalizeClosedLive({ status: 'closed' }, { tape_match: 'matched', tape_yes_price: 0.078 }), 'outbid');
+  assert.strictEqual(finalizeClosedLive({ status: 'closed' }, { tape_match: 'none' }), 'outbid');
+  assert.strictEqual(finalizeClosedLive({ status: 'closed', cancellation_reason: 'user' }, { tape_match: 'none' }), 'no_taker');
+  assert.strictEqual(finalizeClosedLive({ status: 'closed', cancelled_ts: 'x' }, { tape_match: 'matched' }), 'outbid');
+}
+
 testTapeOnSkip().then(() => {
   console.log('skip-tape.test.js ok');
 }).catch((e) => {
