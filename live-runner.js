@@ -199,6 +199,7 @@ const { resolveWorkerScope, scopeLabel } = require('./worker-scope');
 const { createUserCaps } = require('./user-caps');
 const { createAppAlerts } = require('./app-alerts');
 const { createUserLowCash } = require('./user-low-cash');
+const { createUserCredits } = require('./user-credits');
 const { createPolyStallAlerts } = require('./poly-stall-alert');
 const { createPartialQuoteDryRun, isPartialQuoteFlagOn } = require('./partial-quote');
 
@@ -416,6 +417,9 @@ const userCaps = createUserCaps({
   log: (m) => console.log(`[${MODE}] ${m}`),
 });
 
+// Per-user Combo Locks fees: out of allowance + credits => no new quotes.
+const userCredits = createUserCredits({ client: supabase, log: (m) => console.log(`[${MODE}] ${m}`) });
+
 const pausePoller = createPausePoller({ supabase, log: (m) => console.log(`[${MODE}] ${m.replace(/^\[PAUSE\] /, 'PAUSE ')}`) });
 
 async function cancelPausedLock(parlayId) {
@@ -512,6 +516,7 @@ async function refresh() {
       : { data: (fillsQ.data || []).filter(countsTowardCap), error: null };
     filledByParlay = applyRefreshFilledByParlay(filledByParlay, fillsForCap, 'count', refreshLog);
     userCaps.refreshDay({ supabase, parlays, filledSoFarFor }).catch(() => {});
+    userCredits.refresh([...new Set((parlays || []).map((p) => p && p.user_id).filter(Boolean))]).catch(() => {});
 
     // Pre-stage prices (Step 3). Soft-fail keeps previous staged with the locks.
     if (!parlaysFailed) {
@@ -605,7 +610,9 @@ const filledSoFarFor = (id) => Math.max(filledByParlay[id] || 0, sessionFilledBy
 // Not allowlisted => always engaged, whatever combo_settings says.
 const killEngagedFor = (userId, lock = null) => !liveUsers.isAllowed(userId)
   || killByUser[userId] !== false
-  || userCaps.dayBlocked(userId, { parlays, filledSoFarFor, outstandingFor: (id) => outstandingFor(id), lock });
+  || userCaps.dayBlocked(userId, { parlays, filledSoFarFor, outstandingFor: (id) => outstandingFor(id), lock })
+  // Fee users out of monthly allowance + purchased credits: no new quotes.
+  || userCredits.blocked(userId);
 
 // DB check constraint allows: shadow | filled | unfilled | declined.
 // Live quotes: status=filled + is_live + no order_id → Combo Locks shows "quoted (awaiting)".
