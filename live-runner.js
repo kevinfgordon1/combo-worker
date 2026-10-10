@@ -198,7 +198,7 @@ const { formatAlertStatus } = require('./venue-alert');
 const { createBucketManager } = require('./bucket-manager');
 const { createTesterFunder, logOwnKeyScopes } = require('./tester-funder');
 const { startBalanceReporter } = require('./balance-reporter');
-const { splitPaused, diffPaused, createPausePoller } = require('./lock-pause');
+const { splitPaused, diffPaused, createPausePoller, expiredProbePauses } = require('./lock-pause');
 const { createUserCancelPoller } = require('./user-cancel');
 const { createLiveUserGate } = require('./live-users');
 const { resolveWorkerScope, scopeLabel } = require('./worker-scope');
@@ -401,6 +401,8 @@ const SKIP_TAPE_MAX_PER_TICK = 5;
 
 // --- per-lock pause -----------------------------------------------------------
 let pausedParlayIds = new Set();
+// Locks paused only by a "Check market price" probe: id -> end ms (≤30s after it started).
+let probePauseUntil = new Map();
 // Whose keys this process holds (Kevin's main worker, or one tester child).
 const SCOPE = resolveWorkerScope(process.env);
 // Rows written by a tester child carry its user id; the main worker leaves
@@ -448,6 +450,19 @@ function notePausedIds(next) {
   }
   for (const id of resumed) console.log(`[${MODE}] RESUMED lock ${id} — quoting again`);
   return { pausedNow, resumed };
+}
+
+// Every 2s: safety net for market-check pauses. A probe pause ends on its own at
+// probe_pause_until (capped 30s after it started) even if the server never cleared it
+// and even if the 5s DB poll is failing.
+function expireProbePauses() {
+  const expired = expiredProbePauses(pausedParlayIds, probePauseUntil, Date.now());
+  if (!expired.length) return;
+  const next = new Set(pausedParlayIds);
+  for (const id of expired) { next.delete(id); probePauseUntil.delete(id); }
+  console.log(`[${MODE}] PROBE-PAUSE expired for ${expired.join(',')} — resuming`);
+  notePausedIds(next);
+  refresh();
 }
 
 // Every 2s: a quote that raced the pause (POST in flight) is cancelled.
@@ -512,6 +527,7 @@ async function pollUserCancels() {
 async function pollPaused() {
   const ids = await pausePoller.poll();
   if (!ids) return;
+  if (ids.probeUntil) probePauseUntil = ids.probeUntil;
   const { pausedNow, resumed } = diffPaused(pausedParlayIds, ids);
   if (!pausedNow.length && !resumed.length) return;
   if (pausedNow.length) {
@@ -556,6 +572,7 @@ async function refresh() {
       // Missing column => no row has paused === true => everything stays enabled.
       const split = splitPaused(parlays);
       parlays = split.live;
+      probePauseUntil = split.probeUntil;
       notePausedIds(split.pausedIds);
     }
     // Per-user per-lock $ cap clamps max_contracts in memory (no-op for Kevin).
@@ -2669,6 +2686,7 @@ async function main() {
     cancelUnacceptedQuotes().catch((e) => console.error(`[${MODE}] cancel-unaccepted tick`, e.message));
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start tick`, e.message));
     cancelStragglersForPaused();
+    expireProbePauses();
   }), 2000);
   // Confirm holds are never dropped on a timer: verify the stale ones against the venue.
   setInterval(() => {
