@@ -23,10 +23,13 @@ function tickerMatchesCollection(ticker, collection) {
 
 function noBidMatchesFill(fillNoPrice, fillAmerican) {
   if (fillNoPrice == null || fillAmerican == null || fillAmerican === '') return false;
-  const quoted = parseFloat(fillView(fillAmerican).noBid);
   const actual = Number(fillNoPrice);
-  if (!Number.isFinite(quoted) || !Number.isFinite(actual)) return false;
-  return Math.abs(actual - quoted) <= CENT + 1e-9;
+  if (!Number.isFinite(actual)) return false;
+  // Maker fee is per series (0 / 0.0175 / 0.035) — accept a quote priced under any of them.
+  return [0, 0.0175, 0.035].some((makerRate) => {
+    const quoted = parseFloat(fillView(fillAmerican, { makerRate }).noBid);
+    return Number.isFinite(quoted) && Math.abs(actual - quoted) <= CENT + 1e-9;
+  });
 }
 
 // Best-effort only. Never guess when more than one parlay still fits.

@@ -9,7 +9,18 @@ const { toNum, normalizeTrade, matchTapeTrades } = require('./tape');
 
 // Same pad as quote-watcher: RFQ close → public print delay.
 const TAPE_PAD_MS = 45000;
-const SKIP_REASONS = Object.freeze(['oversized', 'limit_reached']);
+// rfq_closed_live: the RFQ closed while OUR quote was still live (someone else won it, or the
+// buyer walked away). Resolved after the tape pad into 'outbid' (closed, not cancelled —
+// tape_yes_price holds the winning YES when the print is found) or 'no_taker' (requester cancelled).
+const CLOSED_LIVE = 'rfq_closed_live';
+const SKIP_REASONS = Object.freeze(['oversized', 'limit_reached', CLOSED_LIVE]);
+
+function finalizeClosedLive(rfq, patch) {
+  const cancelled = !!(rfq && (rfq.cancelled_ts || rfq.cancellation_reason));
+  const matched = !!(patch && patch.tape_match === 'matched');
+  if (matched) return 'outbid';
+  return cancelled ? 'no_taker' : 'outbid';
+}
 
 function classifySkip(decision) {
   if (!decision || decision.ok) return null;
@@ -137,12 +148,14 @@ async function resolveSkipTape(row, { fetchRfq, fetchTrades, now = Date.now(), p
   });
   const patch = tapeFieldsFromMatch(result);
   patch.market_ticker = ticker;
-  return { retry: false, patch, result };
+  return { retry: false, patch, result, rfq };
 }
 
 module.exports = {
   TAPE_PAD_MS,
   SKIP_REASONS,
+  CLOSED_LIVE,
+  finalizeClosedLive,
   classifySkip,
   skipPersistExtra,
   withVenue,

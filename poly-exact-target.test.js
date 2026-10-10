@@ -8,6 +8,14 @@ const Q = require('./polymarket-quote');
 const { createPolymarketHttp } = require('./polymarket-client');
 const { evaluatePolymarketRfq, startPolymarketRfqLoop, quoteBodyFromEval } = require('./polymarket-rfq');
 
+// Rebate mechanics below run with the old straight-market theta (env override). Polymarket US combos
+// pay NO maker rebate since 2026-10-07, so the default is 0 — asserted right here.
+const R = { POLY_MAKER_REBATE_THETA: '0.0125' };
+assert.strictEqual(Q.DEFAULT_REBATE_THETA, 0);
+assert.strictEqual(Q.fillAmericanToExactQuote(910, { contracts: 300, env: {} }).buyPrice, '0.100'); // ceil(target), no credit
+assert.strictEqual(Q.fillAmericanToExactQuote(910, { contracts: 300, env: {} }).credit, 0);
+assert.strictEqual(Q.fillAmericanToExactQuote(250, { contracts: 35, env: { POLY_REBATE_MIN_CONTRACTS: '10' } }).buyPrice, '0.286'); // live CLE+LAD lock was quoting 0.284
+
 const SEED_B64 = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
 const tick3 = (x) => Math.ceil(x * 1000 - 1e-9) / 1000;
 const bankers = (x) => { // round-half-even to cent
@@ -23,7 +31,7 @@ assert.strictEqual(Q.polyExactTargetEnabled({ POLY_EXACT_TARGET: '1' }), true);
 for (const off of ['0', 'false', 'OFF', 'no']) assert.strictEqual(Q.polyExactTargetEnabled({ POLY_EXACT_TARGET: off }), false);
 
 // ── price examples (before -> after) ──────────────────────────────────────────
-const px = (f, contracts) => Q.fillAmericanToExactQuote(f, { contracts, env: {} }).buyPrice;
+const px = (f, contracts) => Q.fillAmericanToExactQuote(f, { contracts, env: R }).buyPrice;
 assert.strictEqual(Q.fillAmericanToBuyPrice(910), '0.099');           // legacy floor
 assert.strictEqual(px(910, 91.61), '0.098');                           // +910, real fill size: 0.1c better
 assert.strictEqual(px(910, 300), '0.098');
@@ -44,7 +52,7 @@ for (let f = -400; f <= 6000; f += (f < 600 ? 7 : 53)) {
   const t = impliedProb(f);
   if (!(t > 0.002 && t < 0.99)) continue;
   for (const qty of [1, 5, 39, 40, 41, 60, 91.61, 175, 400, 2083]) {
-    const r = Q.fillAmericanToExactQuote(f, { contracts: qty, env: {} });
+    const r = Q.fillAmericanToExactQuote(f, { contracts: qty, env: R });
     assert.ok(r, `quote for ${f}@${qty}`);
     const price = parseFloat(r.buyPrice);
     // never nets below the target after the credited rebate
@@ -52,7 +60,7 @@ for (let f = -400; f <= 6000; f += (f < 600 ? 7 : 53)) {
     // minimal tick: one tick lower would net below the target
     if (price > 0.001 + 1e-9) {
       const lower = price - 0.001;
-      const lc = Q.rebateCreditPerContract(lower, qty);
+      const lc = Q.rebateCreditPerContract(lower, qty, { theta: 0.0125 });
       assert.ok(lower + lc < t - 1e-13, `${f}@${qty}: ${lower} would also qualify (price ${price})`);
     }
     // never above ceil(target)
@@ -70,8 +78,8 @@ for (let f = -400; f <= 6000; f += (f < 600 ? 7 : 53)) {
 assert.ok(checked > 1000, `checked ${checked}`);
 
 // invalid inputs
-for (const bad of [null, undefined, '', 0, 'x', NaN]) assert.strictEqual(Q.fillAmericanToExactQuote(bad, { contracts: 100, env: {} }), null);
-assert.strictEqual(Q.fillAmericanToExactQuote(-100000, { contracts: 100, env: {} }), null, 'target above 0.999: no valid tick');
+for (const bad of [null, undefined, '', 0, 'x', NaN]) assert.strictEqual(Q.fillAmericanToExactQuote(bad, { contracts: 100, env: R }), null);
+assert.strictEqual(Q.fillAmericanToExactQuote(-100000, { contracts: 100, env: R }), null, 'target above 0.999: no valid tick');
 
 // theta override via env
 {
@@ -84,7 +92,7 @@ assert.strictEqual(Q.fillAmericanToExactQuote(-100000, { contracts: 100, env: {}
 
 // ── buildPolymarketQuote ──────────────────────────────────────────────────────
 {
-  const qtyQ = Q.buildPolymarketQuote({ fillAmerican: 910, qtyDecimal: '91.61', env: {} });
+  const qtyQ = Q.buildPolymarketQuote({ fillAmerican: 910, qtyDecimal: '91.61', env: R });
   assert.strictEqual(qtyQ.buyPrice, '0.098');
   assert.strictEqual(qtyQ.estimatedContracts, 91.61);
   assert.strictEqual(qtyQ.exact, true);
@@ -98,26 +106,26 @@ assert.strictEqual(Q.fillAmericanToExactQuote(-100000, { contracts: 100, env: {}
   process.env.POLY_EXACT_TARGET = '0';
   assert.strictEqual(Q.buildPolymarketQuote({ fillAmerican: 910, qtyDecimal: '91.61' }).buyPrice, '0.099');
   process.env.POLY_EXACT_TARGET = '1';
-  assert.strictEqual(Q.buildPolymarketQuote({ fillAmerican: 910, qtyDecimal: '91.61' }).buyPrice, '0.098');
+  assert.strictEqual(Q.buildPolymarketQuote({ fillAmerican: 910, qtyDecimal: '91.61' }).buyPrice, '0.100'); // no combo rebate
   if (prev == null) delete process.env.POLY_EXACT_TARGET; else process.env.POLY_EXACT_TARGET = prev;
   // cash RFQ: contracts sized from the quoted price; rebate sized from a haircut estimate
-  const cash = Q.buildPolymarketQuote({ fillAmerican: 910, cashOrderQty: '10', env: {} });
+  const cash = Q.buildPolymarketQuote({ fillAmerican: 910, cashOrderQty: '10', env: R });
   assert.strictEqual(cash.buyPrice, '0.098');
   assert.strictEqual(cash.estimatedContracts, Math.floor(10 / 0.098));
   // tiny cash RFQ ($1 ~ 10 contracts): no rebate credit, ceil(target)
-  const tiny = Q.buildPolymarketQuote({ fillAmerican: 910, cashOrderQty: '1', env: {} });
+  const tiny = Q.buildPolymarketQuote({ fillAmerican: 910, cashOrderQty: '1', env: R });
   assert.strictEqual(tiny.buyPrice, '0.100');
   assert.strictEqual(tiny.rebateCredit, 0);
   // cash RFQ whose haircut size drops under the threshold does not credit (cash 4 ~ 40 contracts -> 34 est)
-  const edge = Q.buildPolymarketQuote({ fillAmerican: 910, cashOrderQty: '4', env: {} });
+  const edge = Q.buildPolymarketQuote({ fillAmerican: 910, cashOrderQty: '4', env: R });
   assert.strictEqual(edge.rebateCredit, 0);
-  assert.strictEqual(Q.buildPolymarketQuote({ fillAmerican: 0, cashOrderQty: 10, env: {} }), null);
+  assert.strictEqual(Q.buildPolymarketQuote({ fillAmerican: 0, cashOrderQty: 10, env: R }), null);
 }
 
 // ── engine Polymarket branch ──────────────────────────────────────────────────
 {
   const base = { parlayStake: 100, parlayAmerican: 400, fillAmerican: 910, rfqContracts: 91.61, hedgeMode: '1x', maxContracts: 1000 };
-  const q = Q.buildPolymarketQuote({ fillAmerican: 910, qtyDecimal: 91.61, env: {} });
+  const q = Q.buildPolymarketQuote({ fillAmerican: 910, qtyDecimal: 91.61, env: R });
   const d = decideAtFill({ ...base, polyQuote: { buyPrice: q.buyPrice, credit: q.rebateCredit, enforce: true } });
   assert.ok(d.ok, d.reason);
   assert.strictEqual(d.venue, 'polymarket');
@@ -165,8 +173,8 @@ const NOW = Date.parse('2026-08-14T12:00:00Z');
 {
   const ev = evaluatePolymarketRfq({ rfq: mkRfq({ qtyDecimal: '91.61' }), parlays: [lock], now: NOW, exactTarget: true });
   assert.strictEqual(ev.action, 'quoteable', ev.reason);
-  assert.strictEqual(ev.quote.buyPrice, '0.098');
-  assert.strictEqual(quoteBodyFromEval(ev).buyPrice, '0.098');
+  assert.strictEqual(ev.quote.buyPrice, '0.100'); // ceil(target): no combo maker rebate to credit
+  assert.strictEqual(quoteBodyFromEval(ev).buyPrice, '0.100');
   assert.strictEqual(ev.decision.venue, 'polymarket');
   const off = evaluatePolymarketRfq({ rfq: mkRfq({ qtyDecimal: '91.61' }), parlays: [lock], now: NOW, exactTarget: false });
   assert.strictEqual(off.quote.buyPrice, '0.099');
@@ -254,7 +262,7 @@ const NOW = Date.parse('2026-08-14T12:00:00Z');
   const fresh = await loop.handleRfq(mkRfq({ id: 'fresh1', qtyDecimal: '91.61', createdTime: iso(120) }), 'ws');
   assert.strictEqual(fresh.post, true);
   assert.strictEqual(posts.length, 2);
-  assert.strictEqual(posts[1].buyPrice, '0.098');
+  assert.strictEqual(posts[1].buyPrice, '0.100');
   const snap = loop.emitPolyHeartbeat();
   assert.ok(snap.latency, 'poly heartbeat carries latency stats');
   assert.strictEqual(snap.latency.posted, 2);

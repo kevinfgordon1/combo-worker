@@ -14,10 +14,11 @@ const SELL_PRICE_DECLINE = '0';
 const MIN_TICKS = 1;     // 0.001
 const MAX_TICKS = 999;   // 0.999
 
-// Polymarket US pays the maker a rebate on every fill: theta * p * (1 - p) per contract, summed per fill
-// and rounded to the cent (banker's). Verified against 40 live combo fills (rebate matched within $0.01).
-// Override with POLY_MAKER_REBATE_THETA if the fee schedule changes.
-const DEFAULT_REBATE_THETA = 0.0125;
+// Polymarket US combos carry NO maker rebate (docs.polymarket.us/fees, effective 2026-10-07; exchange
+// notice "Maker Rebate on Combination Contracts" 2026-10-02: "the maker fee for combos will be zero").
+// The old 0.0125 straight-market rebate was credited here and made POLY_EXACT_TARGET quotes net
+// below the lock target. Default 0; POLY_MAKER_REBATE_THETA can re-enable if Polymarket restores it.
+const DEFAULT_REBATE_THETA = 0;
 // Only credit the rebate on fills this large: the per-fill cent rounding is noise there.
 const DEFAULT_REBATE_MIN_CONTRACTS = 40;
 // Per-fill cent rounding can shave up to half a cent off the rebate; never count on it.
