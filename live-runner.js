@@ -194,6 +194,7 @@ const { createBucketManager } = require('./bucket-manager');
 const { createTesterFunder, logOwnKeyScopes } = require('./tester-funder');
 const { startBalanceReporter } = require('./balance-reporter');
 const { splitPaused, diffPaused, createPausePoller } = require('./lock-pause');
+const { createUserCancelPoller } = require('./user-cancel');
 const { createLiveUserGate } = require('./live-users');
 const { resolveWorkerScope, scopeLabel } = require('./worker-scope');
 const { createUserCaps } = require('./user-caps');
@@ -414,6 +415,7 @@ const userCaps = createUserCaps({
 const userCredits = createUserCredits({ client: supabase, log: (m) => console.log(`[${MODE}] ${m}`) });
 
 const pausePoller = createPausePoller({ supabase, log: (m) => console.log(`[${MODE}] ${m.replace(/^\[PAUSE\] /, 'PAUSE ')}`) });
+const userCancelPoller = createUserCancelPoller({ supabase, log: (m) => console.log(`[${MODE}] ${m.replace(/^\[USER-CANCEL\] /, 'USER-CANCEL ')}`) });
 
 async function cancelPausedLock(parlayId) {
   try {
@@ -448,6 +450,56 @@ function cancelStragglersForPaused() {
   if (!pausedParlayIds.size) return;
   for (const [, pending] of pendingQuotes) {
     if (pending && pausedParlayIds.has(pending.parlayId)) { cancelPausedLock(pending.parlayId); break; }
+  }
+}
+
+
+async function cancelUserRequestedLock(parlayId) {
+  try {
+    const rows = (await loadOpenSubmissionQuotes()).filter((r) => r.parlay_id === parlayId);
+    await cancelOpenQuotesForParlay(parlayId, { kind: 'user_cancel' }, rows);
+  } catch (e) {
+    console.error(`[${MODE}] user-cancel (kalshi)`, e.message);
+  }
+  if (polyLoop && typeof polyLoop.cancelOpenQuotesForParlay === 'function') {
+    try {
+      await polyLoop.cancelOpenQuotesForParlay(parlayId, { kind: 'user_cancel' });
+    } catch (e) {
+      console.error(`[${MODE}] user-cancel (poly)`, e.message);
+    }
+  }
+}
+
+async function cancelUserRequestedQuote(sub) {
+  const quoteId = sub && sub.quote_id;
+  if (!quoteId) return;
+  const reason = { kind: 'user_cancel', rfqId: sub.rfq_id, label: sub.label, parlayId: sub.parlay_id };
+  const venue = String(sub.venue || '').toLowerCase();
+  const isPoly = venue === 'polymarket' || venue === 'polymarket_us';
+  try {
+    if (isPoly && polyLoop && typeof polyLoop.cancelQuoteById === 'function') {
+      await polyLoop.cancelQuoteById(quoteId, reason);
+    } else {
+      const pending = pendingQuotes.get(quoteId) || {
+        label: sub.label, rfqId: sub.rfq_id, parlayId: sub.parlay_id,
+      };
+      await cancelQuoteAndDrop(quoteId, pending, reason);
+    }
+  } catch (e) {
+    console.error(`[${MODE}] user-cancel quote ${quoteId}`, e.message);
+  }
+}
+
+async function pollUserCancels() {
+  const hit = await userCancelPoller.poll();
+  if (!hit) return;
+  for (const id of hit.parlayIds) {
+    console.log(`[${MODE}] USER-CANCEL all open quotes on lock ${id}`);
+    await cancelUserRequestedLock(id);
+  }
+  for (const sub of hit.submissions) {
+    console.log(`[${MODE}] USER-CANCEL quote ${sub.quote_id} lock=${sub.parlay_id}`);
+    await cancelUserRequestedQuote(sub);
   }
 }
 
@@ -920,6 +972,9 @@ function cancelLogLine(quoteId, pending, reason) {
   }
   if (reason && reason.kind === 'paused') {
     return `[${MODE}] CANCEL lock paused ${label} quote_id=${quoteId}` + rfqBit;
+  }
+  if (reason && reason.kind === 'user_cancel') {
+    return `[${MODE}] CANCEL user ${label} quote_id=${quoteId}` + rfqBit;
   }
   if (reason && reason.kind === 'cap_full') {
     return (
@@ -2594,6 +2649,7 @@ async function main() {
   }, 15000);
   setInterval(unlessQuoteHot(() => {
     pollPaused().catch((e) => console.error(`[${MODE}] pause poll`, e.message));
+    pollUserCancels().catch((e) => console.error(`[${MODE}] user-cancel poll`, e.message));
   }), 5000);
   setInterval(unlessQuoteHot(() => {
     reconcileSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape tick`, e.message));

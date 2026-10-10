@@ -1978,6 +1978,14 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
   }
 
+  async function cancelQuoteById(quoteId, reason) {
+    if (!quoteId) return false;
+    const pending = pendingQuotes.get(quoteId) || null;
+    if (!pending && !(reason && reason.rfqId)) return false;
+    await deleteQuoteAndDrop(quoteId, pending || { rfqId: reason.rfqId, label: reason.label, parlayId: reason.parlayId }, reason || { kind: 'user_cancel' });
+    return true;
+  }
+
   async function cancelPendingIfStarted() {
     for (const [quoteId, pending] of pendingQuotes) {
       const p = parlayOfPending(pending);
@@ -2844,6 +2852,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     cancelStartedQuotes,
     cancelPendingIfStarted,
     cancelOpenQuotesForParlay,
+    cancelQuoteById,
     cancelUnaccepted,
     deleteQuoteReliably,
     sweepStrayDeletes,
