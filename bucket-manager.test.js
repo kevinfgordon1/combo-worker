@@ -5,6 +5,7 @@ const {
   dollarsToCenticents,
   centsToCenticents,
   loadBucketConfig,
+  baseBucketTarget,
   isGameday,
   planBucketAction,
   parseShardBalance,
@@ -35,6 +36,17 @@ const LEGACY_LIMITS = {
   KALSHI_BUCKET_TARGET_DEFAULT: '5000',
   KALSHI_BUCKET_TARGET_GAMEDAY: '10000',
   KALSHI_BUCKET_CEILING: '15000',
+  KALSHI_BUCKET_MAX_TRANSFER: '10000',
+  KALSHI_BUCKET_DAILY_CAP: '15000',
+  KALSHI_BUCKET_TARGET_PCT: '0',
+};
+
+// Oct 2 – Oct 9 fixed-dollar defaults (before the 90% target), pinned for those tests.
+const OCT2_FIXED = {
+  KALSHI_BUCKET_TARGET_PCT: '0',
+  KALSHI_BUCKET_CEILING: '22000',
+  KALSHI_BUCKET_MAX_TRANSFER: '10000',
+  KALSHI_BUCKET_DAILY_CAP: '15000',
 };
 
 function baseConfig(over = {}) {
@@ -121,10 +133,13 @@ assert.strictEqual(isGameday(at('2026-11-01T06:30:00.000Z')), true);
   const cfg = loadBucketConfig({});
   assert.strictEqual(cfg.auto, false);
   assert.strictEqual(cfg.sweep, false);
-  assert.strictEqual(cfg.ceilingCents, cents(22_000));
+  assert.strictEqual(cfg.ceilingCents, cents(250_000));
   assert.strictEqual(cfg.floorCents, cents(2_000));
-  assert.strictEqual(cfg.maxTransferCents, cents(10_000));
-  assert.strictEqual(cfg.dailyCapCents, cents(15_000));
+  assert.strictEqual(cfg.maxTransferCents, cents(100_000));
+  assert.strictEqual(cfg.dailyCapCents, cents(250_000));
+  assert.strictEqual(cfg.targetPct, 90);
+  assert.strictEqual(loadBucketConfig({ KALSHI_BUCKET_TARGET_PCT: '75' }).targetPct, 75);
+  assert.strictEqual(loadBucketConfig({ KALSHI_BUCKET_TARGET_PCT: 'abc' }).targetPct, 90);
   assert.strictEqual(cfg.minTransferCents, cents(100));
   assert.strictEqual(cfg.targetGamedayCents, cents(12_000));
   assert.strictEqual(cfg.targetDefaultCents, cents(8_000));
@@ -1145,11 +1160,11 @@ async function main() {
 
   // The confirm path must not loosen the safeguards: floor, per-transfer cap, daily cap, ceiling, minimum.
   {
-    const cfg = loadBucketConfig({});
+    const cfg = loadBucketConfig(LEGACY_LIMITS);
     assert.strictEqual(cfg.floorCents, cents(2_000));
     assert.strictEqual(cfg.maxTransferCents, cents(10_000));
     assert.strictEqual(cfg.dailyCapCents, cents(15_000));
-    assert.strictEqual(cfg.ceilingCents, cents(22_000));
+    assert.strictEqual(cfg.ceilingCents, cents(15_000));
     assert.strictEqual(cfg.minTransferCents, cents(100));
     assert.strictEqual(cfg.confirmDelayMs, 2_000);
     // Big deficit with plenty of main: one transfer clamped to $10k, held while pending.
@@ -1196,7 +1211,7 @@ async function main() {
     let current = FRI_EVE;
     const alerts = [];
     const mgr = createBucketManager({
-      env: { KALSHI_BUCKET_AUTO: '1' }, now: () => current, alert(t) { alerts.push(t); }, log() {},
+      env: { KALSHI_BUCKET_AUTO: '1', KALSHI_BUCKET_TARGET_PCT: '0' }, now: () => current, alert(t) { alerts.push(t); }, log() {},
       sleep: async () => {}, client: book.client, readPolyCash: null,
     });
     const out = await mgr.check('interval');
@@ -1212,7 +1227,7 @@ async function main() {
 
   // Non-gameday target is $8k.
   {
-    const cfg = loadBucketConfig({});
+    const cfg = loadBucketConfig(OCT2_FIXED);
     const plan = planBucketAction({
       mainAvailableCents: cents(15_000), bucketAvailableCents: cents(4_963.42), bucketPortfolioCents: 0,
       gameday: false, sweepEnabled: false, flat: null, dailyTopupCents: 0, config: cfg,
@@ -1223,7 +1238,7 @@ async function main() {
 
   // Ceiling ($22k) is enforced on available cash only; open positions never count.
   {
-    const cfg = loadBucketConfig({});
+    const cfg = loadBucketConfig(OCT2_FIXED);
     const withPositions = planBucketAction({
       mainAvailableCents: cents(50_000), bucketAvailableCents: cents(4_000), bucketPortfolioCents: cents(14_000),
       gameday: true, sweepEnabled: false, flat: null, dailyTopupCents: 0, config: cfg,
@@ -1240,7 +1255,7 @@ async function main() {
 
   // needCents lifts the target to cost + $500 and every clamp still applies.
   {
-    const cfg = loadBucketConfig({});
+    const cfg = loadBucketConfig(OCT2_FIXED);
     const base = {
       mainAvailableCents: cents(15_000), bucketAvailableCents: cents(4_963.42), bucketPortfolioCents: cents(6_343.43),
       gameday: false, sweepEnabled: false, flat: null, dailyTopupCents: 0, config: cfg,
@@ -1281,7 +1296,7 @@ async function main() {
     const alerts = [];
     const logs = [];
     const mgr = createBucketManager({
-      env: { KALSHI_BUCKET_AUTO: '1', KALSHI_BUCKET_TARGET_DEFAULT: '3000' },
+      env: { KALSHI_BUCKET_AUTO: '1', KALSHI_BUCKET_TARGET_DEFAULT: '3000', KALSHI_BUCKET_TARGET_PCT: '0' },
       now: () => at('2026-10-02T14:00:00.000Z'), // Fri 10:00 AM EDT, default target
       alert(t) { alerts.push(t); }, log(l) { logs.push(String(l)); },
       sleep: async () => {}, client: book.client, readPolyCash: null, appAlerts: app,
@@ -1308,7 +1323,7 @@ async function main() {
   {
     const book = fakeBook({ main: cents(30_000), bucket: cents(4_963.42) });
     const mgr = createBucketManager({
-      env: { KALSHI_BUCKET_AUTO: '1', KALSHI_BUCKET_TARGET_DEFAULT: '3000' },
+      env: { KALSHI_BUCKET_AUTO: '1', KALSHI_BUCKET_TARGET_DEFAULT: '3000', KALSHI_BUCKET_TARGET_PCT: '0' },
       now: () => at('2026-10-02T14:00:00.000Z'), alert() {}, log() {},
       sleep: async () => {}, client: book.client, readPolyCash: null,
     });
@@ -1324,7 +1339,7 @@ async function main() {
   {
     const book = fakeBook({ main: cents(40_000), bucket: cents(4_000) });
     const mgr = createBucketManager({
-      env: { KALSHI_BUCKET_AUTO: '1', KALSHI_BUCKET_TARGET_DEFAULT: '3000' },
+      env: { KALSHI_BUCKET_AUTO: '1', KALSHI_BUCKET_TARGET_DEFAULT: '3000', KALSHI_BUCKET_TARGET_PCT: '0' },
       now: () => at('2026-10-02T14:00:00.000Z'), alert() {}, log() {},
       sleep: async () => {}, client: book.client, readPolyCash: null,
     });
@@ -1345,7 +1360,7 @@ async function main() {
       main: cents(40_000), bucket: cents(4_000), applyTransfer: false, recordStatus: 'processing',
     });
     const mgr = createBucketManager({
-      env: { KALSHI_BUCKET_AUTO: '1', KALSHI_BUCKET_TARGET_DEFAULT: '3000' },
+      env: { KALSHI_BUCKET_AUTO: '1', KALSHI_BUCKET_TARGET_DEFAULT: '3000', KALSHI_BUCKET_TARGET_PCT: '0' },
       now: () => at('2026-10-02T14:00:00.000Z'), alert() {}, log() {},
       sleep: async () => {}, client: book.client, readPolyCash: null,
     });
@@ -1370,9 +1385,9 @@ async function main() {
     assert.strictEqual(snap.main_cents, cents(4_862));
     assert.strictEqual(snap.combo_cash_cents, cents(9_271));
     assert.strictEqual(snap.combo_positions_cents, cents(12_731));
-    assert.strictEqual(snap.ceiling_cents, cents(22_000));
+    assert.strictEqual(snap.ceiling_cents, cents(250_000));
     assert.strictEqual(snap.floor_cents, cents(2_000));
-    assert.strictEqual(snap.target_cents, cents(12_000));
+    assert.strictEqual(snap.target_cents, cents(12_719.70), "90% of $14,133");
     assert.strictEqual(snap.gameday, true);
     snap.main_cents = 1;
     assert.strictEqual(mgr.snapshot().main_cents, cents(4_862), 'snapshot is a copy');
@@ -1385,3 +1400,30 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
+
+// --- percentage target (Kevin, Oct 9) ------------------------------------------
+{
+  const cfg = loadBucketConfig({});
+  // Today's numbers: main $10,958.75 + combos $12,313.99 = $23,272.74 -> 90% = $20,945.46
+  const main = 1_095_875, bucket = 1_231_399;
+  assert.strictEqual(baseBucketTarget(cfg, true, main, bucket), 2_094_546);
+  assert.strictEqual(baseBucketTarget(cfg, false, main, bucket), 2_094_546, 'same target off-gameday');
+  const d = planBucketAction({ mainAvailableCents: main, bucketAvailableCents: bucket, gameday: true,
+    sweepEnabled: false, dailyTopupCents: 0, needCents: 0, config: cfg });
+  assert.strictEqual(d.action, 'topup');
+  assert.strictEqual(d.targetCents, 2_094_546);
+  assert.strictEqual(d.amountCents, 2_094_546 - bucket);
+  // Shortfall bump still lifts above the percentage target.
+  const b = planBucketAction({ mainAvailableCents: 500_000, bucketAvailableCents: 0, gameday: false,
+    sweepEnabled: false, dailyTopupCents: 0, needCents: 450_000, config: cfg });
+  assert.strictEqual(b.targetCents, 450_000 + cfg.insufficientBufferCents);
+  assert.strictEqual(b.amountCents, 500_000 - cfg.floorCents, 'floor still applies');
+  // Above target with sweep off: hold.
+  const h = planBucketAction({ mainAvailableCents: 0, bucketAvailableCents: 1_000_000, gameday: false,
+    sweepEnabled: false, dailyTopupCents: 0, needCents: 0, config: cfg });
+  assert.strictEqual(h.action, 'hold');
+  // pct 0 -> fixed dollar targets.
+  const fixed = loadBucketConfig({ KALSHI_BUCKET_TARGET_PCT: '0' });
+  assert.strictEqual(baseBucketTarget(fixed, true, main, bucket), cents(12_000));
+  console.log('bucket pct target ok');
+}

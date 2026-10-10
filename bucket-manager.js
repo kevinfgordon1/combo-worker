@@ -181,18 +181,39 @@ function loadGamedayWindows(env) {
   }
 }
 
+function envPct(env, name, fallback) {
+  const raw = env && env[name];
+  if (raw == null || String(raw).trim() === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || n > 100) return fallback;
+  return n;
+}
+
+// Base combos target before the quote-shortfall bump.
+function baseBucketTarget(config, gameday, mainAvailableCents, bucketAvailableCents) {
+  const pct = Number(config.targetPct) || 0;
+  if (pct > 0) {
+    const total = Math.max(0, (mainAvailableCents || 0) + (bucketAvailableCents || 0));
+    return Math.floor(total * pct / 100);
+  }
+  return gameday ? config.targetGamedayCents : config.targetDefaultCents;
+}
+
 function loadBucketConfig(env = process.env) {
   const schedule = loadGamedayWindows(env || {});
   return {
     auto: envOn(env, 'KALSHI_BUCKET_AUTO'),
     sweep: envOn(env, 'KALSHI_BUCKET_SWEEP'),
-    ceilingCents: envDollarsToCents(env, 'KALSHI_BUCKET_CEILING', 22_000),
+    ceilingCents: envDollarsToCents(env, 'KALSHI_BUCKET_CEILING', 250_000),
     floorCents: envDollarsToCents(env, 'KALSHI_MAIN_FLOOR', 2_000),
-    maxTransferCents: envDollarsToCents(env, 'KALSHI_BUCKET_MAX_TRANSFER', 10_000),
-    dailyCapCents: envDollarsToCents(env, 'KALSHI_BUCKET_DAILY_CAP', 15_000),
+    maxTransferCents: envDollarsToCents(env, 'KALSHI_BUCKET_MAX_TRANSFER', 100_000),
+    dailyCapCents: envDollarsToCents(env, 'KALSHI_BUCKET_DAILY_CAP', 250_000),
     minTransferCents: envDollarsToCents(env, 'KALSHI_BUCKET_MIN_TRANSFER', 100),
     // Extra cash kept above a rejected quote's cost when topping up after an insufficient_balance.
     insufficientBufferCents: envDollarsToCents(env, 'KALSHI_BUCKET_INSUFFICIENT_BUFFER', 500),
+    // Target = this % of total Kalshi cash (main + combos), recomputed each
+    // cycle. 0 falls back to the fixed gameday/default dollar targets.
+    targetPct: envPct(env, 'KALSHI_BUCKET_TARGET_PCT', 90),
     targetGamedayCents: envDollarsToCents(env, 'KALSHI_BUCKET_TARGET_GAMEDAY', 12_000),
     targetDefaultCents: envDollarsToCents(env, 'KALSHI_BUCKET_TARGET_DEFAULT', 8_000),
     lowAlertCents: envDollarsToCents(env, 'KALSHI_BUCKET_LOW_ALERT', 1_500),
@@ -264,7 +285,7 @@ function planBucketAction({
   needCents,
   config,
 }) {
-  const baseTargetCents = gameday ? config.targetGamedayCents : config.targetDefaultCents;
+  const baseTargetCents = baseBucketTarget(config, gameday, mainAvailableCents, bucketAvailableCents);
   // A recently rejected quote (insufficient_balance) lifts the target to its
   // cost plus the buffer. Every limit below (floor, ceiling, daily cap,
   // per-transfer cap, minimum) still applies to the resulting amount.
@@ -1041,7 +1062,7 @@ function createBucketManager({
     }
 
     const gameday = isGameday(date, config.windows);
-    const baseTarget = gameday ? config.targetGamedayCents : config.targetDefaultCents;
+    const baseTarget = baseBucketTarget(config, gameday, shards.main.availableCents, shards.bucket.availableCents);
     const targetCents = Math.max(
       baseTarget,
       needCents > 0 ? Math.floor(needCents) + (config.insufficientBufferCents || 0) : 0,
@@ -1294,6 +1315,7 @@ function createBucketManager({
     log(
       `[BUCKET] started auto=${config.auto ? '1' : '0'} sweep=${config.sweep ? '1' : '0'} ` +
       `interval=${config.intervalMin}m ` +
+      (config.targetPct > 0 ? `target=${config.targetPct}% of total ` : '') +
       `target gameday=${formatDollarsFromCents(config.targetGamedayCents)} ` +
       `default=${formatDollarsFromCents(config.targetDefaultCents)} ` +
       `ceiling=${formatDollarsFromCents(config.ceilingCents)}(available cash) ` +
@@ -1328,6 +1350,7 @@ function createBucketManager({
 }
 
 module.exports = {
+  baseBucketTarget,
   TRANSFER_PATH,
   TRANSFERS_PATH,
   BALANCE_PATH,
