@@ -508,7 +508,7 @@ async function pollUserCancels() {
   }
 }
 
-// Fast path (5s): react to a toggle without waiting for the 30s refresh.
+// Fast path (2s): react to a toggle without waiting for the 30s refresh.
 async function pollPaused() {
   const ids = await pausePoller.poll();
   if (!ids) return;
@@ -2669,13 +2669,14 @@ async function main() {
     cancelUnacceptedQuotes().catch((e) => console.error(`[${MODE}] cancel-unaccepted tick`, e.message));
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start tick`, e.message));
     cancelStragglersForPaused();
+    // 2s: a Check market price hold (probe_hold_until) must drop our quotes fast.
+    pollPaused().catch((e) => console.error(`[${MODE}] pause poll`, e.message));
   }), 2000);
   // Confirm holds are never dropped on a timer: verify the stale ones against the venue.
   setInterval(() => {
     holdResolver.tick().catch((e) => console.error(`[${MODE}] hold resolver`, e && e.message));
   }, 15000);
   setInterval(unlessQuoteHot(() => {
-    pollPaused().catch((e) => console.error(`[${MODE}] pause poll`, e.message));
     pollUserCancels().catch((e) => console.error(`[${MODE}] user-cancel poll`, e.message));
   }), 5000);
   setInterval(unlessQuoteHot(() => {

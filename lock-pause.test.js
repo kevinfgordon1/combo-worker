@@ -1,6 +1,35 @@
 'use strict';
 const assert = require('assert');
-const { isPaused, splitPaused, diffPaused, createPausePoller } = require('./lock-pause');
+const { isPaused, splitPaused, diffPaused, createPausePoller, createProbeHolds, PROBE_HOLD_MAX_MS } = require('./lock-pause');
+
+// Check market price probe hold: paused while probe_hold_until is in the future,
+// never for more than 30s after first seen (safety net).
+{
+  assert.strictEqual(PROBE_HOLD_MAX_MS, 30000);
+  const holds = createProbeHolds();
+  const t0 = Date.parse('2026-10-10T23:00:00Z');
+  const row = { id: 'p', probe_hold_until: new Date(t0 + 20000).toISOString() };
+  assert.strictEqual(isPaused(row, t0, holds), true);
+  assert.strictEqual(isPaused(row, t0 + 19000, holds), true);
+  assert.strictEqual(isPaused(row, t0 + 20000, holds), false, 'expired hold resumes');
+  // Cleared column resumes immediately.
+  assert.strictEqual(isPaused({ id: 'p', probe_hold_until: null }, t0 + 1000, holds), false);
+  // A hold far in the future (crashed probe / bad clock) is capped at 30s.
+  const h2 = createProbeHolds();
+  const far = { id: 'q', probe_hold_until: new Date(t0 + 3600e3).toISOString() };
+  assert.strictEqual(isPaused(far, t0, h2), true);
+  assert.strictEqual(isPaused(far, t0 + 29999, h2), true);
+  assert.strictEqual(isPaused(far, t0 + 30000, h2), false, 'safety net: never paused > 30s');
+  assert.strictEqual(isPaused(far, t0 + 600e3, h2), false);
+  // A new probe (new until) is honored again.
+  const again = { id: 'q', probe_hold_until: new Date(t0 + 600e3 + 15000).toISOString() };
+  assert.strictEqual(isPaused(again, t0 + 600e3, h2), true);
+  // Garbage timestamp => not paused. paused=true still wins.
+  assert.strictEqual(isPaused({ id: 'r', probe_hold_until: 'nope' }, t0, h2), false);
+  assert.strictEqual(isPaused({ id: 'r', paused: true, probe_hold_until: null }, t0, h2), true);
+  const sp = splitPaused([{ id: 'a' }, { id: 'b', probe_hold_until: new Date(t0 + 5000).toISOString() }], t0, createProbeHolds());
+  assert.deepStrictEqual([...sp.pausedIds], ['b']);
+}
 
 // No column / undefined / false => enabled. Only an explicit true pauses.
 assert.strictEqual(isPaused({ id: 'a' }), false);
@@ -54,7 +83,7 @@ function fakeSupabase(result) {
     const p = createPausePoller({ supabase: sb });
     const ids = await p.poll();
     assert.deepStrictEqual([...ids], ['a']);
-    assert.deepStrictEqual(sb.calls[0], { table: 'combo_parlays', cols: 'id,paused', col: 'active', val: true });
+    assert.deepStrictEqual(sb.calls[0], { table: 'combo_parlays', cols: 'id,paused,probe_hold_until', col: 'active', val: true });
   }
   // Column missing: returns null, logs once, stops querying (all locks enabled).
   {
@@ -83,6 +112,27 @@ function fakeSupabase(result) {
     assert.strictEqual(await p.poll(), null);
     assert.strictEqual(p.disabled, false);
     assert.deepStrictEqual([...(await p.poll())], ['z']);
+  }
+  // Held lock shows up in the poller's paused set; missing hold column falls back to id,paused.
+  {
+    const now = Date.now();
+    const sb = fakeSupabase({ data: [{ id: 'h', paused: false, probe_hold_until: new Date(now + 10000).toISOString() }], error: null });
+    const p = createPausePoller({ supabase: sb, holds: createProbeHolds() });
+    assert.deepStrictEqual([...(await p.poll())], ['h']);
+  }
+  {
+    const logs = [];
+    let n = 0;
+    const sb = fakeSupabase(() => (++n === 1
+      ? { data: null, error: { message: "Could not find the 'probe_hold_until' column of 'combo_parlays' in the schema cache" } }
+      : { data: [{ id: 'y', paused: true }], error: null }));
+    const p = createPausePoller({ supabase: sb, log: (m) => logs.push(m) });
+    assert.deepStrictEqual([...(await p.poll())], ['y']);
+    assert.strictEqual(p.disabled, false, 'pause still works without the hold column');
+    assert.strictEqual(sb.calls[1].cols, 'id,paused');
+    await p.poll();
+    assert.strictEqual(sb.calls[2].cols, 'id,paused');
+    assert.strictEqual(logs.length, 1);
   }
   // A throwing client never breaks the worker.
   {
