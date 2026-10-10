@@ -159,6 +159,20 @@ async function main() {
   };
   await tick();
   setInterval(tick, POLL_MS);
+  // Per-user Combo Lock Telegram alerts (off unless COMBO_USER_TG_ALERTS=1).
+  const { createUserTgAlerts } = require('./user-tg-alerts');
+  const tg = createUserTgAlerts({ supabase });
+  if (tg.active) {
+    console.log('[USER-TG] per-user Combo Lock alerts on');
+    const tgMs = Math.max(5_000, Number(process.env.COMBO_USER_TG_POLL_MS) || 10_000);
+    let busy = false;
+    setInterval(async () => {
+      if (busy) return; busy = true;
+      try { await tg.tick(); } catch (e) { console.error('[USER-TG] tick error', e && e.message); } finally { busy = false; }
+    }, tgMs);
+  } else {
+    console.log('[USER-TG] per-user alerts off');
+  }
   const shutdown = (sig) => { sup.stopAll(sig); setTimeout(() => process.exit(0), 3000); };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));

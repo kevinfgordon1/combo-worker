@@ -10,7 +10,7 @@ const crypto = require('crypto');
 // Kevin's channels, money-moving bucket flags, and the identity vars this
 // module sets itself. Everything else (Supabase connection, tuning flags) is
 // inherited, so a dedicated combo-testers service only needs its own vars.
-const FORBIDDEN = /^(KALSHI_KEY_ID|Kalshi_combo_key|KALSHI_PRIVATE_KEY|KALSHI_.*KEY.*|POLYMARKET_KEY_ID|POLYMARKET_SECRET_KEY|POLYMARKET_.*SECRET.*|TELEGRAM_.*|DESK_PROTECT_.*|ADMIN_API_SECRET|COMBO_WORKER_USER_ID|WORKER_MODE|KALSHI_BUCKET_.*|COMBO_CAP_AT_CONFIRM|POLYMARKET_RFQ_LIVE|RAILWAY_.*)$/;
+const FORBIDDEN = /^(KALSHI_KEY_ID|Kalshi_combo_key|KALSHI_PRIVATE_KEY|KALSHI_.*KEY.*|POLYMARKET_KEY_ID|POLYMARKET_SECRET_KEY|POLYMARKET_.*SECRET.*|TELEGRAM_.*|COMBO_USER_TG_.*|DESK_PROTECT_.*|ADMIN_API_SECRET|COMBO_WORKER_USER_ID|WORKER_MODE|KALSHI_BUCKET_.*|COMBO_CAP_AT_CONFIRM|POLYMARKET_RFQ_LIVE|RAILWAY_.*)$/;
 
 function buildTesterEnv(base, { userId, kalshi, poly } = {}) {
   const env = {};
