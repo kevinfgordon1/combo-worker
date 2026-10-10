@@ -204,6 +204,8 @@ const { createPolyStallAlerts } = require('./poly-stall-alert');
 const { createPartialQuoteDryRun, isPartialQuoteFlagOn } = require('./partial-quote');
 
 const MODE = 'LIVE';
+const { createTelegramGate } = require('./tg-gate');
+const { createPolyDeskFillWatcher } = require('./poly-desk-fills');
 let bucketManager = null;
 // Tester children only: moves the tester's own Kalshi Default -> Combos money
 // (tester-funder.js). Never created in Kevin's worker.
@@ -301,23 +303,14 @@ const capBook = createCapBook({
 });
 let reserveSeq = 0;
 
-const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TG_CHAT = process.env.TELEGRAM_ALERT_CHAT_ID;
+// Telegram: fills (+ failed bucket transfers) only, batched and 429-aware.
+const tgGate = createTelegramGate({ env: process.env, tag: MODE });
 
 async function sendAlert(text) {
-  if (!TG_TOKEN || !TG_CHAT) {
-    console.log(`[${MODE}] ALERT (telegram not configured): ${text.replace(/\n/g, ' | ')}`);
-    return;
-  }
   try {
-    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: TG_CHAT, text }),
-    });
-    if (!r.ok) console.error(`[${MODE}] telegram send failed`, r.status, await r.text());
+    await tgGate.send(text);
   } catch (e) {
-    console.error(`[${MODE}] telegram error`, e.message);
+    console.error(`[${MODE}] telegram error`, e && e.message);
   }
 }
 const sgn = (n) => (n > 0 ? '+' + n : '' + n);
@@ -2214,7 +2207,7 @@ async function onRfq(rfq, env) {
       `[${MODE}] SKIP game started ${p.label} rfq=${rfq.rfqId} ` +
       `source=${started.source} at=${started.at}`
     );
-    logAsync(p, rfq, null, 'declined');
+    logAsync(p, rfq, null, 'declined', { skip_reason: 'game_started' });
     cancelOpenQuotesForParlay(p.id, started).catch((e) => {
       console.error(`[${MODE}] cancel-on-start`, e.message);
     });
@@ -2235,7 +2228,7 @@ async function onRfq(rfq, env) {
         `target=$${size.targetCost != null ? size.targetCost : rfq.targetCostDollars} — unresolvable size`
       );
     }
-    logAsync(p, rfq, null, 'declined');
+    logAsync(p, rfq, null, 'declined', { skip_reason: 'bad_size' });
     return;
   }
 
@@ -2259,7 +2252,7 @@ async function onRfq(rfq, env) {
       console.error(
         `[${MODE}] SKIP quote_below_target ${p.label} rfq=${rfq.rfqId} no_bid=${d.quotedNoBid} fill=${p.fill_american}`
       );
-      logAsync(p, rfq, null, 'declined');
+      logAsync(p, rfq, null, 'declined', { skip_reason: 'quote_below_target' });
       return;
     }
     if (d.reason === 'no_cap') {
@@ -2267,7 +2260,7 @@ async function onRfq(rfq, env) {
       console.log(
         `[${MODE}] SKIP no cap ${p.label} rfq=${rfq.rfqId} — free bet riskfree with max_contracts=${p.max_contracts}; not quoting`
       );
-      logAsync(p, rfq, null, 'declined');
+      logAsync(p, rfq, null, 'declined', { skip_reason: 'no_cap' });
       return;
     }
     if (d.reason === 'limit_reached') {
@@ -2300,7 +2293,7 @@ async function onRfq(rfq, env) {
       logSkip(p, rfq, d, 'declined', size);
       return;
     }
-    logAsync(p, rfq, null, 'declined');
+    logAsync(p, rfq, null, 'declined', d && d.reason ? { skip_reason: String(d.reason) } : {});
     return;
   }
 
@@ -2696,6 +2689,18 @@ async function main() {
     }).catch((e) => console.error('onQuoteExecuted', e)),
   });
   polyLoop = poly;
+
+  // Polymarket US fills outside Combo Locks (Live Trading Desk) -> Telegram.
+  // Kevin's account only; POLY_DESK_FILL_ALERTS=0 turns it off.
+  if (!SCOPE.isTester && process.env.POLY_DESK_FILL_ALERTS !== '0' && poly && poly.http) {
+    const deskFills = createPolyDeskFillWatcher({
+      http: poly.http,
+      sendAlert,
+      log: (m) => console.log(`[${MODE}] ${m}`),
+    });
+    deskFills.tick();
+    setInterval(unlessQuoteHot(() => { deskFills.tick(); }), 30000);
+  }
 
   const wsAlerter = createWsStatusAlerter();
   const shardFactor = readShardFactor(undefined, process.env, DEFAULT_LIVE_SHARD_FACTOR);
