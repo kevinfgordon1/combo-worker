@@ -54,7 +54,7 @@ function fakeSupabase(result) {
     const p = createPausePoller({ supabase: sb });
     const ids = await p.poll();
     assert.deepStrictEqual([...ids], ['a']);
-    assert.deepStrictEqual(sb.calls[0], { table: 'combo_parlays', cols: 'id,paused,probe_paused_at,probe_pause_until', col: 'active', val: true });
+    assert.deepStrictEqual(sb.calls[0], { table: 'combo_parlays', cols: 'id,user_id,paused,probe_paused_at,probe_pause_until', col: 'active', val: true });
   }
   // Column missing: returns null, logs once, stops querying (all locks enabled).
   {
@@ -141,7 +141,7 @@ function fakeSupabase(result) {
     const ids = await p.poll();
     assert.deepStrictEqual([...ids], ['m']);
     assert.strictEqual(p.disabled, false);
-    assert.strictEqual(sb.calls[1].cols, 'id,paused');
+    assert.strictEqual(sb.calls[1].cols, 'id,user_id,paused');
     assert.ok(logs.some((m) => /probe_pause/.test(m)));
   }
   // live-runner wiring: 2s safety net + poll/refresh feed probePauseUntil.
@@ -150,6 +150,16 @@ function fakeSupabase(result) {
     assert.match(src, /expireProbePauses\(\);\n  \}\), 2000\);/);
     assert.match(src, /probePauseUntil = ids\.probeUntil/);
     assert.match(src, /probePauseUntil = split\.probeUntil/);
+  }
+  // Scoped: a tester child only tracks its own locks' pauses (no flapping on Kevin's).
+  {
+    const sb = fakeSupabase({ data: [{ id: 'kev', user_id: 'K', paused: true }, { id: 'mine', user_id: 'T', paused: true }], error: null });
+    const p = createPausePoller({ supabase: sb, filterRows: (rows) => rows.filter((r) => r.user_id === 'T') });
+    assert.deepStrictEqual([...(await p.poll())], ['mine']);
+  }
+  {
+    const src = require('fs').readFileSync(require('path').join(__dirname, 'live-runner.js'), 'utf8');
+    assert.match(src, /createPausePoller\(\{ supabase, filterRows: \(rows\) => liveUsers\.filterParlays\(rows\)/);
   }
   console.log('lock-pause probe tests ok');
 })().catch((e) => { console.error(e); process.exit(1); });

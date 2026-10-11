@@ -421,7 +421,7 @@ const userCaps = createUserCaps({
 // Per-user Combo Locks fees: out of allowance + credits => no new quotes.
 const userCredits = createUserCredits({ client: supabase, log: (m) => console.log(`[${MODE}] ${m}`) });
 
-const pausePoller = createPausePoller({ supabase, log: (m) => console.log(`[${MODE}] ${m.replace(/^\[PAUSE\] /, 'PAUSE ')}`) });
+const pausePoller = createPausePoller({ supabase, filterRows: (rows) => liveUsers.filterParlays(rows), log: (m) => console.log(`[${MODE}] ${m.replace(/^\[PAUSE\] /, 'PAUSE ')}`) });
 const userCancelPoller = createUserCancelPoller({ supabase, log: (m) => console.log(`[${MODE}] ${m.replace(/^\[USER-CANCEL\] /, 'USER-CANCEL ')}`) });
 
 async function cancelPausedLock(parlayId) {
