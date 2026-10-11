@@ -284,11 +284,13 @@ function isQuoteExecutionStub(row) {
   return false;
 }
 
-// Cap / filled-so-far. Polymarket order fills count. Kalshi quote-execution
-// stubs do not — only rows Kalshi's fills API confirmed (or any other
-// non-stub combo row already stored from that API).
+// Cap / filled-so-far. Only true lock (maker) fills count. Manual taker
+// buys attributed to a parlay must not consume remaining. Kalshi
+// quote-execution stubs do not either — only rows Kalshi's fills API
+// confirmed (or any other non-stub combo row already stored from that API).
 function countsTowardCap(row) {
   if (!row) return false;
+  if (row.is_taker === true) return false;
   if (isQuoteExecutionStub(row)) return false;
   return true;
 }

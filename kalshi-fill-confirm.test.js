@@ -69,6 +69,7 @@ assert.ok(PHANTOMS.every(isQuoteExecutionStub));
 assert.ok(!isQuoteExecutionStub(REAL));
 assert.ok(PHANTOMS.every((row) => !countsTowardCap(row)));
 assert.ok(countsTowardCap(REAL));
+assert.ok(!countsTowardCap({ ...REAL, is_taker: true }), 'taker fills do not count toward the lock cap');
 close(sumConfirmedFillCounts(PHANTOMS.concat([REAL])), 2820.86);
 close(
   PHANTOMS.reduce((sum, row) => sum + row.count, 0) + REAL.count,
