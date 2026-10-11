@@ -68,7 +68,9 @@ function diffPaused(prev, next) {
 
 // Fast poll of {id, paused} for active locks so a toggle takes effect in
 // seconds instead of waiting for the 30s refresh.
-function createPausePoller({ supabase, log = () => {}, now = () => Date.now() } = {}) {
+// filterRows: keep only this process's locks (tester children: their own user), so the
+// poll set matches refresh() and a lock outside scope never flaps PAUSED/RESUMED.
+function createPausePoller({ supabase, log = () => {}, now = () => Date.now(), filterRows = (rows) => rows } = {}) {
   let columnMissing = false;
   let probeColsMissing = false;
   return {
@@ -77,7 +79,7 @@ function createPausePoller({ supabase, log = () => {}, now = () => Date.now() } 
     async poll() {
       if (columnMissing || !supabase) return null;
       try {
-        const cols = probeColsMissing ? 'id,paused' : 'id,paused,probe_paused_at,probe_pause_until';
+        const cols = probeColsMissing ? 'id,user_id,paused' : 'id,user_id,paused,probe_paused_at,probe_pause_until';
         const res = await supabase.from('combo_parlays').select(cols).eq('active', true);
         if (res && res.error) {
           const msg = String(res.error.message || '');
@@ -92,7 +94,7 @@ function createPausePoller({ supabase, log = () => {}, now = () => Date.now() } 
           }
           return null;
         }
-        const split = splitPaused((res && res.data) || [], now());
+        const split = splitPaused(filterRows((res && res.data) || []) || [], now());
         const ids = split.pausedIds;
         ids.probeUntil = split.probeUntil;
         return ids;
