@@ -83,8 +83,9 @@ function fakeDb(init) {
   };
   return db;
 }
-function fakeKalshi({ main = 50000, combo = 3000, transferStatus = 'completed', transferError = null } = {}) {
-  const k = { transfers: [], records: [] };
+function fakeKalshi({ main = 50000, combo = 3000, transferStatus = 'completed', transferError = null, resting = false, restingErr = null, uncertain = false } = {}) {
+  const k = { transfers: [], records: [], activity: [] };
+  k.shardActivity = async (i) => { k.activity.push(i); if (restingErr) throw restingErr; return { openPositions: false, restingOrders: resting, uncertain }; };
   k.getShard = async (i) => ({ availableCents: i === 0 ? main : combo, portfolioCents: 0 });
   k.transfer = async (args) => {
     if (transferError) throw transferError;
@@ -105,6 +106,21 @@ const base = () => ({
 const mk = (db, k, extra = {}) => createTesterFunder({ userId: T, supabase: db, client: k, env: {}, now: () => NOW, log: () => {}, sleep: async () => {}, ...extra });
 
 (async () => {
+  // Resting orders on Default (shard 0): no Default -> Combos move; failed/unknown check also skips.
+  {
+    const db = fakeDb(base()); const k = fakeKalshi({ resting: true });
+    const r = await mk(db, k).check('test');
+    assert.equal(r.skipped, 'default_resting_orders'); assert.equal(k.transfers.length, 0); assert.equal(db.inserts.length, 0);
+    assert.deepEqual(k.activity, [0]);
+  }
+  {
+    const db = fakeDb(base()); const k = fakeKalshi({ restingErr: new Error('boom') });
+    assert.equal((await mk(db, k).check('test')).skipped, 'resting_check_failed'); assert.equal(k.transfers.length, 0);
+  }
+  {
+    const db = fakeDb(base()); const k = fakeKalshi({ uncertain: true });
+    assert.equal((await mk(db, k).check('test')).skipped, 'resting_unknown'); assert.equal(k.transfers.length, 0);
+  }
   // Happy path: logged first, own Default (0) -> own Combos (1), confirmed.
   {
     const db = fakeDb(base()); const k = fakeKalshi();

@@ -282,6 +282,16 @@ function createTesterFunder({
       note(`hold: ${plan.reason}`, `combos=${fmt(combo.availableCents)} default=${fmt(main.availableCents)} cap=${fmt(capCents)} today=${fmt(todayCents)}`);
       return { plan };
     }
+    // Never pull Default cash while the tester has resting orders there:
+    // Kalshi cancels resting orders whose collateral a transfer takes.
+    // If the check fails, skip the move.
+    let act;
+    try {
+      if (!kalshi.shardActivity) throw new Error('no resting-order check');
+      act = await kalshi.shardActivity(DEFAULT_SHARD);
+    } catch (e) { note('hold: Default resting-order check failed', shortErr(e)); return { skipped: 'resting_check_failed' }; }
+    if (!act || act.uncertain) { note('hold: Default resting orders unknown'); return { skipped: 'resting_unknown' }; }
+    if (act.restingOrders) { note('hold: resting orders on Default', `default=${fmt(main.availableCents)}`); return { skipped: 'default_resting_orders' }; }
     return send({ maxMoveCents: configFor(s).maxMoveCents, amountCents: plan.amountCents, fromShard: DEFAULT_SHARD, toShard: COMBOS_SHARD, reason: plan.reason, trigger, combo, main, capCents, todayCents, date });
   }
 
