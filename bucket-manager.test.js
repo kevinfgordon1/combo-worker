@@ -340,8 +340,9 @@ function fakeBook(initial) {
       if (state.recordsError) throw new Error(state.recordsError);
       return state.records.map((r) => ({ ...r }));
     },
-    async shardActivity() {
+    async shardActivity(shard) {
       calls.shardActivity += 1;
+      if (shard === 0 && state.mainFlat) return { ...state.mainFlat };
       if (state.flatError) throw new Error(state.flatError);
       return { ...state.flat };
     },
@@ -502,6 +503,23 @@ async function main() {
     assert.ok(!h.alerts.some((t) => /bucket transfer/.test(t)));
   }
 
+  // Top-up never drains shard 0 while it has resting orders (Kalshi cancels them).
+  {
+    const book = fakeBook({ main: cents(20_000), bucket: cents(2_000) });
+    book.state.mainFlat = { openPositions: false, restingOrders: true, uncertain: false };
+    const h = harness(LIVE, book);
+    const out = await h.mgr.check('interval');
+    assert.strictEqual(out.decision.action, 'hold');
+    assert.strictEqual(out.decision.reason, 'topup_main_resting_orders');
+    assert.strictEqual(book.transfers.length, 0);
+    book.state.mainFlat = { openPositions: false, restingOrders: false, uncertain: true };
+    const unk = await h.mgr.check('interval');
+    assert.strictEqual(unk.decision.reason, 'topup_main_orders_unknown');
+    assert.strictEqual(book.transfers.length, 0);
+    book.state.mainFlat = { openPositions: true, restingOrders: false, uncertain: false };
+    const ok = await h.mgr.check('interval');
+    assert.strictEqual(ok.decision.action, 'topup', 'open positions alone do not block');
+  }
   // Sweep: off by default, then on only when flat, off-window, and above target.
   {
     const book = fakeBook({ main: cents(20_000), bucket: cents(12_000) });
@@ -1425,5 +1443,12 @@ main().catch((err) => {
   // pct 0 -> fixed dollar targets.
   const fixed = loadBucketConfig({ KALSHI_BUCKET_TARGET_PCT: '0' });
   assert.strictEqual(baseBucketTarget(fixed, true, main, bucket), cents(12_000));
+  {
+    const d = planBucketAction({ mainAvailableCents: 500_000, bucketAvailableCents: 0, gameday: false,
+      sweepEnabled: false, dailyTopupCents: 0, needCents: 0, config: cfg,
+      mainResting: { restingOrders: true } });
+    assert.strictEqual(d.action, 'hold');
+    assert.strictEqual(d.amountCents, 0);
+  }
   console.log('bucket pct target ok');
 }

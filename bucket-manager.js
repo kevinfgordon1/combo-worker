@@ -284,6 +284,7 @@ function planBucketAction({
   dailyTopupCents,
   needCents,
   config,
+  mainResting = null,
 }) {
   const baseTargetCents = baseBucketTarget(config, gameday, mainAvailableCents, bucketAvailableCents);
   // A recently rejected quote (insufficient_balance) lifts the target to its
@@ -304,6 +305,18 @@ function planBucketAction({
   };
 
   if (gap > 0) {
+    // Never pull cash out of shard 0 while the user has resting orders there
+    // (or we could not tell): Kalshi cancels resting orders whose collateral
+    // a transfer takes. Manual orders on main cash must survive top-ups.
+    if (mainResting && (mainResting.restingOrders || mainResting.uncertain)) {
+      return {
+        ...base,
+        action: 'hold',
+        block: null,
+        amountCents: 0,
+        reason: mainResting.restingOrders ? 'topup_main_resting_orders' : 'topup_main_orders_unknown',
+      };
+    }
     // Ceiling on available cash only (open positions do not count).
     const headroom = config.ceilingCents - bucketAvailableCents;
     const spare = mainAvailableCents - config.floorCents;
@@ -1079,7 +1092,18 @@ function createBucketManager({
       }
     }
 
+    let mainResting = null;
+    if (targetCents - shards.bucket.availableCents > 0) {
+      try {
+        mainResting = await kalshi.shardActivity(MAIN_SHARD);
+      } catch (e) {
+        log(`[BUCKET] shard 0 resting-order check failed ${e && e.message ? e.message : e} — not topping up`);
+        mainResting = { uncertain: true, openPositions: false, restingOrders: false };
+      }
+    }
+
     const decision = planBucketAction({
+      mainResting,
       mainAvailableCents: shards.main.availableCents,
       bucketAvailableCents: shards.bucket.availableCents,
       bucketPortfolioCents: shards.bucket.portfolioCents,
