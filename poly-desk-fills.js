@@ -28,7 +28,7 @@ function formatDeskFillAlert(activity, trade) {
     (trade.marketSlug ? `\n${trade.marketSlug}` : '');
 }
 
-function createPolyDeskFillWatcher({ http, sendAlert, now = Date.now, log = console.log, maxPages = 1 } = {}) {
+function createPolyDeskFillWatcher({ http, sendAlert, now = Date.now, log = console.log, maxPages = 1, skipSlug = null } = {}) {
   const seen = new Set();
   const startedAt = now();
   let primed = false;
@@ -53,6 +53,8 @@ function createPolyDeskFillWatcher({ http, sendAlert, now = Date.now, log = cons
         remember(id);
         if (!primed) continue;
         if (isComboSlug(trade.marketSlug)) continue;
+        // Single-leg Combo Lock rests send their own FILL alert.
+        if (skipSlug && skipSlug(trade.marketSlug)) continue;
         const ts = Date.parse(trade.createTime || '');
         if (Number.isFinite(ts) && ts < startedAt - 60000) continue;
         const text = formatDeskFillAlert(a, trade);

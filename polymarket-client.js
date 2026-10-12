@@ -288,6 +288,24 @@ function createPolymarketHttp({
       const j = res.json;
       return (j && j.market) || j;
     },
+    // Single-market limit orders (single-leg Combo Locks). Same Retail
+    // endpoints the Live Trading Desk uses.
+    async createOrder(body) {
+      const res = await request('POST', '/v1/orders', { body });
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        throwHttpError('POST', '/v1/orders', res, { signMode: res.signMode });
+      }
+      return res.json;
+    },
+    async cancelOrder(orderId, marketSlug) {
+      const path = `/v1/order/${encodeURIComponent(orderId)}/cancel`;
+      const res = await request('POST', path, { body: { marketSlug } });
+      if (res.statusCode === 404) return { statusCode: 404 };
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        throwHttpError('POST', path, res, { signMode: res.signMode });
+      }
+      return { statusCode: res.statusCode, json: res.json };
+    },
     async createQuote(body) {
       const res = await request('POST', '/v1/rfqs/quotes', { body });
       if (res.statusCode < 200 || res.statusCode >= 300) {

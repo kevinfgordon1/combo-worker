@@ -236,3 +236,14 @@ cap (`combo_settings.autofund_cap_usd`, set on the Combo Locks card), clamped
 to their `combo_live_users.max_per_day_usd`; no cap set = the daily limit.
 Successful moves are logged quietly (log table only, no banner or Telegram). Per-tester off switches: the tester's kill
 switch, owner Pause, `can_trade=false`, or a key without Transfers.
+
+## Single-leg locks (SINGLE_LEG_LIVE)
+
+1-leg Combo Locks rest the hedge as plain limit orders on Kalshi (single
+market, shard 0 / main cash) and Polymarket US (single moneyline market), capped
+across venues (single-leg.js, single-leg-runner.js). Needs
+`sql/20261012_combo_single_leg.sql` from aibetbuilder applied first.
+
+- `SINGLE_LEG_LIVE` unset/0 = off (default), `dry` = log what it would place, `1` = live.
+- `SINGLE_LEG_POLL_MS` fill poll, default 1500 (min 1000).
+- Same variable on combo-testers applies to every tester child (their own keys).

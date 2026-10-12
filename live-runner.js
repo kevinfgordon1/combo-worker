@@ -212,6 +212,9 @@ const { createPartialQuoteDryRun, isPartialQuoteFlagOn } = require('./partial-qu
 const MODE = 'LIVE';
 const { createTelegramGate } = require('./tg-gate');
 const { createPolyDeskFillWatcher } = require('./poly-desk-fills');
+const { comboLocksOnly } = require('./single-leg');
+const { createSingleLegRunner } = require('./single-leg-runner');
+let singleLeg = null;
 let bucketManager = null;
 // Tester children only: moves the tester's own Kalshi Default -> Combos money
 // (tester-funder.js). Never created in Kevin's worker.
@@ -2222,7 +2225,7 @@ async function onRfq(rfq, env) {
     });
   }
 
-  const p = matchParlay(rfq, parlays);
+  const p = matchParlay(rfq, comboLocksOnly(parlays));
   const intakeAgeMs = p ? latency.noteIntake(rfq.createdTs) : null;
   if (p && intakeAgeMs != null && intakeAgeMs > STALE_RFQ_MS) {
     // Delivered late (reconnect gap / backlog). Kalshi has almost surely closed it (the 234
@@ -2749,7 +2752,7 @@ async function main() {
     kalshiPendingQuotes: pendingQuotes,
     capBook,
     getOutstanding: outstandingFor,
-    getParlays: () => parlays,
+    getParlays: () => comboLocksOnly(parlays),
     filledSoFarFor,
     freshFilledFor,
     resolveHolds,
@@ -2791,6 +2794,22 @@ async function main() {
   });
   polyLoop = poly;
 
+  // Single-leg locks: rest the hedge on Kalshi + Polymarket single markets,
+  // capped across venues (single-leg.js). SINGLE_LEG_LIVE=1 to enable.
+  singleLeg = createSingleLegRunner({
+    env: process.env,
+    supabase,
+    kalshiSigned: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
+    polyHttp: (poly && poly.http) || null,
+    seriesFees,
+    getParlays: () => parlays,
+    userIds: SCOPE.userIds,
+    isBlocked: (userId, lock) => killEngagedFor(userId, lock),
+    sendAlert,
+    log: (m) => console.log(`[${MODE}] ${m}`),
+  });
+  singleLeg.start();
+
   // Polymarket US fills outside Combo Locks (Live Trading Desk) -> Telegram.
   // Kevin's account only; POLY_DESK_FILL_ALERTS=0 turns it off.
   if (!SCOPE.isTester && process.env.POLY_DESK_FILL_ALERTS !== '0' && poly && poly.http) {
@@ -2798,6 +2817,7 @@ async function main() {
       http: poly.http,
       sendAlert,
       log: (m) => console.log(`[${MODE}] ${m}`),
+      skipSlug: (slug) => !!(singleLeg && singleLeg.ownsSlug(slug)),
     });
     deskFills.tick();
     setInterval(unlessQuoteHot(() => { deskFills.tick(); }), 30000);
