@@ -1595,6 +1595,8 @@ async function persistExecutedFill(pending, evt) {
           label: pending.label,
           venue,
           source: evt.source || 'live-runner',
+          yesPrice: evt.yesPrice,
+          fee: evt.fee,
         })),
         { onConflict: 'fill_id' },
       );

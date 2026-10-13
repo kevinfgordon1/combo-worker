@@ -1048,6 +1048,16 @@ function findPendingForOrderExecution(pendingQuotes, ex) {
   return null;
 }
 
+// Execution price (YES, dollars): lastPx, else the order's avg/limit price.
+function execYesPrice(ex) {
+  const order = (ex && ex.order) || {};
+  for (const v of [ex && (ex.lastPx || ex.last_px), order.avgPx || order.avg_px, order.price]) {
+    const n = parseFloat(v && typeof v === 'object' ? v.value : v);
+    if (Number.isFinite(n) && n > 0 && n < 1) return n;
+  }
+  return null;
+}
+
 function orderFillEvent(ex, pending, pendingId) {
   const typ = normalizeExecutionType(ex && ex.type);
   const orderId = orderIdFromExecution(ex);
@@ -1060,6 +1070,8 @@ function orderFillEvent(ex, pending, pendingId) {
     contracts,
     venue: 'polymarket',
     isPartial: typ === 'EXECUTION_TYPE_PARTIAL_FILL',
+    yesPrice: execYesPrice(ex),
+    fee: 0,
     rfqId: (pending && pending.rfqId) || rfqIdFromExecution(ex) || null,
     marketTicker: (pending && (pending.marketTicker || pending.market_ticker || pending.symbol)) || null,
     label: pending && pending.label,
