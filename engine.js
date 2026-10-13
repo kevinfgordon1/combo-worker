@@ -295,7 +295,9 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
   const reserved = outstanding > 0 ? outstanding : 0;
   const already = alreadyFilled + reserved;
   const remainingBefore = Math.max(0, totalLimit - already);
-  if (remainingBefore <= 0) {
+  // Under one contract left on a lock that was sized >= 1: treat as full. Sub-contract
+  // RFQs only produce dust fills and keep a nearly-done lock quoting all game.
+  if (remainingBefore <= 0 || (remainingBefore < 1 && totalLimit >= 1)) {
     return { ok: false, reason: 'limit_reached', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved, remaining: 0 };
   }
   const maxThisFill = Math.min(remainingBefore, cap);
