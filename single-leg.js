@@ -11,12 +11,22 @@
 //               (US rebates need $10M+ monthly maker volume from Oct 19), so
 //               the price is just 1 - implied(fill), floored to the tick.
 //
-// Cross-venue cap: filled(K) + filled(P) never exceeds the lock size. Each
-// venue rests at most `remaining = cap - totalFilled`. Every poll (default
-// 1.5s) reads both orders; when anything filled, the other venue is shrunk to
-// the new remaining (Kalshi: decrease; Polymarket: cancel + re-rest) or
-// cancelled at 0. Both filling inside one poll is the only way to over-hedge;
-// it is trimmed at once and sent as a CRITICAL Telegram alert.
+// Taker first: when the hedge side's best price on a venue is at or better
+// than the lock's hedge price AFTER the taker fee, it is taken (IOC), sized
+// to the depth at acceptable prices and capped at what is left to hedge.
+// Otherwise it rests maker-only at the lock price, never crossing: if that
+// price would cross the book it rests one tick behind the best price.
+//
+// Cross-venue cap: filled(K) + filled(P) + open(K) + open(P) never exceeds
+// the lock size. The remaining size is SPLIT between venues (Kalshi gets
+// ceil(remaining × SINGLE_LEG_KALSHI_SHARE, default 0.5), Polymarket the
+// rest), so even if both venues fill at the same instant the total can't go
+// past the cap. Every poll (default 1.5s) reads both orders; after a fill the
+// targets shrink and the other venue is decreased/cancelled. Orders whose
+// cancel failed stay tracked (and counted as open) until a later read shows
+// them closed; nothing is placed on that venue meanwhile. If an over-hedge is
+// ever detected anyway (e.g. a manual order), a CRITICAL Telegram alert goes
+// out; the excess is NOT sold back automatically.
 //
 // Both orders are cancelled when the game starts, the lock is cancelled,
 // paused, edited (price changes => cancel + re-rest), deactivated, or the
@@ -131,18 +141,18 @@ function polyHedgeIntent(leg, market) {
 
 // Polymarket US limit body (same shape the Live Trading Desk sends).
 // price.value is always the LONG (YES) price.
-function polyOrderBody({ slug, intent, cost, qty, tick = 0.01 }) {
+function polyOrderBody({ slug, intent, cost, qty, tick = 0.01, taker = false }) {
   const yes = intent === 'ORDER_INTENT_BUY_SHORT' ? round6(1 - cost) : cost;
-  const dec = Number(tick) < 0.01 ? 3 : 2;
+  const dec = Number(tick) < 0.01 ? 4 : 2;
   return {
     marketSlug: slug,
     type: 'ORDER_TYPE_LIMIT',
     price: { value: yes.toFixed(dec), currency: 'USD' },
     quantity: Math.floor(qty),
-    tif: 'TIME_IN_FORCE_GOOD_TILL_CANCEL',
+    tif: taker ? 'TIME_IN_FORCE_IMMEDIATE_OR_CANCEL' : 'TIME_IN_FORCE_GOOD_TILL_CANCEL',
     intent,
     manualOrderIndicator: 'MANUAL_ORDER_INDICATOR_MANUAL',
-    participateDontInitiate: true,
+    participateDontInitiate: !taker,
   };
 }
 
@@ -163,39 +173,170 @@ function lockStartMs(p) {
   return times.length ? Math.min(...times) : null;
 }
 
+// ── Fees / odds ────────────────────────────────────────────────────────────
+const KALSHI_TAKER_K = 0.07;
+const POLY_TAKER_THETA = 0.0695; // Polymarket US taker: 0.0695 × C × p(1−p)
+const takerFee = (k, q) => k * q * (1 - q);
+// American odds for buying a contract at cost c (0..1).
+function americanFromCost(c) {
+  const x = Number(c);
+  if (!(x > 0 && x < 1)) return null;
+  return x >= 0.5 ? -Math.round((100 * x) / (1 - x)) : Math.round((100 * (1 - x)) / x);
+}
+const fmtAmerican = (a) => (a == null ? '?' : a > 0 ? `+${a}` : `${a}`);
+// The hedge cost the lock can afford per contract, after fees.
+const hedgeTarget = (fillAmerican) => {
+  const a = Number(fillAmerican);
+  return Number.isFinite(a) && a !== 0 ? 1 - impliedProb(a) : null;
+};
+
+// Kalshi orderbook_fp: yes_dollars / no_dollars are BIDS [[price, qty]].
+// Buying side S takes the opposite side's bids: ask(S) = 1 − bid(other).
+function kalshiAsks(fp, buySide) {
+  const src = (fp && (fp.orderbook_fp || fp.orderbook || fp)) || {};
+  const bids = buySide === 'no' ? (src.yes_dollars || src.yes || []) : (src.no_dollars || src.no || []);
+  return bids.map((r) => {
+    const px = Number(Array.isArray(r) ? r[0] : r && r.price);
+    const qty = Number(Array.isArray(r) ? r[1] : r && r.count);
+    const p = px > 1 ? px / 100 : px;
+    return { cost: round6(1 - p), qty };
+  }).filter((l) => l.cost > 0 && l.cost < 1 && l.qty > 0).sort((a, b) => a.cost - b.cost);
+}
+// Polymarket US book: bids/offers are LONG prices. BUY_SHORT takes long bids
+// (cost 1−px); BUY_LONG takes offers (cost px).
+function polyAsks(book, intent) {
+  const d = (book && (book.marketData || book)) || {};
+  const rows = intent === 'ORDER_INTENT_BUY_SHORT' ? (d.bids || []) : (d.offers || []);
+  return rows.map((r) => {
+    const px = Number(r && r.px && typeof r.px === 'object' ? r.px.value : r && r.px);
+    const qty = Number(r && r.qty);
+    return { cost: round6(intent === 'ORDER_INTENT_BUY_SHORT' ? 1 - px : px), qty };
+  }).filter((l) => l.cost > 0 && l.cost < 1 && l.qty > 0).sort((a, b) => a.cost - b.cost);
+}
+
+// Walk asks while cost + taker fee <= target. Returns the IOC plan.
+function takePlan(asks, target, takerK, maxQty) {
+  let qty = 0; let spend = 0; let worst = null;
+  const cap = Math.floor(Number(maxQty) || 0);
+  for (const l of asks || []) {
+    if (qty >= cap) break;
+    if (l.cost + takerFee(takerK, l.cost) > target + 1e-9) break;
+    const q = Math.min(Math.floor(l.qty), cap - qty);
+    if (q < 1) continue;
+    qty += q; spend += q * (l.cost + takerFee(takerK, l.cost)); worst = l.cost;
+  }
+  return qty > 0 ? { qty, worstCost: worst, avgNet: round6(spend / qty) } : null;
+}
+
+// Maker rest price: the lock price, or one tick behind the best ask if the
+// lock price would cross (post-only would be rejected).
+function restCost(lockCost, asks, tick) {
+  if (lockCost == null) return null;
+  const best = asks && asks.length ? asks[0].cost : null;
+  if (best == null || lockCost < best - 1e-9) return lockCost;
+  const c = round6(floorTo(best - tick, tick));
+  return c > 0 && c < 1 ? Math.min(c, lockCost) : null;
+}
+
+// Split what is left to hedge across enabled venues (combined exposure cap).
+function allocate(remaining, enabled, kalshiShare = 0.5) {
+  const r = Math.max(0, Math.floor(remaining));
+  const out = { kalshi: 0, polymarket: 0 };
+  if (enabled.kalshi && enabled.polymarket) {
+    const sh = Number(kalshiShare);
+    out.kalshi = Math.min(r, Math.ceil(r * (sh >= 0 && sh <= 1 ? sh : 0.5)));
+    out.polymarket = r - out.kalshi;
+  } else if (enabled.kalshi) out.kalshi = r;
+  else if (enabled.polymarket) out.polymarket = r;
+  return out;
+}
+
+// ── Polymarket US player props (NHL goals, NFL TDs, MLB HRs) ───────────────
+const PROP_SERIES = {
+  KXNHLGOAL: { game: 'KXNHLGAME', kind: 'hockey_player_goals' },
+  KXNFLTD: { game: 'KXNFLGAME', kind: 'football_player_touchdowns' },
+  KXMLBHR: { game: 'KXMLBGAME', kind: 'baseball_player_home_runs' },
+};
+const nameTokens = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+  .replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((t) => t.length > 1);
+// -> { eventSlugs, kind, threshold, name } or null
+function propPolyRef(leg) {
+  const parts = String((leg && leg.ticker) || '').toUpperCase().split('-');
+  const spec = PROP_SERIES[parts[0]];
+  if (!spec || parts.length < 4) return null;
+  const threshold = Number(parts[parts.length - 1]);
+  if (!(threshold >= 1)) return null;
+  const name = String(leg.player || leg.label || '').split(':')[0].trim();
+  if (nameTokens(name).length < 2) return null;
+  const eventSlugs = [...new Set(polySlugCandidates(`${spec.game}-${parts[1]}`).map((s) => s.replace(/^aec-/, '')))];
+  return eventSlugs.length ? { eventSlugs, kind: spec.kind, threshold, name } : null;
+}
+// Unique market in a Poly event for this player + line, else null.
+function findPropMarket(event, ref) {
+  const want = nameTokens(ref.name);
+  const lineOk = (l) => { const n = Number(l); return n === ref.threshold || n === ref.threshold - 0.5; };
+  const hits = ((event && event.markets) || []).filter((m) => m && (m.sportsMarketType || m.marketType) === ref.kind
+    && m.closed !== true && m.active !== false && lineOk(m.line)
+    && want.every((t) => nameTokens((m.metadata && m.metadata.playerName) || '').includes(t)));
+  return hits.length === 1 ? hits[0] : null;
+}
+// LONG = player reaches the line. User on yes -> hedge buys SHORT.
+const propIntent = (leg) => (String(leg.side || 'yes').toLowerCase() === 'no' ? 'ORDER_INTENT_BUY_LONG' : 'ORDER_INTENT_BUY_SHORT');
+
 // ── Pure cross-venue plan ──────────────────────────────────────────────────
-// venues: { kalshi: { filled, open, price, wantPrice, enabled }, poly: {...} }
-//   filled  contracts filled so far on that venue (this lock)
-//   open    contracts still resting (0 = no live order)
-//   price / wantPrice   current resting price vs the lock's price now
-//   enabled venue configured + market found
-// Returns { remaining, over, actions: [{ venue, op: place|resize|cancel, size }] }
-function planCrossVenue({ cap, venues, active }) {
+// venues: { kalshi: {...}, polymarket: {...} } each
+//   filled   contracts filled so far on that venue (this lock)
+//   open     contracts still resting or unconfirmed (incl. failed cancels)
+//   pending  contracts on orders whose cancel failed (can't be touched)
+//   price / wantPrice   current resting cost vs the cost we want now
+//   enabled  venue configured + market found
+// Returns { remaining, over, filled, targets, actions:[{venue, op, size}] }
+// Invariant: filled + open across venues never goes above cap.
+function planCrossVenue({ cap, venues, active, kalshiShare = 0.5 }) {
   const names = Object.keys(venues || {});
   const filled = names.reduce((n, v) => n + (Number(venues[v].filled) || 0), 0);
   const capN = Math.max(0, Math.floor(Number(cap) || 0));
   const remaining = Math.max(0, capN - filled);
   const over = Math.max(0, filled - capN);
+  const enabled = {};
+  for (const v of names) enabled[v] = !!(active && venues[v].enabled);
+  const targets = allocate(remaining, enabled, kalshiShare);
   const actions = [];
+  const after = {};
   for (const v of names) {
     const s = venues[v];
     const open = Math.max(0, Number(s.open) || 0);
-    if (!active || !s.enabled || remaining <= 0) {
-      if (open > 0) actions.push({ venue: v, op: 'cancel', size: 0 });
+    const pending = Math.max(0, Math.min(open, Number(s.pending) || 0));
+    const movable = open - pending;
+    const tgt = targets[v] || 0;
+    after[v] = open;
+    if (tgt <= 0) {
+      if (movable > 0) { actions.push({ venue: v, op: 'cancel', size: 0 }); after[v] = pending; }
       continue;
     }
-    if (open > 0 && s.wantPrice != null && s.price != null && Number(s.price) !== Number(s.wantPrice)) {
-      actions.push({ venue: v, op: 'cancel', size: 0, reprice: true });
-      actions.push({ venue: v, op: 'place', size: remaining });
-      continue;
+    const repriced = movable > 0 && s.wantPrice != null && s.price != null && Math.abs(Number(s.price) - Number(s.wantPrice)) > 1e-9;
+    if (repriced) { actions.push({ venue: v, op: 'cancel', size: 0, reprice: true }); after[v] = pending; }
+    else if (open > tgt && movable > 0) {
+      const keep = Math.max(0, tgt - pending);
+      actions.push(keep > 0 ? { venue: v, op: 'resize', size: keep } : { venue: v, op: 'cancel', size: 0 });
+      after[v] = pending + keep;
     }
-    if (open > remaining) actions.push({ venue: v, op: 'resize', size: remaining });
-    else if (open === 0 && !s.done) actions.push({ venue: v, op: 'place', size: remaining });
   }
-  // Shrinks/cancels first: never add exposure before removing it.
+  // Places only after every shrink, and only into room that is really free.
+  let room = remaining - names.reduce((n, v) => n + after[v], 0);
+  for (const v of names) {
+    const s = venues[v];
+    if (!(targets[v] > 0) || (Number(s.pending) || 0) > 0) continue;
+    const gap = Math.min(targets[v] - after[v], room);
+    // top-ups below 10% of target are not worth the churn
+    if (gap >= 1 && (after[v] === 0 || gap >= Math.max(1, 0.1 * targets[v]))) {
+      actions.push({ venue: v, op: 'place', size: Math.floor(gap) });
+      room -= Math.floor(gap);
+    }
+  }
   const rank = { cancel: 0, resize: 1, place: 2 };
   actions.sort((a, b) => rank[a.op] - rank[b.op]);
-  return { remaining, over, filled, actions };
+  return { remaining, over, filled, targets, actions };
 }
 
 module.exports = {
@@ -211,4 +352,18 @@ module.exports = {
   cancelHeld,
   planCrossVenue,
   nominalFromNet,
+  americanFromCost,
+  fmtAmerican,
+  hedgeTarget,
+  kalshiAsks,
+  polyAsks,
+  takePlan,
+  restCost,
+  allocate,
+  propPolyRef,
+  findPropMarket,
+  propIntent,
+  takerFee,
+  KALSHI_TAKER_K,
+  POLY_TAKER_THETA,
 };
