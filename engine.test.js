@@ -566,3 +566,9 @@ console.log('engine.test.js ok');
   assert.deepStrictEqual(scCount, { rfq_id: 'rfq-sub2', yes_bid: '0.00', no_bid: '0.774', rest_remainder: false });
 }
 console.log('engine subcent ok');
+
+{
+  const d = decideAtFill({ parlayStake: 75, parlayAmerican: 200, fillAmerican: 175, rfqContracts: 0.5, hedgeMode: 'riskfree_open', maxContracts: 235, filledSoFar: 234.1 });
+  assert.equal(d.ok, false); assert.equal(d.reason, 'limit_reached');
+  console.log('engine remaining<1 gate ok');
+}
