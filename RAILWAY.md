@@ -84,8 +84,8 @@ The poller starts only on the Combo Locks service (`npm start` / `start-live.js`
 | `DESK_PROTECT_SWEEP_URL` | unset | HTTPS URL, `POST /api/desk-protect-sweep` on aibetbuilder. Unset → poller is not started. |
 | `DESK_PROTECT_SWEEP_SECRET` | unset | Shared secret, request header `X-Desk-Protect-Secret`. At least 16 characters, one line. Not a Supabase user JWT. Do not prefix with `VITE_`. Do not put it in the URL. |
 | `DESK_PROTECT_POLL_MS` | `1500` | Clamped to 1000–10000. |
-| `DESK_PROTECT_THROUGH_CENTS` | `3` | X. Cents through mid that count as picked off. Sent as `defaults.throughCents`. |
-| `DESK_PROTECT_REST_OFFSET_CENTS` | `1` | Y. Re-rest a buy at mid − Y and a sell at mid + Y. `0` re-rests at mid. |
+| `DESK_PROTECT_THROUGH_CENTS` | `2` | X. Cents through mid that count as picked off. Sent as `defaults.throughCents`. |
+| `DESK_PROTECT_REST_OFFSET_CENTS` | `0.5` | Y. Re-rest a buy at mid − Y and a sell at mid + Y. `0` re-rests at mid. |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALERT_CHAT_ID` | optional | One ping per adverse event. If unset, the same text is logged once. |
 
 Point Combo Locks at the sweep after aibetbuilder is serving it (same secret on that server only):
