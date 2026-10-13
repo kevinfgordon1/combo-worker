@@ -234,8 +234,17 @@ function claimFillKey(seen, fillKey) {
   return true;
 }
 
-function liveRunnerFillRow({ quoteId, orderId, fillId, parlayId, count, ticker, rfqId, label, createdAt, venue, source }) {
+// Polymarket US prices are the YES price in dollars (e.g. 0.176). Our hedge
+// sells YES, i.e. holds NO, so no_price = 1 - yes (same shape as Kalshi rows).
+function polyYesPriceOf(v) {
+  const n = parseFloat(v && typeof v === 'object' ? v.value : v);
+  return Number.isFinite(n) && n > 0 && n < 1 ? Math.round(n * 1e6) / 1e6 : null;
+}
+
+function liveRunnerFillRow({ quoteId, orderId, fillId, parlayId, count, ticker, rfqId, label, createdAt, venue, source, yesPrice, fee }) {
   const id = fillId || orderId || quoteId;
+  const yes = polyYesPriceOf(yesPrice);
+  const feeNum = fee != null && Number.isFinite(Number(fee)) ? Number(fee) : null;
   return {
     fill_id: id,
     order_id: orderId || null,
@@ -246,6 +255,9 @@ function liveRunnerFillRow({ quoteId, orderId, fillId, parlayId, count, ticker, 
     is_taker: false,
     outcome_side: 'no',
     action: 'sell',
+    yes_price: yes,
+    no_price: yes == null ? null : Math.round((1 - yes) * 1e6) / 1e6,
+    fee: yes == null ? null : feeNum,
     kalshi_created_time: createdAt || new Date().toISOString(),
     raw: {
       source: source || 'live-runner',
@@ -412,6 +424,7 @@ module.exports = {
   submissionFilledPatch,
   canStampSubmission,
   liveRunnerFillRow,
+  polyYesPriceOf,
   claimFillKey,
   resolveFillLookup,
   findPendingFill,

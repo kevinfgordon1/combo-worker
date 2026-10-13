@@ -738,6 +738,11 @@ function pendingFromSubmission(row) {
   };
 }
 
+function orderPx(v) {
+  const n = parseFloat(v && typeof v === 'object' ? v.value : v);
+  return Number.isFinite(n) && n > 0 && n < 1 ? n : null;
+}
+
 function fillEventFromReconcile({
   quote,
   order,
@@ -775,6 +780,8 @@ function fillEventFromReconcile({
     label: (pending && pending.label) || null,
     parlayId: pending && pending.parlayId,
     source,
+    yesPrice: order ? (orderPx(order.avgPx || order.avg_px) || orderPx(order.price)) : null,
+    fee: 0,
     pending: pending
       ? {
         parlayId: pending.parlayId,
@@ -1275,6 +1282,8 @@ function activityFillEvent({ trade, lock, source }) {
     parlayId: lock.id,
     source: kind,
     tradeTime: trade.createTime || null,
+    yesPrice: trade.price > 0 ? trade.price : null,
+    fee: trade.isAggressor ? null : 0,
     pending: {
       parlayId: lock.id,
       userId: lock.user_id || lock.userId || null,
