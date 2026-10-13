@@ -164,7 +164,7 @@ assert.strictEqual(isAdverseProtectEvent({ id: 'x', adverse: true }), true);
   const body = sweepBody(readDeskProtectConfig(enabledEnv()), ['prot_1']);
   assert.strictEqual(body.op, 'sweep');
   assert.strictEqual(body.mode, 'adverse-only');
-  assert.deepStrictEqual(body.defaults, { throughCents: 3, restOffsetCents: 1 });
+  assert.deepStrictEqual(body.defaults, { throughCents: 2, restOffsetCents: 0.5 });
   assert.deepStrictEqual(body.ackedIds, ['prot_1']);
   assert.ok(!JSON.stringify(body).includes(SECRET));
 }
