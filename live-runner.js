@@ -1350,9 +1350,9 @@ async function reconcileSkipTapes() {
         if (out.error) console.error(`[${MODE}] skip-tape`, row.rfq_id, out.error.message);
         continue;
       }
-      if (row.skip_reason === CLOSED_LIVE) out.patch.skip_reason = finalizeClosedLive(out.rfq, out.patch);
+      if (row.skip_reason === CLOSED_LIVE) out.patch.skip_reason = finalizeClosedLive(out.rfq, out.patch, out.windowTrades);
       await persistSkipTape(id, out.patch);
-      if (out.patch.tape_match === 'matched') counts.tapeMatched++;
+      if (out.patch.tape_match === 'matched' || out.patch.tape_match === 'matched_time') counts.tapeMatched++;
       else counts.tapeNone++;
       console.log(
         `[${MODE}] skip-tape ${out.patch.tape_match} rfq=${row.rfq_id} ` +
