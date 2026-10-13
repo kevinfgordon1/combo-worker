@@ -1511,13 +1511,27 @@ async function reconcileLockActivityEvents(http, {
       seenFillIds,
       slugMap: map,
       bookedFills: booked,
+      activities,
     }));
   } catch (_) {
     return events;
   }
 }
 
-function positionFillEvent({ pos, lock, source = 'poly-position' }) {
+// Positions carry no fill price; recover it from trade history (size-weighted
+// YES price of our maker trades on that market slug).
+function slugYesPrice(activities, slug) {
+  if (!slug) return null;
+  let q = 0; let c = 0;
+  for (const a of activities || []) {
+    const t = tradeFromActivity(a);
+    if (!t || t.marketSlug !== slug || t.isAggressor || !(t.price > 0 && t.price < 1) || !(t.qty > 0)) continue;
+    q += t.qty; c += t.qty * t.price;
+  }
+  return q > 0 ? Math.round((c / q) * 1e6) / 1e6 : null;
+}
+
+function positionFillEvent({ pos, lock, source = 'poly-position', yesPrice = null }) {
   const qty = positionQty(pos);
   if (!lock || !(qty > 0)) return null;
   const slug = pos.marketSlug || (pos.marketMetadata && pos.marketMetadata.slug) || 'pos';
@@ -1533,6 +1547,8 @@ function positionFillEvent({ pos, lock, source = 'poly-position' }) {
     label: lock.label || null,
     parlayId: lock.id,
     source,
+    yesPrice,
+    fee: yesPrice != null ? 0 : null,
     pending: {
       parlayId: lock.id,
       userId: lock.user_id || lock.userId || null,
@@ -1544,7 +1560,7 @@ function positionFillEvent({ pos, lock, source = 'poly-position' }) {
   };
 }
 
-function matchPositionsToLocks(positions, locks, { seenFillIds, slugMap, bookedFills } = {}) {
+function matchPositionsToLocks(positions, locks, { seenFillIds, slugMap, bookedFills, activities } = {}) {
   const events = [];
   const booked = seenFillIds && typeof seenFillIds.has === 'function' ? seenFillIds : null;
   const local = new Set();
@@ -1559,7 +1575,7 @@ function matchPositionsToLocks(positions, locks, { seenFillIds, slugMap, bookedF
     const lock = uniqueLockForMarket(locks, hay || title, slug, map);
     if (!lock) continue;
     if (lockHasPolyContractsForCaoc(lock, slug, bookedFills)) continue;
-    const evt = positionFillEvent({ pos, lock });
+    const evt = positionFillEvent({ pos, lock, yesPrice: slugYesPrice(activities, slug) });
     if (!evt || local.has(evt.fillId) || (booked && booked.has(evt.fillId))) continue;
     local.add(evt.fillId);
     events.push(evt);
@@ -1636,6 +1652,7 @@ module.exports = {
   activityFillEvent,
   matchActivitiesToLocks,
   listAllActivities,
+  slugYesPrice,
   listActivitiesForMarketSlugs,
   hydrateMissingQuotes,
   _resetSlugScanForTest() { slugScanOffset = 0; slugFullPassDone = false; },
