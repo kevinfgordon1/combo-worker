@@ -482,6 +482,10 @@ function messageTypeOf(raw) {
   }
 }
 
+function isRealFeedMessage(parsed) {
+  return !!(parsed && parsed.type && parsed.type !== 'other');
+}
+
 function createPolymarketRfqWs({
   keyId,
   secretKey,
@@ -595,7 +599,8 @@ function createPolymarketRfqWs({
 
     sock.on('open', () => {
       if (ws !== sock) return;
-      backoff = 1000;
+      // Do not reset backoff on open: Polymarket can accept the socket and then
+      // reply with an error / send nothing (outage). Reset only on real data.
       connectedAt = now();
       sendSubscribe();
       status('subscribed');
@@ -621,12 +626,18 @@ function createPolymarketRfqWs({
       if (ws !== sock) return;
       lastMessageAt = now();
       messagesThisConn += 1;
-      if (stalledPending) {
-        stalledPending = false;
-        try { onRecovered && onRecovered({ stalls, reconnects }); } catch (_) {}
-        status('recovered');
-      }
       const parsed = parsePrivateMessage(d.toString());
+      // Only real feed data (RFQ/quote/execution events) proves the socket is
+      // healthy. An error reply or subscribe ack must not clear a stall alert
+      // or reset the reconnect backoff.
+      if (isRealFeedMessage(parsed)) {
+        backoff = 1000;
+        if (stalledPending) {
+          stalledPending = false;
+          try { onRecovered && onRecovered({ stalls, reconnects }); } catch (_) {}
+          status('recovered');
+        }
+      }
       lastMessageType = !parsed ? messageTypeOf(d)
         : (parsed.type === 'other' && parsed.raw && typeof parsed.raw === 'object'
           ? `other:${Object.keys(parsed.raw)[0] || '{}'}` : parsed.type);
@@ -678,6 +689,7 @@ module.exports = {
   queryString,
   createPolymarketHttp,
   createPolymarketRfqWs,
+  isRealFeedMessage,
   DEFAULT_WS_STALL_MS,
   parsePrivateMessage,
   orderUpdateFromMessage,

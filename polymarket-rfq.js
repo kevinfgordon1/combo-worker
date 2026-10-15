@@ -2434,6 +2434,12 @@ function startPolymarketRfqLoop(ctx = {}) {
   let lastWsStallAt = 0;
   let lastReconcileAt = 0;
   let restBackoffSkips = 0;
+  // REST intake health, so stall alerts can say whether REST is really covering.
+  let lastRestOkAt = 0;
+  let lastRestFailAt = 0;
+  function restFailing() {
+    return restBackedOff() || lastRestFailAt > lastRestOkAt;
+  }
   function wsHealthy() {
     if (!ws || typeof ws.stats !== 'function') return false;
     const st = ws.stats();
@@ -2457,6 +2463,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     try {
       const listed = await http.listRfqs({ status: 'RFQ_STATUS_OPEN', limit: 100 });
       const rows = (listed && listed.rfqs) || [];
+      lastRestOkAt = Date.now();
       if (!locks.length) {
         console.log(
           `[${MODE}] reconcile open=${rows.length} locks=0 priceable=0 live=${live} skip=no_locks`
@@ -2479,6 +2486,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         (hist ? ` ${hist}` : '')
       );
     } catch (e) {
+      lastRestFailAt = Date.now();
       logReconcileAuthFailure(e);
     }
   }
@@ -2505,6 +2513,8 @@ function startPolymarketRfqLoop(ctx = {}) {
         shouldPause: ctx.shouldPause,
       });
       intake.recordCrawl(res, Date.now() - t0);
+      if (res.rows.length || !res.error) lastRestOkAt = Date.now();
+      else lastRestFailAt = Date.now();
       const fresh = [];
       for (const row of res.rows) {
         const id = rowId(row);
@@ -2550,6 +2560,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       );
       return { ...res, rows: undefined, open: res.rows.length, exact, near, bulk };
     } catch (e) {
+      lastRestFailAt = Date.now();
       logReconcileAuthFailure(e);
       return null;
     } finally {
@@ -2671,7 +2682,7 @@ function startPolymarketRfqLoop(ctx = {}) {
           `msSinceLastPong=${info.ping && info.ping.msSinceLastPong != null ? info.ping.msSinceLastPong : 'n/a'}`
         );
         if (typeof ctx.onWsStall === 'function') {
-          try { Promise.resolve(ctx.onWsStall(info)).catch(() => {}); } catch (_) { /* observability only */ }
+          try { Promise.resolve(ctx.onWsStall({ ...info, restFailing: restFailing() })).catch(() => {}); } catch (_) { /* observability only */ }
         }
         // REST is the only intake until the WS is back: crawl deep right now.
         if (crawlEnabled && !restBackedOff()) {

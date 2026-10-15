@@ -28,6 +28,12 @@ function fmtCause(info) {
   return parts.join('; ');
 }
 
+function restNote(info) {
+  return info && info.restFailing
+    ? 'REST also failing - no RFQ intake until Polymarket recovers'
+    : 'REST crawl is covering intake meanwhile';
+}
+
 function createPolyStallAlerts({ appAlerts, now = () => Date.now(), log = () => {}, ...opts } = {}) {
   const cfg = { ...DEFAULTS, ...opts };
   const stallTimes = [];
@@ -46,7 +52,7 @@ function createPolyStallAlerts({ appAlerts, now = () => Date.now(), log = () => 
       kind: 'poly_ws_stall_escalated',
       severity: 'warn',
       title: 'Polymarket RFQ WebSocket keeps stalling',
-      body: `${reason}. ${fmtCause(info)}. REST crawl is covering intake meanwhile.`,
+      body: `${reason}. ${fmtCause(info)}. ${restNote(info)}.`,
       dedupeKey: ESCALATED_KEY,
       meta: { reason, stalls_last_hour: recent(), service: 'combo-worker', ...(info || {}) },
     });
@@ -61,7 +67,7 @@ function createPolyStallAlerts({ appAlerts, now = () => Date.now(), log = () => 
       kind: 'poly_ws_stall',
       severity: 'info',
       title: 'Polymarket RFQ WebSocket stalled - reconnecting',
-      body: `${fmtCause(info)}. Socket terminated and reconnected; REST crawl is covering intake meanwhile.`,
+      body: `${fmtCause(info)}. Socket terminated and reconnected; ${restNote(info)}.`,
       dedupeKey: STALL_KEY,
       meta: {
         service: 'combo-worker',
@@ -102,4 +108,5 @@ function createPolyStallAlerts({ appAlerts, now = () => Date.now(), log = () => 
   return { onStall, onRecovered, tick, _state: () => ({ escalated, pending: !!pendingSince, recent: recent() }) };
 }
 
-module.exports = { createPolyStallAlerts, fmtCause, STALL_KEY, ESCALATED_KEY, DEFAULTS };
+module.exports = {
+  restNote, createPolyStallAlerts, fmtCause, STALL_KEY, ESCALATED_KEY, DEFAULTS };

@@ -1,7 +1,7 @@
 'use strict';
 const assert = require('assert');
 const EventEmitter = require('events');
-const { createPolyStallAlerts, fmtCause } = require('./poly-stall-alert');
+const { createPolyStallAlerts, fmtCause, restNote } = require('./poly-stall-alert');
 const { createPolymarketRfqWs, DEFAULT_WS_STALL_MS } = require('./polymarket-client');
 
 const SEED_B64 = Buffer.alloc(32, 7).toString('base64');
@@ -129,7 +129,66 @@ function testClientDiagnostics() {
   ws2.stop();
 }
 
+async function testRestNote() {
+  assert.ok(/REST crawl is covering/.test(restNote({})));
+  assert.ok(/REST also failing/.test(restNote({ restFailing: true })));
+  const a = fakeAlerts(); let t = 1e7;
+  const s = createPolyStallAlerts({ appAlerts: a, now: () => t });
+  for (let k = 0; k < 3; k++) await s.onStall({ silentMs: 35000, restFailing: true });
+  assert.ok(a.raised.every((r) => /REST also failing/.test(r.body) && !/covering/.test(r.body)));
+}
+
+function testOutageNoFalseRecovery() {
+  let t = 2_000_000;
+  const socks = []; const rec = []; const statuses = [];
+  const realST = global.setTimeout; const fns = [];
+  global.setTimeout = (fn) => { fns.push(fn); return 0; };
+  const ws = createPolymarketRfqWs({
+    keyId: 'k', secretKey: SEED_B64, stallMs: 30000, stallCheckMs: 3_600_000, now: () => t,
+    WebSocketImpl: function F() { const s = new FakeSock(); s.terminate = () => s.emit('close', 1006); socks.push(s); return s; },
+    onRecovered: (i) => rec.push(i), onStatus: (s, i) => statuses.push([s, i]),
+  });
+  ws.start();
+  const errMsg = Buffer.from(JSON.stringify({ error: { message: 'unavailable' } }));
+  for (let k = 0; k < 4; k++) {
+    const s = socks[socks.length - 1];
+    s.emit('open'); s.emit('message', errMsg);
+    t += 35000; ws.checkStall(); fns.shift()();
+  }
+  global.setTimeout = realST;
+  assert.strictEqual(rec.length, 0, 'error replies must not count as recovered');
+  const w = statuses.filter(([s]) => s === 'reconnecting').map(([, i]) => i.wait);
+  assert.deepStrictEqual(w, [1000, 2000, 4000, 8000], 'backoff grows during outage');
+  ws.stop();
+}
+
+function testRealDataRecoversAndResetsBackoff() {
+  let t = 3_000_000;
+  const socks = []; const rec = []; const statuses = [];
+  const realST = global.setTimeout; const fns = [];
+  global.setTimeout = (fn) => { fns.push(fn); return 0; };
+  const ws = createPolymarketRfqWs({
+    keyId: 'k', secretKey: SEED_B64, stallMs: 30000, stallCheckMs: 3_600_000, now: () => t,
+    WebSocketImpl: function F() { const s = new FakeSock(); s.terminate = () => s.emit('close', 1006); socks.push(s); return s; },
+    onRecovered: (i) => rec.push(i), onStatus: (s, i) => statuses.push([s, i]),
+  });
+  ws.start();
+  socks[0].emit('open'); t += 31000; ws.checkStall(); fns.shift()();
+  socks[1].emit('open'); t += 31000; ws.checkStall(); fns.shift()();
+  socks[2].emit('open');
+  socks[2].emit('message', Buffer.from(JSON.stringify({ rfqEvent: { rfqCreated: { rfq: { id: 'y' } } } })));
+  assert.strictEqual(rec.length, 1, 'real RFQ recovers');
+  t += 31000; ws.checkStall();
+  global.setTimeout = realST;
+  const w = statuses.filter(([s]) => s === 'reconnecting').map(([, i]) => i.wait);
+  assert.deepStrictEqual(w, [1000, 2000, 1000], 'backoff resets only after real data');
+  ws.stop();
+}
+
 (async () => {
+  await testRestNote();
+  testRealDataRecoversAndResetsBackoff();
+  testOutageNoFalseRecovery();
   await testPolicy();
   await testUnrecovered();
   testClientDiagnostics();

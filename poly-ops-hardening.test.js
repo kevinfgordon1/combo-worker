@@ -102,7 +102,9 @@ async function testWsWatchdog() {
   socks[1].emit('open');
   assert.strictEqual(recovered.length, 0);
   socks[1].emit('message', Buffer.from('{}'));
-  assert.strictEqual(recovered.length, 1, 'recovery reported on first message');
+  assert.strictEqual(recovered.length, 0, 'non-RFQ frame is not recovery');
+  socks[1].emit('message', Buffer.from(JSON.stringify({ rfqEvent: { rfqCreated: { rfq: { id: 'z' } } } })));
+  assert.strictEqual(recovered.length, 1, 'recovery reported on first real RFQ message');
   // a dead socket that never sends anything after reconnect is re-flagged
   t += 61000;
   ws.checkStall();
