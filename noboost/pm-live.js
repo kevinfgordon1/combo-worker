@@ -182,16 +182,28 @@ function createPmLiveBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 
     const out = [];
     let p = 1;
     for (const l of legs || []) {
-      if (!l || l.kind === 'td') return { p: null, american: null, reason: 'td_leg', legs: out };
+      if (!l) return { p: null, american: null, reason: 'bad_leg', legs: out };
+      if (l.kind === 'td') {
+        // Inverse bet for anytime-TD legs: 1 − fee-included $500 VWAP of the OPPOSITE side.
+        // Kalshi is the only live TD book wired in (Polymarket US TD books rate-limit; Novig /
+        // ProphetX have no TD feed here). Same 15s staleness + $500 depth gate (td-book).
+        const s = tdBook ? tdBook.legStats(l) : null;
+        const pi = s && s.inverse > 0 && s.inverse < 1 ? s.inverse : null;
+        out.push({ kind: 'td', id: l.id, side: l.side, p: pi, fairAmerican: pi != null ? american(pi) : null, best: pi != null ? 'kalshi' : null, sources: s ? [{ venue: 'kalshi', via: 'td_opposite', used: pi != null, reason: pi != null ? 'ok' : 'bad_price', costAmerican: s.td ? american(s.td.oppVwap) : null, ageMs: Math.round(s.ageMs || 0) }] : [] });
+        if (pi == null) return { p: null, american: null, reason: tdBook ? 'td_no_fresh_source' : 'td_leg', legs: out };
+        p *= pi;
+        continue;
+      }
       const f = legFair(l.gameId, l.team);
-      out.push({ gameId: l.gameId, team: l.team, fairAmerican: f ? f.american : null, best: f ? f.best : null, sources: f ? f.sources.map(({ venue, via, used, reason, costAmerican, topAmerican, ageMs, changeAgeMs }) => ({ venue, via, used, reason, costAmerican, topAmerican, ageMs, changeAgeMs })) : [] });
+      out.push({ gameId: l.gameId, team: l.team, p: f && f.p != null ? f.p : null, fairAmerican: f ? f.american : null, best: f ? f.best : null, sources: f ? f.sources.map(({ venue, via, used, reason, costAmerican, topAmerican, ageMs, changeAgeMs }) => ({ venue, via, used, reason, costAmerican, topAmerican, ageMs, changeAgeMs })) : [] });
       if (!f || f.p == null) return { p: null, american: null, reason: f ? 'no_fresh_source' : 'no_game', legs: out };
       p *= f.p;
     }
     return { p, american: american(p), reason: 'ok', legs: out };
   }
 
-  return { ingestKalshiOrderbooks, ingestRelay, ingestProphetX, legFair, comboFair, gameCount: () => games.size, _asks: asks };
+  let tdBook = null;
+  return { setTdBook: (tb) => { tdBook = tb || null; }, ingestKalshiOrderbooks, ingestRelay, ingestProphetX, legFair, comboFair, gameCount: () => games.size, _asks: asks };
 }
 
 function shift(date, d) {
