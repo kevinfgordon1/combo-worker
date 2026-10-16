@@ -21,6 +21,7 @@
 const { classifyNfl } = require('./shadow');
 const { americanFromProb } = require('./quote');
 const { createTtlSet } = require('./ttl-set');
+const { legFairsWithInverse } = require('./leg-fairs');
 
 const POLY_COMBO_TAKER = 0.0695;
 const POLY_COMBO_TAKER_TAIL = 0.06;
@@ -105,6 +106,7 @@ function createPolyRfqTracker({
       fair_promo_american: rec.fair_promo_american, fair_promo_best_american: rec.fair_promo_best_american,
       promo_n_books: rec.promo_n_books, promo_max_age_ms: rec.promo_max_age_ms,
       fair_pm_inverse_american: rec.fair_pm_inverse_american, pm_inverse_reason: rec.pm_inverse_reason, pm_inverse_legs: rec.pm_inverse_legs,
+      leg_fairs: legFairsWithInverse(null, rec), // per-leg inverse values (logging only)
       max_leg_age_ms: rec.max_leg_age_ms,
       outcome: rec.outcome, taker_side: rec.taker_side || null,
       traded_yes: rec.traded_yes == null ? null : rec.traded_yes,
