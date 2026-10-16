@@ -51,6 +51,7 @@ const ESPN_SCOREBOARD = Object.freeze({
 });
 const US_SLUG_CAP = 100;
 const US_FRESH_MS = 15_000;
+const US_DEAD_MS = 60_000;
 const KALSHI_TWO_LETTER = new Set(['NE', 'SF', 'GB', 'KC', 'TB', 'LV', 'NO', 'AZ']);
 
 function parseLeague(raw) {
@@ -1136,6 +1137,16 @@ function startPolymarketUs(state, deps) {
     catalog.clear();
     for (const meta of capped) catalog.set(meta.slug, meta);
     slugs = capped.map((meta) => meta.slug);
+    // Drop US quotes for markets that left the catalog (settled / closed games).
+    for (const league of Object.keys(state.books.polymarket || {})) {
+      const book = state.books.polymarket[league];
+      for (const [key, q] of book) {
+        if (q && q.feed === 'polymarket-us') {
+          const m = String(q.token_id || '').match(/^us:(.+):(?:yes|no)$/);
+          if (m && !catalog.has(m[1])) book.delete(key);
+        }
+      }
+    }
     const quotes = [];
     for (const meta of capped) {
       const ts = meta.updatedAt || Date.now();
@@ -1154,17 +1165,37 @@ function startPolymarketUs(state, deps) {
     subscribedKey = key;
   };
 
+  // Per-league: one failing league must not freeze the others. Before this, any
+  // throw (timeout / network) skipped seed() for every league, so the catalog and
+  // WS subscription stayed on whatever games were discovered last, forever.
+  const lastGood = new Map(); // league -> markets from the last good pull
   const discover = async () => {
     const markets = [];
+    const errors = [];
     for (const league of LEAGUES) {
       const path = US_LEAGUE_PATH[league];
       const url = `${US_GATEWAY}/v2/leagues/${path}/events?limit=80&active=true&closed=false`;
-      const res = await fetchJson(fetchFn, url, { timeoutMs: 8000 });
-      const events = (res.body && res.body.events) || [];
-      markets.push(...usMarketsFromEvents(events, league, Date.now()));
+      try {
+        const res = await fetchJson(fetchFn, url, { timeoutMs: 20000 });
+        if (!res.ok || !res.body || !Array.isArray(res.body.events)) {
+          throw new Error(`HTTP ${res.status}${res.body ? '' : ' (non-JSON body)'}`);
+        }
+        lastGood.set(league, usMarketsFromEvents(res.body.events, league, Date.now()));
+      } catch (err) {
+        errors.push(`${league}: ${(err && err.message) || err}${err && err.cause ? ` (${err.cause.code || err.cause.message || err.cause})` : ''}`);
+      }
+      // Re-filter cached markets so finished games age out even while a league fails.
+      for (const m of lastGood.get(league) || []) {
+        if (m.live || (Date.parse(m.start || '') || 0) > Date.now() - 8 * 3600 * 1000) markets.push(m);
+      }
     }
-    seed(markets, 'rest');
-    sendSub();
+    state.usDiscoverError = errors.length ? errors.join('; ') : null;
+    if (errors.length) console.error(`[odds-relay] polymarket us discover failed: ${state.usDiscoverError}`);
+    if (markets.length) {
+      seed(markets, 'rest');
+      sendSub();
+    }
+    if (errors.length === LEAGUES.length) throw new Error(state.usDiscoverError);
   };
 
   const connect = () => {
@@ -1196,12 +1227,23 @@ function startPolymarketUs(state, deps) {
       for (const [league, group] of groupByLeague(seeded)) {
         publish(state, 'polymarket', league, group, 'snapshot', 'polymarket-us');
       }
+      state.usLastAliveAt = Date.now();
       if (ping) clearInterval(ping);
+      // Dead-socket watchdog: a half-open socket stays readyState 1 and the board
+      // kept reporting us:'up' while no frames arrived for 31h. No message or pong
+      // for US_DEAD_MS -> terminate and reconnect.
       ping = setInterval(() => {
+        if (Date.now() - (state.usLastAliveAt || 0) > US_DEAD_MS) {
+          console.error(`[odds-relay] polymarket us socket silent ${Math.round((Date.now() - state.usLastAliveAt) / 1000)}s, reconnecting`);
+          try { if (ws && ws.terminate) ws.terminate(); else if (ws && ws.close) ws.close(); } catch (_) { /* ignore */ }
+          return;
+        }
         try { if (ws && ws.ping) ws.ping(); } catch (_) { /* closing */ }
       }, 15000);
     });
+    ws.on('pong', () => { state.usLastAliveAt = Date.now(); });
     ws.on('message', (data) => {
+      state.usLastAliveAt = Date.now();
       let parsed;
       try { parsed = JSON.parse(String(data)); } catch (_) { return; }
       const quotes = usQuotesFromMessage(parsed, catalog, Date.now());
@@ -1236,7 +1278,6 @@ function startPolymarketUs(state, deps) {
     while (!stopped) {
       try { await discover(); } catch (err) {
         state.status.us = state.usSocketUp ? 'up' : 'down';
-        console.error('[odds-relay] polymarket us discover failed');
       }
       if (stopped) break;
       if (!ws || ws.readyState === 2 || ws.readyState === 3) connect();
@@ -4656,7 +4697,7 @@ function handleRequest(req, res, state) {
     const novig = state.novigFeed ? state.novigFeed.health() : null;
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     const dkfd = state.dkfd && state.dkfd.poller ? state.dkfd.poller.health() : null;
-    res.end(JSON.stringify({ ok: true, status: state.status, counts, novig, betstamp: state.betstamp ? state.betstamp.health() : null, underdog: state.underdog ? state.underdog.health() : null, dkfd }));
+    res.end(JSON.stringify({ ok: true, status: state.status, counts, polymarketUs: { lastFrameAgeMs: state.usLastFrameAt ? Date.now() - state.usLastFrameAt : null, lastAliveAgeMs: state.usLastAliveAt ? Date.now() - state.usLastAliveAt : null, discoverError: state.usDiscoverError || null }, novig, betstamp: state.betstamp ? state.betstamp.health() : null, underdog: state.underdog ? state.underdog.health() : null, dkfd }));
     return;
   }
   if (url.pathname !== '/stream' && url.pathname !== '/board') {
