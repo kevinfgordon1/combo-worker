@@ -31,6 +31,9 @@ const { createTdBook, isTdTicker } = require('./td-book');
 const { espnKickoffs, oddsKickoffs } = require('./kickoffs');
 const { createPmLiveBook } = require('./pm-live');
 const { createProphetXClient, hasProphetXCreds } = require('./prophetx-live');
+const { priceCombo } = require('./quote');
+const { pmFields } = require('./paper');
+const { createPolyRfqTracker, normalizePolyRfq, normalizePolyTrade } = require('./poly-rfq');
 
 // v2 = matching-window / TTL seen-set / eviction / real-kickoff fixes (2026-10-07). Bump for a clean run.
 const DEFAULT_RUN_ID = 'v2-20261007';
@@ -319,6 +322,91 @@ async function main(env = process.env) {
       loop(pmPx, 'pm_prophetx', Number(env.NOBOOST_PM_PX_POLL_MS) || 5000);
     }
     console.log(`[NOBOOST] PM live inverse fair ON: kalshi public orderbooks, relay=${relayBase || 'none'} (polymarket-us, novig), prophetx=${hasProphetXCreds(env) ? 'on' : 'off (no PROPHETX key)'}; games=${pmLive.gameCount()}`);
+  }
+  // Polymarket US parlay RFQs (Combo Sniper, PAPER ONLY — never quotes). Read-only private WS
+  // (SUBSCRIPTION_TYPE_RFQ: rfqCreated / rfqClosed / anonymous rfqTrade prints) + GET /v1/rfqs/trades
+  // backfill (1 req/s documented limit; we make ~1 request per NOBOOST_POLY_BACKFILL_MS, skipped while
+  // the client's Cloudflare-429 backoff is active). Never calls GET /v1/rfqs (combo-worker's budget).
+  const polyOn = !['0', 'false', 'off', 'no'].includes(String(env.NOBOOST_POLY_RFQ || '1').toLowerCase())
+    && !!env.POLYMARKET_KEY_ID && !!env.POLYMARKET_SECRET_KEY;
+  if (polyOn) {
+    const { createPolymarketHttp, createPolymarketRfqWs } = require('../polymarket-client');
+    const http = createPolymarketHttp({ keyId: env.POLYMARKET_KEY_ID, secretKey: env.POLYMARKET_SECRET_KEY });
+    const promoCfg = promo ? promo.cfg : null;
+    const priceFairs = (legs) => {
+      const out = {};
+      try {
+        const pr = priceCombo(legs.map((l) => ({ ...l })), book.source, { cfg: primary.cfg, venue: 'polymarket' });
+        if (pr && pr.ok) {
+          for (const k of ['fair_mid_american', 'fair_inverse_american', 'lock_american']) out[k] = pr[k] != null ? Math.round(pr[k]) : null;
+          out.fair_ref_american = pr.ref_american != null ? Math.round(pr.ref_american) : null;
+          out.max_leg_age_ms = Math.round(pr.maxLegAgeMs || 0);
+        }
+        if (promoCfg) {
+          const pp = priceCombo(legs.map((l) => ({ ...l })), book.source, { cfg: promoCfg, venue: 'polymarket' });
+          if (pp && pp.ok) {
+            out.fair_promo_american = pp.fair_promo_american != null ? Math.round(pp.fair_promo_american) : null;
+            out.fair_promo_best_american = pp.fair_promo_best_american != null ? Math.round(pp.fair_promo_best_american) : null;
+            out.promo_n_books = pp.promoBooks || null; out.promo_max_age_ms = Math.round(pp.promoAgeMs || 0);
+          }
+        }
+      } catch (e) { out.pm_inverse_reason = 'error'; }
+      return { ...out, ...pmFields(pmLive, { ok: true, legs }) };
+    };
+    const poly = createPolyRfqTracker({ book, priceFairs, persistRow: store.persistRow, runId });
+    const comboCache = new Map(); let lastHydrate = 0;
+    async function hydrate(rfq) {
+      if (Array.isArray(rfq.comboLegs) && rfq.comboLegs.length) return rfq;
+      if (!rfq.symbol) return rfq;
+      if (comboCache.has(rfq.symbol)) return { ...rfq, comboLegs: comboCache.get(rfq.symbol) };
+      if (Date.now() - lastHydrate < 500 || http.isBackedOff('/v1/combos')) return rfq; // <=2 req/s, respect 429 backoff
+      lastHydrate = Date.now();
+      try {
+        const j = await http.getCombo(rfq.symbol);
+        const c = (j && j.combo) || (j && j.combos && j.combos[0]) || null;
+        if (c && Array.isArray(c.legs) && c.legs.length) { comboCache.set(rfq.symbol, c.legs); if (comboCache.size > 20000) comboCache.clear(); return { ...rfq, comboLegs: c.legs }; }
+      } catch (e) { /* counted as no_legs */ }
+      return rfq;
+    }
+    const ws = createPolymarketRfqWs({
+      keyId: env.POLYMARKET_KEY_ID, secretKey: env.POLYMARKET_SECRET_KEY, subscribeOrders: false,
+      onStatus: (s, i) => { console.log(`[NOBOOST][POLY] ws ${s}${i && i.message ? ` ${i.message}` : ''}`); },
+      onEvent: (ev) => {
+        try {
+          if (ev.type === 'rfqCreated') {
+            const r = normalizePolyRfq(ev.rfq, Date.now());
+            if (r) hydrate(r).then((h) => poly.onRfq(h)).catch(() => {});
+          } else if (ev.type === 'rfqClosed') poly.onClosed(ev.rfq);
+          else if (ev.type === 'other') {
+            const t = ev.raw && ev.raw.rfqEvent && ev.raw.rfqEvent.rfqTrade;
+            if (t) poly.onTrade(normalizePolyTrade(t.trade || t));
+          }
+        } catch (e) { console.log(`[NOBOOST][POLY] event error: ${e.message}`); }
+      },
+    });
+    ws.start();
+    // Overlapping-window backfill: last NOBOOST_POLY_BACKFILL_WINDOW_MS (default 5 min) every 90s, deduped by tradeId.
+    async function polyBackfill() {
+      if (http.isBackedOff('/v1/rfqs/trades')) return;
+      const startTime = new Date(Date.now() - (Number(env.NOBOOST_POLY_BACKFILL_WINDOW_MS) || 300000)).toISOString();
+      let cursor = '';
+      for (let pg = 0; pg < 10; pg += 1) {
+        const res = await http.request('GET', '/v1/rfqs/trades', { query: { limit: 100, startTime, ...(cursor ? { cursor } : {}) } });
+        if (res.statusCode === 429) return; // client backoff now active
+        if (res.statusCode < 200 || res.statusCode >= 300) throw new Error(`GET /v1/rfqs/trades -> ${res.statusCode}`);
+        const j = res.json;
+        for (const t of (j && j.trades) || []) poly.onTrade(normalizePolyTrade(t));
+        cursor = (j && j.cursor) || '';
+        if (!cursor) break;
+        await new Promise((res) => setTimeout(res, 1100)); // documented 1 req/s on this endpoint
+      }
+    }
+    loop(polyBackfill, 'poly_backfill', Number(env.NOBOOST_POLY_BACKFILL_MS) || 90000);
+    setInterval(() => { try { poly.sweep(); } catch (e) { console.log(`[NOBOOST][POLY] sweep error: ${e.message}`); } }, 2000);
+    setInterval(() => { console.log(`[NOBOOST][POLY] SUMMARY run_id=${runId} ${JSON.stringify(poly.takeStats())}`); }, 60000);
+    console.log('[NOBOOST] Polymarket US RFQ logger ON (paper only, never quotes): private WS rfqCreated/rfqClosed/rfqTrade + /v1/rfqs/trades backfill');
+  } else {
+    console.log('[NOBOOST] Polymarket US RFQ logger off (NOBOOST_POLY_RFQ=0 or no POLYMARKET_KEY_ID/POLYMARKET_SECRET_KEY)');
   }
   loop(refreshMarkets, 'markets', Number(env.NOBOOST_MARKETS_POLL_MS) || 2000);
   loop(pollRfqs, 'rfqs', Number(env.NOBOOST_RFQ_POLL_MS) || 1000);

@@ -201,6 +201,8 @@ function createNflBook({ now = () => Date.now(), staleMs = DEFAULT_STALE_MS, pro
 
   // optional sportsbook reference: setReference(gameId, team, noVigProb)  (pushed by a background refresher, never fetched on the RFQ path)
   const refs = new Map();
+  // Kalshi KXNFLGAME ticker for team-wins in this game (maps Polymarket legs onto Kalshi markets)
+  function kalshiTickerFor(gameId, team) { const s = teams.get(`${gameId}:${team}`); return (s && s.kalshi && s.kalshi.ticker) || null; }
   function setReference(gameId, team, p) { refs.set(`${gameId}:${team}`, { p, at: now() }); }
   function reference(leg) {
     const r = refs.get(`${leg.gameId}:${leg.team}`);
@@ -249,7 +251,7 @@ function createNflBook({ now = () => Date.now(), staleMs = DEFAULT_STALE_MS, pro
   return {
     ingestKalshiMarkets, ingestPolyMarket, setBooks, legStats, setTdBook, hasTd, onMove, expire, opponentQuotes, ownQuotes, kickoffMs,
     setKickoffs, kickoffSource, hasStarted, _kicks: kicks,
-    setReference, source, takerThetaForVenue, pmMlSlugsFromKalshiLeg,
+    setReference, kalshiTickerFor, source, takerThetaForVenue, pmMlSlugsFromKalshiLeg,
     games: () => [...games.entries()],
     _teams: teams, _games: games,
   };

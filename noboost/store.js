@@ -7,6 +7,7 @@ function createStore({ url, key, fetchImpl = fetch, log = console.log, flushMs =
   const base = String(url || '').replace(/\/$/, '');
   const headers = { apikey: key, Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' };
   const upserts = new Map();
+  const rowUpserts = new Map(); // pre-built rows (Polymarket RFQs): own batches, since PostgREST batch keys must match
   const patches = [];
   const stats = [];
   let warned = 0;
@@ -18,6 +19,7 @@ function createStore({ url, key, fetchImpl = fetch, log = console.log, flushMs =
     if (kind === 'patch') patches.push(rec);
     else upserts.set(rec.rfq_id, toRow(rec));
   }
+  function persistRow(row) { if (base && key && row && row.rfq_id) rowUpserts.set(row.rfq_id, row); }
   function persistStats(payload) { if (base && key) stats.push(payload); }
 
   async function call(method, path, body, extra = {}) {
@@ -29,6 +31,12 @@ function createStore({ url, key, fetchImpl = fetch, log = console.log, flushMs =
     try {
       if (upserts.size) {
         const rows = [...upserts.values()]; upserts.clear();
+        for (let i = 0; i < rows.length; i += batch) {
+          await call('POST', 'noboost_paper_rfqs?on_conflict=rfq_id', rows.slice(i, i + batch), { Prefer: 'resolution=merge-duplicates,return=minimal' });
+        }
+      }
+      if (rowUpserts.size) {
+        const rows = [...rowUpserts.values()]; rowUpserts.clear();
         for (let i = 0; i < rows.length; i += batch) {
           await call('POST', 'noboost_paper_rfqs?on_conflict=rfq_id', rows.slice(i, i + batch), { Prefer: 'resolution=merge-duplicates,return=minimal' });
         }
@@ -53,6 +61,6 @@ function createStore({ url, key, fetchImpl = fetch, log = console.log, flushMs =
       return await r.json();
     } catch (e) { warn(e.message); return []; }
   }
-  return { persist, persistStats, flush, start, loadOpenFills, _q: { upserts, patches, stats } };
+  return { persist, persistRow, persistStats, flush, start, loadOpenFills, _q: { upserts, rowUpserts, patches, stats } };
 }
 module.exports = { createStore };
