@@ -113,9 +113,12 @@ function createPmLiveBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 
       const startMs = Date.parse(q.start || '') || 0;
       const odds = Number(q.odds);
       if ((startMs && !q.is_live && now() - startMs > SETTLED_AFTER_MS) || (Number.isFinite(odds) && !(odds > SETTLED_PRICE && odds < 1 - SETTLED_PRICE))) continue;
-      // Polymarket US: age = time since the price really changed. "Feed up" no
-      // longer vouches for a quiet book (it reported up for 31h with frozen prices).
-      const at = venue === 'polymarket' ? changedAt : (feedLive ? polledAt : changedAt);
+      // Freshness = last time the feed CONFIRMED this price is current, changed or not.
+      // Polymarket US: relay's per-market confirmed_at (live socket + subscribed, or
+      // last gateway snapshot). Novig: feedLive only when its socket spoke < 15s ago.
+      // A quiet book is fresh; a silent feed ages out after staleMs.
+      const confirmedAt = Date.parse(q.confirmed_at || '') || 0;
+      const at = venue === 'polymarket' ? Math.max(confirmedAt, changedAt) : (feedLive ? polledAt : changedAt);
       let levels; let depthKnown;
       if (Array.isArray(q.depth) && q.depth.length) { levels = q.depth.map((d) => [Number(d.odds), Number(d.size)]); depthKnown = true; } else if (q.size > 0) { levels = [[Number(q.odds), Number(q.size)]]; depthKnown = true; } else { levels = [[Number(q.odds), Infinity]]; depthKnown = false; } // relay gives top-of-book only
       set(asks, gid, side, venue, { levels, at, changedAt, depthKnown, key: q.token_id || null });
