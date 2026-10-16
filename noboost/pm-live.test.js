@@ -25,3 +25,20 @@ const c = b.comboFair([{ gameId: 'nfl|2026-10-19|sf+was', team: 'sf' }]);
 assert.equal(c.reason, 'no_fresh_source');
 assert.equal(b.comboFair([{ kind: 'td' }]).reason, 'td_leg');
 console.log('pm-live ok');
+{
+  // Polymarket US: age = last real change, not "feed up"; settled games skipped.
+  let t2 = Date.parse('2026-10-16T17:00:00Z'); const b2 = createPmLiveBook({ now: () => t2 });
+  b2.ingestKalshiOrderbooks([
+    { ticker: 'KXNFLGAME-26OCT19WASSF-SF', orderbook_fp: { yes_dollars: [['0.77', '100000']], no_dollars: [['0.22', '100000']] } },
+    { ticker: 'KXNFLGAME-26OCT19WASSF-WAS', orderbook_fp: { yes_dollars: [['0.23', '100000']], no_dollars: [['0.76', '100000']] } },
+  ]);
+  const q = (u, odds = 0.225) => ({ bet_type: 'moneyline', feed: 'polymarket-us', away: 'Washington Commanders', home: 'San Francisco 49ers', side: 'Washington Commanders', start: '2026-10-20T00:15:00.000Z', odds, updated_at: u });
+  b2.ingestRelay('polymarket', [q(new Date(t2 - 31 * 3600e3).toISOString())], { feedLive: true });
+  const pm = b2.legFair('nfl|2026-10-19|sf+was', 'sf').sources.find((s) => s.venue === 'polymarket');
+  assert.equal(pm.reason, 'stale');
+  b2.ingestRelay('polymarket', [q(new Date(t2 - 2000).toISOString())], { feedLive: true });
+  assert.notEqual(b2.legFair('nfl|2026-10-19|sf+was', 'sf').sources.find((s) => s.venue === 'polymarket').reason, 'stale');
+  const b3 = createPmLiveBook({ now: () => t2 });
+  assert.equal(b3.ingestRelay('polymarket', [q(new Date(t2).toISOString(), 0.9975)]), 0);
+  console.log('pm-live poly-age ok');
+}

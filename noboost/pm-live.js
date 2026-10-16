@@ -13,6 +13,7 @@
 //   fair(T) = 1 − min_v cost_v           (best opposite-side price, sign-flipped)
 // Fees: Kalshi 0.07·p·(1−p), Polymarket US 0.0695·p·(1−p), Novig none, ProphetX 2% of net winnings.
 // A venue older than staleMs (15s) or without $DEPTH of depth is dropped for that leg (reason kept);
+// Polymarket's age is time since its last real price change; settled games are skipped at ingest.
 // at least one venue must survive. Every venue's price is returned for the audit trail.
 'use strict';
 const { parseKalshiUnhedgedTicker } = require('../unhedged-rfq');
@@ -20,6 +21,8 @@ const { normTeam } = require('../leg-identity');
 const { teamCode, etDate } = require('../mm-paper-odds');
 
 const DEPTH_USD = 500;
+const SETTLED_AFTER_MS = 4.5 * 3600 * 1000;
+const SETTLED_PRICE = 0.015;
 const FEES = {
   kalshi: (p) => 0.07 * p * (1 - p),
   polymarket: (p) => 0.0695 * p * (1 - p),
@@ -105,7 +108,14 @@ function createPmLiveBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 
       const gid = findGame(date, a, h);
       if (!gid) continue;
       const changedAt = Date.parse(q.updated_at || '') || 0;
-      const at = feedLive ? polledAt : changedAt;
+      // Settled / finished games: started > SETTLED_AFTER_MS ago (and not live), or
+      // a decided price (<=1.5c / >=98.5c). Never let those into the fair.
+      const startMs = Date.parse(q.start || '') || 0;
+      const odds = Number(q.odds);
+      if ((startMs && !q.is_live && now() - startMs > SETTLED_AFTER_MS) || (Number.isFinite(odds) && !(odds > SETTLED_PRICE && odds < 1 - SETTLED_PRICE))) continue;
+      // Polymarket US: age = time since the price really changed. "Feed up" no
+      // longer vouches for a quiet book (it reported up for 31h with frozen prices).
+      const at = venue === 'polymarket' ? changedAt : (feedLive ? polledAt : changedAt);
       let levels; let depthKnown;
       if (Array.isArray(q.depth) && q.depth.length) { levels = q.depth.map((d) => [Number(d.odds), Number(d.size)]); depthKnown = true; } else if (q.size > 0) { levels = [[Number(q.odds), Number(q.size)]]; depthKnown = true; } else { levels = [[Number(q.odds), Infinity]]; depthKnown = false; } // relay gives top-of-book only
       set(asks, gid, side, venue, { levels, at, changedAt, depthKnown, key: q.token_id || null });
