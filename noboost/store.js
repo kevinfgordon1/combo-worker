@@ -35,12 +35,6 @@ function createStore({ url, key, fetchImpl = fetch, log = console.log, flushMs =
           await call('POST', 'noboost_paper_rfqs?on_conflict=rfq_id', rows.slice(i, i + batch), { Prefer: 'resolution=merge-duplicates,return=minimal' });
         }
       }
-      if (rowUpserts.size) {
-        const rows = [...rowUpserts.values()]; rowUpserts.clear();
-        for (let i = 0; i < rows.length; i += batch) {
-          await call('POST', 'noboost_paper_rfqs?on_conflict=rfq_id', rows.slice(i, i + batch), { Prefer: 'resolution=merge-duplicates,return=minimal' });
-        }
-      }
       while (patches.length) {
         const p = patches.shift();
         const { rfq_id: id, ...rest } = p;
@@ -51,6 +45,15 @@ function createStore({ url, key, fetchImpl = fetch, log = console.log, flushMs =
         stats.shift();
       }
     } catch (e) { warn(e.message); }
+    // Polymarket rows in their own try (PGRST102 etc.): a failure here must never block the Kalshi patches / stats above.
+    try {
+      if (rowUpserts.size) {
+        const rows = [...rowUpserts.values()]; rowUpserts.clear();
+        for (let i = 0; i < rows.length; i += batch) {
+          await call('POST', 'noboost_paper_rfqs?on_conflict=rfq_id', rows.slice(i, i + batch), { Prefer: 'resolution=merge-duplicates,return=minimal' });
+        }
+      }
+    } catch (e) { warn(`poly rows: ${e.message}`); }
   }
   function start() { if (!timer) timer = setInterval(flush, flushMs); return flush; }
   // Only THIS run's open fills: a new run_id starts with empty paper risk books (old runs' rows stay for reference).

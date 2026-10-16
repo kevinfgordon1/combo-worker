@@ -90,9 +90,10 @@ function createPolyRfqTracker({
 
   function windowEnd(rec) { return (rec.close_ms != null ? rec.close_ms : rec.created_ms + maxOpenMs) + closeGraceMs; }
 
+  // Every row carries the SAME key set (undefined -> null): PostgREST rejects a batch whose keys differ (PGRST102).
   function row(rec) {
     const iso = (ms) => (ms ? new Date(ms).toISOString() : null);
-    return {
+    const out = {
       rfq_id: rec.rfq_id, venue: 'polymarket', run_id: runId,
       rfq_created_ts: iso(rec.created_ms), seen_at: iso(rec.seen_ms), detect_lag_ms: rec.detect_lag_ms,
       rfq_status: rec.close_status || null, rfq_closed_at: iso(rec.close_ms),
@@ -115,6 +116,8 @@ function createPolyRfqTracker({
       match_note: rec.match_note || null, size_ratio: rec.size_ratio == null ? null : rec.size_ratio,
       primary_action: 'none', lock_action: 'none',
     };
+    for (const k of Object.keys(out)) if (out[k] === undefined || (typeof out[k] === 'number' && !Number.isFinite(out[k]))) out[k] = null;
+    return out;
   }
   const save = (rec) => persistRow(row(rec));
 

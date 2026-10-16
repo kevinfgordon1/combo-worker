@@ -54,3 +54,23 @@ assert.ok(Math.abs(100 * polyComboTakerFee(0.5) - 1.92) < 0.006); // docs table 
   assert.strictEqual(m.outcome, 'taker_no');
 }
 console.log('poly-rfq tests ok');
+{ // every persisted row has the same key set even when fairs are missing (PostgREST PGRST102)
+  const out = [];
+  const p = createPolyRfqTracker({ book, now, persistRow: (r) => out.push(r), priceFairs: () => ({}) });
+  const p2 = createPolyRfqTracker({ book, now, persistRow: (r) => out.push(r), priceFairs: () => ({ fair_mid_american: 300, fair_promo_best_american: 310, pm_inverse_legs: [] }) });
+  p.onRfq(rfq('k1')); p2.onRfq(rfq('k2'));
+  const keys = (r) => Object.keys(JSON.parse(JSON.stringify(r))).sort().join(',');
+  assert.strictEqual(keys(out[0]), keys(out[1]));
+  console.log('poly-rfq row keys ok');
+}
+{ // a failing Polymarket batch never blocks Kalshi patches / stats
+  const { createStore } = require('./store');
+  const calls = [];
+  const fetchImpl = async (url, o) => { calls.push(`${o.method} ${url.split('/rest/v1/')[1].split('?')[0]}`); const bad = o.method === 'POST' && /"venue":"polymarket"/.test(o.body || ''); return { ok: !bad, status: bad ? 400 : 201, text: async () => 'PGRST102' }; };
+  const st = createStore({ url: 'http://x', key: 'k', fetchImpl, log: () => {} });
+  st.persistRow({ rfq_id: 'p1', venue: 'polymarket' }); st.persist({ rfq_id: 'k1', settled: true }, 'patch'); st.persistStats({ a: 1 });
+  st.flush().then(() => {
+    assert.ok(calls.includes('PATCH noboost_paper_rfqs')); assert.ok(calls.includes('POST noboost_paper_stats'));
+    console.log('store isolation ok');
+  });
+}
