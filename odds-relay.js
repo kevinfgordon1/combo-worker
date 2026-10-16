@@ -155,6 +155,18 @@ function bestBidFromBids(bids) {
   return best;
 }
 
+// Full ladders (cheapest ask first) for the US book. YES asks = long offers;
+// NO asks = 1 − long bids. size = contracts. Capped to keep /board small.
+const US_DEPTH_LEVELS = 25;
+function usLadders(offers, bids) {
+  const lv = (rows, flip) => (rows || []).map(pxQty)
+    .filter(({ price, size }) => Number.isFinite(price) && price > 0 && price < 1 && Number.isFinite(size) && size > 0)
+    .map(({ price, size }) => ({ odds: flip ? round4(1 - price) : price, size }))
+    .sort((a, b) => a.odds - b.odds)
+    .slice(0, US_DEPTH_LEVELS);
+  return { yes: lv(offers, false), no: lv(bids, true) };
+}
+
 function polyQuote(fields) {
   const odds = asProb(fields.odds);
   if (odds == null || !fields.side || !fields.token_id) return null;
@@ -174,11 +186,12 @@ function polyQuote(fields) {
     feed: fields.feed,
     pair_key: fields.pair_key || '',
   };
+  if (Array.isArray(fields.depth) && fields.depth.length) quote.depth = fields.depth;
   if (fields.start) quote.start = fields.start;
   return quote;
 }
 
-function usQuotesFromPrices(meta, bestBid, bestAsk, ts) {
+function usQuotesFromPrices(meta, bestBid, bestAsk, ts, ladders) {
   if (!meta || !meta.slug) return [];
   const updated = isoFromMs(ts);
   const yesOdds = asProb(bestAsk);
@@ -196,7 +209,8 @@ function usQuotesFromPrices(meta, bestBid, bestAsk, ts) {
     updated_at: updated,
     feed: 'polymarket-us',
     pair_key: meta.pairKey,
-    size: meta.askSize || null,
+    size: ladders && ladders.yes[0] ? ladders.yes[0].size : (meta.askSize || null),
+    depth: ladders ? ladders.yes : null,
   });
   const no = polyQuote({
     token_id: `us:${meta.slug}:no`,
@@ -210,7 +224,8 @@ function usQuotesFromPrices(meta, bestBid, bestAsk, ts) {
     updated_at: updated,
     feed: 'polymarket-us',
     pair_key: meta.pairKey,
-    size: meta.bidSize || null,
+    size: ladders && ladders.no[0] ? ladders.no[0].size : (meta.bidSize || null),
+    depth: ladders ? ladders.no : null,
   });
   if (yes) out.push(yes);
   if (no) out.push(no);
@@ -277,7 +292,9 @@ function usSubscribeMessage(slugs, requestId) {
   return {
     subscribe: {
       requestId: requestId || `odds-${Date.now()}`,
-      subscriptionType: 'SUBSCRIPTION_TYPE_MARKET_DATA_LITE',
+      // Full book (bids/offers with qty). LITE is best bid/ask only, no sizes:
+      // that is why Combo Sniper saw Polymarket as top_only.
+      subscriptionType: 'SUBSCRIPTION_TYPE_MARKET_DATA',
       marketSlugs: slugs.slice(0, US_SLUG_CAP),
     },
   };
@@ -326,7 +343,8 @@ function usQuotesFromMessage(message, catalog, nowMs) {
     const ask = bestAskFromOffers(book.offers || book.asks);
     const bid = bestBidFromBids(book.bids);
     const ts = book.transactTime || book.transact_time || msg.transactTime || nowMs;
-    out.push(...usQuotesFromPrices(meta, bid, ask, ts));
+    // Keep the whole ladder (was: best price only, sizes discarded).
+    out.push(...usQuotesFromPrices(meta, bid, ask, ts, usLadders(book.offers || book.asks, book.bids)));
   }
   return out;
 }
@@ -554,7 +572,9 @@ function publish(state, venue, league, quotes, mode, feed) {
       });
       continue;
     }
-    const next = keepNewerQuote(prev, quote);
+    let next = keepNewerQuote(prev, quote);
+    // A gateway seed carries no ladder; keep the socket's ladder while the top price agrees.
+    if (next && next !== prev && prev && prev.depth && !next.depth && prev.odds === next.odds) next = { ...next, depth: prev.depth, size: prev.size };
     if (next) book.set(key, next);
   }
   if (replaced) emitter.forceSnapshot();
