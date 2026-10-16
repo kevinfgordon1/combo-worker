@@ -100,7 +100,7 @@ function offersWorstFirst() {
 
 {
   const sub = usSubscribeMessage(['aec-nfl-atl-gb-2026-09-24'], 'req-1');
-  assert.strictEqual(sub.subscribe.subscriptionType, 'SUBSCRIPTION_TYPE_MARKET_DATA_LITE');
+  assert.strictEqual(sub.subscribe.subscriptionType, 'SUBSCRIPTION_TYPE_MARKET_DATA');
   assert.strictEqual(sub.responsesDebounced, undefined);
   assert.deepStrictEqual(sub.subscribe.marketSlugs, ['aec-nfl-atl-gb-2026-09-24']);
 }
@@ -292,3 +292,15 @@ require('./novig-feed.test.js');
 // Novig freshness (replica-aware books, reserved live lane) and the Betstamp live fan-out.
 require('./novig-fresh.test.js');
 require('./betstamp-relay.test.js');
+
+{
+  // Full US book keeps the ladder (YES from offers, NO from 1 - bids).
+  const { usQuotesFromMessage } = require('./odds-relay');
+  const meta = { slug: 'aec-nfl-hou-jax-2026-10-18', league: 'NFL', away: 'Houston Texans', home: 'Jacksonville Jaguars', yesName: 'Houston Texans', noName: 'Jacksonville Jaguars', pairKey: 'hou|jax' };
+  const q = usQuotesFromMessage({ marketData: { marketSlug: meta.slug, offers: [{ px: { value: '0.44' }, qty: '100' }, { px: { value: '0.4325' }, qty: '50' }], bids: [{ px: { value: '0.43' }, qty: '200' }, { px: { value: '0.42' }, qty: '10' }] } }, new Map([[meta.slug, meta]]), Date.now());
+  const yes = q.find((x) => x.token_id.endsWith(':yes')); const no = q.find((x) => x.token_id.endsWith(':no'));
+  assert.deepStrictEqual(yes.depth, [{ odds: 0.4325, size: 50 }, { odds: 0.44, size: 100 }]);
+  assert.deepStrictEqual(no.depth, [{ odds: 0.57, size: 200 }, { odds: 0.58, size: 10 }]);
+  assert.strictEqual(yes.size, 50);
+  console.log('us depth ok');
+}
