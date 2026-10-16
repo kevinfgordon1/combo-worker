@@ -136,6 +136,7 @@ function createPaperRun({
       decision_ms: d1.decisionMs, decision_ms_lockcf: d2.decisionMs,
       max_leg_age_ms: pr ? Math.round(pr.maxLegAgeMs || 0) : null,
       leg_ages_ms: pr ? pr.legAgesMs : null,
+      leg_fairs: pr && pr.legFairs ? pr.legFairs : null,
       // classified legs for EVERY in-scope RFQ (not only when PRIMARY/LOCKCF quote) so a PROMO-only
       // quote still runs the per-game / per-team caps and its fill books game/team exposure
       cls: cls.ok ? cls.legs : (d1.legs || d2.legs || (d3 && d3.legs) || null),
@@ -364,7 +365,7 @@ function toRow(rec) {
     quote_lock_american: american(L.quote_american), quote_lock_yes: L.quoteYes, lock_action: L.action,
     lock_reason: L.reason, lock_pulled: L.pulled ? L.pulled.reason : null,
     margin: rec.margin, decision_ms: rec.decision_ms == null ? null : +rec.decision_ms.toFixed(3),
-    max_leg_age_ms: rec.max_leg_age_ms, leg_ages_ms: rec.leg_ages_ms,
+    max_leg_age_ms: rec.max_leg_age_ms, leg_ages_ms: rec.leg_ages_ms, leg_fairs: rec.leg_fairs || null,
     outcome: rec.outcome, traded_yes: rec.traded_yes == null ? null : rec.traded_yes,
     traded_american: rec.traded_yes > 0 && rec.traded_yes < 1 ? Math.round(americanFromProb(rec.traded_yes)) : null,
     traded_contracts: rec.traded_contracts == null ? null : rec.traded_contracts,
