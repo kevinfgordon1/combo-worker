@@ -36,6 +36,10 @@ console.log('pm-live ok');
   b2.ingestRelay('polymarket', [q(new Date(t2 - 31 * 3600e3).toISOString())], { feedLive: true });
   const pm = b2.legFair('nfl|2026-10-19|sf+was', 'sf').sources.find((s) => s.venue === 'polymarket');
   assert.equal(pm.reason, 'stale');
+  // quiet book, price unchanged 31h, but relay confirms the live socket covers it => fresh
+  b2.ingestRelay('polymarket', [{ ...q(new Date(t2 - 31 * 3600e3).toISOString()), confirmed_at: new Date(t2 - 1000).toISOString() }]);
+  assert.notEqual(b2.legFair('nfl|2026-10-19|sf+was', 'sf').sources.find((s) => s.venue === 'polymarket').reason, 'stale');
+  b2.ingestRelay('polymarket', [{ ...q(new Date(t2 - 31 * 3600e3).toISOString()), confirmed_at: new Date(t2 - 16000).toISOString() }]);
   b2.ingestRelay('polymarket', [q(new Date(t2 - 2000).toISOString())], { feedLive: true });
   assert.notEqual(b2.legFair('nfl|2026-10-19|sf+was', 'sf').sources.find((s) => s.venue === 'polymarket').reason, 'stale');
   const b3 = createPmLiveBook({ now: () => t2 });

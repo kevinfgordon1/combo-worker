@@ -308,7 +308,10 @@ async function main(env = process.env) {
         const r = await fetch(`${relayBase}/board?venue=${venue}&league=NFL`);
         if (!r.ok) throw new Error(`relay ${venue} ${r.status}`);
         const j = await r.json();
-        const feedLive = venue === 'polymarket' ? st.us === 'up' : /ws:up/.test(String(st.novig || ''));
+        // Novig: socket must have actually spoken in the last 15s, not just be "up".
+        const nv = (h && h.novig) || {};
+        const novigLive = /ws:up/.test(String(st.novig || '')) && Number(nv.lastWsMsgAt) > 0 && polledAt - Number(nv.lastWsMsgAt) < 15000;
+        const feedLive = venue === 'polymarket' ? false : novigLive;
         pmLive.ingestRelay(venue, j.quotes || [], { feedLive, polledAt });
       }
     };

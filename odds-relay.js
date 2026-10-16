@@ -52,6 +52,8 @@ const ESPN_SCOREBOARD = Object.freeze({
 const US_SLUG_CAP = 100;
 const US_FRESH_MS = 15_000;
 const US_DEAD_MS = 60_000;
+const US_PING_MS = 5_000;
+const US_CONFIRM_MS = 15_000;
 const KALSHI_TWO_LETTER = new Set(['NE', 'SF', 'GB', 'KC', 'TB', 'LV', 'NO', 'AZ']);
 
 function parseLeague(raw) {
@@ -473,6 +475,9 @@ function createState() {
     usPairs: new Set(),
     usSocketUp: false,
     usLastFrameAt: 0,
+    usLastAliveAt: 0,
+    usSubscribed: new Set(),
+    usSeedAt: new Map(),
     kalshiWsUp: false,
     status: { us: 'starting', clob: 'starting', kalshi: 'starting', novig: 'off' },
     novigFeed: null,
@@ -1148,6 +1153,8 @@ function startPolymarketUs(state, deps) {
       }
     }
     const quotes = [];
+    const seededAt = Date.now();
+    if (mode === 'rest') for (const meta of capped) state.usSeedAt.set(meta.slug, seededAt);
     for (const meta of capped) {
       const ts = meta.updatedAt || Date.now();
       quotes.push(...usQuotesFromPrices(meta, meta.bestBid, meta.bestAsk, ts));
@@ -1163,6 +1170,7 @@ function startPolymarketUs(state, deps) {
     if (key === subscribedKey) return;
     ws.send(JSON.stringify(usSubscribeMessage(slugs, `odds-${Date.now()}`)));
     subscribedKey = key;
+    state.usSubscribed = new Set(slugs);
   };
 
   // Per-league: one failing league must not freeze the others. Before this, any
@@ -1239,7 +1247,7 @@ function startPolymarketUs(state, deps) {
           return;
         }
         try { if (ws && ws.ping) ws.ping(); } catch (_) { /* closing */ }
-      }, 15000);
+      }, US_PING_MS);
     });
     ws.on('pong', () => { state.usLastAliveAt = Date.now(); });
     ws.on('message', (data) => {
@@ -1259,6 +1267,7 @@ function startPolymarketUs(state, deps) {
       if (ping) clearInterval(ping);
       ping = null;
       subscribedKey = '';
+      state.usSubscribed = new Set();
       schedule();
     };
     ws.on('close', reopen);
@@ -4652,9 +4661,30 @@ function setCors(res) {
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
+// confirmed_at: newest time the relay KNOWS this price is current, changed or not.
+// Polymarket US: socket alive (message/pong within 15s) and this market subscribed
+// => any change would have arrived, so the price is current now. Else the last
+// gateway snapshot that included it (every 30s), else its last change.
+function usConfirmedAt(state, quote, now = Date.now()) {
+  const m = String(quote.token_id || '').match(/^us:(.+):(?:yes|no)$/);
+  const slug = m && m[1];
+  let at = Date.parse(quote.updated_at || '') || 0;
+  if (slug) {
+    const seed = state.usSeedAt && state.usSeedAt.get(slug);
+    if (seed > at) at = seed;
+    if (state.usSocketUp && state.usSubscribed && state.usSubscribed.has(slug)
+      && state.usLastAliveAt && now - state.usLastAliveAt < US_CONFIRM_MS) at = now;
+  }
+  return at ? new Date(at).toISOString() : null;
+}
+
 function boardQuotes(state, venue, league) {
   const book = state.books[venue] && state.books[venue][league];
-  return book ? [...book.values()] : [];
+  if (!book) return [];
+  const quotes = [...book.values()];
+  if (venue !== 'polymarket') return quotes;
+  const now = Date.now();
+  return quotes.map((q) => (q && q.feed === 'polymarket-us' ? { ...q, confirmed_at: usConfirmedAt(state, q, now) } : q));
 }
 
 function handleRequest(req, res, state) {
@@ -4830,6 +4860,7 @@ module.exports = {
   relayKalshiCreds,
   willOpenKalshiWs,
   usOwnsPair,
+  usConfirmedAt,
   createQuoteEmitter,
   formatQuoteSse,
   mergeQuoteSnapshot,
