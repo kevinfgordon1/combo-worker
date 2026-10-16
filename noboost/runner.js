@@ -27,6 +27,7 @@ const { isNoBoostShadow, isNoBoostLive, configFromEnv } = require('./quote');
 const { teamCode, etDate } = require('../mm-paper-odds');
 const { gameEntries } = require('./odds-ingest');
 const { createTtlSet } = require('./ttl-set');
+const { createTdBook, isTdTicker } = require('./td-book');
 const { espnKickoffs, oddsKickoffs } = require('./kickoffs');
 
 // v2 = matching-window / TTL seen-set / eviction / real-kickoff fixes (2026-10-07). Bump for a clean run.
@@ -79,6 +80,15 @@ async function main(env = process.env) {
   }
   const get = createGetter(env);
   const book = createNflBook({ staleMs: Number(env.NOBOOST_STALE_MS) || 15000 });
+  // NFL anytime-TD legs (flag NOBOOST_TD=1). Books come from Kalshi PUBLIC orderbooks
+  // (unauthenticated GETs, separate from the shared key's budget), $500 depth gate per side.
+  const tdOn = ['1', 'true', 'on', 'yes'].includes(String(env.NOBOOST_TD || '').toLowerCase());
+  const tdBook = tdOn ? createTdBook({
+    staleMs: Number(env.NOBOOST_TD_STALE_MS) || 15000,
+    depthUsd: Number(env.NOBOOST_TD_DEPTH_USD) || 500,
+    maxOverround: Number(env.NOBOOST_TD_MAX_OVERROUND) || 0.15,
+  }) : null;
+  if (tdBook) book.setTdBook(tdBook);
   const logger = (l) => console.log(l);
   const primary = createNoBoostShadow({ book, env, log: logger, label: 'PRIMARY' });
   const lockcf = createNoBoostShadow({ book, env: { ...env, NOBOOST_GUARDRAIL: 'lock' }, log: logger, label: 'LOCKCF' });
@@ -114,6 +124,40 @@ async function main(env = process.env) {
       if (!cursor) break;
     }
   }
+  // TD market list (every 60s) + their orderbooks (every NOBOOST_TD_POLL_MS, 100 tickers/GET).
+  const pubGet = async (path) => {
+    const r = await fetch(ORIGIN + path, { headers: { accept: 'application/json' } });
+    if (r.status === 429) throw new Error(`public GET ${path.split('?')[0]} -> 429`);
+    if (!r.ok) throw new Error(`public GET ${path.split('?')[0]} -> ${r.status}`);
+    return r.json();
+  };
+  let tdTickers = [];
+  const tdKick = {};
+  async function refreshTdMarkets() {
+    const out = []; let cursor = '';
+    for (let i = 0; i < 5; i += 1) {
+      const j = await pubGet(`${P}/markets?series_ticker=KXNFLTD&status=open&limit=1000${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`);
+      for (const m of j.markets || []) {
+        const t = String(m.ticker || '').toUpperCase();
+        if (!isTdTicker(t)) continue;
+        out.push(t);
+        const occ = Date.parse(m.occurrence_datetime || '');
+        if (Number.isFinite(occ)) tdKick[t] = occ;
+      }
+      cursor = j.cursor || '';
+      if (!cursor) break;
+    }
+    tdTickers = out;
+  }
+  async function refreshTdBooks() {
+    for (let i = 0; i < tdTickers.length; i += 100) {
+      const chunk = tdTickers.slice(i, i + 100);
+      const j = await pubGet(`${P}/markets/orderbooks?${chunk.map((t) => `tickers=${encodeURIComponent(t)}`).join('&')}`);
+      tdBook.ingest(j.orderbooks || [], tdKick);
+      if (i + 100 < tdTickers.length) await new Promise((res) => setTimeout(res, 150));
+    }
+  }
+
   async function refreshOdds() {
     const r = await fetch(`${env.SUPABASE_URL}/rest/v1/odds_cache?sport=eq.americanfootball_nfl&select=data,fetched_at&order=fetched_at.desc&limit=1`,
       { headers: { apikey: env.SUPABASE_SERVICE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}` } });
@@ -210,7 +254,7 @@ async function main(env = process.env) {
     const rows = await store.loadOpenFills();
     let n = 0;
     for (const row of rows) {
-      const cls = classifyNfl({ legKeys: row.legs }, 'kalshi');
+      const cls = classifyNfl({ legKeys: row.legs }, 'kalshi', { td: book.hasTd() });
       if (!cls.ok) continue;
       if (row.primary_fill && run.restoreFill('primary', row, cls.legs)) n += 1;
       if (row.lock_fill && run.restoreFill('lockcf', row, cls.legs)) n += 1;
@@ -225,6 +269,14 @@ async function main(env = process.env) {
   await guard(refreshKickoffs, 'kickoffs')();
   store.start();
   book.onMove(() => { try { run.sweep(); } catch (e) { console.log(`[NOBOOST] sweep error: ${e.message}`); } });
+  if (tdBook) {
+    await guard(refreshTdMarkets, 'td_markets')();
+    await guard(refreshTdBooks, 'td_books')();
+    loop(refreshTdMarkets, 'td_markets', 60000);
+    loop(refreshTdBooks, 'td_books', Number(env.NOBOOST_TD_POLL_MS) || 5000);
+    setInterval(() => { console.log(`[NOBOOST] TD book: markets=${tdTickers.length} books=${tdBook.size()} leg_fails=${JSON.stringify(tdBook.takeFails())}`); }, 300000);
+    console.log(`[NOBOOST] TD legs ON: ${tdTickers.length} anytime-TD markets, $${Number(env.NOBOOST_TD_DEPTH_USD) || 500} depth gate, public orderbooks every ${Number(env.NOBOOST_TD_POLL_MS) || 5000}ms`);
+  }
   loop(refreshMarkets, 'markets', Number(env.NOBOOST_MARKETS_POLL_MS) || 2000);
   loop(pollRfqs, 'rfqs', Number(env.NOBOOST_RFQ_POLL_MS) || 1000);
   loop(pollTrades, 'trades', Number(env.NOBOOST_TRADES_POLL_MS) || 2000);

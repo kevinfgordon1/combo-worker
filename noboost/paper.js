@@ -110,7 +110,7 @@ function createPaperRun({
     const P = decisionOf(d1); const L = decisionOf(d2); const M = d3 ? decisionOf(d3) : null;
     const pp = d3 && d3.priced && d3.priced.ok ? d3.priced : null;
     const pr = (d1.priced && d1.priced.ok) ? d1.priced : (d2.priced && d2.priced.ok ? d2.priced : null);
-    const cls = classifyNfl(rfq, 'kalshi');
+    const cls = classifyNfl(rfq, 'kalshi', { td: !!(book && book.hasTd && book.hasTd()) });
     const rec = {
       run_id: runId,
       rfq_id: rfq.rfqId, market_ticker: rfq.marketTicker || null, legs: rfq.legKeys, n_legs: rfq.legKeys.length,

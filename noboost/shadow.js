@@ -17,6 +17,7 @@ const { parseKalshiUnhedgedTicker, parsePmUnhedgedSlug } = require('../unhedged-
 const { normTeam } = require('../leg-identity');
 const { priceCombo, winsPrint, fmtAm, contractsFor, configFromEnv, isNoBoostShadow, isNoBoostLive } = require('./quote');
 const { createRiskBook, riskConfigFromEnv } = require('./risk');
+const { isTdTicker, parseTdTicker } = require('./td-book');
 
 function splitKey(k) {
   const s = String(k || '');
@@ -45,12 +46,21 @@ function polyLegInputs(rfq) {
 }
 
 // → { ok, legs:[{gameId,team,opp,id}], reason }
-function classifyNfl(rfq, venue) {
+// opts.td: also accept Kalshi NFL player ANYTIME-TD legs (KXNFLTD-…-1), still one leg per game.
+function classifyNfl(rfq, venue, opts = {}) {
   const inputs = venue === 'polymarket' ? polyLegInputs(rfq) : kalshiLegInputs(rfq);
   if (inputs.length < 2) return { ok: false, reason: 'not_combo' };
   const legs = [];
   const games = new Set();
   for (const inp of inputs) {
+    if (opts.td && venue === 'kalshi' && isTdTicker(inp.id)) {
+      const t = parseTdTicker(inp.id);
+      if (!t) return { ok: false, reason: 'not_nfl_td' };
+      if (games.has(t.gameId)) return { ok: false, reason: 'correlated_same_game' };
+      games.add(t.gameId);
+      legs.push({ kind: 'td', gameId: t.gameId, team: `td:${t.player}:${inp.side}`, id: t.ticker, side: inp.side });
+      continue;
+    }
     const parsed = venue === 'polymarket'
       ? parsePmUnhedgedSlug(inp.id, 'yes')
       : parseKalshiUnhedgedTicker(inp.id, 'yes');
@@ -103,7 +113,7 @@ function createNoBoostShadow({
   function decide(rfq, { venue = 'kalshi' } = {}) {
     if (!isNoBoostShadow(env)) { counts.flag_off += 1; return { action: 'skip', reason: 'flag_off' }; }
     counts.rfqs += 1;
-    const cls = classifyNfl(rfq, venue);
+    const cls = classifyNfl(rfq, venue, { td: !!(book && book.hasTd && book.hasTd()) });
     if (!cls.ok) { bumpSkip(cls.reason); return { action: 'skip', reason: cls.reason }; }
     counts.scope += 1;
     const nowMs = now();

@@ -138,7 +138,11 @@ function createNflBook({ now = () => Date.now(), staleMs = DEFAULT_STALE_MS, pro
     }
   }
   // Cached leg stats or null when missing/stale (caller must skip the RFQ). ageMs = oldest input age.
+  let tdBook = null;
+  function setTdBook(tb) { tdBook = tb || null; }
+  function hasTd() { return !!tdBook; }
   function legStats(leg) {
+    if (leg && leg.kind === 'td') return tdBook ? tdBook.legStats(leg) : null;
     const st = legCache.get(`${leg.gameId}:${leg.team}`);
     if (!st) return null;
     const age = now() - st.at;
@@ -243,7 +247,7 @@ function createNflBook({ now = () => Date.now(), staleMs = DEFAULT_STALE_MS, pro
   const source = { opponentQuotes, ownQuotes, reference, legStats };
 
   return {
-    ingestKalshiMarkets, ingestPolyMarket, setBooks, legStats, onMove, expire, opponentQuotes, ownQuotes, kickoffMs,
+    ingestKalshiMarkets, ingestPolyMarket, setBooks, legStats, setTdBook, hasTd, onMove, expire, opponentQuotes, ownQuotes, kickoffMs,
     setKickoffs, kickoffSource, hasStarted, _kicks: kicks,
     setReference, source, takerThetaForVenue, pmMlSlugsFromKalshiLeg,
     games: () => [...games.entries()],
