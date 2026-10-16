@@ -29,6 +29,8 @@ const { gameEntries } = require('./odds-ingest');
 const { createTtlSet } = require('./ttl-set');
 const { createTdBook, isTdTicker } = require('./td-book');
 const { espnKickoffs, oddsKickoffs } = require('./kickoffs');
+const { createPmLiveBook } = require('./pm-live');
+const { createProphetXClient, hasProphetXCreds } = require('./prophetx-live');
 
 // v2 = matching-window / TTL seen-set / eviction / real-kickoff fixes (2026-10-07). Bump for a clean run.
 const DEFAULT_RUN_ID = 'v2-20261007';
@@ -97,8 +99,12 @@ async function main(env = process.env) {
   const promo = promoOn ? createNoBoostShadow({ book, env: { ...env, NOBOOST_FAIR_METHOD: 'promo', NOBOOST_GUARDRAIL: 'off' }, log: logger, label: 'PROMO' }) : null;
   const runId = String(env.NOBOOST_RUN_ID || DEFAULT_RUN_ID).trim() || DEFAULT_RUN_ID;
   const store = createStore({ url: env.SUPABASE_URL, key: env.SUPABASE_SERVICE_KEY, log: logger, runId });
+  // PM live inverse fair (Combo Sniper): Kalshi public orderbooks + odds-relay Polymarket US / Novig + ProphetX.
+  const pmOn = !['0', 'false', 'off', 'no'].includes(String(env.NOBOOST_PM_LIVE || '1').toLowerCase());
+  const pmLive = pmOn ? createPmLiveBook({ staleMs: Number(env.NOBOOST_PM_STALE_MS) || 15000 }) : null;
+  const relayBase = env.NOBOOST_ODDS_RELAY_URL || (env.RAILWAY_SERVICE_ODDS_RELAY_URL ? `https://${env.RAILWAY_SERVICE_ODDS_RELAY_URL}` : '');
   const run = createPaperRun({
-    book, primary, lockcf, promo, margin: primary.cfg.margin, runId,
+    book, primary, lockcf, promo, pmLive, margin: primary.cfg.margin, runId,
     persist: store.persist, persistStats: store.persistStats,
     samplePct: Number(env.NOBOOST_SAMPLE_PCT) || 2,
     graceMs: env.NOBOOST_MATCH_GRACE_MS != null && env.NOBOOST_MATCH_GRACE_MS !== '' ? Number(env.NOBOOST_MATCH_GRACE_MS) : 2000,
@@ -276,6 +282,43 @@ async function main(env = process.env) {
     loop(refreshTdBooks, 'td_books', Number(env.NOBOOST_TD_POLL_MS) || 5000);
     setInterval(() => { console.log(`[NOBOOST] TD book: markets=${tdTickers.length} books=${tdBook.size()} leg_fails=${JSON.stringify(tdBook.takeFails())}`); }, 300000);
     console.log(`[NOBOOST] TD legs ON: ${tdTickers.length} anytime-TD markets, $${Number(env.NOBOOST_TD_DEPTH_USD) || 500} depth gate, public orderbooks every ${Number(env.NOBOOST_TD_POLL_MS) || 5000}ms`);
+  }
+  if (pmLive) {
+    let kTickers = [];
+    const pmKalshi = async () => {
+      if (!kTickers.length || !pmKalshi.at || Date.now() - pmKalshi.at > 60000) {
+        const j = await pubGet(`${P}/markets?series_ticker=KXNFLGAME&status=open&limit=1000`);
+        kTickers = (j.markets || []).map((m) => String(m.ticker || '').toUpperCase()).filter(Boolean); pmKalshi.at = Date.now();
+      }
+      for (let i = 0; i < kTickers.length; i += 100) {
+        const chunk = kTickers.slice(i, i + 100);
+        const j = await pubGet(`${P}/markets/orderbooks?${chunk.map((t) => `tickers=${encodeURIComponent(t)}`).join('&')}`);
+        pmLive.ingestKalshiOrderbooks(j.orderbooks || []);
+      }
+    };
+    const pmRelay = async () => {
+      if (!relayBase) return;
+      const h = await (await fetch(`${relayBase}/health`)).json();
+      const st = (h && h.status) || {};
+      for (const venue of ['polymarket', 'novig']) {
+        const polledAt = Date.now();
+        const r = await fetch(`${relayBase}/board?venue=${venue}&league=NFL`);
+        if (!r.ok) throw new Error(`relay ${venue} ${r.status}`);
+        const j = await r.json();
+        const feedLive = venue === 'polymarket' ? st.us === 'up' : /ws:up/.test(String(st.novig || ''));
+        pmLive.ingestRelay(venue, j.quotes || [], { feedLive, polledAt });
+      }
+    };
+    await guard(pmKalshi, 'pm_kalshi')(); await guard(pmRelay, 'pm_relay')();
+    loop(pmKalshi, 'pm_kalshi', Number(env.NOBOOST_PM_KALSHI_POLL_MS) || 3000);
+    loop(pmRelay, 'pm_relay', Number(env.NOBOOST_PM_RELAY_POLL_MS) || 2000);
+    if (hasProphetXCreds(env)) {
+      const px = createProphetXClient({ env });
+      const pmPx = async () => { pmLive.ingestProphetX(await px.nflMoneylines()); };
+      await guard(pmPx, 'pm_prophetx')();
+      loop(pmPx, 'pm_prophetx', Number(env.NOBOOST_PM_PX_POLL_MS) || 5000);
+    }
+    console.log(`[NOBOOST] PM live inverse fair ON: kalshi public orderbooks, relay=${relayBase || 'none'} (polymarket-us, novig), prophetx=${hasProphetXCreds(env) ? 'on' : 'off (no PROPHETX key)'}; games=${pmLive.gameCount()}`);
   }
   loop(refreshMarkets, 'markets', Number(env.NOBOOST_MARKETS_POLL_MS) || 2000);
   loop(pollRfqs, 'rfqs', Number(env.NOBOOST_RFQ_POLL_MS) || 1000);

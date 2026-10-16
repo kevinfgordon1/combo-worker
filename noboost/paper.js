@@ -65,7 +65,7 @@ function bump(o, k, d = 1) { o[k] = (o[k] || 0) + d; }
 function hash100(s) { let h = 0; for (let i = 0; i < s.length; i += 1) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h % 100; }
 
 function createPaperRun({
-  book, primary, lockcf, promo = null, now = () => Date.now(), persist = () => {}, persistStats = () => {},
+  book, primary, lockcf, promo = null, pmLive = null, now = () => Date.now(), persist = () => {}, persistStats = () => {},
   samplePct = 2, margin = null, runId = null,
   quoteTtlMs = null, graceMs = 2000, tradeLagMs = 15000, minPrintYes = 0.001, sizeTol = {},
 } = {}) {
@@ -127,6 +127,7 @@ function createPaperRun({
       fairPromo: pp ? pp.fairPromo : null,
       promo_n_books: pp ? pp.promoBooks : null,
       promo_max_age_ms: pp ? Math.round(pp.promoAgeMs || 0) : null,
+      ...pmFields(pmLive, cls),
       fair_mid_american: pr && pr.fair_mid_american != null ? Math.round(pr.fair_mid_american) : null,
       fair_inverse_american: pr && pr.fair_inverse_american != null ? Math.round(pr.fair_inverse_american) : null,
       fair_ref_american: pr && pr.ref_american != null ? Math.round(pr.ref_american) : null,
@@ -373,6 +374,8 @@ function toRow(rec) {
     lock_fill: !!L.fill, lock_position: L.position || null,
     fair_promo_american: rec.fair_promo_american == null ? null : rec.fair_promo_american,
     fair_promo_best_american: rec.fair_promo_best_american == null ? null : rec.fair_promo_best_american,
+    fair_pm_inverse_american: rec.fair_pm_inverse_american == null ? null : rec.fair_pm_inverse_american,
+    pm_inverse_reason: rec.pm_inverse_reason || null, pm_inverse_legs: rec.pm_inverse_legs || null,
     promo_n_books: rec.promo_n_books || null, promo_max_age_ms: rec.promo_max_age_ms == null ? null : rec.promo_max_age_ms,
     ...(M ? {
       quote_promo_american: M.quote_american, quote_promo_yes: M.quoteYes, promo_action: M.action, promo_reason: M.reason,
@@ -381,4 +384,13 @@ function toRow(rec) {
   };
 }
 
-module.exports = { createPaperRun, toRow, sizeCheck, HIST_EDGES, legBucket, hash100 };
+// PM live inverse fair (Kalshi / Polymarket US / Novig / ProphetX live books, $500 depth). Audit legs stored.
+function pmFields(pmLive, cls) {
+  if (!pmLive || !cls || !cls.ok) return {};
+  try {
+    const f = pmLive.comboFair(cls.legs);
+    return { fair_pm_inverse_american: f.american != null ? Math.round(f.american) : null, pm_inverse_reason: f.reason, pm_inverse_legs: f.legs };
+  } catch (e) { return { pm_inverse_reason: 'error' }; }
+}
+
+module.exports = { pmFields, createPaperRun, toRow, sizeCheck, HIST_EDGES, legBucket, hash100 };
