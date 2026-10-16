@@ -20,6 +20,13 @@ if (mode === 'unhedged') {
   process.exit(1);
 }
 
+if (mode === 'testers') {
+  // Per-tester Combo Locks: one child per approved tester, on THAT tester's
+  // keys. Kevin's quoter, fills reader and desk protect never start here.
+  run('start-testers.js');
+  return;
+}
+
 run('live-runner.js');
 run('fills-reader.js');
 

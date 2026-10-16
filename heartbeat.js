@@ -16,6 +16,8 @@
 // That's it. No order logic changes. Remove the line to turn it off.
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
+const { resolveWorkerScope } = require('./worker-scope');
+const SCOPE = resolveWorkerScope(process.env);
 
 /**
  * @param {object} supabase        an initialized supabase-js client
@@ -56,12 +58,25 @@ function startHeartbeat(supabase, mode, counts, getActive, intervalMs = 60000, g
         limit_reached: c.limitReached || 0,
         dollar_rfqs: c.dollarRfqs || 0,
       };
+      // Tester child: stats belong to that tester (the main worker leaves the
+      // DB default, Kevin). Keeps Kevin's bucket/stats view his own.
+      if (SCOPE.writeUserId) row.user_id = SCOPE.writeUserId;
       // Optional extra columns (e.g. { poly: {...} } jsonb). If the column is
       // not migrated yet the insert is retried once without them.
       let extra = null;
       try { extra = typeof getExtra === 'function' ? getExtra() : null; } catch (_) { extra = null; }
       if (extra && typeof extra === 'object') {
-        const res = await supabase.from('combo_worker_stats').insert({ ...row, ...extra });
+        // A not-yet-migrated extra column must only drop THAT column, not every
+        // extra (poly / latency / bucket ...). Retry, removing the column the
+        // error names; give up to the bare row after a few rounds.
+        const payload = { ...row, ...extra };
+        let res = await supabase.from('combo_worker_stats').insert(payload);
+        for (let i = 0; res && res.error && i < 6; i += 1) {
+          const m = /Could not find the '([^']+)' column/i.exec(String(res.error.message || ''));
+          if (!m || !(m[1] in payload) || m[1] in row) break;
+          delete payload[m[1]];
+          res = await supabase.from('combo_worker_stats').insert(payload);
+        }
         if (res && res.error) await supabase.from('combo_worker_stats').insert(row);
       } else {
         await supabase.from('combo_worker_stats').insert(row);

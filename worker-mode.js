@@ -13,10 +13,13 @@
 const WORKER_MODE_COMBO = 'combo';
 const WORKER_MODE_UNHEDGED = 'unhedged';
 const WORKER_MODE_ALL = 'all';
+// Per-tester supervisor (start-testers.js): never runs Kevin's quoter.
+const WORKER_MODE_TESTERS = 'testers';
 
 const COMBO_ALIASES = new Set(['combo', 'locks', 'combo_locks', 'live']);
 const UNHEDGED_ALIASES = new Set(['unhedged', 'unhedged_rfq', 'rfq']);
 const ALL_ALIASES = new Set(['all', 'both', 'combined']);
+const TESTERS_ALIASES = new Set(['testers', 'tester', 'combo_testers']);
 
 function resolveWorkerMode(env = process.env) {
   const raw = env && env.WORKER_MODE;
@@ -24,6 +27,7 @@ function resolveWorkerMode(env = process.env) {
   const s = String(raw).trim().toLowerCase();
   if (UNHEDGED_ALIASES.has(s)) return WORKER_MODE_UNHEDGED;
   if (ALL_ALIASES.has(s)) return WORKER_MODE_ALL;
+  if (TESTERS_ALIASES.has(s)) return WORKER_MODE_TESTERS;
   if (COMBO_ALIASES.has(s)) return WORKER_MODE_COMBO;
   return WORKER_MODE_COMBO;
 }
@@ -42,6 +46,7 @@ module.exports = {
   WORKER_MODE_COMBO,
   WORKER_MODE_UNHEDGED,
   WORKER_MODE_ALL,
+  WORKER_MODE_TESTERS,
   resolveWorkerMode,
   shouldRunComboLocks,
   shouldRunUnhedged,

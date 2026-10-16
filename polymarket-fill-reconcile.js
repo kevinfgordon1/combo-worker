@@ -98,6 +98,14 @@ function isFilledOrderState(state) {
   return s === 'ORDER_STATE_FILLED' || s === 'FILLED' || isPartialOrderState(s);
 }
 
+// Order is finished without (further) fills: safe to release a confirm hold.
+function isDeadOrderState(state) {
+  const s = normalizeStatus(state);
+  return s === 'ORDER_STATE_CANCELED' || s === 'ORDER_STATE_CANCELLED' || s === 'CANCELED'
+    || s === 'CANCELLED' || s === 'ORDER_STATE_REJECTED' || s === 'REJECTED'
+    || s === 'ORDER_STATE_EXPIRED' || s === 'EXPIRED';
+}
+
 function cumQuantityOf(order) {
   if (!order || typeof order !== 'object') return 0;
   return parsePositive(
@@ -239,18 +247,54 @@ function quotedSizesByLock(submissions, pendingQuotes) {
   return map;
 }
 
+// Poly takers repeatedly send identical $10 cash RFQs, so two genuine fills on
+// the same lock routinely have the SAME contract count (e.g. 91.61 @ 0.099 at
+// 15:45Z and again at 17:46Z). Size alone therefore cannot prove a twin.
+//  - Two distinct activity trades (distinct poly-act:<tradeId>) are never twins.
+//  - An activity trade only matches a non-activity row (poly-recon / poly-pos /
+//    WS row) of the same size when the two are close in time.
+const TWIN_WINDOW_MS = Number(process.env.POLY_TWIN_WINDOW_MS) > 0
+  ? Number(process.env.POLY_TWIN_WINDOW_MS) : 300000;
+
+function timeMsOf(v) {
+  if (v == null || v === '') return null;
+  const t = v instanceof Date ? v.getTime() : Date.parse(String(v));
+  return Number.isFinite(t) ? t : null;
+}
+
+// Booked-row timestamp (booking time is within seconds of the trade for
+// activity/recon rows). Null when unknown -> caller keeps the old size-only match.
+function bookedRowTimeMs(row) {
+  if (!row) return null;
+  return timeMsOf(
+    row.kalshi_created_time ?? row.recorded_at ?? row.created_at
+    ?? row.createTime ?? row.create_time ?? row.tradeTime
+  );
+}
+
+// Set<string> of size keys that also remembers who booked each key and when.
+class SizeKeySet extends Set {
+  constructor() { super(); this.meta = new Map(); }
+  addEntry(key, info) {
+    this.add(key);
+    let list = this.meta.get(key);
+    if (!list) { list = []; this.meta.set(key, list); }
+    list.push(info);
+  }
+}
+
 function bookedPolySizeKeys({ bookedFills, seenFillIds, include } = {}) {
   const want = include || {
     activity: true, reconcile: true, position: true, other: true,
   };
-  const keys = new Set();
-  const add = (parlayId, slug, qty) => {
+  const keys = new SizeKeySet();
+  const add = (parlayId, slug, qty, info) => {
     const n = parsePositive(qty);
     if (!(n > 0)) return;
     const sk = sizeKey(n);
-    if (parlayId) keys.add(`${parlayId}:${sk}`);
-    if (slug) keys.add(`${slug}:${sk}`);
-    if (parlayId && slug) keys.add(`${parlayId}:${slug}:${sk}`);
+    if (parlayId) keys.addEntry(`${parlayId}:${sk}`, info);
+    if (slug) keys.addEntry(`${slug}:${sk}`, info);
+    if (parlayId && slug) keys.addEntry(`${parlayId}:${slug}:${sk}`, info);
   };
   for (const row of bookedFills || []) {
     if (!isPolyFillRecord(row)) continue;
@@ -264,7 +308,8 @@ function bookedPolySizeKeys({ bookedFills, seenFillIds, include } = {}) {
     add(
       parlayIdOfRecord(row),
       slugOfRecord(row) || normalizeMarketSlug(row.marketTicker || row.ticker || row.market_ticker),
-      polyFillQty(row)
+      polyFillQty(row),
+      { activity: isActivityFillRecord(row), ts: bookedRowTimeMs(row) }
     );
   }
   if (seenFillIds && typeof seenFillIds.forEach === 'function') {
@@ -300,17 +345,35 @@ function bookedActivityKeys({ bookedFills, seenFillIds } = {}) {
   });
 }
 
-function alreadyBookedSameSize(trade, lock, bookedKeys) {
+function alreadyBookedSameSize(trade, lock, bookedKeys, opts = {}) {
   if (!trade || !bookedKeys || typeof bookedKeys.has !== 'function') return false;
   const qty = sizeKey(trade.qty ?? trade.contracts ?? trade.count);
   if (!(qty > 0)) return false;
   const parlayId = (lock && lock.id) || trade.parlayId || trade.parlay_id || '';
-  if (parlayId && bookedKeys.has(`${parlayId}:${qty}`)) return true;
   const slug = normalizeMarketSlug(
     trade.marketSlug || trade.marketTicker || trade.ticker || trade.market_ticker
   );
-  if (slug && bookedKeys.has(`${slug}:${qty}`)) return true;
-  if (parlayId && slug && bookedKeys.has(`${parlayId}:${slug}:${qty}`)) return true;
+  const keys = [];
+  if (parlayId) keys.push(`${parlayId}:${qty}`);
+  if (slug) keys.push(`${slug}:${qty}`);
+  if (parlayId && slug) keys.push(`${parlayId}:${slug}:${qty}`);
+  // Time-aware matching only for an incoming ACTIVITY trade (it has a unique
+  // trade id and a trade time). Everything else keeps the size-only match.
+  const timed = !!(opts && opts.activity) && bookedKeys.meta instanceof Map;
+  if (timed) {
+    const tradeTs = timeMsOf(opts.tradeTs ?? trade.createTime ?? trade.tradeTime);
+    for (const k of keys) {
+      const list = bookedKeys.meta.get(k);
+      if (!list) continue;
+      for (const e of list) {
+        if (e.activity) continue; // distinct activity trade, not a twin
+        if (e.ts == null || tradeTs == null || Math.abs(e.ts - tradeTs) <= TWIN_WINDOW_MS) return true;
+      }
+    }
+    // `:size` keys come from seenFillIds (poly-recon/poly-pos ids, no time).
+    return bookedKeys.has(`:${qty}`);
+  }
+  for (const k of keys) if (bookedKeys.has(k)) return true;
   return bookedKeys.has(`:${qty}`);
 }
 
@@ -323,13 +386,26 @@ function bookedAnyPolyKeys({ bookedFills, seenFillIds } = {}) {
 }
 
 function activityAlreadyReconciled(trade, lock, bookedKeys) {
-  return alreadyBookedSameSize(trade, lock, bookedKeys);
+  return alreadyBookedSameSize(trade, lock, bookedKeys, { activity: true, tradeTs: trade && trade.createTime });
 }
 
 // Same lock + caoc + size already booked under a different fill_id
 // (poly-act vs poly-recon). Used at persist time so a restart with an
 // empty seenFillIds / stale slug cache cannot insert the 06:41 twin.
-function findPolyEconomicTwin(trade, lock, bookedFills) {
+//
+// opts.live: the incoming fill is a LIVE execution (WS orderExecution / the
+// quoteExecuted order check), not a restart replay. Equal-size $10 cash RFQs
+// make equal-size genuine fills routine (91.61 at 11:45 AM and again at
+// 1:46 PM ET), so a live fill is a twin only of a same-size row booked within
+// TWIN_WINDOW_MS of it (the same fill arriving by a second path), never of
+// hours-old rows. Booking time prefers recorded_at: kalshi_created_time was
+// overwritten by the 2026-10-02 3:29 PM replay on 36 rows.
+function bookedRowRecordedMs(row) {
+  if (!row) return null;
+  return timeMsOf(row.recorded_at ?? row.created_at ?? row.kalshi_created_time ?? row.tradeTime);
+}
+
+function findPolyEconomicTwin(trade, lock, bookedFills, opts = {}) {
   const qty = sizeKey(trade && (trade.qty ?? trade.contracts ?? trade.count));
   if (!(qty > 0)) return null;
   const parlayId = (lock && lock.id) || (trade && (trade.parlayId || trade.parlay_id)) || '';
@@ -337,10 +413,23 @@ function findPolyEconomicTwin(trade, lock, bookedFills) {
     trade && (trade.marketSlug || trade.marketTicker || trade.ticker || trade.market_ticker)
   );
   const selfId = fillIdOf(trade);
+  const incomingActivity = String(selfId || '').startsWith('poly-act:');
+  const tradeTs = timeMsOf(trade && (trade.tradeTime ?? trade.createTime));
+  const live = !!(opts && opts.live);
+  const refTs = tradeTs != null ? tradeTs : (live ? ((opts && opts.nowMs) || Date.now()) : null);
   for (const row of bookedFills || []) {
     if (!isPolyFillRecord(row)) continue;
     if (selfId && fillIdOf(row) === selfId) continue;
     if (sizeKey(polyFillQty(row)) !== qty) continue;
+    if (incomingActivity) {
+      // A different poly-act:<tradeId> is a different trade, whatever its size.
+      if (isActivityFillRecord(row)) continue;
+      const rowTs = bookedRowTimeMs(row);
+      if (rowTs != null && tradeTs != null && Math.abs(rowTs - tradeTs) > TWIN_WINDOW_MS) continue;
+    } else if (live) {
+      const rowTs = bookedRowRecordedMs(row);
+      if (rowTs != null && refTs != null && Math.abs(rowTs - refTs) > TWIN_WINDOW_MS) continue;
+    }
     const rowPid = parlayIdOfRecord(row);
     const rowSlug = slugOfRecord(row);
     if (parlayId && rowPid && rowPid !== parlayId) continue;
@@ -348,6 +437,24 @@ function findPolyEconomicTwin(trade, lock, bookedFills) {
     if ((parlayId && rowPid === parlayId) || (slug && rowSlug === slug)) return row;
   }
   return null;
+}
+
+// Live quote-path fill (confirmQuoteFill / watchdog): already booked?
+function quoteFillAlreadyBooked(evt, lock, bookedFills, opts = {}) {
+  if (!evt) return false;
+  const twin = findPolyEconomicTwin(
+    {
+      qty: evt.contracts,
+      marketSlug: evt.marketTicker || evt.marketSlug || evt.ticker || null,
+      parlay_id: evt.parlayId || (lock && lock.id) || null,
+      fill_id: evt.fillId || null,
+      tradeTime: evt.tradeTime || null,
+    },
+    lock,
+    bookedFills,
+    { live: true, nowMs: opts.nowMs },
+  );
+  return !!twin;
 }
 
 // Position fallback: any poly contracts already on this lock's caoc ticker.
@@ -631,6 +738,11 @@ function pendingFromSubmission(row) {
   };
 }
 
+function orderPx(v) {
+  const n = parseFloat(v && typeof v === 'object' ? v.value : v);
+  return Number.isFinite(n) && n > 0 && n < 1 ? n : null;
+}
+
 function fillEventFromReconcile({
   quote,
   order,
@@ -668,6 +780,8 @@ function fillEventFromReconcile({
     label: (pending && pending.label) || null,
     parlayId: pending && pending.parlayId,
     source,
+    yesPrice: order ? (orderPx(order.avgPx || order.avg_px) || orderPx(order.price)) : null,
+    fee: 0,
     pending: pending
       ? {
         parlayId: pending.parlayId,
@@ -1032,16 +1146,40 @@ function mergeQuoteCandidates(executedQuotes, submissions, pendingQuotes) {
   return [...byId.entries()].map(([id, v]) => ({ id, ...v }));
 }
 
+// Each hydrate is one GET /v1/rfqs/quotes. With ~15 per 20s tick plus two list
+// calls this endpoint alone ran ~50 req/min and kept tripping Cloudflare 429.
+// Hydrate accepted/confirmed pending quotes first (they may have executed),
+// cap the rest, and stop on the first 429 (next tick continues).
+const HYDRATE_PER_TICK = Number(process.env.POLY_HYDRATE_PER_TICK) > 0
+  ? Number(process.env.POLY_HYDRATE_PER_TICK) : 5;
+
+function hydratePriority(c) {
+  const p = c && c.pending;
+  if (p && (p.accepted || p.confirmed || p.executed || p.creatorOrderId || p.orderId)) return 0;
+  return 1;
+}
+
 async function hydrateMissingQuotes(http, candidates, maxHydrate) {
+  const limit = Math.min(Number.isFinite(maxHydrate) ? maxHydrate : HYDRATE_PER_TICK, HYDRATE_PER_TICK);
   let n = 0;
-  for (const c of candidates) {
-    if (n >= maxHydrate) break;
+  const ordered = (candidates || []).map((c, i) => ({ c, i }))
+    .sort((a, b) => hydratePriority(a.c) - hydratePriority(b.c) || a.i - b.i)
+    .map((x) => x.c);
+  for (const c of ordered) {
+    if (n >= limit) break;
     if (c.quote && isExecutedQuoteStatus(c.quote.status) && orderIdOfQuote(c.quote)) continue;
     const rfqId = rfqIdOf(c.quote) || (c.pending && c.pending.rfqId);
     const quoteId = quoteIdOf(c.quote) || c.id;
     if (!rfqId || !quoteId) continue;
     if (c.quote && isExecutedQuoteStatus(c.quote.status)) continue;
-    const got = await fetchQuoteByIds(http, { rfqId, quoteId });
+    let got = null;
+    try {
+      const listed = await http.listQuotes({ rfqId, quoteId });
+      const rows = quotesFromListed(listed);
+      got = rows.find((q) => quoteIdOf(q) === quoteId) || rows[0] || null;
+    } catch (e) {
+      if (e && e.statusCode === 429) break;
+    }
     n += 1;
     if (got) c.quote = { ...(c.quote || {}), ...got };
   }
@@ -1143,6 +1281,9 @@ function activityFillEvent({ trade, lock, source }) {
     label: lock.label || null,
     parlayId: lock.id,
     source: kind,
+    tradeTime: trade.createTime || null,
+    yesPrice: trade.price > 0 ? trade.price : null,
+    fee: trade.isAggressor ? null : 0,
     pending: {
       parlayId: lock.id,
       userId: lock.user_id || lock.userId || null,
@@ -1169,6 +1310,13 @@ function matchActivitiesToLocks(activities, locks, {
     ? coerceSlugMap(slugMap)
     : null;
   const bookedKeys = bookedAnyPolyKeys({ bookedFills, seenFillIds });
+  // Identity dedup: an activity trade already stored under its own fill_id is
+  // never re-emitted (restart replays must stay silent: no re-count/alert).
+  const bookedFillIds = new Set();
+  for (const row of bookedFills || []) {
+    const id = fillIdOf(row);
+    if (id) bookedFillIds.add(String(id));
+  }
   const quoteSizes = quotedByLock instanceof Map
     ? quotedByLock
     : quotedSizesByLock(quotedByLock);
@@ -1179,6 +1327,10 @@ function matchActivitiesToLocks(activities, locks, {
     const hit = lockMatchForActivity(locks, trade.hay || trade.title, trade.marketSlug, map);
     const lock = hit.lock;
     if (!lock) continue;
+    if (trade.id && bookedFillIds.has(`poly-act:${trade.id}`)) {
+      matchedLockIds.add(lock.id);
+      continue;
+    }
     if (activityAlreadyReconciled(trade, lock, bookedKeys)) {
       matchedLockIds.add(lock.id);
       continue;
@@ -1209,13 +1361,20 @@ async function listActivitiesPage(http, { limit = 100, maxPages = 8, marketSlug 
   const out = [];
   let cursor;
   for (let page = 0; page < maxPages; page += 1) {
-    const listed = await http.listActivities({
-      types: 'ACTIVITY_TYPE_TRADE',
-      limit,
-      cursor,
-      sortOrder: 'SORT_ORDER_DESCENDING',
-      ...(marketSlug ? { marketSlug } : {}),
-    });
+    let listed;
+    try {
+      listed = await http.listActivities({
+        types: 'ACTIVITY_TYPE_TRADE',
+        limit,
+        cursor,
+        sortOrder: 'SORT_ORDER_DESCENDING',
+        ...(marketSlug ? { marketSlug } : {}),
+      });
+    } catch (e) {
+      // Keep the pages already collected when a later page is rate limited.
+      if (out.length && e && e.statusCode === 429) break;
+      throw e;
+    }
     const rows = activitiesFromListed(listed);
     out.push(...rows);
     cursor = listed && (listed.nextCursor || listed.next_cursor || listed.cursor) || null;
@@ -1250,15 +1409,35 @@ function mergeActivities(...lists) {
   return out;
 }
 
-async function listActivitiesForMarketSlugs(http, slugs, { limit = 100, maxPages = 4 } = {}) {
+// Per-slug activity scans used to hit EVERY known caoc slug (~50+ GETs) on each
+// 20s fill reconcile on top of the 8-page global scan: ~150-200 req/min, a
+// major contributor to Cloudflare 1015 (HTTP 429). The global scan already
+// covers the newest ~800 trades, so the per-slug pass only matters for older
+// trades: do ONE full pass (first call after boot), then rotate through
+// POLY_ACT_SLUGS_PER_TICK slugs per call, and stop early on a 429.
+let slugScanOffset = 0;
+let slugFullPassDone = false;
+const SLUGS_PER_TICK = Number(process.env.POLY_ACT_SLUGS_PER_TICK) > 0
+  ? Number(process.env.POLY_ACT_SLUGS_PER_TICK) : 8;
+
+async function listActivitiesForMarketSlugs(http, slugs, { limit = 100, maxPages = 4, perTick = SLUGS_PER_TICK, full } = {}) {
   const out = [];
-  for (const slug of slugs || []) {
-    const key = normalizeMarketSlug(slug);
-    if (!isComboActivitySlug(key)) continue;
+  const all = (slugs || []).map(normalizeMarketSlug).filter((k) => isComboActivitySlug(k));
+  const doFull = full != null ? full : !slugFullPassDone;
+  let pick = all;
+  if (!doFull && all.length > perTick) {
+    pick = [];
+    for (let i = 0; i < perTick; i += 1) pick.push(all[(slugScanOffset + i) % all.length]);
+    slugScanOffset = (slugScanOffset + perTick) % all.length;
+  }
+  if (doFull) slugFullPassDone = true;
+  for (const key of pick) {
     try {
       const rows = await listActivitiesPage(http, { limit, maxPages, marketSlug: key });
       out.push(...rows);
-    } catch (_) { /* keep other slugs */ }
+    } catch (e) {
+      if (e && e.statusCode === 429) break; // rate limited: stop, next tick continues
+    }
   }
   return out;
 }
@@ -1332,13 +1511,27 @@ async function reconcileLockActivityEvents(http, {
       seenFillIds,
       slugMap: map,
       bookedFills: booked,
+      activities,
     }));
   } catch (_) {
     return events;
   }
 }
 
-function positionFillEvent({ pos, lock, source = 'poly-position' }) {
+// Positions carry no fill price; recover it from trade history (size-weighted
+// YES price of our maker trades on that market slug).
+function slugYesPrice(activities, slug) {
+  if (!slug) return null;
+  let q = 0; let c = 0;
+  for (const a of activities || []) {
+    const t = tradeFromActivity(a);
+    if (!t || t.marketSlug !== slug || t.isAggressor || !(t.price > 0 && t.price < 1) || !(t.qty > 0)) continue;
+    q += t.qty; c += t.qty * t.price;
+  }
+  return q > 0 ? Math.round((c / q) * 1e6) / 1e6 : null;
+}
+
+function positionFillEvent({ pos, lock, source = 'poly-position', yesPrice = null }) {
   const qty = positionQty(pos);
   if (!lock || !(qty > 0)) return null;
   const slug = pos.marketSlug || (pos.marketMetadata && pos.marketMetadata.slug) || 'pos';
@@ -1354,6 +1547,8 @@ function positionFillEvent({ pos, lock, source = 'poly-position' }) {
     label: lock.label || null,
     parlayId: lock.id,
     source,
+    yesPrice,
+    fee: yesPrice != null ? 0 : null,
     pending: {
       parlayId: lock.id,
       userId: lock.user_id || lock.userId || null,
@@ -1365,7 +1560,7 @@ function positionFillEvent({ pos, lock, source = 'poly-position' }) {
   };
 }
 
-function matchPositionsToLocks(positions, locks, { seenFillIds, slugMap, bookedFills } = {}) {
+function matchPositionsToLocks(positions, locks, { seenFillIds, slugMap, bookedFills, activities } = {}) {
   const events = [];
   const booked = seenFillIds && typeof seenFillIds.has === 'function' ? seenFillIds : null;
   const local = new Set();
@@ -1380,7 +1575,7 @@ function matchPositionsToLocks(positions, locks, { seenFillIds, slugMap, bookedF
     const lock = uniqueLockForMarket(locks, hay || title, slug, map);
     if (!lock) continue;
     if (lockHasPolyContractsForCaoc(lock, slug, bookedFills)) continue;
-    const evt = positionFillEvent({ pos, lock });
+    const evt = positionFillEvent({ pos, lock, yesPrice: slugYesPrice(activities, slug) });
     if (!evt || local.has(evt.fillId) || (booked && booked.has(evt.fillId))) continue;
     local.add(evt.fillId);
     events.push(evt);
@@ -1401,6 +1596,7 @@ module.exports = {
   orderStateOf,
   isFilledOrderState,
   isPartialOrderState,
+  isDeadOrderState,
   cumQuantityOf,
   contractsFromQuote,
   firstPositiveAmount,
@@ -1424,6 +1620,8 @@ module.exports = {
   alreadyBookedSameSize,
   activityAlreadyReconciled,
   findPolyEconomicTwin,
+  quoteFillAlreadyBooked,
+  bookedRowRecordedMs,
   lockHasPolyContractsForCaoc,
   selectDuplicatePolyFillsToDrop,
   slugMakerSizeAllowed,
@@ -1454,7 +1652,10 @@ module.exports = {
   activityFillEvent,
   matchActivitiesToLocks,
   listAllActivities,
+  slugYesPrice,
   listActivitiesForMarketSlugs,
+  hydrateMissingQuotes,
+  _resetSlugScanForTest() { slugScanOffset = 0; slugFullPassDone = false; },
   mergeActivities,
   reconcileLockActivityEvents,
   lockTeamNicknames,

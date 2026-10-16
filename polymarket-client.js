@@ -3,7 +3,7 @@
 // Do not POST from callers that have POLYMARKET_RFQ_LIVE off — this module
 // only transports. Never log key material.
 'use strict';
-const { Client } = require('undici');
+const { Pool } = require('undici');
 const WebSocket = require('ws');
 const {
   authHeaders,
@@ -14,6 +14,31 @@ const {
 const DEFAULT_BASE = 'https://api.polymarket.us';
 const DEFAULT_WS = 'wss://api.polymarket.us/v1/ws/private';
 const WS_SIGN_PATH = '/v1/ws/private';
+
+// undici Client has ONE socket and pipelining=1, so a quote POST queued behind every background GET
+// (positions, activities, RFQ crawl, hydrate). Reads get a small Pool; quote mutations (POST/PUT/DELETE)
+// get their own warm Pool so a burst of RFQs never waits on a GET. Same fix Kalshi got in #110.
+const READ_CONNECTIONS = 4;
+const QUOTE_CONNECTIONS = 3;
+const QUOTE_WARM_PATH = '/v1/rfqs/user-id';
+const CONNECT_TIMEOUT_MS = 2_500;
+const HEADERS_TIMEOUT_MS = 8_000;
+const BODY_TIMEOUT_MS = 8_000;
+
+const READ_HEADERS_TIMEOUT_MS = 20_000; // bulk GETs (activities, crawl pages) are slower than a quote POST
+const READ_BODY_TIMEOUT_MS = 20_000;
+
+function polyPoolOptions(connections, { headersTimeout = HEADERS_TIMEOUT_MS, bodyTimeout = BODY_TIMEOUT_MS } = {}) {
+  return {
+    keepAliveTimeout: 60_000,
+    keepAliveMaxTimeout: 600_000,
+    pipelining: 1,
+    connections,
+    connectTimeout: CONNECT_TIMEOUT_MS,
+    headersTimeout,
+    bodyTimeout,
+  };
+}
 
 function queryString(query) {
   if (!query || typeof query !== 'object') return '';
@@ -45,6 +70,8 @@ function throwHttpError(method, path, res, extra = {}) {
   err.statusCode = res.statusCode;
   err.auth = classify;
   err.signMode = extra.signMode || null;
+  if (res.localBackoff) { err.localBackoff = true; err.retryInMs = res.retryInMs; }
+  if (res.backoffMs) err.backoffMs = res.backoffMs;
   throw err;
 }
 
@@ -53,20 +80,58 @@ function createPolymarketHttp({
   secretKey,
   baseUrl = DEFAULT_BASE,
   requestFn,
+  poolFactory,
 } = {}) {
   const origin = String(baseUrl || DEFAULT_BASE).replace(/\/$/, '');
   const accessKey = normalizeCred(keyId);
   const secret = normalizeCred(secretKey);
-  const http = requestFn ? null : new Client(origin, {
-    keepAliveTimeout: 60_000,
-    keepAliveMaxTimeout: 600_000,
-  });
+  const makePool = poolFactory || ((o, opts) => new Pool(o, opts));
+  const http = requestFn ? null : makePool(origin, polyPoolOptions(READ_CONNECTIONS, { headersTimeout: READ_HEADERS_TIMEOUT_MS, bodyTimeout: READ_BODY_TIMEOUT_MS }));
+  // Quote mutations: separate sockets, created lazily so read-only users (bucket manager, mm-paper) open none.
+  let quotePool = null;
+  function dispatcherFor(method, forceQuote) {
+    if (!http) return null;
+    if (forceQuote || (method && method !== 'GET')) {
+      if (!quotePool) quotePool = makePool(origin, polyPoolOptions(QUOTE_CONNECTIONS));
+      return quotePool;
+    }
+    return http;
+  }
   // Official Retail docs sign pathname only. Some gateways verify RequestURI
   // (path + query). Auto: try pathname, then one path+query retry on 401.
   let signModeLatched = null;
   let querySignTried = false;
 
-  async function requestOnce(method, path, { query, body, ts, signMode = 'path' } = {}) {
+  // GET-only 429 circuit breaker, keyed by path. Cloudflare error 1015 (rate
+  // limited) used to be retried on the next 3s poll, which keeps the ban
+  // alive. After a 429 we skip GETs to that path for a jittered, exponentially
+  // growing window (honoring Retry-After). Writes (POST/PUT/DELETE: quote,
+  // confirm, delete) are NEVER blocked here.
+  const getBackoff = new Map(); // path -> { until, step, hits, last }
+  const BACKOFF_BASE_MS = Number(process.env.POLY_429_BASE_MS) || 5000;
+  const BACKOFF_MAX_MS = Number(process.env.POLY_429_MAX_MS) || 120000;
+  const nowMs = () => Date.now();
+
+  function backoffFor(path) {
+    let b = getBackoff.get(path);
+    if (!b) { b = { until: 0, step: 0, hits: 0, skipped: 0, last: 0 }; getBackoff.set(path, b); }
+    return b;
+  }
+
+  function note429(path, res) {
+    const b = backoffFor(path);
+    b.hits += 1;
+    b.step = Math.min(b.step + 1, 10);
+    const exp = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * (2 ** (b.step - 1)));
+    const ra = Number(res && res.headers && (res.headers['retry-after'] || res.headers['Retry-After']));
+    const base = Number.isFinite(ra) && ra > 0 ? Math.min(BACKOFF_MAX_MS, ra * 1000) : exp;
+    const wait = Math.round(base * (0.75 + Math.random() * 0.5)); // +/-25% jitter
+    b.until = nowMs() + wait;
+    b.last = nowMs();
+    return wait;
+  }
+
+  async function requestOnce(method, path, { query, body, ts, signMode = 'path', forceQuotePool = false } = {}) {
     const qs = queryString(query);
     const fullPath = `${path}${qs}`;
     const includeQuery = signMode === 'path+query';
@@ -103,7 +168,7 @@ function createPolymarketHttp({
       };
     }
 
-    const { statusCode, body: resBody } = await http.request({
+    const { statusCode, headers: resHeaders, body: resBody } = await dispatcherFor(method, forceQuotePool).request({
       path: fullPath,
       method,
       headers,
@@ -114,12 +179,37 @@ function createPolymarketHttp({
     if (text) {
       try { json = JSON.parse(text); } catch (_) { json = null; }
     }
-    return { statusCode, text, json, signMode, signedPath };
+    return { statusCode, text, json, signMode, signedPath, headers: resHeaders };
   }
 
   async function request(method, path, { query, body, ts, signMode } = {}) {
+    const isGet = method === 'GET';
+    if (isGet) {
+      const b = getBackoff.get(path);
+      if (b && b.until > nowMs()) {
+        b.skipped += 1;
+        // Synthetic 429: no network call, so we stop feeding the rate limiter.
+        return {
+          statusCode: 429,
+          text: 'local backoff after upstream 429',
+          json: null,
+          signMode: signMode || signModeLatched || 'path',
+          localBackoff: true,
+          retryInMs: b.until - nowMs(),
+        };
+      }
+    }
     const mode = signMode || signModeLatched || 'path';
     const res = await requestOnce(method, path, { query, body, ts, signMode: mode });
+    if (isGet) {
+      if (res.statusCode === 429) {
+        const wait = note429(path, res);
+        res.backoffMs = wait;
+      } else if (res.statusCode >= 200 && res.statusCode < 300) {
+        const b = getBackoff.get(path);
+        if (b && b.step) { b.step = 0; b.until = 0; }
+      }
+    }
     if (res.statusCode >= 200 && res.statusCode < 300) {
       if (!signModeLatched) signModeLatched = mode;
       return res;
@@ -152,8 +242,25 @@ function createPolymarketHttp({
     return res.json;
   }
 
+  function backoffSnapshot() {
+    const out = {};
+    const t = nowMs();
+    for (const [path, b] of getBackoff) {
+      out[path] = { hits: b.hits, skipped: b.skipped, blockedMs: Math.max(0, b.until - t), step: b.step };
+    }
+    return out;
+  }
+
+  // True when any GET on `path` is currently inside a 429 backoff window.
+  function isBackedOff(path) {
+    const b = getBackoff.get(path);
+    return !!(b && b.until > nowMs());
+  }
+
   return {
     request,
+    backoffSnapshot,
+    isBackedOff,
     getUserId: () => getJson('/v1/rfqs/user-id'),
     listRfqs: (query) => getJson('/v1/rfqs', query),
     listQuotes: (query) => getJson('/v1/rfqs/quotes', query),
@@ -181,6 +288,24 @@ function createPolymarketHttp({
       const j = res.json;
       return (j && j.market) || j;
     },
+    // Single-market limit orders (single-leg Combo Locks). Same Retail
+    // endpoints the Live Trading Desk uses.
+    async createOrder(body) {
+      const res = await request('POST', '/v1/orders', { body });
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        throwHttpError('POST', '/v1/orders', res, { signMode: res.signMode });
+      }
+      return res.json;
+    },
+    async cancelOrder(orderId, marketSlug) {
+      const path = `/v1/order/${encodeURIComponent(orderId)}/cancel`;
+      const res = await request('POST', path, { body: { marketSlug } });
+      if (res.statusCode === 404) return { statusCode: 404 };
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        throwHttpError('POST', path, res, { signMode: res.signMode });
+      }
+      return { statusCode: res.statusCode, json: res.json };
+    },
     async createQuote(body) {
       const res = await request('POST', '/v1/rfqs/quotes', { body });
       if (res.statusCode < 200 || res.statusCode >= 300) {
@@ -206,9 +331,28 @@ function createPolymarketHttp({
       return { statusCode: res.statusCode, json: res.json };
     },
     getSignMode: () => signModeLatched,
+    // Keep every quote-pool socket hot (LB idle-kill otherwise costs a TLS handshake on the next burst POST).
+    // Fires QUOTE_CONNECTIONS concurrent GETs so a Pool opens/refreshes all sockets. Never throws.
+    async warmQuotePool(fanout = QUOTE_CONNECTIONS) {
+      if (!http) return { ok: false, sockets: 0, reason: 'no_http' };
+      if (isBackedOff(QUOTE_WARM_PATH)) return { ok: false, sockets: 0, reason: 'backoff' };
+      const t0 = nowMs();
+      try {
+        const results = await Promise.all(
+          Array.from({ length: Math.max(1, fanout) }, () => requestOnce('GET', QUOTE_WARM_PATH, {
+            signMode: signModeLatched || 'path', forceQuotePool: true,
+          }))
+        );
+        return { ok: results.every((r) => r.statusCode >= 200 && r.statusCode < 300), sockets: results.length, ms: nowMs() - t0, statusCode: results[0].statusCode };
+      } catch (e) {
+        return { ok: false, sockets: 0, ms: nowMs() - t0, error: e.message };
+      }
+    },
     close() {
-      if (http) {
-        try { http.close(); } catch (_) {}
+      for (const d of [http, quotePool]) {
+        if (d) {
+          try { d.close(); } catch (_) {}
+        }
       }
     },
   };
@@ -312,20 +456,76 @@ function executionsFromOrderUpdate(update) {
   return [];
 }
 
+// RFQ flow never drops below ~55 msg/s, so 30s of silence is already a dead
+// socket (was 60s). Override with POLY_WS_STALL_MS (0 disables).
+const DEFAULT_WS_STALL_MS = 30000;
+const DEFAULT_WS_STALL_CHECK_MS = 5000;
+function envStallMs() {
+  const raw = process.env.POLY_WS_STALL_MS;
+  if (raw == null || raw === '') return DEFAULT_WS_STALL_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_WS_STALL_MS;
+}
+
+// Best-effort label for a message parsePrivateMessage did not recognize
+// (acks, heartbeats, errors): its first top-level JSON key.
+function messageTypeOf(raw) {
+  try {
+    const m = JSON.parse(raw.toString());
+    if (m && typeof m === 'object') {
+      const k = Object.keys(m)[0];
+      return k ? `other:${k}` : 'other:{}';
+    }
+    return `other:${typeof m}`;
+  } catch (_) {
+    return 'non-json';
+  }
+}
+
+function isRealFeedMessage(parsed) {
+  return !!(parsed && parsed.type && parsed.type !== 'other');
+}
+
 function createPolymarketRfqWs({
   keyId,
   secretKey,
   url = DEFAULT_WS,
   onEvent,
   onStatus,
+  onStall,
+  onRecovered,
   subscribeOrders = false,
+  // Silent-stall watchdog: the RFQ firehose normally delivers tens of
+  // messages/s. A socket that stays "open" (pings still answered) but delivers
+  // nothing for stallMs is dead; terminate it so the close handler reconnects.
+  // 0 disables.
+  stallMs = envStallMs(),
+  stallCheckMs = DEFAULT_WS_STALL_CHECK_MS,
+  WebSocketImpl = WebSocket,
+  now = () => Date.now(),
 } = {}) {
   keyId = normalizeCred(keyId);
   secretKey = normalizeCred(secretKey);
   let ws = null;
   let pingTimer = null;
+  let stallTimer = null;
+  let reconnectTimer = null;
   let backoff = 1000;
   let closedByUs = false;
+  let lastMessageAt = 0;
+  let connectedAt = 0;
+  let stalls = 0;
+  let reconnects = 0;
+  let stalledPending = false; // a stall was declared; waiting for traffic to resume
+  // Cause diagnostics for the stall log: what the last message was and
+  // whether the socket still answers pings (a "zombie" socket keeps ponging).
+  let lastMessageType = null;
+  let messagesThisConn = 0;
+  let pingsSent = 0;
+  let pongsRecv = 0;
+  let lastPingAt = 0;
+  let lastPongAt = 0;
+  let pingsAtLastPong = 0;
   const status = (s, i) => { try { onStatus && onStatus(s, i); } catch (_) {} };
 
   function sendSubscribe() {
@@ -349,39 +549,118 @@ function createPolymarketRfqWs({
     }
   }
 
+  function checkStall() {
+    if (closedByUs || !ws || !(stallMs > 0)) return;
+    const t = now();
+    const ref = lastMessageAt || connectedAt;
+    const silentMs = t - ref;
+    if (silentMs < stallMs) return;
+    stalls += 1;
+    stalledPending = true;
+    const info = {
+      silentMs, stalls, reconnects, lastMessageAt: lastMessageAt || null,
+      // cause details
+      lastMessageType,
+      messagesThisConn,
+      socketAgeMs: connectedAt ? t - connectedAt : null,
+      readyState: ws && ws.readyState != null ? ws.readyState : null,
+      ping: {
+        sent: pingsSent,
+        pongs: pongsRecv,
+        unansweredPings: Math.max(0, pingsSent - pingsAtLastPong),
+        msSinceLastPing: lastPingAt ? t - lastPingAt : null,
+        msSinceLastPong: lastPongAt ? t - lastPongAt : null,
+        state: !pingsSent ? 'no-pings-sent'
+          : (lastPongAt && t - lastPongAt <= 25000 ? 'pong-ok (socket alive, no data)' : 'pong-missing (socket dead)'),
+      },
+    };
+    status('stalled', { message: `no ws message for ${Math.round(silentMs / 1000)}s - reconnecting` });
+    try { onStall && onStall(info); } catch (_) {}
+    // Reset the clock so a socket that stays dead after reconnect is re-flagged
+    // after another full window rather than every check tick.
+    lastMessageAt = 0;
+    connectedAt = t;
+    try { ws.terminate(); } catch (_) {}
+  }
+
   function connect() {
+    reconnectTimer = null;
     const headers = authHeaders({
       keyId, secretKey, method: 'GET', path: WS_SIGN_PATH,
     });
     status('connecting', { url });
-    ws = new WebSocket(url, { headers });
+    connectedAt = now();
+    lastMessageAt = 0;
+    lastMessageType = null;
+    messagesThisConn = 0;
+    pingsSent = 0; pongsRecv = 0; lastPingAt = 0; lastPongAt = 0; pingsAtLastPong = 0;
+    const sock = new WebSocketImpl(url, { headers });
+    ws = sock;
 
-    ws.on('open', () => {
-      backoff = 1000;
+    sock.on('open', () => {
+      if (ws !== sock) return;
+      // Do not reset backoff on open: Polymarket can accept the socket and then
+      // reply with an error / send nothing (outage). Reset only on real data.
+      connectedAt = now();
       sendSubscribe();
       status('subscribed');
       clearInterval(pingTimer);
-      pingTimer = setInterval(() => { try { ws.ping(); } catch (_) {} }, 10000);
+      pingTimer = setInterval(() => {
+        try { sock.ping(); pingsSent += 1; lastPingAt = now(); } catch (_) {}
+      }, 10000);
+      clearInterval(stallTimer);
+      if (stallMs > 0) {
+        stallTimer = setInterval(checkStall, stallCheckMs);
+        if (stallTimer.unref) stallTimer.unref();
+      }
     });
 
-    ws.on('message', (d) => {
+    sock.on('pong', () => {
+      if (ws !== sock) return;
+      pongsRecv += 1;
+      lastPongAt = now();
+      pingsAtLastPong = pingsSent;
+    });
+
+    sock.on('message', (d) => {
+      if (ws !== sock) return;
+      lastMessageAt = now();
+      messagesThisConn += 1;
       const parsed = parsePrivateMessage(d.toString());
+      // Only real feed data (RFQ/quote/execution events) proves the socket is
+      // healthy. An error reply or subscribe ack must not clear a stall alert
+      // or reset the reconnect backoff.
+      if (isRealFeedMessage(parsed)) {
+        backoff = 1000;
+        if (stalledPending) {
+          stalledPending = false;
+          try { onRecovered && onRecovered({ stalls, reconnects }); } catch (_) {}
+          status('recovered');
+        }
+      }
+      lastMessageType = !parsed ? messageTypeOf(d)
+        : (parsed.type === 'other' && parsed.raw && typeof parsed.raw === 'object'
+          ? `other:${Object.keys(parsed.raw)[0] || '{}'}` : parsed.type);
       if (!parsed) return;
       try { onEvent && onEvent(parsed); } catch (e) { console.error('[POLY] ws event', e && e.message); }
     });
 
-    ws.on('close', (c) => {
+    sock.on('close', (c) => {
+      if (ws !== sock) return; // superseded socket
       clearInterval(pingTimer);
+      clearInterval(stallTimer);
       status('closed', { code: c });
       if (!closedByUs) reconnect();
     });
-    ws.on('error', (e) => status('error', { message: e && e.message }));
+    sock.on('error', (e) => status('error', { message: e && e.message }));
   }
 
   function reconnect() {
+    if (reconnectTimer) return;
     const wait = Math.min(backoff, 30000);
     status('reconnecting', { wait });
-    setTimeout(() => { backoff *= 2; connect(); }, wait);
+    reconnects += 1;
+    reconnectTimer = setTimeout(() => { backoff = Math.min(backoff * 2, 30000); connect(); }, wait);
   }
 
   return {
@@ -389,17 +668,29 @@ function createPolymarketRfqWs({
     stop() {
       closedByUs = true;
       clearInterval(pingTimer);
+      clearInterval(stallTimer);
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       try { ws && ws.close(); } catch (_) {}
+    },
+    // Exposed for tests/heartbeat: run one watchdog pass.
+    checkStall,
+    stats() {
+      return { lastMessageAt: lastMessageAt || null, stalls, reconnects, silentMs: lastMessageAt ? now() - lastMessageAt : null };
     },
   };
 }
 
 module.exports = {
+  READ_CONNECTIONS,
+  QUOTE_CONNECTIONS,
+  polyPoolOptions,
   DEFAULT_BASE,
   DEFAULT_WS,
   queryString,
   createPolymarketHttp,
   createPolymarketRfqWs,
+  isRealFeedMessage,
+  DEFAULT_WS_STALL_MS,
   parsePrivateMessage,
   orderUpdateFromMessage,
   executionsFromOrderUpdate,

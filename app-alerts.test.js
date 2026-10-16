@@ -35,6 +35,10 @@ async function main() {
   assert.strictEqual(await a.raise({ kind: 'combo_low_cash', severity: 'warn', title: 'T', body: 'B', dedupeKey: 'k' }), true);
   assert.strictEqual(inserted[0].owner_email, 'kev120909@gmail.com');
   assert.strictEqual(inserted[0].dedupe_key, 'k');
+  assert.strictEqual(inserted[0].read_at, undefined, 'normal alerts are unread');
+  assert.strictEqual(await a.raise({ kind: 'bucket_transfer', title: 'moved', quiet: true }), true);
+  assert.ok(inserted[1].read_at && inserted[1].resolved_at, 'quiet rows are recorded already read + resolved');
+  assert.ok(logs.some((l) => /logged \(quiet\) bucket_transfer/.test(l)));
   insertError = { code: '23505', message: 'duplicate key value violates unique constraint' };
   assert.strictEqual(await a.raise({ kind: 'combo_low_cash', title: 'T', dedupeKey: 'k' }), true, 'existing unresolved row = present');
   insertError = { code: '42P01', message: 'relation does not exist' };

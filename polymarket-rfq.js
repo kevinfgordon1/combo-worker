@@ -43,7 +43,8 @@
 // (default off) is what stops open quotes from reserving; these checks stay on.
 'use strict';
 const { matchParlay } = require('./rfq');
-const { decideAtFill, isFreeBetRow, quoteFailureSkipReason } = require('./engine');
+const { decideAtFill, isFreeBetRow, quoteFailureSkipReason, isRfqClosedFailure } = require('./engine');
+const { createLatencyStats } = require('./latency-stats');
 const { findStartedEvent } = require('./started');
 const {
   RESERVE_TTL_MS,
@@ -82,8 +83,12 @@ const {
 const { createPolymarketHttp, createPolymarketRfqWs } = require('./polymarket-client');
 const { createMarketCache } = require('./polymarket-market-cache');
 const {
-  identitiesFromParlay,
+  identitiesFromParlay: identitiesFromParlayRaw,
   identitiesFromPolymarketLegs,
+  startTimesAgree,
+  POLY_LINE_SPORT,
+  LINE_SERIES,
+  PROP_SERIES,
   identitiesFromPolymarketSlugs,
   sameIdentitySet,
   TEAM_ALIASES,
@@ -122,9 +127,31 @@ const {
   reconcileLockActivityEvents,
   alreadyBookedSameSize,
   bookedActivityKeys,
+  quoteFillAlreadyBooked,
+  orderStateOf,
+  isFilledOrderState,
+  isDeadOrderState,
+  cumQuantityOf,
+  polyFillQty,
+  bookedRowRecordedMs,
 } = require('./polymarket-fill-reconcile');
 
 const MODE = 'POLY';
+
+// Lock identities for POLY matching: ML legs plus exact-line spread/total legs
+// (NFL/MLB/NHL full game). Memoized per parlay object — the RFQ firehose runs
+// couldMatchActiveLocks for every request against every lock (the Kalshi matcher
+// in rfq.js keeps using the ML-only identitiesFromParlay).
+const lockIdMemo = new WeakMap();
+function identitiesFromParlay(parlay) {
+  if (!parlay || typeof parlay !== 'object') return identitiesFromParlayRaw(parlay, { lines: true });
+  const keys = parlay.leg_keys || parlay.legKeys;
+  const hit = lockIdMemo.get(parlay);
+  if (hit && hit.keys === keys && hit.legs === parlay.legs) return hit.res;
+  const res = identitiesFromParlayRaw(parlay, { lines: true });
+  lockIdMemo.set(parlay, { keys, legs: parlay.legs, res });
+  return res;
+}
 function envIntLocal(name, def) {
   const n = Number(process.env[name]);
   return process.env[name] != null && process.env[name] !== '' && Number.isFinite(n) && n >= 0 ? n : def;
@@ -333,10 +360,14 @@ function teamInTokens(league, team, tokens) {
 
 function identityHitsTokens(id, tokens) {
   if (!id) return false;
-  // Combo Locks only price full-game ML (`aec`). Player-prop prefixes
+  // Combo Locks price full-game ML (`aec`) and exact-line spread/total legs
+  // (asc / tsc; NFL, MLB, NHL). Player-prop prefixes
   // (astatc, …) share league/date tokens and emit 2-char stat suffixes
   // (`tb` = total bases) that collide with team codes (TB Rays).
-  if (!tokens.has('aec')) return false;
+  // Line legs (spread/total) ride asc-/tsc- slugs instead. Mapped player props (astatc,
+  // anytime TD / MLB HR) carry a `line` too but are NEVER token-matched: they only match
+  // through the exact verified slug-identity set (see couldMatchActiveLocks).
+  if (id.line != null ? !(tokens.has('asc') || tokens.has('tsc')) : !tokens.has('aec')) return false;
   const leagueTokens = LEAGUE_SLUG_TOKENS[id.league] || (id.league ? [id.league] : []);
   if (!leagueTokens.some((t) => tokens.has(t))) return false;
   if (!tokensHaveDate(tokens, id.date)) return false;
@@ -396,7 +427,7 @@ function isKalshiMoneylineLock(parlay) {
   return kalshiMlTickersFromParlay(parlay).some((text) => {
     const raw = String(text).trim();
     const series = raw.split('-')[0].split(':')[0].toUpperCase();
-    return Boolean(SERIES[series]);
+    return Boolean(SERIES[series] || LINE_SERIES[series] || PROP_SERIES[series] || series === 'KXNCAAFGAME');
   });
 }
 
@@ -487,6 +518,22 @@ function explainLockOverlapMiss(rfq, parlays) {
   return { code: 'no_shared_game' };
 }
 
+// Why a lock cannot be mapped to Poly legs (log `why=`): player_prop (not
+// mapped; see notes), ncaaf_not_mapped (a college team/game is not in the verified
+// Kalshi<->Poly crosswalk, or its label/line could not be proven),
+// line_leg_unparsed (NFL/MLB/NHL line leg whose ticker/label could not be proven exact).
+function unpriceableReason(parlay) {
+  const tickers = kalshiMlTickersFromParlay(parlay).map((t) => String(t).split('-')[0].split(':')[0].toUpperCase());
+  // KXNFLTD / KXMLBHR legs: mapped only through the verified player crosswalk with an
+  // exact "Player: N+" label; anything else about them (player not in the crosswalk,
+  // D/ST, label missing, game text disagreeing) lands here.
+  if (tickers.some((t) => PROP_SERIES[t])) return 'prop_not_mapped';
+  if (tickers.some((t) => /PROP|TD|YDS|REC|RUSH|PASS|HR|HITS/.test(t) && !SERIES[t] && !LINE_SERIES[t])) return 'player_prop';
+  if (tickers.some((t) => /^KXNCAAF/.test(t))) return 'ncaaf_not_mapped';
+  if (tickers.some((t) => LINE_SERIES[t])) return 'line_leg_unparsed';
+  return 'other_leg_type';
+}
+
 function logUnpriceablePolyLocks(parlays, log = console.log) {
   if (!Array.isArray(parlays) || !parlays.length) return 0;
   const failing = [];
@@ -495,14 +542,14 @@ function logUnpriceablePolyLocks(parlays, log = console.log) {
     if (lock.ok) continue;
     const tickers = kalshiMlTickersFromParlay(p);
     const series = tickers.map((t) => String(t).split('-')[0].split(':')[0].toUpperCase());
-    if (!series.some((s) => /SPREAD|TOTAL|PROP/.test(s))) continue;
+    if (!series.some((s) => /SPREAD|TOTAL|PROP/.test(s) || s === 'KXNCAAFGAME' || PROP_SERIES[s])) continue;
     failing.push(p);
   }
   const n = failing.length;
   if (!n) { lockDiagLog.unpriceable.clear(); return 0; }
   for (const p of dueLockDiag(lockDiagLog.unpriceable, failing, Date.now())) {
     const label = p.label || p.id || '?';
-    log(`[${MODE}] lock-unpriceable-on-poly reason=not_moneyline n=${n} label=${label}`);
+    log(`[${MODE}] lock-unpriceable-on-poly reason=not_moneyline why=${unpriceableReason(p)} n=${n} label=${label}`);
   }
   return n;
 }
@@ -517,6 +564,16 @@ function formatReasonTally(reasons) {
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .map(([k, n]) => `${k}=${n}`)
     .join(' ');
+}
+
+// Locks that need at least one spread/total leg to be mapped (subset of priceable).
+function countPriceableLineLocks(parlays) {
+  let n = 0;
+  for (const p of parlays || []) {
+    const r = identitiesFromParlay(p);
+    if (r.ok && r.identities.some((id) => id.line != null)) n += 1;
+  }
+  return n;
 }
 
 function countPriceableLocks(parlays) {
@@ -571,6 +628,10 @@ function couldMatchActiveLocks(rfq, parlays, { partial = false } = {}) {
     if (!lock.ok || !lock.identities.length) continue;
     if (!partial && keys.length && keys.length !== lock.identities.length) continue;
     if (!partial && slugIds.ok && sameIdentitySet(slugIds.keys, lock.keys)) return true;
+    // A lock with spread/total legs is a candidate ONLY via the exact slug
+    // identity-set route above (full leg set, exact lines + sides). Loose token
+    // overlap must never pull wide RFQs into market fetches for line locks.
+    if (!partial && lock.identities.some((id) => id.line != null)) continue;
     const hits = partial
       ? lock.identities.some((id) => identityHitsTokens(id, tokens))
       : lock.identities.every((id) => identityHitsTokens(id, tokens));
@@ -604,18 +665,32 @@ function matchPolymarketParlayDetailed(rfq, parlays, opts = {}) {
   }
 
   const hits = [];
+  let startMismatch = false;
   for (const p of parlays) {
     const lock = identitiesFromParlay(p);
     if (!lock.ok) continue;
-    if (sameIdentitySet(pm.keys, lock.keys)) hits.push(p);
+    if (!sameIdentitySet(pm.keys, lock.keys)) continue;
+    // Same legs + same lines, but a different clock (doubleheader / replay)?
+    if (!startTimesAgree(lock.identities, pm.identities)) { startMismatch = true; continue; }
+    hits.push(p);
   }
   if (hits.length === 1) {
-    return { parlay: hits[0], reason: null, identityKeys: pm.keys };
+    return { parlay: hits[0], reason: null, identityKeys: pm.keys, polyStartMs: earliestPolyStart(pm.identities) };
   }
   if (hits.length > 1) {
     return { parlay: null, reason: 'ambiguous', identityKeys: pm.keys };
   }
-  return { parlay: null, reason: 'unmatched', identityKeys: pm.keys };
+  return { parlay: null, reason: startMismatch ? 'start_mismatch' : 'unmatched', identityKeys: pm.keys };
+}
+
+// Earliest Poly-reported kickoff / first pitch among VERIFIED line legs and verified
+// NCAAF moneyline legs (ms). Other ML identities carry no Poly clock.
+function earliestPolyStart(identities) {
+  let at = null;
+  for (const id of identities || []) {
+    if (id && (id.line != null || id.league === 'ncaaf') && id.startMs != null && (at == null || id.startMs < at)) at = id.startMs;
+  }
+  return at;
 }
 
 function matchPolymarketParlay(rfq, parlays, opts) {
@@ -631,6 +706,7 @@ function evaluatePolymarketRfq({
   startedFor,
   killEngaged,
   markets,
+  exactTarget,
 } = {}) {
   const rfq = raw && raw.map ? raw : normalizePolymarketRfq(raw);
   if (!rfq || !rfq.rfqId) return { action: 'skip', reason: 'bad_rfq' };
@@ -662,11 +738,30 @@ function evaluatePolymarketRfq({
   if (started && started.started) {
     return { action: 'skip', reason: 'game_started', rfq, parlay, started };
   }
+  // Poly's own kickoff for verified spread/total legs: lock keys for NFL are
+  // date-only, so this is the exact-clock backstop on top of starts_at.
+  const nowMs = now != null ? now : Date.now();
+  if (hit.polyStartMs != null && hit.polyStartMs <= nowMs) {
+    return {
+      action: 'skip',
+      reason: 'game_started',
+      rfq,
+      parlay,
+      started: {
+        started: true,
+        reason: 'game_started',
+        source: 'poly.market.gameStartTime',
+        at: new Date(hit.polyStartMs).toISOString(),
+        atMs: hit.polyStartMs,
+      },
+    };
+  }
 
   const quote = buildPolymarketQuote({
     fillAmerican: parlay.fill_american,
     cashOrderQty: rfq.cashOrderQty,
     qtyDecimal: rfq.qtyDecimal,
+    exact: exactTarget,
   });
   if (!shouldPostPolymarketQuote(quote)) {
     return { action: 'skip', reason: 'bad_size', rfq, parlay, quote };
@@ -690,6 +785,9 @@ function evaluatePolymarketRfq({
     // (size > min(remaining, per-fill cap)) are declined as rfq_too_large.
     allowPartial: false,
     isFreeBet: isFreeBetRow(parlay),
+    // Price actually sent + credited maker rebate: hit/miss/worst are computed at it, and with
+    // POLY_EXACT_TARGET the quote is refused unless price + rebate >= the lock target.
+    polyQuote: { buyPrice: quote.buyPrice, credit: quote.rebateCredit, enforce: quote.exact },
   });
   if (!decision.ok) {
     return {
@@ -702,7 +800,7 @@ function evaluatePolymarketRfq({
     };
   }
 
-  const kill = typeof killEngaged === 'function' ? !!killEngaged(parlay.user_id) : false;
+  const kill = typeof killEngaged === 'function' ? !!killEngaged(parlay.user_id, parlay) : false;
   return {
     action: 'quoteable',
     reason: kill ? 'kill' : null,
@@ -711,6 +809,7 @@ function evaluatePolymarketRfq({
     quote,
     decision,
     kill,
+    polyStartMs: hit.polyStartMs != null ? hit.polyStartMs : null,
   };
 }
 
@@ -949,6 +1048,16 @@ function findPendingForOrderExecution(pendingQuotes, ex) {
   return null;
 }
 
+// Execution price (YES, dollars): lastPx, else the order's avg/limit price.
+function execYesPrice(ex) {
+  const order = (ex && ex.order) || {};
+  for (const v of [ex && (ex.lastPx || ex.last_px), order.avgPx || order.avg_px, order.price]) {
+    const n = parseFloat(v && typeof v === 'object' ? v.value : v);
+    if (Number.isFinite(n) && n > 0 && n < 1) return n;
+  }
+  return null;
+}
+
 function orderFillEvent(ex, pending, pendingId) {
   const typ = normalizeExecutionType(ex && ex.type);
   const orderId = orderIdFromExecution(ex);
@@ -961,6 +1070,8 @@ function orderFillEvent(ex, pending, pendingId) {
     contracts,
     venue: 'polymarket',
     isPartial: typ === 'EXECUTION_TYPE_PARTIAL_FILL',
+    yesPrice: execYesPrice(ex),
+    fee: 0,
     rfqId: (pending && pending.rfqId) || rfqIdFromExecution(ex) || null,
     marketTicker: (pending && (pending.marketTicker || pending.market_ticker || pending.symbol)) || null,
     label: pending && pending.label,
@@ -1441,6 +1552,8 @@ function startPolymarketRfqLoop(ctx = {}) {
       cashOrderQty: parsePositiveShares(rfq && rfq.cashOrderQty) || null,
       buyPrice: q && q.buyPrice,
       estimatedContracts: q && q.estimatedContracts,
+      // Poly kickoff of verified spread/total legs: re-checked at confirm.
+      polyStartMs: evaluation && evaluation.polyStartMs != null ? evaluation.polyStartMs : null,
     };
   }
 
@@ -1472,13 +1585,103 @@ function startPolymarketRfqLoop(ctx = {}) {
     return typeof ctx.filledSoFarFor === 'function' ? ctx.filledSoFarFor(id) : 0;
   }
 
+  // Last look before a confirm: DB-fresh filled for the lock, after giving the
+  // venue a bounded chance to settle any unresolved holds on it. Never throws;
+  // a slow venue must not eat the ~3s confirm window.
+  async function lastLookFilled(parlayId) {
+    const budgetMs = ctx.lastLookBudgetMs > 0 ? ctx.lastLookBudgetMs : 900;
+    const work = (async () => {
+      if (typeof ctx.resolveHolds === 'function') {
+        try { await ctx.resolveHolds(parlayId); } catch (_) { /* best effort */ }
+      }
+      return typeof ctx.freshFilledFor === 'function' ? await ctx.freshFilledFor(parlayId) : 0;
+    })();
+    const timeout = new Promise((resolve) => {
+      const t = setTimeout(() => resolve(0), budgetMs);
+      if (t.unref) t.unref();
+    });
+    const fresh = await Promise.race([work, timeout]);
+    return Math.max(Number(fresh) || 0, filledSoFarFor(parlayId));
+  }
+
+  // Resolver check for a Polymarket confirm hold: is the fill booked, is the
+  // order dead, or did it fill at the venue without being booked?
+  async function checkHold(row) {
+    const quoteId = row.quoteId;
+    const pending = pendingQuotes.get(quoteId) || closedContext.get(quoteId) || null;
+    if (pending && pending.filledContracts > 0) return { state: 'booked' };
+    const orderId = (pending && (pending.creatorOrderId || pending.orderId))
+      || (row.meta && row.meta.orderId) || null;
+    if (!http || !orderId || typeof http.getOrder !== 'function') return { state: 'unknown' };
+    let order;
+    try { order = await http.getOrder(orderId); } catch (e) { return { state: 'unknown', error: e && e.message }; }
+    order = (order && order.order) || order;
+    if (!order) return { state: 'unknown' };
+    const cum = cumQuantityOf(order);
+    if (cum > 0 || isFilledOrderState(orderStateOf(order))) {
+      let booked = [];
+      if (typeof ctx.loadPolySlugRecords === 'function') {
+        try { booked = (await ctx.loadPolySlugRecords()) || []; } catch (_) { booked = []; }
+      }
+      const since = (row.at != null ? row.at : 0) - 120000;
+      const hit = booked.some((b) => {
+        if (b.parlay_id && b.parlay_id !== row.parlayId) return false;
+        const qty = polyFillQty(b);
+        if (!(qty > 0) || !(cum > 0) || Math.abs(qty - cum) > Math.max(0.02, cum * 0.005)) return false;
+        const at = bookedRowRecordedMs(b);
+        return at == null || at >= since;
+      });
+      return hit ? { state: 'booked', contracts: cum } : { state: 'filled_unbooked', contracts: cum, orderId };
+    }
+    if (isDeadOrderState(orderStateOf(order))) return { state: 'cancelled' };
+    return { state: 'open' };
+  }
+
+  // Resolver action: book a fill the venue reports but we never booked.
+  async function rebookHold(row, res) {
+    const pending = pendingQuotes.get(row.quoteId) || closedContext.get(row.quoteId)
+      || {
+        parlayId: row.parlayId, quoteId: row.quoteId, rfqId: row.meta && row.meta.rfqId,
+        label: row.meta && row.meta.label, contracts: row.meta && row.meta.contracts,
+        maxContracts: row.meta && row.meta.maxContracts, userId: row.meta && row.meta.userId,
+        creatorOrderId: res && res.orderId,
+      };
+    return confirmQuoteFill(
+      { id: row.quoteId, quoteId: row.quoteId, rfqId: pending.rfqId, creatorOrderId: pending.creatorOrderId || (res && res.orderId) },
+      pending,
+      row.quoteId,
+      { live: true },
+    );
+  }
+
+  // Fast watchdog: a quoteExecuted order can show FILLED a beat after the event.
+  // Re-check on a short ladder instead of waiting for the 20s activity reconcile.
+  const FAST_WATCH_MS = Array.isArray(ctx.fastWatchMs) ? ctx.fastWatchMs : [3000, 10000, 25000, 60000, 120000];
+  function startFillWatch(quote, pending, quoteId) {
+    if (!quoteId || !http || ctx.fastWatch === false) return;
+    FAST_WATCH_MS.forEach((ms) => {
+      const t = setTimeout(() => {
+        if (stopped) return;
+        const p = pendingQuotes.get(quoteId) || pending;
+        if (p && p.filledContracts > 0) return;
+        if (!capBook.has(p && p.parlayId, quoteId) && !pendingQuotes.has(quoteId)) return;
+        confirmQuoteFill(quote, p, quoteId, { live: true }).then((evt) => {
+          if (evt && evt.contracts > 0) {
+            console.log(`[${MODE}] WATCHDOG booked quote_id=${quoteId} contracts=${evt.contracts} after ${ms}ms`);
+          }
+        }).catch((e) => console.error(`[${MODE}] fill watchdog`, e && e.message));
+      }, ms);
+      if (t.unref) t.unref();
+    });
+  }
+
   function startedFor(p, rfq) {
     if (typeof ctx.startedFor === 'function') return ctx.startedFor(p, rfq);
     return findStartedEvent(rfq, p);
   }
 
-  function killEngagedFor(userId) {
-    return typeof ctx.killEngagedFor === 'function' ? ctx.killEngagedFor(userId) : false;
+  function killEngagedFor(userId, lock) {
+    return typeof ctx.killEngagedFor === 'function' ? ctx.killEngagedFor(userId, lock) : false;
   }
 
   function bump(key) {
@@ -1498,15 +1701,22 @@ function startPolymarketRfqLoop(ctx = {}) {
 
   const intake = ctx.intakeStats || createPolyIntakeStats();
   const wsSeen = createWsSeenSet();
+  // Quote-path latency (same histograms as Kalshi): RFQ age when a lock-matched RFQ reaches us (intake_ms),
+  // match -> POST done (quote_ms), RFQ age when the POST returned (posted_age_ms), late/failed/stale counts.
+  const latency = ctx.latencyStats || createLatencyStats();
+  // WS-delivered RFQs older than this are late deliveries (reconnect gap / backlog): skip instead of quoting a
+  // dead auction. REST-crawled RFQs are exempt (an open RFQ found by a crawl is still quotable). 0 = off.
+  const staleRfqMs = ctx.staleRfqMs != null ? ctx.staleRfqMs : envIntLocal('POLY_STALE_RFQ_MS', 30000);
 
   // Every RFQ the Poly path handles is tallied (seen / source / reason).
   async function handleRfq(raw, src) {
-    const out = await handleRfqCore(raw);
+    const out = await handleRfqCore(raw, src);
     try { intake.recordOutcome(out, src); } catch (_) { /* observability only */ }
     return out;
   }
 
-  async function handleRfqCore(raw) {
+  async function handleRfqCore(raw, src) {
+    const tMatch0 = Date.now();
     const locks = parlays();
     let rfq = normalizePolymarketRfq(raw);
     if (!rfq || !rfq.rfqId) return { action: 'skip', reason: 'bad_rfq' };
@@ -1555,6 +1765,20 @@ function startPolymarketRfqLoop(ctx = {}) {
       killEngaged: killEngagedFor,
     });
 
+    let intakeAgeMs = null;
+    if (evaluation.parlay) intakeAgeMs = latency.noteIntake(rfq.createdTime);
+    if (
+      evaluation.action === 'quoteable' && src === 'ws' && staleRfqMs > 0
+      && intakeAgeMs != null && intakeAgeMs > staleRfqMs
+    ) {
+      latency.noteStaleSkip();
+      const n = latency.staleSkipsTotal();
+      if (n <= 5 || n % 50 === 0) {
+        console.log(`[${MODE}] STALE RFQ skipped rfq=${rfq.rfqId} age=${Math.round(intakeAgeMs)}ms (> ${staleRfqMs}ms) n=${n}`);
+      }
+      return { action: 'skip', reason: 'stale_rfq', rfq, parlay: evaluation.parlay };
+    }
+
     if (evaluation.action !== 'quoteable') {
       logSkip(evaluation);
       if (
@@ -1602,6 +1826,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     pendingQuotes.set(reserveKey, pendingEntry(p, rfq, d.contracts, sizeMeta));
     try {
       const posted = await http.createQuote(quoteBodyFromEval(evaluation));
+      latency.notePost({ totalMs: Date.now() - tMatch0, createdTs: rfq.createdTime, ok: true });
       const quoteId = posted && (posted.quoteId || posted.id);
       pendingQuotes.delete(reserveKey);
       if (quoteId) {
@@ -1611,7 +1836,9 @@ function startPolymarketRfqLoop(ctx = {}) {
       console.log(
         `[${MODE}] QUOTED ${p.label} rfq=${rfq.rfqId} quote_id=${quoteId || '?'} ` +
         `buy=${q.buyPrice} sell=${q.sellPrice} contracts=${d.contracts} ` +
-        `${exposureBit(outstandingFor(p.id))}/${d.totalLimit}`
+        `${exposureBit(outstandingFor(p.id))}/${d.totalLimit} ` +
+        `fill=${p.fill_american} eff=${d.quotedEffAmerican} rebate_c=${(((d.rebateCredit || 0) * 100)).toFixed(3)} ` +
+        `exact=${q.exact ? 1 : 0} ms=${Date.now() - tMatch0}`
       );
       persistLockTape(evaluation, 'quoted', {
         quote_id: quoteId, is_live: true, contracts: d.contracts,
@@ -1628,6 +1855,10 @@ function startPolymarketRfqLoop(ctx = {}) {
       return { ...evaluation, post: true, quoteId };
     } catch (e) {
       pendingQuotes.delete(reserveKey);
+      latency.notePost({
+        totalMs: Date.now() - tMatch0, createdTs: rfq.createdTime, ok: false,
+        rfqClosed: isRfqClosedFailure(e && e.message) || /closed|not[_ ]?open|expired/i.test(String((e && e.message) || '')),
+      });
       console.error(`[${MODE}] POST FAILED ${p.label} rfq=${rfq.rfqId}`, e.message);
       const skipReason = quoteFailureSkipReason(e.message);
       if (skipReason) {
@@ -1646,6 +1877,88 @@ function startPolymarketRfqLoop(ctx = {}) {
     return parlayFromPending(pending, parlays());
   }
 
+  // ── quote delete with retry + stray tracking ──────────────────────────
+  // DELETE /v1/rfqs/{rfq}/quotes/{quote} sometimes 5xx/429s. Previously one
+  // failure was logged and the quote dropped from tracking while it may still
+  // rest on the venue. Now: retry transient failures inline, then park the
+  // quote in `strayDeletes` and keep re-deleting with backoff until it is gone
+  // (2xx/404), judged unrecoverable (other 4xx = already closed/not deletable),
+  // or the attempt budget runs out (logged loudly).
+  const strayDeletes = new Map(); // quoteId -> { rfqId, attempts, nextAt, firstAt, err }
+  const STRAY_MAX_ATTEMPTS = envIntLocal('POLY_STRAY_DELETE_MAX', 8);
+  const STRAY_BASE_MS = envIntLocal('POLY_STRAY_DELETE_BASE_MS', 4000);
+  const INLINE_DELETE_TRIES = envIntLocal('POLY_DELETE_INLINE_TRIES', 3);
+  const deleteStats = { ok: 0, retried: 0, stray: 0, strayCleared: 0, abandoned: 0, terminal4xx: 0 };
+
+  function isTransientDeleteError(e) {
+    const sc = e && e.statusCode;
+    if (sc == null) return true; // network / timeout
+    return sc >= 500 || sc === 429 || sc === 408;
+  }
+
+  async function deleteQuoteReliably(rfqId, quoteId, { label = 'delete' } = {}) {
+    if (!live || !rfqId || !quoteId) return { ok: true, skipped: true };
+    let lastErr = null;
+    for (let i = 0; i < INLINE_DELETE_TRIES; i += 1) {
+      try {
+        await http.deleteQuote(rfqId, quoteId);
+        if (i > 0) deleteStats.retried += 1;
+        deleteStats.ok += 1;
+        strayDeletes.delete(quoteId);
+        return { ok: true };
+      } catch (e) {
+        lastErr = e;
+        if (!isTransientDeleteError(e)) {
+          // 400 etc: venue says it cannot process the delete (RFQ already
+          // closed/expired or quote not deletable). Retrying will not help.
+          deleteStats.terminal4xx += 1;
+          console.error(`[${MODE}] ${label} not deletable (terminal ${e.statusCode}) quote_id=${quoteId} rfq=${rfqId}: ${e.message}`);
+          return { ok: false, terminal: true, error: e };
+        }
+        if (i < INLINE_DELETE_TRIES - 1) await new Promise((r) => setTimeout(r, 150 * (2 ** i) + Math.floor(Math.random() * 100)));
+      }
+    }
+    deleteStats.stray += 1;
+    strayDeletes.set(quoteId, {
+      rfqId, attempts: INLINE_DELETE_TRIES, firstAt: Date.now(),
+      nextAt: Date.now() + STRAY_BASE_MS, err: lastErr && lastErr.message,
+    });
+    console.error(`[${MODE}] ${label} FAILED after ${INLINE_DELETE_TRIES} tries - queued for retry quote_id=${quoteId} rfq=${rfqId}: ${lastErr && lastErr.message}`);
+    return { ok: false, queued: true, error: lastErr };
+  }
+
+  async function sweepStrayDeletes() {
+    if (!live || !strayDeletes.size) return;
+    const t = Date.now();
+    for (const [quoteId, st] of [...strayDeletes]) {
+      if (stopped) return;
+      if (st.nextAt > t) continue;
+      try {
+        await http.deleteQuote(st.rfqId, quoteId);
+        strayDeletes.delete(quoteId);
+        deleteStats.strayCleared += 1;
+        console.log(`[${MODE}] stray quote deleted quote_id=${quoteId} rfq=${st.rfqId} attempts=${st.attempts + 1} age_s=${Math.round((t - st.firstAt) / 1000)}`);
+      } catch (e) {
+        st.attempts += 1;
+        st.err = e && e.message;
+        if (!isTransientDeleteError(e)) {
+          strayDeletes.delete(quoteId);
+          deleteStats.terminal4xx += 1;
+          console.error(`[${MODE}] stray delete terminal ${e.statusCode} quote_id=${quoteId}: ${e.message}`);
+        } else if (st.attempts >= STRAY_MAX_ATTEMPTS) {
+          strayDeletes.delete(quoteId);
+          deleteStats.abandoned += 1;
+          console.error(`[${MODE}] STRAY QUOTE ABANDONED after ${st.attempts} delete attempts quote_id=${quoteId} rfq=${st.rfqId}: ${e.message}`);
+          if (typeof ctx.sendAlert === 'function') {
+            try { ctx.sendAlert(`[POLY] could not delete resting quote ${quoteId} on rfq ${st.rfqId} after ${st.attempts} attempts: ${e.message}`); } catch (_) {}
+          }
+        } else {
+          st.nextAt = Date.now() + Math.min(60000, STRAY_BASE_MS * (2 ** Math.max(0, st.attempts - INLINE_DELETE_TRIES))) * (0.75 + Math.random() * 0.5);
+        }
+      }
+    }
+  }
+
   async function deleteQuoteAndDrop(quoteId, pending, reason) {
     if (!quoteId) return;
     if (isReserveKey(quoteId)) {
@@ -1653,14 +1966,11 @@ function startPolymarketRfqLoop(ctx = {}) {
       return;
     }
     const rfqId = pending && pending.rfqId;
-    try {
-      if (live && rfqId) await http.deleteQuote(rfqId, quoteId);
-    } catch (e) {
+    if (live && rfqId) {
       const failKind = (reason && reason.started) ? 'game started' : (reason && reason.kind) || '';
-      console.error(
-        `[${MODE}] CANCEL FAILED ${failKind} ${(pending && pending.label) || '(unknown)'} quote_id=${quoteId}`,
-        e.message
-      );
+      await deleteQuoteReliably(rfqId, quoteId, {
+        label: `CANCEL ${failKind} ${(pending && pending.label) || '(unknown)'}`.trim(),
+      });
     }
     forgetQuote(quoteId, pending);
     pendingQuotes.delete(quoteId);
@@ -1680,10 +1990,24 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
   }
 
+  async function cancelQuoteById(quoteId, reason) {
+    if (!quoteId) return false;
+    const pending = pendingQuotes.get(quoteId) || null;
+    if (!pending && !(reason && reason.rfqId)) return false;
+    await deleteQuoteAndDrop(quoteId, pending || { rfqId: reason.rfqId, label: reason.label, parlayId: reason.parlayId }, reason || { kind: 'user_cancel' });
+    return true;
+  }
+
   async function cancelPendingIfStarted() {
     for (const [quoteId, pending] of pendingQuotes) {
       const p = parlayOfPending(pending);
-      const started = startedFor(p);
+      let started = startedFor(p);
+      if (!(started && started.started) && pending && pending.polyStartMs != null && pending.polyStartMs <= Date.now()) {
+        started = {
+          started: true, reason: 'game_started', source: 'poly.market.gameStartTime',
+          at: new Date(pending.polyStartMs).toISOString(), atMs: pending.polyStartMs,
+        };
+      }
       if (started && started.started) await deleteQuoteAndDrop(quoteId, pending, started);
     }
   }
@@ -1715,7 +2039,16 @@ function startPolymarketRfqLoop(ctx = {}) {
       }
     }
     const parlay = parlayOfPending(pending);
-    const started = parlay ? startedFor(parlay) : { started: false };
+    let started = parlay ? startedFor(parlay) : { started: false };
+    if (!(started && started.started) && pending && pending.polyStartMs != null && pending.polyStartMs <= Date.now()) {
+      started = {
+        started: true,
+        reason: 'game_started',
+        source: 'poly.market.gameStartTime',
+        at: new Date(pending.polyStartMs).toISOString(),
+        atMs: pending.polyStartMs,
+      };
+    }
     const gate = shouldConfirmNow(acceptedSide, { live, started });
     if (!gate.confirm) {
       if (gate.reason === 'game_started') {
@@ -1731,9 +2064,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         );
       }
       if (quoteId && pending && live && (gate.reason === 'side_not_buy' || gate.reason === 'game_started')) {
-        try { await http.deleteQuote(rfqId, quoteId); } catch (e) {
-          console.error(`[${MODE}] decline delete failed`, e.message);
-        }
+        await deleteQuoteReliably(rfqId, quoteId, { label: 'decline delete' });
         forgetQuote(quoteId, pending);
         pendingQuotes.delete(quoteId);
       }
@@ -1767,6 +2098,14 @@ function startPolymarketRfqLoop(ctx = {}) {
         maxContracts: pending.maxContracts,
         size: want,
         getFilled: () => filledSoFarFor(pending.parlayId),
+        lastLook: () => lastLookFilled(pending.parlayId),
+        onLastLookRaise: (info) => console.warn(
+          `[${MODE}] LAST LOOK raised filled ${info.memory} -> ${info.fresh} lock=${pending.parlayId} quote_id=${quoteId}`
+        ),
+        meta: {
+          venue: 'polymarket', rfqId, label: pending.label, contracts: pending.contracts,
+          maxContracts: pending.maxContracts, userId: pending.userId,
+        },
         getOpenHeld: () => outstandingFor(pending.parlayId, quoteId),
         confirm: () => http.confirmQuote(rfqId, quoteId),
         onExceed: async (info) => {
@@ -1782,7 +2121,7 @@ function startPolymarketRfqLoop(ctx = {}) {
             size: info.size,
             maxContracts: info.maxContracts,
           }));
-          try { await http.deleteQuote(rfqId, quoteId); } catch (_) {}
+          await deleteQuoteReliably(rfqId, quoteId, { label: 'cap delete' });
           forgetQuote(quoteId, pending);
           pendingQuotes.delete(quoteId);
         },
@@ -1817,7 +2156,7 @@ function startPolymarketRfqLoop(ctx = {}) {
           fallback();
         }
       }
-      try { if (live) await http.deleteQuote(rfqId, quoteId); } catch (_) {}
+      await deleteQuoteReliably(rfqId, quoteId, { label: 'confirm-failed delete' });
       forgetQuote(quoteId, pending);
       pendingQuotes.delete(quoteId);
       return { confirmed: false, reason: skipReason || 'confirm_failed', error: e.message };
@@ -1882,14 +2221,15 @@ function startPolymarketRfqLoop(ctx = {}) {
       `quote_id=${quoteId || '?'} rfq=${q.rfqId || (pending && pending.rfqId) || '?'} ` +
       `creatorOrderId=${q.creatorOrderId || q.creator_order_id || '?'}`
     );
-    confirmQuoteFill(q, pending, quoteId).catch((e) => {
+    confirmQuoteFill(q, pending, quoteId, { live: true }).catch((e) => {
       console.error(`[${MODE}] quoteExecuted fill-check`, e && e.message);
     });
+    startFillWatch(q, pending, quoteId);
   }
 
   const seenReconciledQuotes = new Set();
 
-  async function confirmQuoteFill(quote, pending, pendingId) {
+  async function confirmQuoteFill(quote, pending, pendingId, opts = {}) {
     if (!http) return null;
     const already = pending && pending.filledContracts ? pending.filledContracts : 0;
     let fromDb = 0;
@@ -1909,13 +2249,15 @@ function startPolymarketRfqLoop(ctx = {}) {
     if (typeof ctx.loadPolySlugRecords === 'function') {
       try { bookedPrior = bookedPrior.concat((await ctx.loadPolySlugRecords()) || []); } catch (_) { /* keep prior */ }
     }
-    if (alreadyBookedSameSize(
-      evt,
-      { id: evt.parlayId || (pending && pending.parlayId) },
-      bookedActivityKeys({ bookedFills: bookedPrior })
-    )) {
-      return null;
-    }
+    const lockRef = { id: evt.parlayId || (pending && pending.parlayId) };
+    // Live fills are a twin only of a same-size row booked within the twin
+    // window (the same fill via another path). Same size alone is routine for
+    // repeated $10 cash RFQs and must never drop a genuine fill.
+    const isTwin = opts.live
+      ? quoteFillAlreadyBooked(evt, lockRef, bookedPrior)
+      : alreadyBookedSameSize(evt, lockRef, bookedActivityKeys({ bookedFills: bookedPrior }));
+    if (isTwin) return null;
+    if (opts.live) evt.live = true;
     if (pending && evt.contracts > 0) {
       pending.filledContracts = (pending.filledContracts || 0) + evt.contracts;
     }
@@ -2055,6 +2397,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         pending.filledContracts = (pending.filledContracts || 0) + evt.contracts;
       }
       if (!pending && !(evt.contracts > 0)) evt.contracts = null;
+      evt.live = true;
       emitOrderFill(evt);
       if (typ === 'EXECUTION_TYPE_FILL' && pendingId) pendingQuotes.delete(pendingId);
       console.log(
@@ -2079,7 +2422,40 @@ function startPolymarketRfqLoop(ctx = {}) {
     return row && (row.id || row.rfqId || row.rfq_id || (row.rfq && row.rfq.id)) || null;
   }
 
+  // WS-health gating for the REST backup. When the WS is delivering, the 3s
+  // first-page poll and the deep crawl add almost nothing (~99.9% of RFQs
+  // arrive on the WS) but together made ~130 req/min and tripped Cloudflare
+  // 1015 (HTTP 429). While healthy we poll slowly and crawl shallow; the
+  // moment the WS goes quiet/stalls we go back to full-rate coverage.
+  const wsHealthyMaxSilentMs = envIntLocal('POLY_WS_HEALTHY_SILENT_MS', 15000);
+  const reconcileHealthyMs = envIntLocal('POLY_RECONCILE_HEALTHY_MS', 15000);
+  const crawlHealthyPages = envIntLocal('POLY_CRAWL_HEALTHY_PAGES', 5);
+  const stallRecoveryMs = envIntLocal('POLY_WS_STALL_RECOVERY_MS', 10 * 60 * 1000);
+  let lastWsStallAt = 0;
+  let lastReconcileAt = 0;
+  let restBackoffSkips = 0;
+  // REST intake health, so stall alerts can say whether REST is really covering.
+  let lastRestOkAt = 0;
+  let lastRestFailAt = 0;
+  function restFailing() {
+    return restBackedOff() || lastRestFailAt > lastRestOkAt;
+  }
+  function wsHealthy() {
+    if (!ws || typeof ws.stats !== 'function') return false;
+    const st = ws.stats();
+    if (!st || st.lastMessageAt == null) return false;
+    if (st.silentMs != null && st.silentMs > wsHealthyMaxSilentMs) return false;
+    if (lastWsStallAt && Date.now() - lastWsStallAt < stallRecoveryMs) return false;
+    return true;
+  }
+  function restBackedOff() {
+    return !!(http && typeof http.isBackedOff === 'function' && http.isBackedOff('/v1/rfqs'));
+  }
+
   async function reconcileOpenRfqs() {
+    if (restBackedOff()) { restBackoffSkips += 1; return; }
+    if (wsHealthy() && Date.now() - lastReconcileAt < reconcileHealthyMs) return;
+    lastReconcileAt = Date.now();
     const locks = parlays();
     const priceable = countPriceableLocks(locks);
     logActiveLockIdentityFails(locks);
@@ -2087,6 +2463,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     try {
       const listed = await http.listRfqs({ status: 'RFQ_STATUS_OPEN', limit: 100 });
       const rows = (listed && listed.rfqs) || [];
+      lastRestOkAt = Date.now();
       if (!locks.length) {
         console.log(
           `[${MODE}] reconcile open=${rows.length} locks=0 priceable=0 live=${live} skip=no_locks`
@@ -2109,6 +2486,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         (hist ? ` ${hist}` : '')
       );
     } catch (e) {
+      lastRestFailAt = Date.now();
       logReconcileAuthFailure(e);
     }
   }
@@ -2122,17 +2500,21 @@ function startPolymarketRfqLoop(ctx = {}) {
   let crawling = false;
   async function crawlAllOpenRfqs() {
     if (crawling || stopped) return null;
+    if (restBackedOff()) { restBackoffSkips += 1; return null; }
     crawling = true;
     const t0 = Date.now();
     try {
       const locks = parlays();
+      const shallow = wsHealthy();
       const res = await crawlOpenRfqs(http, {
-        maxPages: crawlMaxPages,
+        maxPages: shallow ? Math.min(crawlMaxPages, crawlHealthyPages) : crawlMaxPages,
         pageDelayMs: crawlPageDelayMs,
         isStopped: () => stopped,
         shouldPause: ctx.shouldPause,
       });
       intake.recordCrawl(res, Date.now() - t0);
+      if (res.rows.length || !res.error) lastRestOkAt = Date.now();
+      else lastRestFailAt = Date.now();
       const fresh = [];
       for (const row of res.rows) {
         const id = rowId(row);
@@ -2142,6 +2524,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       let bulk = 0;
       let exact = 0;
       let near = 0;
+      let exactMatched = 0; // fresh crawl RFQs whose FULL leg set matched an active lock
       if (!locks.length) {
         intake.noteBulkNoOverlap(fresh.length);
       } else {
@@ -2162,20 +2545,22 @@ function startPolymarketRfqLoop(ctx = {}) {
         let n = 0;
         for (const row of hot.concat(nearRows)) {
           if (stopped) break;
-          await handleRfq(row, 'rest').catch((e) => console.error(`[${MODE}] crawl rfq`, e.message));
+          const out = await handleRfq(row, 'rest').catch((e) => { console.error(`[${MODE}] crawl rfq`, e.message); return null; });
+          if (out && out.parlay) exactMatched += 1;
           if (++n % 25 === 0) await yieldLoop();
         }
         intake.noteBulkNoOverlap(bulk);
       }
       if (missTape) missTape.flushNoise();
       console.log(
-        `[${MODE}] crawl open=${res.rows.length} pages=${res.pages} ms=${Date.now() - t0}` +
+        `[${MODE}] crawl${shallow ? '(shallow)' : ''} open=${res.rows.length} pages=${res.pages} ms=${Date.now() - t0}` +
         ` ws_dup=${res.rows.length - fresh.length} fresh=${fresh.length}` +
-        ` lock_exact=${exact} lock_near=${near} noise=${bulk}` +
-        (res.truncated ? ` TRUNCATED${res.error ? ` err=${res.error.statusCode || '?'}${res.error.forbidden ? '(403)' : ''}` : ''}` : '')
+        ` lock_exact=${exact} lock_near=${near} lock_matched=${exactMatched} noise=${bulk}` +
+        (res.truncated && !(shallow && !res.error) ? ` TRUNCATED${res.error ? ` err=${res.error.statusCode || '?'}${res.error.forbidden ? '(403)' : ''}` : ''}` : '')
       );
       return { ...res, rows: undefined, open: res.rows.length, exact, near, bulk };
     } catch (e) {
+      lastRestFailAt = Date.now();
       logReconcileAuthFailure(e);
       return null;
     } finally {
@@ -2183,8 +2568,9 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
   }
 
+  let rateLimitCount = 0;
+  let lastRateLimitLog = 0;
   function logReconcileAuthFailure(err) {
-    authFailCount += 1;
     const now = Date.now();
     const classify = (err && err.auth) || classifyPolymarketAuthError({
       statusCode: err && err.statusCode,
@@ -2197,6 +2583,19 @@ function startPolymarketRfqLoop(ctx = {}) {
       signMode: err && err.signMode,
       includeStatus: false,
     });
+    if (err && err.statusCode === 429) {
+      // Rate limit, not an auth problem: the http client is backing off GETs.
+      rateLimitCount += 1;
+      if (now - lastRateLimitLog >= 30000) {
+        lastRateLimitLog = now;
+        console.error(
+          `[${MODE}] rest 429 rate-limited (cloudflare 1015) ${err.localBackoff ? 'local-backoff' : 'upstream'} ` +
+          `backoff_ms=${err.backoffMs || err.retryInMs || '?'} n=${rateLimitCount} skipped=${restBackoffSkips}`
+        );
+      }
+      return;
+    }
+    authFailCount += 1;
     if (authFailCount === 1 || now - lastAuthFailLog >= 15000) {
       lastAuthFailLog = now;
       console.error(`[${MODE}] reconcile rfqs ${err && err.message} ${detail} n=${authFailCount}`);
@@ -2217,11 +2616,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         if (quote && quote.rfqId) seenRfqs.delete(quote.rfqId);
         continue;
       }
-      try {
-        if (live && quote.rfqId) await http.deleteQuote(quote.rfqId, id);
-      } catch (e) {
-        console.error(`[${MODE}] TTL delete failed`, e.message);
-      }
+      if (live && quote.rfqId) await deleteQuoteReliably(quote.rfqId, id, { label: 'TTL delete' });
       pendingQuotes.delete(id);
       if (quote && quote.rfqId) seenRfqs.delete(quote.rfqId);
       console.log(
@@ -2275,6 +2670,31 @@ function startPolymarketRfqLoop(ctx = {}) {
       onStatus: (s, i) => console.log(`[${MODE}] ws:${s}`, i && i.message ? i.message : (i && i.wait != null ? `wait=${i.wait}` : '')),
       onEvent: onWsEvent,
       subscribeOrders: live,
+      onStall: (info) => {
+        lastWsStallAt = Date.now();
+        console.error(
+          `[${MODE}] WS STALL no message for ${Math.round(info.silentMs / 1000)}s ` +
+          `(stalls=${info.stalls}) - terminating socket and reconnecting | cause: ` +
+          `lastMsg=${info.lastMessageType || 'none'} msSinceLastMsg=${info.silentMs} ` +
+          `msgsOnSocket=${info.messagesThisConn} socketAgeMs=${info.socketAgeMs} ` +
+          `readyState=${info.readyState} ping=${info.ping ? info.ping.state : 'n/a'} ` +
+          `pings=${info.ping ? info.ping.sent : 0}/pongs=${info.ping ? info.ping.pongs : 0} ` +
+          `msSinceLastPong=${info.ping && info.ping.msSinceLastPong != null ? info.ping.msSinceLastPong : 'n/a'}`
+        );
+        if (typeof ctx.onWsStall === 'function') {
+          try { Promise.resolve(ctx.onWsStall({ ...info, restFailing: restFailing() })).catch(() => {}); } catch (_) { /* observability only */ }
+        }
+        // REST is the only intake until the WS is back: crawl deep right now.
+        if (crawlEnabled && !restBackedOff()) {
+          crawlAllOpenRfqs().catch((e) => console.error(`[${MODE}] stall crawl`, e.message));
+        }
+      },
+      onRecovered: (info) => {
+        console.log(`[${MODE}] WS recovered after stall (stalls=${info.stalls})`);
+        if (typeof ctx.onWsRecovered === 'function') {
+          try { Promise.resolve(ctx.onWsRecovered(info)).catch(() => {}); } catch (_) { /* observability only */ }
+        }
+      },
     });
     try { ws.start(); } catch (e) { console.error(`[${MODE}] ws start`, e.message); }
   }
@@ -2310,8 +2730,31 @@ function startPolymarketRfqLoop(ctx = {}) {
     const snap = intake.rollInterval();
     snap.locks = parlays().length;
     snap.priceable_locks = countPriceableLocks(parlays());
+    snap.priceable_line_locks = countPriceableLineLocks(parlays());
     snap.pending_quotes = pendingQuotes.size;
+    if (ws && typeof ws.stats === 'function') {
+      const st = ws.stats();
+      snap.ws_silent_s = st.silentMs != null ? Math.round(st.silentMs / 1000) : -1;
+      snap.ws_stalls = st.stalls;
+      snap.ws_reconnects = st.reconnects;
+    }
+    if (http && typeof http.backoffSnapshot === 'function') {
+      const bo = http.backoffSnapshot();
+      snap.rest_429 = Object.values(bo).reduce((n, x) => n + x.hits, 0);
+      const top = Object.entries(bo).filter(([, x]) => x.hits > 0).sort((a, b) => b[1].hits - a[1].hits).slice(0, 3);
+      if (top.length) snap.rest_429_paths = top.map(([k, x]) => `${k}:${x.hits}`).join('|');
+    }
     console.log(formatPolyHeartbeat(snap));
+    try {
+      snap.latency = latency.rollInterval();
+      const L = snap.latency;
+      console.log(
+        `[POLY-LATENCY] interval=${L.interval_s}s posted=${L.posted} failed=${L.post_failed} rfq_closed=${L.rfq_closed} ` +
+        `late_posts=${L.late_posts}(>${L.late_post_ms}ms) quote_ms p50=${L.quote_ms.p50} p99=${L.quote_ms.p99} max=${L.quote_ms.max} ` +
+        `intake_age_ms p50=${L.intake_ms.p50} p99=${L.intake_ms.p99} max=${L.intake_ms.max} n=${L.intake_ms.n}` +
+        (L.stale_skipped ? ` stale_skipped=${L.stale_skipped}` : '')
+      );
+    } catch (_) { /* observability only */ }
     if (typeof ctx.onPolyHeartbeat === 'function') {
       try { ctx.onPolyHeartbeat(snap); } catch (_) { /* observability only */ }
     }
@@ -2331,6 +2774,43 @@ function startPolymarketRfqLoop(ctx = {}) {
     }, crawlMs);
     if (crawlTimer.unref) crawlTimer.unref();
   }
+  // Keep the quote Pool's sockets hot, and keep line/prop leg market metadata cached, so the first RFQ in a
+  // burst pays neither a TLS handshake nor a market GET.
+  let warmTimer = null;
+  let prewarmTimer = null;
+  const warmMs = ctx.quoteWarmMs != null ? ctx.quoteWarmMs : envIntLocal('POLY_QUOTE_WARM_MS', 15000);
+  if (live && http && typeof http.warmQuotePool === 'function' && warmMs > 0 && ctx.startWs !== false) {
+    const warmOnce = () => http.warmQuotePool().then((r) => {
+      if (r && !r.ok && r.reason !== 'backoff') console.warn(`[${MODE}] quote warm failed ${r.error || r.statusCode || r.reason || ''}`);
+    }).catch(() => {});
+    warmOnce();
+    warmTimer = setInterval(warmOnce, warmMs);
+    if (warmTimer.unref) warmTimer.unref();
+  }
+  async function prewarmMarkets() {
+    if (stopped || !http) return 0;
+    const seen = new Set();
+    for (const p of parlays() || []) {
+      for (const leg of (p && p.legs) || []) {
+        const sym = polymarketLegSymbol(leg);
+        if (sym) seen.add(sym);
+      }
+    }
+    let n = 0;
+    for (const sym of seen) {
+      if (stopped) break;
+      if (marketCache.peek(sym) && marketCache.peek(sym).market) continue;
+      try { await marketCache.get(sym); n += 1; } catch (_) { /* cache stores the miss */ }
+      await new Promise((r) => setTimeout(r, 250)); // gentle on the REST limiter
+    }
+    return n;
+  }
+  if (enableLocks && ctx.startWs !== false && ctx.prewarmMarkets !== false) {
+    const first = setTimeout(() => { prewarmMarkets().catch(() => {}); }, 8000);
+    if (first.unref) first.unref();
+    prewarmTimer = setInterval(() => { prewarmMarkets().catch(() => {}); }, 5 * 60 * 1000);
+    if (prewarmTimer.unref) prewarmTimer.unref();
+  }
   const heartbeatTimer = heartbeatMs > 0 ? setInterval(emitPolyHeartbeat, heartbeatMs) : null;
   if (heartbeatTimer && heartbeatTimer.unref) heartbeatTimer.unref();
   const reconcileTimer = setInterval(() => {
@@ -2346,6 +2826,7 @@ function startPolymarketRfqLoop(ctx = {}) {
   const ttlTimer = setInterval(() => {
     closedContext.sweep();
     cancelUnaccepted().catch((e) => console.error(`[${MODE}] ttl`, e.message));
+    sweepStrayDeletes().catch((e) => console.error(`[${MODE}] stray sweep`, e.message));
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start`, e.message));
   }, 2000);
   let fillTimer = null;
@@ -2365,28 +2846,41 @@ function startPolymarketRfqLoop(ctx = {}) {
       clearInterval(reconcileTimer);
       if (crawlTimer) clearInterval(crawlTimer);
       if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (warmTimer) clearInterval(warmTimer);
+      if (prewarmTimer) clearInterval(prewarmTimer);
       clearInterval(ttlTimer);
       clearInterval(fillReconcileTimer);
       if (fillTimer) clearInterval(fillTimer);
       try { ws && ws.stop && ws.stop(); } catch (_) {}
       try { http.close && http.close(); } catch (_) {}
     },
+    http,
     handleRfq,
     crawlAllOpenRfqs,
     emitPolyHeartbeat,
     intake,
+    latency,
+    prewarmMarkets,
     wsSeen,
     handleQuoteAccepted,
     handleRfqClosed,
     handleQuoteExecuted,
     handleOrderExecution,
     confirmQuoteFill,
+    checkHold,
+    rebookHold,
+    lastLookFilled,
     reconcileLockFills,
     onWsEvent,
     cancelStartedQuotes,
     cancelPendingIfStarted,
     cancelOpenQuotesForParlay,
+    cancelQuoteById,
     cancelUnaccepted,
+    deleteQuoteReliably,
+    sweepStrayDeletes,
+    strayDeletes,
+    deleteStats,
     pendingQuotes,
     seenRfqs,
     missTape,
@@ -2416,6 +2910,7 @@ module.exports = {
   tallyReconcileOutcome,
   formatReasonTally,
   countPriceableLocks,
+  countPriceableLineLocks,
   lockSkipReasonOf,
   isKalshiMoneylineLock,
   matchPolymarketParlay,

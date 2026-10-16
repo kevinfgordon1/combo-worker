@@ -11,14 +11,33 @@
 // rfqClosed for CLOSED_CONTEXT_TTL_MS, a missing context does not confirm,
 // and a fill larger than the quoted size is flagged. Polymarket confirms
 // are capped against the largest size that accept could still fill.
+//
+// Holds are never dropped on a timer. A confirm hold stays until its fill is
+// booked or the venue order is confirmed dead (createHoldResolver); only
+// COMBO_HOLD_HARD_TTL_MS (default 30 min) force-releases, loudly. Every confirm
+// takes a last look: filled = max(in-memory, DB, venue-verified) so a fill that
+// was never booked cannot hide capacity (2026-10-02 Padres/Yankees/Dodgers
+// 1309.48/1251). Kalshi/Polymarket quotes carry no size, so a quote cannot be
+// shrunk to the remaining capacity; an RFQ larger than remaining is skipped.
 'use strict';
 
 const { wouldExceedCap } = require('./reserve');
 const { formatAlertStatus } = require('./venue-alert');
 
 const CLOSED_CONTEXT_TTL_MS = 60_000;
-// A confirm that never reports a fill must not pin the lock forever.
+// A confirm hold older than this is UNRESOLVED, not expired: it keeps counting
+// against the lock until a resolver proves the order was booked or cancelled
+// at the venue (createHoldResolver). Silently dropping it at 90s hid a real
+// 91.61-contract Poly fill and let the lock cross its cap (Padres/Yankees/
+// Dodgers, 2026-10-02).
 const IN_FLIGHT_TTL_MS = 90_000;
+// Last resort only: a hold the venue cannot be asked about is force-released
+// after this long, loudly (onForced), so a venue outage cannot pin a lock forever.
+const IN_FLIGHT_HARD_TTL_MS = Number(process.env.COMBO_HOLD_HARD_TTL_MS) > 0
+  ? Number(process.env.COMBO_HOLD_HARD_TTL_MS) : 30 * 60_000;
+// A booked fill at least this share of the hold is the whole accept: Kalshi
+// takers accept fewer contracts than quoted and fills come back ~4-6% small.
+const FINAL_FILL_RATIO = 0.85;
 
 function capAtConfirmEnabled(env = process.env) {
   const src = env || {};
@@ -30,20 +49,29 @@ function positive(n) {
   return Number.isFinite(x) && x > 0 ? x : 0;
 }
 
-function createInFlightConfirms({ now = Date.now, ttlMs = IN_FLIGHT_TTL_MS } = {}) {
+function createInFlightConfirms({
+  now = Date.now, ttlMs = IN_FLIGHT_TTL_MS, hardTtlMs = IN_FLIGHT_HARD_TTL_MS, onForced = null,
+} = {}) {
   const by = new Map();
 
+  // Only the hard TTL drops a hold, and it says so. The soft ttl just marks a
+  // hold stale so the resolver verifies it against the venue.
   function sweep(at) {
     const t = at != null ? at : now();
     for (const [parlayId, rows] of by) {
       for (const [quoteId, row] of rows) {
-        if (row.at != null && t - row.at >= ttlMs) rows.delete(quoteId);
+        if (row.at != null && t - row.at >= hardTtlMs) {
+          rows.delete(quoteId);
+          if (typeof onForced === 'function') {
+            try { onForced({ parlayId, quoteId, size: row.size, ageMs: t - row.at, meta: row.meta }); } catch (_) {}
+          }
+        }
       }
       if (!rows.size) by.delete(parlayId);
     }
   }
 
-  function hold(parlayId, quoteId, size, at) {
+  function hold(parlayId, quoteId, size, at, meta) {
     const n = positive(size);
     if (parlayId == null || quoteId == null || !(n > 0)) return;
     let rows = by.get(parlayId);
@@ -51,7 +79,7 @@ function createInFlightConfirms({ now = Date.now, ttlMs = IN_FLIGHT_TTL_MS } = {
       rows = new Map();
       by.set(parlayId, rows);
     }
-    rows.set(quoteId, { size: n, at: at != null ? at : now() });
+    rows.set(quoteId, { size: n, at: at != null ? at : now(), meta: meta || null, checkedAt: null });
   }
 
   function release(parlayId, quoteId) {
@@ -67,7 +95,7 @@ function createInFlightConfirms({ now = Date.now, ttlMs = IN_FLIGHT_TTL_MS } = {
     const row = rows.get(quoteId);
     const left = row.size - positive(amount);
     if (!(left > 1e-9)) release(parlayId, quoteId);
-    else rows.set(quoteId, { size: left, at: row.at });
+    else rows.set(quoteId, { ...row, size: left });
   }
 
   function sum(parlayId, excludeQuoteId, at) {
@@ -82,7 +110,41 @@ function createInFlightConfirms({ now = Date.now, ttlMs = IN_FLIGHT_TTL_MS } = {
     return n;
   }
 
-  return { hold, release, reduce, sum, sweep };
+  // Holds older than minAgeMs (default: the soft ttl), optionally for one lock.
+  function stale({ parlayId = null, minAgeMs = ttlMs, at } = {}) {
+    const t = at != null ? at : now();
+    const out = [];
+    for (const [pid, rows] of by) {
+      if (parlayId != null && pid !== parlayId) continue;
+      for (const [quoteId, row] of rows) {
+        const ageMs = row.at != null ? t - row.at : 0;
+        if (ageMs >= minAgeMs) {
+          out.push({
+            parlayId: pid, quoteId, size: row.size, at: row.at, ageMs, meta: row.meta, checkedAt: row.checkedAt,
+          });
+        }
+      }
+    }
+    return out;
+  }
+
+  function touch(parlayId, quoteId, at) {
+    const row = by.get(parlayId) && by.get(parlayId).get(quoteId);
+    if (row) row.checkedAt = at != null ? at : now();
+  }
+
+  function has(parlayId, quoteId) {
+    const rows = by.get(parlayId);
+    return !!(rows && rows.has(quoteId));
+  }
+
+  function size(parlayId, quoteId) {
+    const rows = by.get(parlayId);
+    const row = rows && rows.get(quoteId);
+    return row ? row.size : 0;
+  }
+
+  return { hold, release, reduce, sum, sweep, stale, touch, has, size };
 }
 
 function createConfirmQueue() {
@@ -142,8 +204,12 @@ function createClosedContext({ ttlMs = CLOSED_CONTEXT_TTL_MS, now = Date.now } =
   return { put, get, take, drop, sweep, ttlMs };
 }
 
-function createCapBook({ enabled = false, now, inFlightTtlMs } = {}) {
-  const flight = createInFlightConfirms({ now, ttlMs: inFlightTtlMs });
+function createCapBook({
+  enabled = false, now, inFlightTtlMs, inFlightHardTtlMs, onForced,
+} = {}) {
+  const flight = createInFlightConfirms({
+    now, ttlMs: inFlightTtlMs, hardTtlMs: inFlightHardTtlMs, onForced,
+  });
   const queue = createConfirmQueue();
   return {
     enabled: !!enabled,
@@ -152,6 +218,10 @@ function createCapBook({ enabled = false, now, inFlightTtlMs } = {}) {
     reduce: flight.reduce,
     sum: flight.sum,
     sweep: flight.sweep,
+    stale: flight.stale,
+    touch: flight.touch,
+    has: flight.has,
+    holdSize: flight.size,
     run: queue.run,
     exposure(openOutstanding, parlayId, excludeQuoteId) {
       if (!this.enabled) {
@@ -168,7 +238,19 @@ function createCapBook({ enabled = false, now, inFlightTtlMs } = {}) {
 // (other open quotes) and does not queue.
 async function confirmAgainstCap(book, args) {
   const run = async () => {
-    const filled = typeof args.getFilled === 'function' ? Number(args.getFilled()) || 0 : 0;
+    // Last look: the in-memory count can be behind the books (a fill booked by
+    // another path, or one that was never booked here). Re-read from the DB and,
+    // when the lock has unresolved holds, from the venue, and trust the larger.
+    let filled = typeof args.getFilled === 'function' ? Number(await args.getFilled()) || 0 : 0;
+    if (typeof args.lastLook === 'function') {
+      try {
+        const fresh = Number(await args.lastLook()) || 0;
+        if (fresh > filled) {
+          if (typeof args.onLastLookRaise === 'function') args.onLastLookRaise({ memory: filled, fresh });
+          filled = fresh;
+        }
+      } catch (_) { /* last look is best-effort; the in-memory count still gates */ }
+    }
     const openHeld = typeof args.getOpenHeld === 'function' ? Number(args.getOpenHeld()) || 0 : 0;
     const held = book && book.enabled
       ? book.sum(args.parlayId, args.quoteId)
@@ -186,7 +268,7 @@ async function confirmAgainstCap(book, args) {
       if (typeof args.onExceed === 'function') await args.onExceed(info);
       return info;
     }
-    if (book && book.enabled) book.hold(args.parlayId, args.quoteId, size);
+    if (book && book.enabled) book.hold(args.parlayId, args.quoteId, size, undefined, args.meta);
     try {
       await args.confirm();
       return { ok: true, filled, held, size };
@@ -199,10 +281,84 @@ async function confirmAgainstCap(book, args) {
   return run();
 }
 
-function releaseConfirmedFill(book, { parlayId, quoteId, partial, contracts } = {}) {
+// A booked fill that is the whole accept (>= FINAL_FILL_RATIO of the hold)
+// releases the hold; a smaller one only reduces it and the rest is verified by
+// the resolver. Without this a normal Kalshi fill (4-6% under the quote) was
+// "partial" and left the remainder pinned until the TTL, over-reserving.
+function isFinalFill(held, contracts) {
+  const h = positive(held);
+  const c = positive(contracts);
+  if (!(h > 0)) return true;
+  return c >= h * FINAL_FILL_RATIO - 1e-9;
+}
+
+function releaseConfirmedFill(book, { parlayId, quoteId, partial, contracts, held } = {}) {
   if (!book || !book.enabled || parlayId == null || quoteId == null) return;
-  if (partial) book.reduce(parlayId, quoteId, contracts);
+  const heldSize = held != null ? held : (typeof book.holdSize === 'function' ? book.holdSize(parlayId, quoteId) : null);
+  if (partial && !(heldSize != null && isFinalFill(heldSize, contracts))) book.reduce(parlayId, quoteId, contracts);
   else book.release(parlayId, quoteId);
+}
+
+// Verifies holds that outlived the soft ttl (or are about to gate a confirm).
+// check(row) -> { state: 'booked' | 'cancelled' | 'filled_unbooked' | 'open' | 'unknown' }.
+//  booked / cancelled  -> release (the fill is in the count, or the order is dead)
+//  filled_unbooked     -> keep the hold, call onFilledUnbooked(row, res) to book it
+//  open / unknown      -> keep the hold (the hard ttl is the only exit)
+function createHoldResolver({
+  book, check, onFilledUnbooked = null, now = Date.now, log = () => {},
+  minRecheckMs = 15_000, maxPerTick = 4,
+} = {}) {
+  async function resolveRow(row) {
+    book.touch(row.parlayId, row.quoteId, now());
+    let res;
+    try {
+      res = await check(row);
+    } catch (e) {
+      res = { state: 'unknown', error: e && e.message };
+    }
+    const state = (res && res.state) || 'unknown';
+    if (state === 'booked' || state === 'cancelled') {
+      book.release(row.parlayId, row.quoteId);
+      log(`HOLD RELEASED (${state}) quote_id=${row.quoteId} lock=${row.parlayId} size=${row.size} age=${Math.round(row.ageMs / 1000)}s`);
+    } else if (state === 'filled_unbooked') {
+      log(`HOLD KEPT (filled at venue, not booked) quote_id=${row.quoteId} lock=${row.parlayId} size=${row.size} contracts=${res.contracts != null ? res.contracts : '?'}`);
+      if (typeof onFilledUnbooked === 'function') {
+        try { await onFilledUnbooked(row, res); } catch (e) {
+          log(`HOLD rebook failed quote_id=${row.quoteId} ${e && e.message}`);
+        }
+      }
+    } else {
+      log(`HOLD KEPT (${state}) quote_id=${row.quoteId} lock=${row.parlayId} size=${row.size} age=${Math.round(row.ageMs / 1000)}s`);
+    }
+    return { row, state };
+  }
+
+  function due(rows, t) {
+    return rows.filter((r) => r.checkedAt == null || t - r.checkedAt >= minRecheckMs);
+  }
+
+  async function tick() {
+    if (!book || !book.enabled) return [];
+    const t = now();
+    book.sweep(t);
+    const rows = due(book.stale({ at: t }), t).slice(0, maxPerTick);
+    const out = [];
+    for (const row of rows) out.push(await resolveRow(row));
+    return out;
+  }
+
+  // Last look for one lock before a confirm. Younger holds than minAgeMs are
+  // normal in-flight confirms; older ones should have booked by now.
+  async function resolveParlay(parlayId, { minAgeMs = 10_000, max = 3 } = {}) {
+    if (!book || !book.enabled || parlayId == null) return [];
+    const t = now();
+    const rows = due(book.stale({ parlayId, minAgeMs, at: t }), t).slice(0, max);
+    const out = [];
+    for (const row of rows) out.push(await resolveRow(row));
+    return out;
+  }
+
+  return { tick, resolveParlay, resolveRow };
 }
 
 const POLY_SIZE_KEYS = [
@@ -281,6 +437,10 @@ function formatMissingContext(mode, quoteId, rfqId) {
 module.exports = {
   CLOSED_CONTEXT_TTL_MS,
   IN_FLIGHT_TTL_MS,
+  IN_FLIGHT_HARD_TTL_MS,
+  FINAL_FILL_RATIO,
+  isFinalFill,
+  createHoldResolver,
   capAtConfirmEnabled,
   positive,
   createInFlightConfirms,

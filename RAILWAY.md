@@ -84,8 +84,8 @@ The poller starts only on the Combo Locks service (`npm start` / `start-live.js`
 | `DESK_PROTECT_SWEEP_URL` | unset | HTTPS URL, `POST /api/desk-protect-sweep` on aibetbuilder. Unset → poller is not started. |
 | `DESK_PROTECT_SWEEP_SECRET` | unset | Shared secret, request header `X-Desk-Protect-Secret`. At least 16 characters, one line. Not a Supabase user JWT. Do not prefix with `VITE_`. Do not put it in the URL. |
 | `DESK_PROTECT_POLL_MS` | `1500` | Clamped to 1000–10000. |
-| `DESK_PROTECT_THROUGH_CENTS` | `3` | X. Cents through mid that count as picked off. Sent as `defaults.throughCents`. |
-| `DESK_PROTECT_REST_OFFSET_CENTS` | `1` | Y. Re-rest a buy at mid − Y and a sell at mid + Y. `0` re-rests at mid. |
+| `DESK_PROTECT_THROUGH_CENTS` | `2` | X. Cents through mid that count as picked off. Sent as `defaults.throughCents`. |
+| `DESK_PROTECT_REST_OFFSET_CENTS` | `0.5` | Y. Re-rest a buy at mid − Y and a sell at mid + Y. `0` re-rests at mid. |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALERT_CHAT_ID` | optional | One ping per adverse event. If unset, the same text is logged once. |
 
 Point Combo Locks at the sweep after aibetbuilder is serving it (same secret on that server only):
@@ -183,9 +183,67 @@ npm test
 - Poly REST crawl pauses (bounded) while a Kalshi quote POST/confirm is in flight.
 - Heartbeat: `[LATENCY]` log line + `combo_worker_stats.latency` jsonb (migration `20261002_combo_worker_stats_latency.sql`): `quote_ms`, `intake_ms` (RFQ age at our handler), `posted_age_ms` histograms, `late_posts` (>1s), `rfq_closed`, `stale_skipped`, reconnects by reason, `resubscribe_gap_max_ms`, `loop_lag_ms`.
 
+## Polymarket exact-target pricing and burst-latency knobs
+
+- `POLY_EXACT_TARGET` (default on; `0`/`false`/`off`/`no` restores the old floor-to-tick price) — Polymarket `buyPrice` is the lowest 0.001 tick where `price + guaranteed maker rebate >= lock target` (`ceil(target)` when the rebate cannot be credited). Rebate = `theta*p*(1-p)` per contract (theta `POLY_MAKER_REBATE_THETA`, default `0.0125`), credited only on fills of at least `POLY_REBATE_MIN_CONTRACTS` (default `40`) and net of half a cent of per-fill rounding. The engine refuses a quote whose net is below target (`quote_below_target`) and computes hit/miss/worst at the price sent. Read per RFQ, so a flip needs no restart for new quotes after a redeploy of env.
+- `POLY_STALE_RFQ_MS` (default `30000`, `0` disables) — WS-delivered RFQs older than this are skipped, not quoted (REST-crawled RFQs are exempt).
+- `POLY_QUOTE_WARM_MS` (default `15000`) — warm all quote-pool sockets this often.
+- Polymarket HTTP uses an undici `Pool` of 4 sockets for reads and a separate lazily-created `Pool` of 3 for quote POST/PUT/DELETE (was a single-socket `Client`); connect 2.5s, headers/body 8s on the quote pool.
+- Active lock leg market metadata is prefetched every 5 min so the first line/prop RFQ in a burst pays no market GET.
+- Heartbeat: `[POLY-LATENCY]` log line and `latency` inside the `combo_worker_stats.poly` jsonb (same histograms as Kalshi: `quote_ms`, `intake_ms`, `posted_age_ms`, `late_posts`, `rfq_closed`, `stale_skipped`). The `[POLY] QUOTED` line now carries `fill`, `eff`, `rebate_c`, `exact`, `ms`.
+
 ## Success checks after you deploy
 
 - Combo Locks logs: `WORKER_MODE=combo` and `Unhedged /markets, fill ticks, and shadow miss are off`.
 - Unhedged logs: `[UNHEDGED] starting — paper/shadow only` and `UNHEDGED_RFQ_LIVE=off`.
 - Combo Locks still posts / confirms lock quotes. Unhedged never logs `QUOTED` / `CONFIRMED` for Combo Locks.
 - `unhedged_rfqs` still receives in-scope unmatched MLB/NFL full-game moneyline paper rows when the Unhedged job is up.
+
+## Odds relay: DraftKings / FanDuel feed (`DKFD_FEED`)
+
+Off unless `DKFD_FEED=1` on the **odds-relay** service. Kevin approved this feed for the New Odds Board (Oct 7 2026).
+
+- DraftKings: `sportsbook-nash.draftkings.com/api/sportscontent/dkusnj/v1/leagues/{id}` (NJ), one request per league per poll. Akamai answers 403 without normal browser headers (`Accept-Language`, `Origin`, `Referer`).
+- FanDuel: `sbapi.nj.sportsbook.fanduel.com/api/content-managed-page` (public `_ak`) is the catalog only (CloudFront `max-age=30, stale-while-revalidate=60`, refreshed every 60s). Prices come from `smp.nj.sportsbook.fanduel.com/.../getMarketPrices` (uncached, max 80 market ids per call; in-play / starting-within-6h markets every call, the rest rotate).
+- Cadence: one request per book per league every `DKFD_POLL_MS` (default 4000, min 3000) while a board is watching that league, `DKFD_IDLE_POLL_MS` (default 30000) otherwise. Errors back off exponentially (honours `Retry-After`); a 403 block backs off from 60s up to 15 min.
+- `DKFD_LEAGUES` (default `NFL,NCAAF,MLB,NHL`). `DKFD_BOOKS` (default `draftkings,fanduel`).
+- **Railway egress is blocked by DraftKings' Akamai** (403 Access Denied on every request from the odds-relay, Oct 7 2026; the same request works from the agent box). Production runs `DKFD_BOOKS=fanduel` until DraftKings has another egress (residential proxy or Kevin's computer).
+- Routes: `/stream?venue=draftkings|fanduel&league=NFL` (SSE `quote` packets like Novig plus an `event: feed` heartbeat after every poll), `/board?venue=...` (JSON), `/health` → `dkfd`.
+- Code lives inline in `odds-relay.js` (`dkfdFeed`) so the odds-relay watch paths pick up changes.
+
+## Tester auto-funding (combo-testers service)
+
+Each tester child keeps that tester's Kalshi Combos balance (Exchange 1) topped
+up from their own Default balance (Exchange 0) with their own key
+(`tester-funder.js`), and sweeps Combos cash above the cap back to Default.
+Only Default <-> Combos on the tester's own account; never
+subaccounts, other users, or Kevin's money. Needs the tester key to have Full
+access (`write`) or Transfers (`write::transfer`); the Supabase table
+`combo_fund_moves` (aibetbuilder `sql/20261009_combo_fund_moves.sql`) must
+exist, otherwise nothing moves (fail closed).
+
+| Var (on combo-testers) | Default | Meaning |
+| --- | --- | --- |
+| `TESTER_AUTOFUND` | on | `0` = global kill switch, no tester moves at all |
+| `TESTER_FUND_MAX_MOVE_USD` | 100 | per-move limit |
+| `TESTER_FUND_DAILY_USD` | 250 | per-tester daily limit (ET day, from the log) |
+| `TESTER_FUND_MIN_MOVE_USD` | 5 | smallest move |
+| `TESTER_FUND_MAIN_FLOOR_USD` | 0 | Default balance always kept |
+| `TESTER_FUND_INTERVAL_MIN` | 5 | check interval |
+
+Cap: Combos available cash + unconfirmed moves never exceed the tester's own
+cap (`combo_settings.autofund_cap_usd`, set on the Combo Locks card), clamped
+to their `combo_live_users.max_per_day_usd`; no cap set = the daily limit.
+Successful moves are logged quietly (log table only, no banner or Telegram). Per-tester off switches: the tester's kill
+switch, owner Pause, `can_trade=false`, or a key without Transfers.
+
+## Single-leg locks (SINGLE_LEG_LIVE)
+
+1-leg Combo Locks rest the hedge as plain limit orders on Kalshi (single
+market, shard 0 / main cash) and Polymarket US (single moneyline market), capped
+across venues (single-leg.js, single-leg-runner.js). Needs
+`sql/20261012_combo_single_leg.sql` from aibetbuilder applied first.
+
+- `SINGLE_LEG_LIVE` unset/0 = off (default), `dry` = log what it would place, `1` = live.
+- `SINGLE_LEG_POLL_MS` fill poll, default 1500 (min 1000).
+- Same variable on combo-testers applies to every tester child (their own keys).

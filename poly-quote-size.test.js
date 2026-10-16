@@ -1,4 +1,7 @@
 'use strict';
+// These cases pin the legacy floor-to-tick price (POLY_EXACT_TARGET=0). The exact-target default is covered
+// in poly-exact-target.test.js.
+process.env.POLY_EXACT_TARGET = '0';
 // Polymarket US quote sizing: CreateQuote has no size field, so the venue fills
 // the FULL RFQ size. We must never "clip" on Poly; oversized RFQs are declined
 // and the confirm-time cap uses the venue-recorded size.

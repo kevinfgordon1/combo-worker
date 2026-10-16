@@ -34,7 +34,9 @@ function createAppAlerts({ client, log = (...a) => console.log(...a), ownerEmail
 
   // Returns true when the alert exists afterwards (new row, or an unresolved
   // row with the same dedupe_key already there); false on a write error.
-  async function raise({ kind, severity = 'info', title, body = '', dedupeKey = null, meta = {} }) {
+  // quiet: record the row for history but stamp read_at/resolved_at so it
+  // never shows as a banner or bell badge (routine, successful activity).
+  async function raise({ kind, severity = 'info', title, body = '', dedupeKey = null, meta = {}, quiet = false }) {
     try {
       const row = {
         owner_email: ownerEmail,
@@ -45,13 +47,18 @@ function createAppAlerts({ client, log = (...a) => console.log(...a), ownerEmail
         dedupe_key: dedupeKey || null,
         meta: meta || {},
       };
+      if (quiet) {
+        const now = new Date().toISOString();
+        row.read_at = now;
+        row.resolved_at = now;
+      }
       const { error } = await client.from(TABLE).insert(row);
       if (error) {
         if (dedupeKey && isUniqueViolation(error)) return true;
         log(`[APP-ALERT] insert failed ${kind}: ${errText(error)}`);
         return false;
       }
-      log(`[APP-ALERT] raised ${kind}${dedupeKey ? ` key=${dedupeKey}` : ''}`);
+      log(`[APP-ALERT] ${quiet ? 'logged (quiet)' : 'raised'} ${kind}${dedupeKey ? ` key=${dedupeKey}` : ''}`);
       return true;
     } catch (e) {
       log(`[APP-ALERT] insert error ${kind}: ${errText(e)}`);

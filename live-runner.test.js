@@ -204,12 +204,42 @@ assert.ok(
   'Kalshi POST/confirm must classify underfunded rejects'
 );
 assert.ok(
-  /if \(quoteFailureSkipReason\(e\.message\)\) \{[\s\S]*?logFundingSkip\(p, rfq, d\)/.test(liveSrc),
+  /if \(quoteFailureSkipReason\(e\.message\)\) \{[\s\S]*?logFundingSkip\(p, rfq, d(, \{[^}]*\})?\)/.test(liveSrc),
   'underfunded Kalshi POST must persist declined + skip_reason, not silent unfilled'
 );
 assert.ok(
-  /logFundingSkip\(p, rfq, d\)/.test(liveSrc) && /logAsync\(p, rfq, d, 'unfilled'\)/.test(liveSrc),
+  /logFundingSkip\(p, rfq, d(, \{[^}]*\})?\)/.test(liveSrc) && /logAsync\(p, rfq, d, 'unfilled'\)/.test(liveSrc),
   'non-funding POST fails stay unfilled'
+);
+assert.ok(
+  /costDollars:\s*quoteCostDollars\(d && d\.contracts, noBid\)/.test(liveSrc) &&
+    /takeCostHint\(\)/.test(liveSrc) && /onInsufficientBalance\(venue, info\)/.test(liveSrc),
+  'an underfunded Kalshi POST must hand its cash need (contracts x NO bid) to the bucket manager'
+);
+assert.ok(
+  !/\.\.\.withVenue\(extra\)[\s\S]{0,40}costDollars/.test(liveSrc) && !/costDollars:\s*extra\.costDollars/.test(liveSrc),
+  'costDollars is a one-shot hint, never a combo_submissions column'
+);
+assert.ok(
+  /splitPaused\(parlays\)/.test(liveSrc) && /notePausedIds\(split\.pausedIds\)/.test(liveSrc) &&
+    /parlays = split\.live/.test(liveSrc),
+  'refresh drops paused locks (combo_parlays.paused) from the lock list both venues read'
+);
+assert.ok(
+  /getParlays:\s*\(\) => parlays/.test(liveSrc),
+  'Polymarket reads the same filtered lock list as Kalshi, so a paused lock stops on both'
+);
+assert.ok(
+  /cancelPausedLock/.test(liveSrc) && /polyLoop\.cancelOpenQuotesForParlay\(parlayId, \{ kind: 'paused' \}\)/.test(liveSrc),
+  'pausing a lock cancels its open Kalshi and Polymarket quotes'
+);
+assert.ok(
+  /pollPaused\(\)/.test(liveSrc) && /, 5000\);/.test(liveSrc),
+  'a pause toggle is picked up by the 5s poll, not only the 30s refresh'
+);
+assert.ok(
+  !/\.select\('[^']*paused/.test(liveSrc.replace(/createPausePoller[\s\S]*$/, '')),
+  'the main lock query stays select(*) so a missing paused column cannot break refresh'
 );
 assert.ok(
   /persistQuoteSkip\(quoteId, skipReason/.test(liveSrc),

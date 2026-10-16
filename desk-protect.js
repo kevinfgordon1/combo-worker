@@ -19,12 +19,13 @@
 const { shortId } = require('./short-id');
 
 const MODE = 'DESK-PROTECT';
+const { classifyAlert } = require('./tg-gate');
 const SECRET_HEADER = 'X-Desk-Protect-Secret';
 const DEFAULT_POLL_MS = 1500;
 const MIN_POLL_MS = 1000;
 const MAX_POLL_MS = 10000;
-const DEFAULT_THROUGH_CENTS = 3;
-const DEFAULT_REST_OFFSET_CENTS = 1;
+const DEFAULT_THROUGH_CENTS = 2;
+const DEFAULT_REST_OFFSET_CENTS = 0.5;
 const SWEEP_TIMEOUT_MS = 8000;
 const ERROR_LOG_MS = 60000;
 const ALERT_RETRY_MS = 30000;
@@ -283,6 +284,11 @@ function parseSweepResponse(status, json) {
 async function sendTelegramAlert(text, env = process.env, fetchImpl = fetch) {
   const token = trimEnv(env && env.TELEGRAM_BOT_TOKEN);
   const chat = trimEnv(env && env.TELEGRAM_ALERT_CHAT_ID);
+  // Telegram is fills only (tg-gate.js). Adverse-protect pings are console-only.
+  if (!classifyAlert(text)) {
+    console.log(`[${MODE}] (console only) ${String(text).replace(/\n/g, ' | ')}`);
+    return;
+  }
   if (!token || !chat) {
     console.log(`[${MODE}] (telegram not configured) ${String(text).replace(/\n/g, ' | ')}`);
     return;

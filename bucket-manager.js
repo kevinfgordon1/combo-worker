@@ -14,7 +14,9 @@
 // balance_dollars as the exact fixed-point string. portfolio_value is
 // integer cents on the requested exchange_index.
 // https://docs.kalshi.com/api-reference/portfolio/get-balance
-// Shard total for the ceiling is available + portfolio_value.
+// The ceiling is measured on shard 1 available cash only. Open-position value
+// (portfolio_value) is shown in status/alerts but does not count toward it, so
+// locked positions never block a top-up.
 //
 // KALSHI_BUCKET_AUTO defaults to off: log the decision, do not POST.
 // KALSHI_BUCKET_SWEEP defaults to off.
@@ -28,15 +30,18 @@
 //
 // Schedule (America/New_York, DST-aware). A window is { start, end }
 // with dow 0=Sunday .. 6=Saturday and time "HH:MM". The end minute is
-// included. A window that wraps the week (Saturday through Monday) has
+// included. A window that wraps the week (Friday through Monday) has
 // start > end.
-//   Saturday 00:00 through Monday 23:59
+//   Friday 12:00 through Monday 23:59 (Friday playoff + college locks, weekend)
 //   Thursday 12:00 through Friday 03:00 (NFL Thursday night)
 'use strict';
 
 const { createPolymarketHttp } = require('./polymarket-client');
 
 const TRANSFER_PATH = '/trade-api/v2/portfolio/intra_exchange_instance_transfer';
+// Kalshi's own record of each transfer (newest first): transfer_id, status,
+// amount (dollars string), source/destination_exchange_shard.
+const TRANSFERS_PATH = '/trade-api/v2/portfolio/intra_exchange_instance_transfers';
 const BALANCE_PATH = '/trade-api/v2/portfolio/balance';
 const POSITIONS_PATH = '/trade-api/v2/portfolio/positions';
 const ORDERS_PATH = '/trade-api/v2/portfolio/orders';
@@ -53,16 +58,24 @@ const LOW_REPEAT_MS = 60 * 60 * 1000;
 const BLOCKED_ALERT_MS = 60 * 60 * 1000;
 const INSUFFICIENT_IN_APP_MS = 5 * 60 * 1000;
 const CHECK_COALESCE_MS = 15_000;
+// A rejected quote's cost keeps lifting the top-up target for this long.
+const NEED_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_SETTLE_MS = 180_000;
+// Pause between the transfer POST and the first confirm, so the first read is
+// not the (known to lag) immediate balance re-read.
+const DEFAULT_CONFIRM_DELAY_MS = 2_000;
 const DEFAULT_ERROR_COOLDOWN_MS = 60_000;
 const UNCONFIRMED_COOLDOWN_MS = 5 * 60 * 1000;
+// A transfer Kalshi has no record of (and no balance trace) after this long
+// is treated as never having happened and the hold is released.
+const PENDING_MAX_MS = 30 * 60 * 1000;
 
 const DOW = Object.freeze({
   Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
 });
 
 const DEFAULT_GAMEDAY_WINDOWS = Object.freeze([
-  { id: 'weekend', start: { dow: 6, time: '00:00' }, end: { dow: 1, time: '23:59' } },
+  { id: 'weekend', start: { dow: 5, time: '12:00' }, end: { dow: 1, time: '23:59' } },
   { id: 'thursday-night', start: { dow: 4, time: '12:00' }, end: { dow: 5, time: '03:00' } },
 ]);
 
@@ -168,23 +181,47 @@ function loadGamedayWindows(env) {
   }
 }
 
+function envPct(env, name, fallback) {
+  const raw = env && env[name];
+  if (raw == null || String(raw).trim() === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || n > 100) return fallback;
+  return n;
+}
+
+// Base combos target before the quote-shortfall bump.
+function baseBucketTarget(config, gameday, mainAvailableCents, bucketAvailableCents) {
+  const pct = Number(config.targetPct) || 0;
+  if (pct > 0) {
+    const total = Math.max(0, (mainAvailableCents || 0) + (bucketAvailableCents || 0));
+    return Math.floor(total * pct / 100);
+  }
+  return gameday ? config.targetGamedayCents : config.targetDefaultCents;
+}
+
 function loadBucketConfig(env = process.env) {
   const schedule = loadGamedayWindows(env || {});
   return {
     auto: envOn(env, 'KALSHI_BUCKET_AUTO'),
     sweep: envOn(env, 'KALSHI_BUCKET_SWEEP'),
-    ceilingCents: envDollarsToCents(env, 'KALSHI_BUCKET_CEILING', 15_000),
+    ceilingCents: envDollarsToCents(env, 'KALSHI_BUCKET_CEILING', 250_000),
     floorCents: envDollarsToCents(env, 'KALSHI_MAIN_FLOOR', 2_000),
-    maxTransferCents: envDollarsToCents(env, 'KALSHI_BUCKET_MAX_TRANSFER', 10_000),
-    dailyCapCents: envDollarsToCents(env, 'KALSHI_BUCKET_DAILY_CAP', 15_000),
+    maxTransferCents: envDollarsToCents(env, 'KALSHI_BUCKET_MAX_TRANSFER', 100_000),
+    dailyCapCents: envDollarsToCents(env, 'KALSHI_BUCKET_DAILY_CAP', 250_000),
     minTransferCents: envDollarsToCents(env, 'KALSHI_BUCKET_MIN_TRANSFER', 100),
-    targetGamedayCents: envDollarsToCents(env, 'KALSHI_BUCKET_TARGET_GAMEDAY', 10_000),
-    targetDefaultCents: envDollarsToCents(env, 'KALSHI_BUCKET_TARGET_DEFAULT', 5_000),
+    // Extra cash kept above a rejected quote's cost when topping up after an insufficient_balance.
+    insufficientBufferCents: envDollarsToCents(env, 'KALSHI_BUCKET_INSUFFICIENT_BUFFER', 500),
+    // Target = this % of total Kalshi cash (main + combos), recomputed each
+    // cycle. 0 falls back to the fixed gameday/default dollar targets.
+    targetPct: envPct(env, 'KALSHI_BUCKET_TARGET_PCT', 90),
+    targetGamedayCents: envDollarsToCents(env, 'KALSHI_BUCKET_TARGET_GAMEDAY', 12_000),
+    targetDefaultCents: envDollarsToCents(env, 'KALSHI_BUCKET_TARGET_DEFAULT', 8_000),
     lowAlertCents: envDollarsToCents(env, 'KALSHI_BUCKET_LOW_ALERT', 1_500),
     comboLowCashCents: envDollarsToCents(env, 'COMBO_LOW_CASH_ALERT_USD', 1_000),
     polyLowAlertCents: envDollarsToCents(env, 'POLY_LOW_ALERT', 1_500),
     intervalMin: envPositiveInt(env, 'KALSHI_BUCKET_INTERVAL_MIN', 5, 1),
     settleMs: envPositiveInt(env, 'KALSHI_BUCKET_SETTLE_MS', DEFAULT_SETTLE_MS, 0),
+    confirmDelayMs: envPositiveInt(env, 'KALSHI_BUCKET_CONFIRM_DELAY_MS', DEFAULT_CONFIRM_DELAY_MS, 0),
     errorCooldownMs: envPositiveInt(env, 'KALSHI_BUCKET_ERROR_COOLDOWN_MS', DEFAULT_ERROR_COOLDOWN_MS, 0),
     windows: schedule.windows,
     scheduleError: schedule.scheduleError,
@@ -245,23 +282,43 @@ function planBucketAction({
   sweepEnabled,
   flat,
   dailyTopupCents,
+  needCents,
   config,
+  mainResting = null,
 }) {
-  const targetCents = gameday ? config.targetGamedayCents : config.targetDefaultCents;
+  const baseTargetCents = baseBucketTarget(config, gameday, mainAvailableCents, bucketAvailableCents);
+  // A recently rejected quote (insufficient_balance) lifts the target to its
+  // cost plus the buffer. Every limit below (floor, ceiling, daily cap,
+  // per-transfer cap, minimum) still applies to the resulting amount.
+  const needTargetCents = needCents > 0
+    ? Math.floor(needCents) + (config.insufficientBufferCents || 0)
+    : 0;
+  const targetCents = Math.max(baseTargetCents, needTargetCents);
   const totalCents = bucketAvailableCents + (bucketPortfolioCents || 0);
   const gap = targetCents - bucketAvailableCents;
   const base = {
     targetCents,
+    needTargetCents,
     gameday: !!gameday,
     totalCents,
     gapCents: gap,
   };
 
   if (gap > 0) {
-    const headroom = Math.min(
-      config.ceilingCents - totalCents,
-      config.ceilingCents - bucketAvailableCents,
-    );
+    // Never pull cash out of shard 0 while the user has resting orders there
+    // (or we could not tell): Kalshi cancels resting orders whose collateral
+    // a transfer takes. Manual orders on main cash must survive top-ups.
+    if (mainResting && (mainResting.restingOrders || mainResting.uncertain)) {
+      return {
+        ...base,
+        action: 'hold',
+        block: null,
+        amountCents: 0,
+        reason: mainResting.restingOrders ? 'topup_main_resting_orders' : 'topup_main_orders_unknown',
+      };
+    }
+    // Ceiling on available cash only (open positions do not count).
+    const headroom = config.ceilingCents - bucketAvailableCents;
     const spare = mainAvailableCents - config.floorCents;
     const dailyLeft = config.dailyCapCents - (dailyTopupCents || 0);
     let amount = gap;
@@ -408,6 +465,30 @@ function orderOnShard(row, shard) {
   return Number(idx) === Number(shard);
 }
 
+const TRANSFER_DONE = new Set(['complete', 'completed', 'success', 'succeeded', 'settled']);
+const TRANSFER_BAD = new Set(['failed', 'failure', 'rejected', 'cancelled', 'canceled', 'error', 'reversed']);
+
+function transferStatusClass(status) {
+  const v = String(status == null ? '' : status).trim().toLowerCase();
+  if (TRANSFER_DONE.has(v)) return 'complete';
+  if (TRANSFER_BAD.has(v)) return 'failed';
+  return 'processing';
+}
+
+function parseTransfers(json) {
+  const rows = json && Array.isArray(json.transfers) ? json.transfers : [];
+  return rows.map((r) => {
+    const amount = Number(r && r.amount);
+    return {
+      transferId: (r && (r.transfer_id || r.transferId)) || null,
+      status: r && r.status != null ? String(r.status) : '',
+      amountCents: Number.isFinite(amount) ? Math.round(amount * 100) : null,
+      fromShard: r && r.source_exchange_shard != null ? Number(r.source_exchange_shard) : null,
+      toShard: r && r.destination_exchange_shard != null ? Number(r.destination_exchange_shard) : null,
+    };
+  }).filter((r) => r.transferId);
+}
+
 function parseJson(text) {
   if (!text) return null;
   try { return JSON.parse(text); } catch (_) { return null; }
@@ -528,7 +609,13 @@ function createKalshiBucketClient(signed) {
     };
   }
 
-  return { getShard, transfer, shardActivity };
+  // Kalshi's transfer records, newest first. Definitive for "did it land".
+  async function getTransfers() {
+    const json = await kalshiCall(signed, 'GET', TRANSFERS_PATH, { query: { limit: '50' } });
+    return parseTransfers(json);
+  }
+
+  return { getShard, transfer, getTransfers, shardActivity };
 }
 
 async function readPolyCashFromHttp(http) {
@@ -557,6 +644,7 @@ function createBucketManager({
   now = () => new Date(),
   alert = async () => {},
   log = (...args) => console.log(...args),
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   client = null,
   signed = null,
   readPolyCash,
@@ -575,6 +663,11 @@ function createBucketManager({
   let pending = null;
   let cooldownUntil = 0;
   let lastCheckAt = 0;
+  let needCents = 0;
+  let needAt = 0;
+  // Last balances this manager read, for the heartbeat / Combo Locks readout.
+  let snap = null;
+  let lastNeedUsed = 0;
   let inflight = null;
   let timer = null;
   let balanceErrorAt = 0;
@@ -616,16 +709,26 @@ function createBucketManager({
     }
   }
 
-  // Kevin asked for in-app alerts, not Telegram, for routine bucket activity:
-  // a completed transfer and a blocked top-up. With the in-app writer wired
-  // those are log-only on Telegram unless KALSHI_BUCKET_TELEGRAM=1. Failures,
-  // unconfirmed transfers, balance-read errors, low-cash and INSUFFICIENT
-  // BALANCE keep their existing Telegram alerts (plus an in-app row).
+  // Kevin asked for in-app alerts, not Telegram, for a blocked top-up. With
+  // the in-app writer wired that is log-only on Telegram unless
+  // KALSHI_BUCKET_TELEGRAM=1. Failures, unconfirmed transfers, balance-read
+  // errors, low-cash and INSUFFICIENT BALANCE keep their existing Telegram
+  // alerts (plus an in-app row).
+  //
+  // A successful routine transfer (shard 0 <-> shard 1) does not alert at
+  // all: no Telegram, no banner, no bell badge. It is logged here and written
+  // to app_alerts as an already-read, resolved row (quiet) for the record.
   const bucketTelegram = !(appAlerts && appAlerts.enabled) || envOn(env, 'KALSHI_BUCKET_TELEGRAM');
   async function emitBucket(text) {
     if (bucketTelegram) return emit(text);
     log(`[BUCKET] ALERT (in-app only): ${String(text).replace(/\n/g, ' | ')}`);
     return undefined;
+  }
+
+  // Successful transfers: log only, never Telegram (even with
+  // KALSHI_BUCKET_TELEGRAM=1).
+  function logTransfer(text) {
+    log(`[BUCKET] transfer logged (no alert): ${String(text).replace(/\n/g, ' | ')}`);
   }
 
   // In-app alert for Kevin (app_alerts). Never throws, never blocks trading.
@@ -654,13 +757,33 @@ function createBucketManager({
       `${shardLabel(decision.fromShard)} → ${shardLabel(decision.toShard)}`;
   }
 
+  async function reportTransferFailed(decision, transferId, why) {
+    log(`[BUCKET] transfer ${transferId || '?'} failed ${why}`);
+    await inApp({
+      kind: 'bucket_transfer_failed',
+      severity: 'error',
+      title: 'Kalshi bucket transfer failed',
+      body: `${transferText(decision)} (transfer_id ${transferId || '?'}) did not complete: ${why}. ` +
+        `No further automatic transfer for a few minutes.`,
+      meta: { transferId: transferId || null, amountCents: decision.amountCents, reason: decision.reason },
+    });
+    await emit(
+      `Kalshi bucket transfer failed\n` +
+      `${transferText(decision)}\n` +
+      `transfer_id: ${transferId || '?'}\n` +
+      `${why}\n` +
+      `No automatic retry until the cooldown ends.`
+    );
+  }
+
   async function inAppTransfer(decision, transferId, after, state) {
     const balances = after ? formatBalances(after.main, after.bucket) : '';
     await inApp({
       kind: 'bucket_transfer',
       severity: 'info',
+      quiet: true,
       title: `Kalshi bucket moved ${formatDollarsFromCents(decision.amountCents)}`,
-      body: `${transferText(decision)} (${decision.reason}${state === 'accepted' ? ', balance re-read pending' : ''}). ` +
+      body: `${transferText(decision)} (${decision.reason}${state === 'accepted' ? ', confirmation pending' : ''}). ` +
         (balances ? `${balances}. ` : '') + `transfer_id ${transferId || '?'}.`,
       meta: {
         transferId: transferId || null,
@@ -712,12 +835,77 @@ function createBucketManager({
     const bucket = await kalshi.getShard(BUCKET_SHARD);
     lastBucketCents = bucket.availableCents;
     seenBucketThisRun = bucket.availableCents;
+    snap = {
+      main_cents: main.availableCents,
+      combo_cash_cents: bucket.availableCents,
+      combo_positions_cents: bucket.portfolioCents || 0,
+      ceiling_cents: config.ceilingCents,
+      floor_cents: config.floorCents,
+      target_cents: (snap && snap.target_cents) || null,
+      gameday: snap ? snap.gameday : null,
+      at: clock().toISOString(),
+    };
     return { main, bucket };
   }
 
   function landed(before, after, decision) {
     const key = decision.toShard === BUCKET_SHARD ? 'bucket' : 'main';
     return after[key].availableCents >= before[key].availableCents + decision.amountCents - 1;
+  }
+
+  // Shard-0 move check. Shard 0 is main cash and combo fills/locks happen on
+  // shard 1, so a shard 0 drop (or rise for a sweep) cannot be explained by
+  // spend. This is the fallback when Kalshi's transfer record is unavailable.
+  function mainShowsMove(before, after, decision) {
+    if (decision.fromShard === MAIN_SHARD) {
+      return before.main.availableCents - after.main.availableCents >= decision.amountCents - 1;
+    }
+    return after.main.availableCents >= before.main.availableCents + decision.amountCents - 1;
+  }
+
+  // Definitive record first, then the shard-0 check, then the destination
+  // balance. Never confirms or fails a transfer off shard 1 spend noise.
+  //   confirmed  - record complete, or balances show the move
+  //   failed     - record says failed/rejected
+  //   processing - record exists, not complete yet
+  //   missing    - no record and balances do not show it (record API worked
+  //                or does not exist on this client)
+  //   unknown    - record API errored and balances do not show it
+  async function verifyTransfer(p, afterHint) {
+    const canRecord = !!p.transferId && typeof kalshi.getTransfers === 'function';
+    let record = null;
+    let recordOk = false;
+    if (canRecord) {
+      try {
+        const list = await kalshi.getTransfers();
+        recordOk = true;
+        record = list.find((r) => r.transferId === p.transferId) || null;
+      } catch (e) {
+        log(`[BUCKET] transfer record read failed ${e && e.message ? e.message : e}`);
+      }
+    }
+    if (record) {
+      const cls = transferStatusClass(record.status);
+      if (cls === 'complete') {
+        // Balances are display only here; the record is what confirms.
+        let shown = afterHint || null;
+        if (!shown) {
+          try { shown = await loadShards(); } catch (_) { shown = null; }
+        }
+        return { state: 'confirmed', via: 'record', record, after: shown };
+      }
+      if (cls === 'failed') return { state: 'failed', via: 'record', record };
+      return { state: 'processing', via: 'record', record };
+    }
+    let after = afterHint || null;
+    if (!after) {
+      try { after = await loadShards(); } catch (_) { after = null; }
+    }
+    const before = { main: p.beforeMain, bucket: p.beforeBucket };
+    if (after && mainShowsMove(before, after, p.decision)) return { state: 'confirmed', via: 'shard0', after };
+    if (after && landed(before, after, p.decision)) return { state: 'confirmed', via: 'balance', after };
+    if (canRecord && !recordOk) return { state: 'unknown', via: 'none', after };
+    return { state: 'missing', via: recordOk ? 'record-missing' : 'balance', after };
   }
 
   async function maybeLow(bucket, polyCash, t) {
@@ -767,10 +955,15 @@ function createBucketManager({
   async function evaluateInner(reason) {
     const date = clock();
     const t = date.getTime();
-    if (reason === 'insufficient_balance' && lastCheckAt && t - lastCheckAt < CHECK_COALESCE_MS) {
+    if (needAt && t - needAt >= NEED_TTL_MS) { needCents = 0; needAt = 0; }
+    if (
+      reason === 'insufficient_balance' && lastCheckAt && t - lastCheckAt < CHECK_COALESCE_MS &&
+      !(needCents > lastNeedUsed)
+    ) {
       return { skipped: 'coalesced' };
     }
     lastCheckAt = t;
+    lastNeedUsed = needCents;
     if (!kalshi) {
       log('[BUCKET] no Kalshi client — skipping balance check');
       return { skipped: 'no_client' };
@@ -809,56 +1002,85 @@ function createBucketManager({
     await maybeLow(shards.bucket, polyCash, t);
 
     if (pending) {
-      let after = null;
-      try { after = await loadShards(); } catch (_) { after = null; }
-      const showedUp = after && landed(
-        { main: pending.beforeMain, bucket: pending.beforeBucket },
-        after,
-        pending.decision,
-      );
-      if (showedUp) {
-        const done = pending;
+      // Never drop a pending transfer without verifying it: Kalshi's transfer
+      // record first, then the shard 0 move, then the destination balance.
+      const p = pending;
+      const v = await verifyTransfer(p, shards);
+      if (v.state === 'confirmed') {
         pending = null;
-        log(`[BUCKET] transfer ${done.transferId || '?'} confirmed ${formatBalances(after.main, after.bucket)}`);
-        await emitBucket(
+        log(
+          `[BUCKET] transfer ${p.transferId || '?'} confirmed via ${v.via}` +
+          (v.after ? ` ${formatBalances(v.after.main, v.after.bucket)}` : '')
+        );
+        logTransfer(
           `Kalshi bucket transfer\n` +
-          `${formatDollarsFromCents(done.decision.amountCents)} ` +
-          `${shardLabel(done.decision.fromShard)} → ${shardLabel(done.decision.toShard)}\n` +
-          `reason: ${done.decision.reason}\n` +
-          `transfer_id: ${done.transferId || '?'}\n` +
-          formatBalances(after.main, after.bucket)
+          `${formatDollarsFromCents(p.decision.amountCents)} ` +
+          `${shardLabel(p.decision.fromShard)} → ${shardLabel(p.decision.toShard)}\n` +
+          `reason: ${p.decision.reason}\n` +
+          `transfer_id: ${p.transferId || '?'}\n` +
+          (v.after ? formatBalances(v.after.main, v.after.bucket) : `confirmed by Kalshi transfer record`)
         );
         // The in-app row was already written when the transfer was accepted.
-        return { confirmed: true, late: true };
-      } else if (t < pending.holdUntil) {
-        log(`[BUCKET] holding — transfer ${pending.transferId || '?'} not visible on the re-read yet`);
-        return { held: true };
-      } else {
-        const id = pending.transferId;
-        const unconfirmedDecision = pending.decision;
+        return { confirmed: true, late: true, via: v.via };
+      }
+      if (v.state === 'failed') {
         pending = null;
         cooldownUntil = t + Math.max(config.errorCooldownMs, UNCONFIRMED_COOLDOWN_MS);
+        await reportTransferFailed(p.decision, p.transferId, `Kalshi transfer record status "${v.record.status}"`);
+        return { failed: true, transferId: p.transferId, via: v.via };
+      }
+      // processing / missing / unknown: still unverified.
+      const overdue = t >= p.holdUntil;
+      if (overdue && !p.alertedUnconfirmed) {
+        p.alertedUnconfirmed = true;
+        cooldownUntil = t + Math.max(config.errorCooldownMs, UNCONFIRMED_COOLDOWN_MS);
+        const why = v.state === 'missing'
+          ? 'Kalshi has no transfer record for it yet and the balances do not show it'
+          : v.state === 'processing'
+            ? `Kalshi transfer record status is "${v.record && v.record.status}"`
+            : 'the Kalshi transfer record could not be read';
         await inApp({
           kind: 'bucket_transfer_unconfirmed',
           severity: 'error',
           title: 'Kalshi bucket transfer not confirmed',
-          body: `${transferText(unconfirmedDecision)} was accepted ` +
-            `(transfer_id ${id || '?'}) but the balance re-read never showed it. ` +
-            `No further automatic transfer for a few minutes. Check Kalshi balances.`,
-          meta: { transferId: id || null },
+          body: `${transferText(p.decision)} was accepted ` +
+            `(transfer_id ${p.transferId || '?'}) but ${why}. ` +
+            `Holding further automatic transfers until it is verified. Check Kalshi balances.`,
+          meta: { transferId: p.transferId || null, verify: v.state },
         });
         await emit(
           `Kalshi bucket transfer not confirmed\n` +
-          `transfer_id ${id || '?'}\n` +
-          `The accept was not reflected in the balance re-read. ` +
-          `No further transfer until the cooldown ends.`
+          `transfer_id ${p.transferId || '?'}\n` +
+          `${why}. Holding further transfers until it is verified.`
         );
-        return { unconfirmed: true };
       }
+      // A transfer with no Kalshi record (record API healthy) and no balance
+      // trace after PENDING_MAX_MS never happened; release the hold then.
+      // Any other unverified state keeps holding.
+      if (overdue && v.state === 'missing' && t - p.sentAt >= PENDING_MAX_MS) {
+        pending = null;
+        log(`[BUCKET] transfer ${p.transferId || '?'} has no Kalshi record after ${Math.round(PENDING_MAX_MS / 60000)}m — releasing hold`);
+        await inApp({
+          kind: 'bucket_transfer_failed',
+          severity: 'error',
+          title: 'Kalshi bucket transfer never appeared',
+          body: `${transferText(p.decision)} (transfer_id ${p.transferId || '?'}) has no Kalshi transfer record ` +
+            `and no balance change after ${Math.round(PENDING_MAX_MS / 60000)} minutes. Automatic transfers resume.`,
+          meta: { transferId: p.transferId || null },
+        });
+        return { lost: true, transferId: p.transferId };
+      }
+      log(`[BUCKET] holding — transfer ${p.transferId || '?'} not verified yet (${v.state})`);
+      return overdue ? { held: true, unconfirmed: true, verify: v.state } : { held: true, verify: v.state };
     }
 
     const gameday = isGameday(date, config.windows);
-    const targetCents = gameday ? config.targetGamedayCents : config.targetDefaultCents;
+    const baseTarget = baseBucketTarget(config, gameday, shards.main.availableCents, shards.bucket.availableCents);
+    const targetCents = Math.max(
+      baseTarget,
+      needCents > 0 ? Math.floor(needCents) + (config.insufficientBufferCents || 0) : 0,
+    );
+    if (snap) { snap.target_cents = targetCents; snap.gameday = !!gameday; }
     const excessCents = shards.bucket.availableCents - targetCents;
     let flat = null;
     if (config.sweep && !gameday && excessCents >= config.minTransferCents) {
@@ -870,7 +1092,18 @@ function createBucketManager({
       }
     }
 
+    let mainResting = null;
+    if (targetCents - shards.bucket.availableCents > 0) {
+      try {
+        mainResting = await kalshi.shardActivity(MAIN_SHARD);
+      } catch (e) {
+        log(`[BUCKET] shard 0 resting-order check failed ${e && e.message ? e.message : e} — not topping up`);
+        mainResting = { uncertain: true, openPositions: false, restingOrders: false };
+      }
+    }
+
     const decision = planBucketAction({
+      mainResting,
       mainAvailableCents: shards.main.availableCents,
       bucketAvailableCents: shards.bucket.availableCents,
       bucketPortfolioCents: shards.bucket.portfolioCents,
@@ -878,6 +1111,7 @@ function createBucketManager({
       sweepEnabled: config.sweep,
       flat,
       dailyTopupCents: dailySpent(date),
+      needCents,
       config,
     });
 
@@ -910,7 +1144,7 @@ function createBucketManager({
         const blockedWhy = {
           floor: `Main (shard 0) is at or under the ${formatDollarsFromCents(config.floorCents)} floor`,
           daily_cap: `Today's auto-transfers hit the ${formatDollarsFromCents(config.dailyCapCents)} daily cap`,
-          ceiling: `Shard 1 is at the ${formatDollarsFromCents(config.ceilingCents)} ceiling`,
+          ceiling: `Shard 1 is at the ${formatDollarsFromCents(config.ceilingCents)} ceiling on available cash`,
         }[reason] || reason;
         const ok = await inApp({
           kind: 'bucket_blocked',
@@ -934,8 +1168,8 @@ function createBucketManager({
           `shard 1 available ${formatDollarsFromCents(shards.bucket.availableCents)}, ` +
           `target ${formatDollarsFromCents(decision.targetCents)}, ` +
           `need ${formatDollarsFromCents(Math.max(0, decision.gapCents))}\n` +
-          `shard 1 total ${formatDollarsFromCents(decision.totalCents)}, ` +
-          `ceiling ${formatDollarsFromCents(config.ceilingCents)}\n` +
+          `shard 1 open positions ${formatDollarsFromCents(Math.max(0, decision.totalCents - shards.bucket.availableCents))}, ` +
+          `ceiling on available cash ${formatDollarsFromCents(config.ceilingCents)}\n` +
           `shard 0 available ${formatDollarsFromCents(shards.main.availableCents)}, ` +
           `floor ${formatDollarsFromCents(config.floorCents)}\n` +
           `daily auto-transferred ${formatDollarsFromCents(dailySpent(date))} ` +
@@ -971,56 +1205,54 @@ function createBucketManager({
         toShard: decision.toShard,
       });
       if (decision.action === 'topup') addDaily(date, decision.amountCents);
-      let after = null;
+      // Pending from the moment Kalshi accepts it: nothing else may transfer
+      // until it is verified, even if the reads below throw.
+      const p = {
+        decision,
+        transferId: sent.transferId,
+        beforeMain: shards.main,
+        beforeBucket: shards.bucket,
+        sentAt: t,
+        holdUntil: t + config.settleMs,
+        alertedUnconfirmed: false,
+      };
+      pending = p;
+      // The immediate balance re-read is known to lag, so wait briefly and
+      // ask Kalshi's transfer record instead of alerting off one early read.
+      if (config.confirmDelayMs > 0) await sleep(config.confirmDelayMs);
+      let v;
       try {
-        after = await loadShards();
+        v = await verifyTransfer(p, null);
       } catch (e) {
-        pending = {
-          decision,
-          transferId: sent.transferId,
-          beforeMain: shards.main,
-          beforeBucket: shards.bucket,
-          holdUntil: t + config.settleMs,
-        };
-        await inAppTransfer(decision, sent.transferId, null, 'accepted');
-        await emit(
-          `Kalshi bucket transfer accepted, balance re-read failed\n` +
-          `${amountText} ${shardLabel(decision.fromShard)} → ${shardLabel(decision.toShard)}\n` +
-          `reason: ${decision.reason}\n` +
-          `transfer_id: ${sent.transferId || '?'}\n` +
-          `${e && e.message ? e.message : e}\n` +
-          `No further transfer until the balance re-read confirms this one.`
-        );
-        return { decision, transferId: sent.transferId, confirmed: false };
+        log(`[BUCKET] confirm check failed ${e && e.message ? e.message : e}`);
+        v = { state: 'unknown', via: 'none', after: null };
       }
-      if (!landed(shards, after, decision)) {
-        pending = {
-          decision,
-          transferId: sent.transferId,
-          beforeMain: shards.main,
-          beforeBucket: shards.bucket,
-          holdUntil: t + config.settleMs,
-        };
-        await inAppTransfer(decision, sent.transferId, after, 'accepted');
-        await emit(
-          `Kalshi bucket transfer accepted\n` +
-          `${amountText} ${shardLabel(decision.fromShard)} → ${shardLabel(decision.toShard)}\n` +
-          `reason: ${decision.reason}\n` +
-          `transfer_id: ${sent.transferId || '?'}\n` +
-          `Balance re-read does not show the move yet. No further transfer until it does.\n` +
-          formatBalances(after.main, after.bucket)
-        );
-        return { decision, transferId: sent.transferId, confirmed: false };
+      if (v.state === 'failed') {
+        pending = null;
+        cooldownUntil = clock().getTime() + Math.max(config.errorCooldownMs, UNCONFIRMED_COOLDOWN_MS);
+        await reportTransferFailed(decision, sent.transferId, `Kalshi transfer record status "${v.record.status}"`);
+        return { decision, transferId: sent.transferId, failed: true };
       }
-      await inAppTransfer(decision, sent.transferId, after, 'confirmed');
-      await emitBucket(
+      if (v.state !== 'confirmed') {
+        // Not visible yet. Info row only (no Telegram, no error): the next
+        // checks keep verifying and only alert if the hold window expires
+        // with no record, or the record says failed.
+        await inAppTransfer(decision, sent.transferId, v.after || null, 'accepted');
+        log(
+          `[BUCKET] transfer ${sent.transferId || '?'} accepted, not confirmed yet (${v.state}) — holding further transfers`
+        );
+        return { decision, transferId: sent.transferId, confirmed: false, verify: v.state };
+      }
+      pending = null;
+      await inAppTransfer(decision, sent.transferId, v.after || null, 'confirmed');
+      logTransfer(
         `Kalshi bucket transfer\n` +
         `${amountText} ${shardLabel(decision.fromShard)} → ${shardLabel(decision.toShard)}\n` +
         `reason: ${decision.reason}\n` +
         `transfer_id: ${sent.transferId || '?'}\n` +
-        formatBalances(after.main, after.bucket)
+        (v.after ? formatBalances(v.after.main, v.after.bucket) : 'confirmed by Kalshi transfer record')
       );
-      return { decision, transferId: sent.transferId, confirmed: true, after };
+      return { decision, transferId: sent.transferId, confirmed: true, after: v.after || null, via: v.via };
     } catch (e) {
       cooldownUntil = clock().getTime() + config.errorCooldownMs;
       log(`[BUCKET] transfer failed ${e && e.message ? e.message : e}`);
@@ -1055,10 +1287,23 @@ function createBucketManager({
     return inflight;
   }
 
-  async function onInsufficientBalance(venue) {
+  // info.costDollars / info.costCents: what the rejected quote needed in cash.
+  async function onInsufficientBalance(venue, info = null) {
     const name = String(venue || '').toLowerCase() === 'polymarket' ? 'polymarket' : 'kalshi';
     const t = clock().getTime();
     const last = venueAlertAt.get(name) || 0;
+    let costCents = 0;
+    if (name === 'kalshi' && info) {
+      const c = info.costCents != null ? Number(info.costCents) : Number(info.costDollars) * 100;
+      if (Number.isFinite(c) && c > 0) costCents = Math.ceil(c);
+    }
+    if (costCents > 0) {
+      if (!needAt || t - needAt >= NEED_TTL_MS) needCents = 0;
+      needCents = Math.max(needCents, costCents);
+      needAt = t;
+      log(`[BUCKET] insufficient_balance: rejected quote needs ${formatDollarsFromCents(costCents)} ` +
+        `(+${formatDollarsFromCents(config.insufficientBufferCents || 0)} buffer)`);
+    }
     if (name === 'kalshi' && t - insufficientInAppAt >= INSUFFICIENT_IN_APP_MS) {
       insufficientInAppAt = t;
       const cash = lastBucketCents != null
@@ -1069,9 +1314,10 @@ function createBucketManager({
         severity: 'error',
         title: 'Combo Locks skipped: Kalshi insufficient funds',
         body: `A Kalshi combo quote was rejected for insufficient balance. ${cash}` +
+          (costCents > 0 ? `It needed about ${formatDollarsFromCents(costCents)}. ` : '') +
           `The bucket manager is re-checking both shards now.`,
         dedupeKey: 'combo_insufficient_funds',
-        meta: { availableCents: lastBucketCents },
+        meta: { availableCents: lastBucketCents, needCents: costCents || null },
       });
     }
     if (t - last >= VENUE_ALERT_MS) {
@@ -1093,9 +1339,10 @@ function createBucketManager({
     log(
       `[BUCKET] started auto=${config.auto ? '1' : '0'} sweep=${config.sweep ? '1' : '0'} ` +
       `interval=${config.intervalMin}m ` +
+      (config.targetPct > 0 ? `target=${config.targetPct}% of total ` : '') +
       `target gameday=${formatDollarsFromCents(config.targetGamedayCents)} ` +
       `default=${formatDollarsFromCents(config.targetDefaultCents)} ` +
-      `ceiling=${formatDollarsFromCents(config.ceilingCents)} ` +
+      `ceiling=${formatDollarsFromCents(config.ceilingCents)}(available cash) ` +
       `floor=${formatDollarsFromCents(config.floorCents)} ` +
       `max=${formatDollarsFromCents(config.maxTransferCents)} ` +
       `daily=${formatDollarsFromCents(config.dailyCapCents)} ` +
@@ -1121,11 +1368,15 @@ function createBucketManager({
     check: requestCheck,
     onInsufficientBalance,
     evaluate: requestCheck,
+    // Read-only copy of the latest balances (cents) for observability.
+    snapshot() { return snap ? { ...snap } : null; },
   };
 }
 
 module.exports = {
+  baseBucketTarget,
   TRANSFER_PATH,
+  TRANSFERS_PATH,
   BALANCE_PATH,
   POSITIONS_PATH,
   ORDERS_PATH,
@@ -1146,6 +1397,8 @@ module.exports = {
   etDateKey,
   planBucketAction,
   parseShardBalance,
+  parseTransfers,
+  transferStatusClass,
   usdCashFromBalances,
   isOpenPosition,
   createKalshiBucketClient,

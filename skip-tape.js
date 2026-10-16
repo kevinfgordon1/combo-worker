@@ -9,7 +9,38 @@ const { toNum, normalizeTrade, matchTapeTrades } = require('./tape');
 
 // Same pad as quote-watcher: RFQ close → public print delay.
 const TAPE_PAD_MS = 45000;
-const SKIP_REASONS = Object.freeze(['oversized', 'limit_reached']);
+// rfq_closed_live: the RFQ closed while OUR quote was still live (someone else won it, or the
+// buyer walked away). Resolved after the tape pad into 'outbid' (closed, not cancelled —
+// tape_yes_price holds the winning YES when the print is found) or 'no_taker' (requester cancelled).
+const CLOSED_LIVE = 'rfq_closed_live';
+const SKIP_REASONS = Object.freeze(['oversized', 'limit_reached', CLOSED_LIVE]);
+
+// NO_PRINT: RFQ closed (not cancelled) but the combo ticker printed no trade at all
+// in the RFQ window — nobody (us or another maker) was filled, so it is not "outbid".
+const NO_PRINT = 'no_print';
+// Fallback when no print matches the RFQ size: one price printed within this many ms of close.
+const NEAR_CLOSE_MS = 10000;
+
+function finalizeClosedLive(rfq, patch, windowTrades = null) {
+  const cancelled = !!(rfq && (rfq.cancelled_ts || rfq.cancellation_reason));
+  const matched = !!(patch && (patch.tape_match === 'matched' || patch.tape_match === 'matched_time'));
+  if (matched) return 'outbid';
+  if (cancelled) return 'no_taker';
+  return windowTrades === 0 ? NO_PRINT : 'outbid';
+}
+
+// Size match failed: take the print(s) closest to RFQ close if they agree on one price.
+function nearCloseMatch(trades, closedMs, ms = NEAR_CLOSE_MS) {
+  if (closedMs == null) return { match: 'none' };
+  const near = (trades || []).filter((t) => t && t.ts != null && t.count > 0 && t.yes != null
+    && Math.abs(t.ts - closedMs) <= ms);
+  if (!near.length) return { match: 'none' };
+  const prices = new Set(near.map((t) => Math.round(t.yes * 10000)));
+  if (prices.size !== 1) return { match: 'ambiguous' };
+  near.sort((a, b) => Math.abs(a.ts - closedMs) - Math.abs(b.ts - closedMs));
+  const best = near[0];
+  return { match: 'matched_time', trade: best, yesPrice: best.yes, noPrice: best.no, count: best.count, tradeTs: best.ts };
+}
 
 function classifySkip(decision) {
   if (!decision || decision.ok) return null;
@@ -51,9 +82,9 @@ function isSkipTapeEligible({ skipReason, tapeMatch, parlayActive, started, now,
 }
 
 function tapeFieldsFromMatch(result) {
-  if (result && result.match === 'matched') {
+  if (result && (result.match === 'matched' || result.match === 'matched_time')) {
     return {
-      tape_match: 'matched',
+      tape_match: result.match,
       tape_yes_price: result.yesPrice != null ? result.yesPrice : null,
       tape_no_price: result.noPrice != null ? result.noPrice : null,
       tape_trade_ts: result.tradeTs != null ? new Date(result.tradeTs).toISOString() : null,
@@ -131,18 +162,27 @@ async function resolveSkipTape(row, { fetchRfq, fetchTrades, now = Date.now(), p
   const windowEnd = (closedMs || now) + padMs;
   const normalized = (trades || []).map((t) => normalizeTrade(t, parseTs))
     .filter((t) => t.ts == null || (t.ts >= windowStart - 1000 && t.ts <= windowEnd + 1000));
-  const result = matchTapeTrades(normalized, {
+  let result = matchTapeTrades(normalized, {
     rfqCount: rfqCountForTape(rfq, row.contracts),
     closedMs,
   });
+  if (result.match !== 'matched') {
+    const near = nearCloseMatch(normalized, closedMs);
+    if (near.match === 'matched_time') result = near;
+  }
   const patch = tapeFieldsFromMatch(result);
   patch.market_ticker = ticker;
-  return { retry: false, patch, result };
+  return { retry: false, patch, result, rfq, windowTrades: normalized.length };
 }
 
 module.exports = {
   TAPE_PAD_MS,
   SKIP_REASONS,
+  CLOSED_LIVE,
+  NO_PRINT,
+  NEAR_CLOSE_MS,
+  nearCloseMatch,
+  finalizeClosedLive,
   classifySkip,
   skipPersistExtra,
   withVenue,

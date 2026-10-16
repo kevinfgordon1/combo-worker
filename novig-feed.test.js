@@ -102,6 +102,25 @@ assert.strictEqual(quotes[0].book_id, 195);
 assert.strictEqual(quotes[0].bet_type, 'moneyline');
 assert.strictEqual(quotes[0].american, 104);
 
+// Live taker fee: quotes stay pre-fee asks; the market's fee.coefficient rides
+// along (consumers add c·P·(1−P) only when is_live). Absent fee → undefined.
+{
+  const feeCat = buildCatalog('NFL', {
+    items: [{ eventId: 'fe', description: 'Pittsburgh Steelers @ Cleveland Browns', league: 'NFL', status: 'OPEN_INGAME', startsTs: Date.now() - 600e3 }],
+  }, {
+    items: [
+      { marketId: 'fm', eventId: 'fe', marketType: 'MONEY', status: 'OPEN', strike: '0', fee: { coefficient: '0.03', makerCredit: '0.5', charged: 'WHEN_LIVE' }, outcomes: [{ outcomeId: 'cle', name: 'CLE' }, { outcomeId: 'pit', name: 'PIT' }] },
+      { marketId: 'nf', eventId: 'fe', marketType: 'TOTAL', status: 'OPEN', strike: '41.5', outcomes: [{ outcomeId: 'o', name: 'Over 41.5' }, { outcomeId: 'u', name: 'Under 41.5' }] },
+    ],
+  });
+  const feeBook = bookFromSnapshot({ seq: 1, orders: { cle: [{ orderId: '1', price: '0.705', qty: 100 }], pit: [{ orderId: '2', price: '0.705', qty: 100 }] } });
+  const fq = quotesForMarket(feeCat.events.get('fe'), feeCat.groups.get('fe|MONEY')[0], feeBook, 'NFL');
+  assert.ok(fq.every((q) => q.is_live === true && q.fee_coefficient === 0.03 && q.odds === 0.295 && q.american === 239));
+  const tb2 = bookFromSnapshot({ seq: 1, orders: { o: [{ orderId: '5', price: '0.460', qty: 100 }], u: [{ orderId: '6', price: '0.500', qty: 100 }] } });
+  const nfq = quotesForMarket(feeCat.events.get('fe'), feeCat.groups.get('fe|TOTAL')[0], tb2, 'NFL');
+  assert.ok(nfq.every((q) => q.fee_coefficient === undefined));
+}
+
 // Deltas: add joins, remove leaves.
 applyBookDeltas(mlBook, [
   { kind: 'add', order: 'e', outcome: 'ari', price: '0.520', qty: 5000 },
@@ -109,6 +128,19 @@ applyBookDeltas(mlBook, [
 ]);
 assert.deepStrictEqual(askFor(mlBook, ml, 'nyg'), { odds: 0.48, size: 50 });
 assert.deepStrictEqual(askFor(mlBook, ml, 'ari'), { odds: 0.52, size: 1 });
+
+// Live wire shape: delta adds carry outcomeId and orderId (not outcome/order).
+{
+  const live = bookFromSnapshot({ seq: 10, orders: { nyg: [{ orderId: 'x1', price: '0.020', qty: 100 }], ari: [{ orderId: 'x2', price: '0.020', qty: 100 }] } });
+  applyBookDeltas(live, [
+    { kind: 'add', orderId: 'x3', outcomeId: 'nyg', price: '0.455', qty: 61400 },
+    { kind: 'add', orderId: 'x4', outcomeId: 'ari', price: '0.530', qty: 150000 },
+    { kind: 'add', orderId: 'x5', price: '0.990', qty: 1 },
+  ]);
+  assert.deepStrictEqual(askFor(live, ml, 'ari'), { odds: 0.545, size: 614 });
+  assert.deepStrictEqual(askFor(live, ml, 'nyg'), { odds: 0.47, size: 1500 });
+  assert.ok(![...live.orders.values()].some((o) => !o.outcome), 'an add with no outcome is skipped');
+}
 
 // Main spread: most balanced two-sided line wins.
 {
@@ -208,6 +240,37 @@ assert.deepStrictEqual(askFor(mlBook, ml, 'ari'), { odds: 0.52, size: 1 });
   sock.msg({ delta: { m1: { book: { seq: 9, deltas: [] } } } });
   assert.ok(conn._state.gapped.has('m1') || sent.some((m) => m.snapshot), 'gap triggers a snapshot');
   conn.stop();
+}
+
+// A refused upgrade (429) reconnects once, after Retry-After. ws does not
+// close or error on its own when an unexpected-response listener is set.
+{
+  const made = [];
+  class RefusedWs {
+    constructor(url, opts) { this.handlers = {}; this.readyState = 0; made.push(this); }
+    on(name, fn) { this.handlers[name] = fn; }
+    send() {}
+    close() { this.readyState = 3; }
+  }
+  const key = novigKey({ NOVIG_KEY_ID: 'kid', NOVIG_PRIVATE_KEY: vectors.keypairs['ed25519-test-1'].private_key_pkcs8_pem });
+  const status = {};
+  const logs = [];
+  const conn = startNovigWs({
+    key, base: 'https://api.novig.com', WebSocket: RefusedWs, status, log: (...a) => logs.push(a.join(' ')),
+    desired: () => [], onBook: () => {}, onOwned: () => {}, onLifecycle: () => {},
+  });
+  let destroyed = false;
+  made[0].handlers['unexpected-response']({ destroy() { destroyed = true; } }, { statusCode: 429, headers: { 'retry-after': '1' }, resume() {} });
+  // A late close from the refused socket must not schedule a second reconnect.
+  if (made[0].handlers.close) made[0].handlers.close(1006, '');
+  assert.strictEqual(status.ws, 'error:http_429');
+  assert.ok(destroyed, 'refused request is destroyed');
+  assert.ok(logs.some((l) => /refused 429 retry-after 1s/.test(l)));
+  setTimeout(() => {
+    assert.strictEqual(made.length, 2, 'exactly one reconnect after a refused upgrade');
+    conn.stop();
+    console.log('novig ws refused-upgrade reconnect ok');
+  }, 2300);
 }
 
 // /stream?venue=novig is accepted and replays the last snapshot.

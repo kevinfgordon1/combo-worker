@@ -1,4 +1,4 @@
-// Kalshi RSA-PSS request signing. Tolerant of a private key pasted with or
+// Kalshi request signing (RSA-PSS or Ed25519). Tolerant of a private key pasted with or
 // without the -----BEGIN/END----- armor lines (same fix as the verify endpoint).
 //
 // Clock: Kalshi rejects KALSHI-ACCESS-TIMESTAMP more than a few seconds off
@@ -19,13 +19,19 @@ let clockOffsetMs = 0;
 // Date header resolution + typical RTT. Offsets inside this band are noise.
 const DATE_NOISE_MS = 1500;
 
+// Accepts RSA (PKCS#1/PKCS#8) and Ed25519 (PKCS#8) keys. A body pasted without
+// armor is tried as RSA first (legacy behaviour), then as PKCS#8 (Ed25519).
 function normalizePem(raw) {
   let v = raw.includes('\\n') ? raw.replace(/\\n/g, '\n') : raw;
   const t = v.trim();
   if (t.startsWith('-----BEGIN')) return t.endsWith('-----') ? t + '\n' : t;
   const body = t.replace(/[^A-Za-z0-9+/=]/g, '');
   const wrapped = (body.match(/.{1,64}/g) || []).join('\n');
-  return `-----BEGIN RSA PRIVATE KEY-----\n${wrapped}\n-----END RSA PRIVATE KEY-----\n`;
+  const rsa = `-----BEGIN RSA PRIVATE KEY-----\n${wrapped}\n-----END RSA PRIVATE KEY-----\n`;
+  if (!body) return rsa;
+  try { crypto.createPrivateKey(rsa); return rsa; } catch (_) { /* not PKCS#1 RSA */ }
+  const pkcs8 = `-----BEGIN PRIVATE KEY-----\n${wrapped}\n-----END PRIVATE KEY-----\n`;
+  try { crypto.createPrivateKey(pkcs8); return pkcs8; } catch (_) { return rsa; }
 }
 
 function headerDate(headers) {
@@ -79,10 +85,16 @@ function privateKeyObject(pem) {
   return key;
 }
 
+// Kalshi signs timestamp + METHOD + path with the key's own algorithm:
+// RSA-PSS/SHA-256 for RSA keys, plain Ed25519 for Ed25519 keys (Kalshi's
+// default key type in the web app since 2026).
 function sign(pem, tsMs, method, signPath) {
   const msg = String(tsMs) + method.toUpperCase() + signPath; // signPath incl /trade-api/..., no query
-  return crypto.sign('sha256', Buffer.from(msg, 'utf8'), {
-    key: privateKeyObject(pem),
+  const key = privateKeyObject(pem);
+  const data = Buffer.from(msg, 'utf8');
+  if (key.asymmetricKeyType === 'ed25519') return crypto.sign(null, data, key).toString('base64');
+  return crypto.sign('sha256', data, {
+    key,
     padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
     saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
   }).toString('base64');

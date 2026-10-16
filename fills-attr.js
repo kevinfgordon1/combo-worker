@@ -23,10 +23,13 @@ function tickerMatchesCollection(ticker, collection) {
 
 function noBidMatchesFill(fillNoPrice, fillAmerican) {
   if (fillNoPrice == null || fillAmerican == null || fillAmerican === '') return false;
-  const quoted = parseFloat(fillView(fillAmerican).noBid);
   const actual = Number(fillNoPrice);
-  if (!Number.isFinite(quoted) || !Number.isFinite(actual)) return false;
-  return Math.abs(actual - quoted) <= CENT + 1e-9;
+  if (!Number.isFinite(actual)) return false;
+  // Maker fee is per series (0 / 0.0175 / 0.035) — accept a quote priced under any of them.
+  return [0, 0.0175, 0.035].some((makerRate) => {
+    const quoted = parseFloat(fillView(fillAmerican, { makerRate }).noBid);
+    return Number.isFinite(quoted) && Math.abs(actual - quoted) <= CENT + 1e-9;
+  });
 }
 
 // Best-effort only. Never guess when more than one parlay still fits.
@@ -231,8 +234,17 @@ function claimFillKey(seen, fillKey) {
   return true;
 }
 
-function liveRunnerFillRow({ quoteId, orderId, fillId, parlayId, count, ticker, rfqId, label, createdAt, venue, source }) {
+// Polymarket US prices are the YES price in dollars (e.g. 0.176). Our hedge
+// sells YES, i.e. holds NO, so no_price = 1 - yes (same shape as Kalshi rows).
+function polyYesPriceOf(v) {
+  const n = parseFloat(v && typeof v === 'object' ? v.value : v);
+  return Number.isFinite(n) && n > 0 && n < 1 ? Math.round(n * 1e6) / 1e6 : null;
+}
+
+function liveRunnerFillRow({ quoteId, orderId, fillId, parlayId, count, ticker, rfqId, label, createdAt, venue, source, yesPrice, fee }) {
   const id = fillId || orderId || quoteId;
+  const yes = polyYesPriceOf(yesPrice);
+  const feeNum = fee != null && Number.isFinite(Number(fee)) ? Number(fee) : null;
   return {
     fill_id: id,
     order_id: orderId || null,
@@ -243,6 +255,9 @@ function liveRunnerFillRow({ quoteId, orderId, fillId, parlayId, count, ticker, 
     is_taker: false,
     outcome_side: 'no',
     action: 'sell',
+    yes_price: yes,
+    no_price: yes == null ? null : Math.round((1 - yes) * 1e6) / 1e6,
+    fee: yes == null ? null : feeNum,
     kalshi_created_time: createdAt || new Date().toISOString(),
     raw: {
       source: source || 'live-runner',
@@ -281,11 +296,13 @@ function isQuoteExecutionStub(row) {
   return false;
 }
 
-// Cap / filled-so-far. Polymarket order fills count. Kalshi quote-execution
-// stubs do not — only rows Kalshi's fills API confirmed (or any other
-// non-stub combo row already stored from that API).
+// Cap / filled-so-far. Only true lock (maker) fills count. Manual taker
+// buys attributed to a parlay must not consume remaining. Kalshi
+// quote-execution stubs do not either — only rows Kalshi's fills API
+// confirmed (or any other non-stub combo row already stored from that API).
 function countsTowardCap(row) {
   if (!row) return false;
+  if (row.is_taker === true) return false;
   if (isQuoteExecutionStub(row)) return false;
   return true;
 }
@@ -407,6 +424,7 @@ module.exports = {
   submissionFilledPatch,
   canStampSubmission,
   liveRunnerFillRow,
+  polyYesPriceOf,
   claimFillKey,
   resolveFillLookup,
   findPendingFill,

@@ -313,6 +313,25 @@ async function testTapeOnSkip() {
   }
 }
 
+// Closed while our quote was live → outbid / no_taker.
+{
+  const { finalizeClosedLive, isSkipTapeEligible: el, CLOSED_LIVE } = require('./skip-tape');
+  assert.strictEqual(el({ skipReason: CLOSED_LIVE, tapeMatch: null, parlayActive: true, started: false, now: 0 }), true);
+  assert.strictEqual(finalizeClosedLive({ status: 'closed' }, { tape_match: 'matched', tape_yes_price: 0.078 }), 'outbid');
+  assert.strictEqual(finalizeClosedLive({ status: 'closed' }, { tape_match: 'none' }), 'outbid');
+  assert.strictEqual(finalizeClosedLive({ status: 'closed', cancellation_reason: 'user' }, { tape_match: 'none' }), 'no_taker');
+  assert.strictEqual(finalizeClosedLive({ status: 'closed', cancelled_ts: 'x' }, { tape_match: 'matched' }), 'outbid');
+  assert.strictEqual(finalizeClosedLive({ status: 'closed' }, { tape_match: 'none' }, 0), 'no_print');
+  assert.strictEqual(finalizeClosedLive({ status: 'closed' }, { tape_match: 'none' }, 3), 'outbid');
+  assert.strictEqual(finalizeClosedLive({ status: 'closed' }, { tape_match: 'matched_time' }, 1), 'outbid');
+  const { nearCloseMatch } = require('./skip-tape');
+  const m = nearCloseMatch([{ ts: 1000, count: 7, yes: 0.08, no: 0.92 }, { ts: 50000, count: 3, yes: 0.2, no: 0.8 }], 4000);
+  assert.strictEqual(m.match, 'matched_time');
+  assert.strictEqual(m.yesPrice, 0.08);
+  assert.strictEqual(nearCloseMatch([{ ts: 1000, count: 7, yes: 0.08 }, { ts: 2000, count: 3, yes: 0.09 }], 1500).match, 'ambiguous');
+  assert.strictEqual(nearCloseMatch([{ ts: 90000, count: 7, yes: 0.08 }], 1500).match, 'none');
+}
+
 testTapeOnSkip().then(() => {
   console.log('skip-tape.test.js ok');
 }).catch((e) => {

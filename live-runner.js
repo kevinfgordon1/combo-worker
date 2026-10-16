@@ -117,6 +117,9 @@
 //        In-app alerts for Kevin (public.app_alerts, sql/app_alerts.sql):
 //        transfers, blocked top-ups, low shard 1 cash, insufficient funds.
 //        COMBO_LOW_CASH_ALERT_USD (default 1000) = shard 1 low-cash level.
+//      Per-user low-cash site alerts (public.combo_user_alerts): user-low-cash.js.
+//        Raised from logAsync / persistQuoteSkip on insufficient_balance for the
+//        lock's owner; resolved by a 60s tick once combo_balances covers it.
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
@@ -136,6 +139,7 @@ const {
 const {
   capAtConfirmEnabled,
   createCapBook,
+  createHoldResolver,
   confirmAgainstCap,
   releaseConfirmedFill,
   overfillOf,
@@ -154,7 +158,12 @@ const {
   withVenue,
   isSkipTapeEligible,
   resolveSkipTape,
+  CLOSED_LIVE,
+  finalizeClosedLive,
 } = require('./skip-tape');
+const { createSeriesFeeCache } = require('./series-fee');
+const seriesFees = createSeriesFeeCache({ log: (m) => console.log(`[${MODE}] ${m}`) });
+const makerRateFor = (row) => seriesFees.rateForTicker(row && (row.combo_ticker || row.market_ticker));
 const {
   isUnhedgedRfqShadow,
   isUnhedgedRfqLive,
@@ -187,15 +196,65 @@ const { startUnhedgedSide } = require('./unhedged-boot');
 const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
 const { formatAlertStatus } = require('./venue-alert');
 const { createBucketManager } = require('./bucket-manager');
+const { createTesterFunder, logOwnKeyScopes } = require('./tester-funder');
+const { startBalanceReporter } = require('./balance-reporter');
+const { splitPaused, diffPaused, createPausePoller, expiredProbePauses } = require('./lock-pause');
+const { createUserCancelPoller } = require('./user-cancel');
+const { createLiveUserGate } = require('./live-users');
+const { resolveWorkerScope, scopeLabel } = require('./worker-scope');
+const { createUserCaps } = require('./user-caps');
 const { createAppAlerts } = require('./app-alerts');
+const { createUserLowCash } = require('./user-low-cash');
+const { createUserCredits } = require('./user-credits');
+const { createPolyStallAlerts } = require('./poly-stall-alert');
 const { createPartialQuoteDryRun, isPartialQuoteFlagOn } = require('./partial-quote');
 
 const MODE = 'LIVE';
+const { createTelegramGate } = require('./tg-gate');
+const { createPolyDeskFillWatcher } = require('./poly-desk-fills');
+const { comboLocksOnly } = require('./single-leg');
+const { createSingleLegRunner } = require('./single-leg-runner');
+let singleLeg = null;
 let bucketManager = null;
+// Tester children only: moves the tester's own Kalshi Default -> Combos money
+// (tester-funder.js). Never created in Kevin's worker.
+let testerFunder = null;
 
-function noteInsufficientBalance(venue) {
+// Cash a NO quote ties up on shard 1: contracts x NO price (dollars). null when unknown.
+function quoteCostDollars(contracts, noBid) {
+  const c = Number(contracts);
+  const n = Number(noBid);
+  if (!(c > 0) || !(n > 0) || n >= 1.0001) return null;
+  return c * n;
+}
+
+// One-shot hint (set and consumed synchronously) so the rejected quote's cash
+// need reaches the bucket manager without becoming a combo_submissions column.
+let costHint = null;
+function setCostHint(costDollars) {
+  costHint = costDollars != null && Number(costDollars) > 0 ? { costDollars: Number(costDollars) } : null;
+}
+function takeCostHint() {
+  const h = costHint;
+  costHint = null;
+  return h;
+}
+
+// Per-user low-cash alerts on the site (user-low-cash.js). Never throws.
+const userLowCash = createUserLowCash({
+  client: createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY),
+  log: (m) => console.log(`[LIVE] ${m}`),
+});
+function noteUserLowCash(info) {
+  Promise.resolve(userLowCash.onRejected(info)).catch(() => {});
+}
+
+function noteInsufficientBalance(venue, info = null) {
+  if (testerFunder && String(venue || '').toLowerCase() !== 'polymarket') {
+    Promise.resolve(testerFunder.check('insufficient_balance')).catch(() => {});
+  }
   if (!bucketManager) return;
-  Promise.resolve(bucketManager.onInsufficientBalance(venue)).catch((e) => {
+  Promise.resolve(bucketManager.onInsufficientBalance(venue, info)).catch((e) => {
     console.error(`[${MODE}] bucket notify`, e && e.message);
   });
 }
@@ -240,26 +299,27 @@ async function kalshiSigned(method, signPath, opts = {}) {
 const cancelingQuotes = new Set();
 const cancelledQuotes = new Set();
 const confirmingQuotes = new Set(); // de-dupe accept + skip 20s TTL during confirm
-const capBook = createCapBook({ enabled: capAtConfirmEnabled(process.env) });
+const capBook = createCapBook({
+  enabled: capAtConfirmEnabled(process.env),
+  // Hard-TTL exit only: a hold the venue could not be asked about for 30 min.
+  onForced: (info) => {
+    const msg = `[${MODE}] HOLD FORCE-RELEASED after ${Math.round(info.ageMs / 1000)}s unresolved ` +
+      `quote_id=${info.quoteId} lock=${info.parlayId} size=${info.size} ` +
+      `label=${(info.meta && info.meta.label) || '(unknown)'}`;
+    console.error(msg);
+    sendAlert(`⚠️ ${msg}`).catch(() => {});
+  },
+});
 let reserveSeq = 0;
 
-const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TG_CHAT = process.env.TELEGRAM_ALERT_CHAT_ID;
+// Telegram: fills (+ failed bucket transfers) only, batched and 429-aware.
+const tgGate = createTelegramGate({ env: process.env, tag: MODE });
 
 async function sendAlert(text) {
-  if (!TG_TOKEN || !TG_CHAT) {
-    console.log(`[${MODE}] ALERT (telegram not configured): ${text.replace(/\n/g, ' | ')}`);
-    return;
-  }
   try {
-    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: TG_CHAT, text }),
-    });
-    if (!r.ok) console.error(`[${MODE}] telegram send failed`, r.status, await r.text());
+    await tgGate.send(text);
   } catch (e) {
-    console.error(`[${MODE}] telegram error`, e.message);
+    console.error(`[${MODE}] telegram error`, e && e.message);
   }
 }
 const sgn = (n) => (n > 0 ? '+' + n : '' + n);
@@ -342,9 +402,155 @@ const SKIP_TAPE_LOOKBACK_MS = 24 * 3600 * 1000;
 const SKIP_TAPE_TICK_MS = 15000;
 const SKIP_TAPE_MAX_PER_TICK = 5;
 
+// --- per-lock pause -----------------------------------------------------------
+let pausedParlayIds = new Set();
+// Locks paused only by a "Check market price" probe: id -> end ms (≤30s after it started).
+let probePauseUntil = new Map();
+// Whose keys this process holds (Kevin's main worker, or one tester child).
+const SCOPE = resolveWorkerScope(process.env);
+// Rows written by a tester child carry its user id; the main worker leaves
+// user_id to the DB defaults exactly as before.
+const withScopeUser = (row) => (SCOPE.writeUserId ? { ...row, user_id: SCOPE.writeUserId } : row);
+const liveUsers = createLiveUserGate({ env: process.env, scope: SCOPE, log: (m) => console.log(`[${MODE}] ${m}`) });
+console.log(`[${MODE}] ${scopeLabel(SCOPE)}; ${liveUsers.summary()}`);
+// Per-user $ caps (testers). Uncapped users (Kevin) pass straight through.
+const userCaps = createUserCaps({
+  gate: liveUsers,
+  costFor: (row) => parseFloat(fillView(row.fill_american, { subcent: SUBCENT, makerRate: makerRateFor(row) }).noBid),
+  countsTowardCap,
+  log: (m) => console.log(`[${MODE}] ${m}`),
+});
+
+// Per-user Combo Locks fees: out of allowance + credits => no new quotes.
+const userCredits = createUserCredits({ client: supabase, log: (m) => console.log(`[${MODE}] ${m}`) });
+
+const pausePoller = createPausePoller({ supabase, filterRows: (rows) => liveUsers.filterParlays(rows), log: (m) => console.log(`[${MODE}] ${m.replace(/^\[PAUSE\] /, 'PAUSE ')}`) });
+const userCancelPoller = createUserCancelPoller({ supabase, log: (m) => console.log(`[${MODE}] ${m.replace(/^\[USER-CANCEL\] /, 'USER-CANCEL ')}`) });
+
+async function cancelPausedLock(parlayId) {
+  try {
+    const rows = (await loadOpenSubmissionQuotes()).filter((r) => r.parlay_id === parlayId);
+    await cancelOpenQuotesForParlay(parlayId, { kind: 'paused' }, rows);
+  } catch (e) {
+    console.error(`[${MODE}] pause cancel (kalshi)`, e.message);
+  }
+  if (polyLoop && typeof polyLoop.cancelOpenQuotesForParlay === 'function') {
+    try {
+      await polyLoop.cancelOpenQuotesForParlay(parlayId, { kind: 'paused' });
+    } catch (e) {
+      console.error(`[${MODE}] pause cancel (poly)`, e.message);
+    }
+  }
+}
+
+// Record the paused set; cancel open quotes for locks that just became paused.
+function notePausedIds(next) {
+  const { pausedNow, resumed } = diffPaused(pausedParlayIds, next);
+  pausedParlayIds = next;
+  for (const id of pausedNow) {
+    console.log(`[${MODE}] PAUSED lock ${id} — no longer quoting (Kalshi + Polymarket); cancelling open quotes`);
+    cancelPausedLock(id);
+  }
+  for (const id of resumed) console.log(`[${MODE}] RESUMED lock ${id} — quoting again`);
+  return { pausedNow, resumed };
+}
+
+// Every 2s: safety net for market-check pauses. A probe pause ends on its own at
+// probe_pause_until (capped 30s after it started) even if the server never cleared it
+// and even if the 5s DB poll is failing.
+function expireProbePauses() {
+  const expired = expiredProbePauses(pausedParlayIds, probePauseUntil, Date.now());
+  if (!expired.length) return;
+  const next = new Set(pausedParlayIds);
+  for (const id of expired) { next.delete(id); probePauseUntil.delete(id); }
+  console.log(`[${MODE}] PROBE-PAUSE expired for ${expired.join(',')} — resuming`);
+  notePausedIds(next);
+  refresh();
+}
+
+// Every 2s: a quote that raced the pause (POST in flight) is cancelled.
+function cancelStragglersForPaused() {
+  if (!pausedParlayIds.size) return;
+  for (const [, pending] of pendingQuotes) {
+    if (pending && pausedParlayIds.has(pending.parlayId)) { cancelPausedLock(pending.parlayId); break; }
+  }
+}
+
+
+async function cancelUserRequestedLock(parlayId) {
+  try {
+    const rows = (await loadOpenSubmissionQuotes()).filter((r) => r.parlay_id === parlayId);
+    await cancelOpenQuotesForParlay(parlayId, { kind: 'user_cancel' }, rows);
+  } catch (e) {
+    console.error(`[${MODE}] user-cancel (kalshi)`, e.message);
+  }
+  if (polyLoop && typeof polyLoop.cancelOpenQuotesForParlay === 'function') {
+    try {
+      await polyLoop.cancelOpenQuotesForParlay(parlayId, { kind: 'user_cancel' });
+    } catch (e) {
+      console.error(`[${MODE}] user-cancel (poly)`, e.message);
+    }
+  }
+}
+
+async function cancelUserRequestedQuote(sub) {
+  const quoteId = sub && sub.quote_id;
+  if (!quoteId) return;
+  const reason = { kind: 'user_cancel', rfqId: sub.rfq_id, label: sub.label, parlayId: sub.parlay_id };
+  const venue = String(sub.venue || '').toLowerCase();
+  const isPoly = venue === 'polymarket' || venue === 'polymarket_us';
+  try {
+    if (isPoly && polyLoop && typeof polyLoop.cancelQuoteById === 'function') {
+      await polyLoop.cancelQuoteById(quoteId, reason);
+    } else {
+      const pending = pendingQuotes.get(quoteId) || {
+        label: sub.label, rfqId: sub.rfq_id, parlayId: sub.parlay_id,
+      };
+      await cancelQuoteAndDrop(quoteId, pending, reason);
+    }
+  } catch (e) {
+    console.error(`[${MODE}] user-cancel quote ${quoteId}`, e.message);
+  }
+}
+
+async function pollUserCancels() {
+  const hit = await userCancelPoller.poll();
+  if (!hit) return;
+  for (const id of hit.parlayIds) {
+    console.log(`[${MODE}] USER-CANCEL all open quotes on lock ${id}`);
+    await cancelUserRequestedLock(id);
+  }
+  for (const sub of hit.submissions) {
+    console.log(`[${MODE}] USER-CANCEL quote ${sub.quote_id} lock=${sub.parlay_id}`);
+    await cancelUserRequestedQuote(sub);
+  }
+}
+
+// Fast path (5s): react to a toggle without waiting for the 30s refresh.
+async function pollPaused() {
+  const ids = await pausePoller.poll();
+  if (!ids) return;
+  if (ids.probeUntil) probePauseUntil = ids.probeUntil;
+  const { pausedNow, resumed } = diffPaused(pausedParlayIds, ids);
+  if (!pausedNow.length && !resumed.length) return;
+  if (pausedNow.length) {
+    parlays = parlays.filter((x) => !ids.has(x.id));
+    for (const id of pausedNow) delete staged[id];
+    try {
+      const plan = lockNeedlePlan(parlays);
+      if (fastDropDisabled(process.env)) plan.enabled = false;
+      quoteHot.setPlan(plan);
+    } catch (e) {
+      console.error(`[${MODE}] pause needle plan`, e.message);
+    }
+  }
+  notePausedIds(ids);
+  if (resumed.length) refresh();
+}
+
 async function refresh() {
   try {
-    const [parlaysQ, settingsQ, fillsQ] = await Promise.all([
+    const [parlaysQ, settingsQ, fillsQ, usersQ] = await Promise.all([
       supabase.from('combo_parlays').select('*').eq('active', true),
       supabase.from('combo_settings').select('user_id,kill_switch'),
       // Confirmed contracts only. Quote-execution stubs (source=live-runner)
@@ -354,28 +560,49 @@ async function refresh() {
         .eq('is_combo', true)
         .eq('is_taker', false)
         .not('parlay_id', 'is', null),
+      // Who may trade (combo_live_users): can_trade, paused, caps.
+      liveUsers.query(supabase),
     ]);
+    liveUsers.apply(usersQ);
     const refreshLog = { error: (msg) => console.error(`[${MODE}] ${msg}`) };
     // supabase-js soft-fails as { data: null, error } — do not treat null as [].
     const parlaysFailed = querySoftFailed(parlaysQ);
-    parlays = applyRefreshParlays(parlays, parlaysQ, refreshLog);
-    killByUser = applyRefreshKillByUser(killByUser, settingsQ, refreshLog);
+    // Only allowlisted users' locks are ever loaded (Kalshi AND Polymarket read
+    // this same list). Everyone else's rows are dropped here, logged once.
+    parlays = liveUsers.filterParlays(applyRefreshParlays(parlays, parlaysQ, refreshLog));
+    if (!parlaysFailed) {
+      // Paused locks (combo_parlays.paused) stay in the table but are not quoted.
+      // Missing column => no row has paused === true => everything stays enabled.
+      const split = splitPaused(parlays);
+      parlays = split.live;
+      probePauseUntil = split.probeUntil;
+      notePausedIds(split.pausedIds);
+    }
+    // Per-user per-lock $ cap clamps max_contracts in memory (no-op for Kevin).
+    parlays = userCaps.applyLockCaps(parlays);
+    killByUser = liveUsers.filterKillByUser(applyRefreshKillByUser(killByUser, settingsQ, refreshLog));
     const fillsForCap = querySoftFailed(fillsQ)
       ? fillsQ
       : { data: (fillsQ.data || []).filter(countsTowardCap), error: null };
     filledByParlay = applyRefreshFilledByParlay(filledByParlay, fillsForCap, 'count', refreshLog);
+    userCaps.refreshDay({ supabase, parlays, filledSoFarFor }).catch(() => {});
+    userCredits.refresh([...new Set((parlays || []).map((p) => p && p.user_id).filter(Boolean))]).catch(() => {});
 
     // Pre-stage prices (Step 3). Soft-fail keeps previous staged with the locks.
     if (!parlaysFailed) {
       const next = {};
+      // Per-series maker fee (Kalshi fee_type) — cached; a failed lookup prices at the conservative 0.035.
+      await seriesFees.prefetchTickers(parlays.map((r) => r && r.combo_ticker)).catch(() => {});
       for (const row of parlays) {
-        const v = fillView(row.fill_american, { subcent: SUBCENT });
+        const makerRate = makerRateFor(row);
+        const v = fillView(row.fill_american, { subcent: SUBCENT, makerRate });
         next[row.id] = {
           noBid: v.noBid,
           yesBid: YES_DECLINE,
           rest_remainder: false,
           fillAmerican: row.fill_american,
           effTaker: v.effTaker,
+          makerRate,
         };
       }
       staged = next;
@@ -422,10 +649,44 @@ async function refresh() {
   }
 }
 
+// DB-fresh filled for one lock, same rule as refresh(): every non-stub maker
+// combo fill. Null on error so a failed read never lowers the count.
+async function freshFilledFor(parlayId) {
+  if (!parlayId) return null;
+  try {
+    const { data, error } = await supabase
+      .from('combo_fills')
+      .select('parlay_id,count,fill_id,order_id,raw')
+      .eq('is_combo', true)
+      .eq('is_taker', false)
+      .eq('parlay_id', parlayId);
+    if (error) {
+      console.error(`[${MODE}] last-look fills read`, error.message);
+      return null;
+    }
+    return (data || []).filter(countsTowardCap).reduce((n, r) => n + (Number(r.count) || 0), 0);
+  } catch (e) {
+    console.error(`[${MODE}] last-look fills read`, e && e.message);
+    return null;
+  }
+}
+
+// Last look before any confirm: the in-memory count can lag the books.
+async function lastLookFilledFor(parlayId) {
+  try { await resolveHolds(parlayId); } catch (_) { /* best effort */ }
+  const fresh = await freshFilledFor(parlayId);
+  return fresh == null ? 0 : fresh;
+}
+
 // Use the larger of DB fills vs session fills so a restart can't under-count,
 // and we don't double-count the same contracts from both sources.
 const filledSoFarFor = (id) => Math.max(filledByParlay[id] || 0, sessionFilledByParlay[id] || 0);
-const killEngagedFor = (userId) => killByUser[userId] !== false;
+// Not allowlisted => always engaged, whatever combo_settings says.
+const killEngagedFor = (userId, lock = null) => !liveUsers.isAllowed(userId)
+  || killByUser[userId] !== false
+  || userCaps.dayBlocked(userId, { parlays, filledSoFarFor, outstandingFor: (id) => outstandingFor(id), lock })
+  // Fee users out of monthly allowance + purchased credits: no new quotes.
+  || userCredits.blocked(userId);
 
 // DB check constraint allows: shadow | filled | unfilled | declined.
 // Live quotes: status=filled + is_live + no order_id → Combo Locks shows "quoted (awaiting)".
@@ -454,7 +715,12 @@ function logAsync(p, rfq, d, status, extra = {}) {
         : rfq.contracts != null ? rfq.contracts : null;
   const venueExtra = withVenue(extra);
   if (venueExtra.skip_reason === 'insufficient_balance') {
-    noteInsufficientBalance(venueExtra.venue || 'kalshi');
+    const hint = takeCostHint();
+    noteInsufficientBalance(venueExtra.venue || 'kalshi', hint);
+    // Per-user site alert (combo_user_alerts): the lock owner sees it.
+    noteUserLowCash({ userId: p.user_id, parlayId: p.id, label: p.label, venue: venueExtra.venue, costDollars: hint && hint.costDollars });
+  } else if (status === 'quoted' && p && p.user_id) {
+    Promise.resolve(userLowCash.onQuoted({ userId: p.user_id, parlayId: p.id, venue: venueExtra.venue })).catch(() => {});
   }
   const body = stripUnknown({
     user_id: p.user_id,
@@ -526,13 +792,15 @@ function fundingSkipExtra(d, rfq, extra = {}) {
 
 function logFundingSkip(p, rfq, d, extra = {}) {
   const persistExtra = fundingSkipExtra(d, rfq, extra);
+  // Not a column: handed to logAsync's notify through a one-shot hint.
+  setCostHint(extra.costDollars);
   logAsync(p, rfq, d, 'declined', persistExtra);
 }
 
 // Confirm already inserted a quoted row — stamp skip_reason on that attempt.
 // If the insert never landed, insert a declined funding row.
-function persistQuoteSkip(quoteId, skipReason, fallback, venue) {
-  if (skipReason === 'insufficient_balance') noteInsufficientBalance(venue || 'kalshi');
+function persistQuoteSkip(quoteId, skipReason, fallback, venue, info = null) {
+  if (skipReason === 'insufficient_balance') noteInsufficientBalance(venue || 'kalshi', info);
   if (!skipReason) return Promise.resolve(null);
   const body = stripUnknown({
     skip_reason: skipReason,
@@ -544,7 +812,14 @@ function persistQuoteSkip(quoteId, skipReason, fallback, venue) {
     return Promise.resolve(fallback());
   };
   if (!quoteId || isReserveKey(quoteId)) return insertFallback();
-  return supabase.from('combo_submissions').update(body).eq('quote_id', quoteId).select('id')
+  // Row found => alert its owner here (the fallback insert alerts via logAsync).
+  const alertRow = (r) => {
+    if (skipReason === 'insufficient_balance' && r && r.user_id) {
+      noteUserLowCash({ userId: r.user_id, parlayId: r.parlay_id, label: r.label, venue: venue || 'kalshi', costDollars: info && info.costDollars });
+    }
+    return r;
+  };
+  return supabase.from('combo_submissions').update(body).eq('quote_id', quoteId).select('id,user_id,parlay_id,label')
     .then(({ data, error }) => {
       if (error) {
         const m = String(error.message || '').match(COL_ERR);
@@ -553,20 +828,20 @@ function persistQuoteSkip(quoteId, skipReason, fallback, venue) {
           console.warn(`[${MODE}] combo_submissions missing column ${m[1]} — degrading`);
           const retry = { ...body };
           delete retry[m[1]];
-          return supabase.from('combo_submissions').update(retry).eq('quote_id', quoteId).select('id')
+          return supabase.from('combo_submissions').update(retry).eq('quote_id', quoteId).select('id,user_id,parlay_id,label')
             .then(({ data: d2, error: e2 }) => {
               if (e2) {
                 console.error(`[${MODE}] quote skip persist`, e2.message);
                 return insertFallback();
               }
-              if (d2 && d2.length) return d2[0];
+              if (d2 && d2.length) return alertRow(d2[0]);
               return insertFallback();
             });
         }
         console.error(`[${MODE}] quote skip persist`, error.message);
         return insertFallback();
       }
-      if (data && data.length) return data[0];
+      if (data && data.length) return alertRow(data[0]);
       return insertFallback();
     })
     .catch((e) => {
@@ -671,6 +946,7 @@ async function loadOpenSubmissionQuotes() {
     const { data, error } = await supabase
       .from('combo_submissions')
       .select('quote_id,parlay_id,label,rfq_id,contracts,user_id,created_at')
+      .in('user_id', SCOPE.userIds)
       .eq('is_live', true)
       .is('order_id', null)
       .not('quote_id', 'is', null)
@@ -692,6 +968,7 @@ async function clearStaleLiveSubmissions() {
     const { data, error } = await supabase
       .from('combo_submissions')
       .update({ is_live: false })
+      .in('user_id', SCOPE.userIds)
       .eq('is_live', true)
       .is('order_id', null)
       .not('quote_id', 'is', null)
@@ -721,6 +998,12 @@ function cancelLogLine(quoteId, pending, reason) {
       rfqBit +
       ` source=${reason.source} at=${reason.at}`
     );
+  }
+  if (reason && reason.kind === 'paused') {
+    return `[${MODE}] CANCEL lock paused ${label} quote_id=${quoteId}` + rfqBit;
+  }
+  if (reason && reason.kind === 'user_cancel') {
+    return `[${MODE}] CANCEL user ${label} quote_id=${quoteId}` + rfqBit;
   }
   if (reason && reason.kind === 'cap_full') {
     return (
@@ -763,6 +1046,21 @@ function markSubmissionNotLive(quoteId) {
     .catch((e) => console.error(`[${MODE}] clear is_live`, e.message));
 }
 
+// The RFQ closed while our quote was still live: someone else won it (or the buyer walked).
+// Stamp skip_reason=rfq_closed_live; reconcileSkipTapes resolves it to outbid / no_taker
+// and records the winning YES (tape_yes_price) when the public print is found.
+function markClosedWhileLive(quoteId) {
+  if (!quoteId || isReserveKey(quoteId) || unknownCols.has('skip_reason')) return;
+  supabase.from('combo_submissions').update({ skip_reason: CLOSED_LIVE })
+    .eq('quote_id', quoteId).neq('status', 'filled').is('skip_reason', null)
+    .select('id,parlay_id,rfq_id,contracts,remaining,skip_reason,market_ticker,created_at,tape_match')
+    .then(({ data, error }) => {
+      if (error) { console.error(`[${MODE}] closed-live stamp`, error.message); return; }
+      for (const row of data || []) if (row && row.id) pendingSkipTapes.set(row.id, row);
+    })
+    .catch((e) => console.error(`[${MODE}] closed-live stamp`, e.message));
+}
+
 function noteReleased(quoteId, pending, reason) {
   if (quoteId && !isReserveKey(quoteId)) {
     cancelledQuotes.add(quoteId);
@@ -792,6 +1090,7 @@ function onRfqDeleted(evt, env) {
   const dropped = dropPendingForRfq(pendingQuotes, rfqId, { confirming: confirmingQuotes });
   for (const { id, quote } of dropped) {
     noteReleased(id, quote, 'closed');
+    markClosedWhileLive(id);
   }
   if (unhedgedFills && rfqId) {
     const closedEvt = evt;
@@ -1051,13 +1350,14 @@ async function reconcileSkipTapes() {
         if (out.error) console.error(`[${MODE}] skip-tape`, row.rfq_id, out.error.message);
         continue;
       }
+      if (row.skip_reason === CLOSED_LIVE) out.patch.skip_reason = finalizeClosedLive(out.rfq, out.patch, out.windowTrades);
       await persistSkipTape(id, out.patch);
-      if (out.patch.tape_match === 'matched') counts.tapeMatched++;
+      if (out.patch.tape_match === 'matched' || out.patch.tape_match === 'matched_time') counts.tapeMatched++;
       else counts.tapeNone++;
       console.log(
         `[${MODE}] skip-tape ${out.patch.tape_match} rfq=${row.rfq_id} ` +
         `ticker=${out.patch.market_ticker || row.market_ticker || '(none)'} ` +
-        `reason=${row.skip_reason}` +
+        `reason=${out.patch.skip_reason || row.skip_reason}` +
         (out.patch.tape_match === 'matched'
           ? ` yes=${out.patch.tape_yes_price} no=${out.patch.tape_no_price}`
           : '')
@@ -1069,14 +1369,14 @@ async function reconcileSkipTapes() {
   }
 }
 
-function resolveRfqContracts(rfq, fillAmerican, stagedNoBid) {
+function resolveRfqContracts(rfq, fillAmerican, stagedNoBid, makerRate) {
   if (rfq.contracts != null && rfq.contracts > 0) {
     return { contracts: rfq.contracts, source: 'contracts' };
   }
   if (rfq.targetCostDollars != null && rfq.targetCostDollars > 0) {
     const noBid = stagedNoBid != null
       ? parseFloat(stagedNoBid)
-      : parseFloat(fillView(fillAmerican, { subcent: SUBCENT }).noBid);
+      : parseFloat(fillView(fillAmerican, { subcent: SUBCENT, makerRate }).noBid);
     const implied = impliedYesBid(noBid);
     const yesPrice = implied ? parseFloat(implied) : Math.max(0.01, 1 - noBid);
     const estimated = Math.floor(rfq.targetCostDollars / yesPrice);
@@ -1155,6 +1455,14 @@ async function onQuoteAccepted(evt) {
       maxContracts,
       size: pending.contracts,
       getFilled: () => filledSoFarFor(pending.parlayId),
+      lastLook: () => withBudget(lastLookFilledFor(pending.parlayId), 900),
+      onLastLookRaise: (info) => console.warn(
+        `[${MODE}] LAST LOOK raised filled ${info.memory} -> ${info.fresh} lock=${pending.parlayId} quote_id=${quoteId}`
+      ),
+      meta: {
+        venue: 'kalshi', rfqId, label: pending.label, contracts: pending.contracts,
+        maxContracts, userId: pending.userId,
+      },
       getOpenHeld: () => openOutstanding(pending.parlayId, quoteId),
       confirm: () => confirmQuote(rfqId, quoteId),
       onExceed: async (info) => {
@@ -1191,13 +1499,16 @@ async function onQuoteAccepted(evt) {
     console.error(`[${MODE}] CONFIRM FAILED quote_id=${quoteId} rfq_id=${rfqId}`, e.message);
     const skipReason = quoteFailureSkipReason(e.message);
     if (skipReason) {
+      const yb = pending && Number(pending.yesBid);
+      const confirmCost = yb > 0 && yb < 1 ? quoteCostDollars(pending.contracts, 1 - yb) : null;
       persistQuoteSkip(quoteId, skipReason, () => {
         const p = parlayFromPending(pending);
         if (!p) return null;
         return logFundingSkip(p, { rfqId, contracts: pending && pending.contracts }, null, {
           contracts: pending && pending.contracts,
+          costDollars: confirmCost,
         });
-      });
+      }, 'kalshi', confirmCost != null ? { costDollars: confirmCost } : null);
     }
     if (!isSilentQuoteFailure(e.message)) {
       sendAlert(
@@ -1233,7 +1544,7 @@ async function persistExecutedFill(pending, evt) {
     if (venue === 'polymarket' && pending.parlayId) {
       const { data: booked, error: bookedErr } = await supabase
         .from('combo_fills')
-        .select('fill_id,parlay_id,ticker,count,raw')
+        .select('fill_id,parlay_id,ticker,count,raw,recorded_at,kalshi_created_time')
         .eq('parlay_id', pending.parlayId)
         .eq('is_combo', true)
         .limit(500);
@@ -1246,9 +1557,11 @@ async function persistExecutedFill(pending, evt) {
           parlay_id: pending.parlayId,
           fill_id: evt.fillId,
           fillId: evt.fillId,
+          tradeTime: evt.tradeTime || null,
         },
         { id: pending.parlayId },
         booked || [],
+        { live: !!evt.live },
       );
       if (twin && (twin.fill_id || twin.fillId) !== evt.fillId) {
         skipFill = true;
@@ -1271,7 +1584,7 @@ async function persistExecutedFill(pending, evt) {
     }
     if (!skipFill) {
       const { error: fillErr } = await supabase.from('combo_fills').upsert(
-        liveRunnerFillRow({
+        withScopeUser(liveRunnerFillRow({
           quoteId,
           orderId,
           fillId: evt.fillId,
@@ -1282,7 +1595,9 @@ async function persistExecutedFill(pending, evt) {
           label: pending.label,
           venue,
           source: evt.source || 'live-runner',
-        }),
+          yesPrice: evt.yesPrice,
+          fee: evt.fee,
+        })),
         { onConflict: 'fill_id' },
       );
       if (fillErr) console.error(`[${MODE}] combo_fills upsert failed`, fillErr.message);
@@ -1327,6 +1642,7 @@ async function pendingFromSubmission({ quoteId, orderId } = {}) {
     let query = supabase
       .from('combo_submissions')
       .select('quote_id,parlay_id,label,rfq_id,contracts,user_id,order_id,status')
+      .in('user_id', SCOPE.userIds)
       .order('created_at', { ascending: false })
       .limit(1);
     if (quoteId) query = query.eq('quote_id', quoteId);
@@ -1360,6 +1676,7 @@ async function loadUnfilledPolyQuotes() {
     const { data, error } = await supabase
       .from('combo_submissions')
       .select('id,quote_id,order_id,rfq_id,parlay_id,label,contracts,user_id,status,created_at,market_ticker')
+      .in('user_id', SCOPE.userIds)
       .eq('venue', 'polymarket')
       .not('quote_id', 'is', null)
       .neq('status', 'filled')
@@ -1417,6 +1734,7 @@ async function loadRecentLocks() {
       supabase
         .from('combo_submissions')
         .select('parlay_id')
+        .in('user_id', SCOPE.userIds)
         .eq('venue', 'polymarket')
         .not('quote_id', 'is', null)
         .gte('created_at', cutoff)
@@ -1426,7 +1744,7 @@ async function loadRecentLocks() {
       console.error(`[${MODE}] load recent locks`, locksQ.error.message);
       return parlays.slice();
     }
-    const recent = locksQ.data || [];
+    const recent = liveUsers.filterByScope(locksQ.data || []);
     const have = new Set(recent.map((p) => p && p.id).filter(Boolean));
     const missing = [];
     for (const row of quotedQ.data || []) {
@@ -1444,7 +1762,7 @@ async function loadRecentLocks() {
       console.error(`[${MODE}] load quoted locks`, extraQ.error.message);
       return recent.length ? recent : parlays.slice();
     }
-    return recent.concat(extraQ.data || []);
+    return recent.concat(liveUsers.filterByScope(extraQ.data || []));
   } catch (e) {
     console.error(`[${MODE}] load recent locks`, e && e.message);
     return parlays.slice();
@@ -1457,13 +1775,15 @@ async function loadPolySlugRecordsUncached() {
     const [fillsQ, subsQ] = await Promise.all([
       supabase
         .from('combo_fills')
-        .select('ticker,parlay_id,raw,count,fill_id')
+        .select('ticker,parlay_id,raw,count,fill_id,recorded_at,kalshi_created_time')
+        .in('user_id', SCOPE.userIds)
         .eq('is_combo', true)
         .gte('recorded_at', cutoff)
         .limit(1000),
       supabase
         .from('combo_submissions')
         .select('quote_id,parlay_id,market_ticker,contracts')
+        .in('user_id', SCOPE.userIds)
         .eq('venue', 'polymarket')
         .not('quote_id', 'is', null)
         .gte('created_at', cutoff)
@@ -1483,6 +1803,8 @@ async function loadPolySlugRecordsUncached() {
           contracts: row.count,
           fill_id: row.fill_id,
           source: row.raw && row.raw.source,
+          recorded_at: row.recorded_at,
+          kalshi_created_time: row.kalshi_created_time,
         });
       }
     }
@@ -1582,11 +1904,11 @@ async function bookConfirmedKalshiFills(pending, evt) {
   for (const row of booked.book) {
     seenFillIds.add(row.fill_id);
     const existing = await findComboFill(row.fill_id);
-    const stored = {
+    const stored = withScopeUser({
       ...row,
       parlay_id: (pending && pending.parlayId) || null,
       is_combo: true,
-    };
+    });
     try {
       const { error } = await supabase.from('combo_fills').upsert(stored, { onConflict: 'fill_id' });
       if (error) {
@@ -1616,6 +1938,118 @@ async function bookConfirmedKalshiFills(pending, evt) {
     }
   }
   return { contracts: booked.contracts, newContracts: added, reason: 'confirmed', partial };
+}
+
+function withBudget(promise, ms) {
+  let t;
+  const timeout = new Promise((resolve) => { t = setTimeout(() => resolve(0), ms); if (t.unref) t.unref(); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
+
+const KALSHI_WATCH_MS = [3000, 10000, 25000, 60000, 120000];
+function startKalshiFillWatch(pending, quoteId, orderId) {
+  if (!capBook.enabled || !pending || !pending.parlayId || !quoteId) return;
+  KALSHI_WATCH_MS.forEach((ms) => {
+    const t = setTimeout(async () => {
+      try {
+        if (!capBook.has(pending.parlayId, quoteId)) return;
+        const confirmed = await bookConfirmedKalshiFills(pending, { quoteId, orderId, contracts: pending.contracts });
+        if (confirmed.newContracts > 0) {
+          console.log(`[${MODE}] WATCHDOG booked kalshi quote_id=${quoteId} contracts=${confirmed.newContracts} after ${ms}ms`);
+          sessionFilledByParlay[pending.parlayId] = (sessionFilledByParlay[pending.parlayId] || 0) + confirmed.newContracts;
+          filledByParlay[pending.parlayId] = (filledByParlay[pending.parlayId] || 0) + confirmed.newContracts;
+          releaseConfirmedFill(capBook, {
+            parlayId: pending.parlayId, quoteId, partial: confirmed.partial, contracts: confirmed.newContracts,
+          });
+        }
+      } catch (e) {
+        console.error(`[${MODE}] kalshi fill watchdog`, e && e.message);
+      }
+    }, ms);
+    if (t.unref) t.unref();
+  });
+}
+
+// Resolver check for a Kalshi confirm hold.
+async function checkKalshiHold(row) {
+  let sub = null;
+  try {
+    const { data } = await supabase
+      .from('combo_submissions')
+      .select('order_id,status')
+      .eq('quote_id', row.quoteId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    sub = data || null;
+  } catch (_) { sub = null; }
+  let orderId = sub && sub.order_id;
+  if (!orderId) {
+    try {
+      const { statusCode, json } = await kalshiGet(`/trade-api/v2/communications/quotes/${row.quoteId}`);
+      if (statusCode === 404 || !json) return { state: 'unknown' };
+      const q = json.quote || json;
+      const st = String(q.status || '').toLowerCase();
+      if (st === 'cancelled' || st === 'canceled' || st === 'expired' || st === 'deleted') return { state: 'cancelled' };
+      orderId = q.creator_order_id || q.creatorOrderId || null;
+      if (!orderId) return { state: 'open' };
+    } catch (e) { return { state: 'unknown', error: e && e.message }; }
+  }
+  let fills;
+  try { fills = await fetchKalshiFillsForOrder(orderId); } catch (e) { return { state: 'unknown', error: e && e.message }; }
+  if (fills.length) {
+    let unbooked = 0;
+    for (const f of fills) {
+      const id = f.fill_id || f.trade_id;
+      const existing = await findComboFill(id);
+      if (!existing) unbooked += Number(f.count_fp != null ? f.count_fp : f.count) || 0;
+    }
+    return unbooked > 0
+      ? { state: 'filled_unbooked', contracts: unbooked, orderId }
+      : { state: 'booked' };
+  }
+  try {
+    const { statusCode, json } = await kalshiGet(`/trade-api/v2/portfolio/orders/${orderId}`);
+    if (statusCode === 404 || !json) return { state: 'unknown', orderId };
+    const o = json.order || json;
+    const st = String(o.status || '').toLowerCase();
+    if (st === 'canceled' || st === 'cancelled') return { state: 'cancelled' };
+    if (st === 'executed') return { state: 'booked' };
+    return { state: 'open', orderId };
+  } catch (e) { return { state: 'unknown', error: e && e.message }; }
+}
+
+async function rebookKalshiHold(row, res) {
+  const pending = {
+    parlayId: row.parlayId, quoteId: row.quoteId, rfqId: row.meta && row.meta.rfqId,
+    label: row.meta && row.meta.label, contracts: row.meta && row.meta.contracts,
+    userId: row.meta && row.meta.userId,
+  };
+  const confirmed = await bookConfirmedKalshiFills(pending, {
+    quoteId: row.quoteId, orderId: res && res.orderId, contracts: pending.contracts,
+  });
+  if (confirmed.newContracts > 0) {
+    sessionFilledByParlay[row.parlayId] = (sessionFilledByParlay[row.parlayId] || 0) + confirmed.newContracts;
+    filledByParlay[row.parlayId] = (filledByParlay[row.parlayId] || 0) + confirmed.newContracts;
+    releaseConfirmedFill(capBook, {
+      parlayId: row.parlayId, quoteId: row.quoteId, partial: confirmed.partial, contracts: confirmed.newContracts,
+    });
+  }
+}
+
+const holdResolver = createHoldResolver({
+  book: capBook,
+  check: (row) => (row.meta && row.meta.venue === 'polymarket'
+    ? (polyLoop && polyLoop.checkHold ? polyLoop.checkHold(row) : { state: 'unknown' })
+    : checkKalshiHold(row)),
+  onFilledUnbooked: (row, res) => (row.meta && row.meta.venue === 'polymarket'
+    ? (polyLoop && polyLoop.rebookHold ? polyLoop.rebookHold(row, res) : null)
+    : rebookKalshiHold(row, res)),
+  log: (m) => console.log(`[${MODE}] ${m}`),
+});
+
+function resolveHolds(parlayId) {
+  return holdResolver.resolveParlay(parlayId);
 }
 
 async function onQuoteExecuted(evt) {
@@ -1670,6 +2104,9 @@ async function onQuoteExecuted(evt) {
         `[${MODE}] quote_executed no portfolio fill quote_id=${quoteId} order_id=${orderId || '?'} ` +
         `quoted=${evt.contracts != null ? evt.contracts : pending.contracts} reason=${confirmed.reason}`
       );
+      // The confirm hold stays (the order may still fill). Re-check on a short
+      // ladder; a hold is only released once the fill is booked or the order is dead.
+      startKalshiFillWatch(pending, quoteId, orderId);
       return;
     }
     contracts = confirmed.newContracts;
@@ -1790,7 +2227,7 @@ async function onRfq(rfq, env) {
     });
   }
 
-  const p = matchParlay(rfq, parlays);
+  const p = matchParlay(rfq, comboLocksOnly(parlays));
   const intakeAgeMs = p ? latency.noteIntake(rfq.createdTs) : null;
   if (p && intakeAgeMs != null && intakeAgeMs > STALE_RFQ_MS) {
     // Delivered late (reconnect gap / backlog). Kalshi has almost surely closed it (the 234
@@ -1873,19 +2310,19 @@ async function onRfq(rfq, env) {
       `[${MODE}] SKIP game started ${p.label} rfq=${rfq.rfqId} ` +
       `source=${started.source} at=${started.at}`
     );
-    logAsync(p, rfq, null, 'declined');
+    logAsync(p, rfq, null, 'declined', { skip_reason: 'game_started' });
     cancelOpenQuotesForParlay(p.id, started).catch((e) => {
       console.error(`[${MODE}] cancel-on-start`, e.message);
     });
     return;
   }
 
-  const engaged = killEngagedFor(p.user_id);
+  const engaged = killEngagedFor(p.user_id, p);
   const filledSoFar = filledSoFarFor(p.id);
   const outstanding = outstandingFor(p.id);
   const st = staged[p.id];
 
-  const size = resolveRfqContracts(rfq, p.fill_american, st && st.noBid);
+  const size = resolveRfqContracts(rfq, p.fill_american, st && st.noBid, makerRateFor(p));
   if (!shouldPostQuote(size)) {
     counts.declined++;
     if (size.source === 'dollar' || (size.source === 'none' && rfq.targetCostDollars > 0)) {
@@ -1894,7 +2331,7 @@ async function onRfq(rfq, env) {
         `target=$${size.targetCost != null ? size.targetCost : rfq.targetCostDollars} — unresolvable size`
       );
     }
-    logAsync(p, rfq, null, 'declined');
+    logAsync(p, rfq, null, 'declined', { skip_reason: 'bad_size' });
     return;
   }
 
@@ -1910,6 +2347,7 @@ async function onRfq(rfq, env) {
     outstanding,
     isFreeBet: isFreeBetRow(p),
     subcent: SUBCENT,
+    makerRate: makerRateFor(p),
   });
 
   if (!d.ok) {
@@ -1918,7 +2356,7 @@ async function onRfq(rfq, env) {
       console.error(
         `[${MODE}] SKIP quote_below_target ${p.label} rfq=${rfq.rfqId} no_bid=${d.quotedNoBid} fill=${p.fill_american}`
       );
-      logAsync(p, rfq, null, 'declined');
+      logAsync(p, rfq, null, 'declined', { skip_reason: 'quote_below_target' });
       return;
     }
     if (d.reason === 'no_cap') {
@@ -1926,7 +2364,7 @@ async function onRfq(rfq, env) {
       console.log(
         `[${MODE}] SKIP no cap ${p.label} rfq=${rfq.rfqId} — free bet riskfree with max_contracts=${p.max_contracts}; not quoting`
       );
-      logAsync(p, rfq, null, 'declined');
+      logAsync(p, rfq, null, 'declined', { skip_reason: 'no_cap' });
       return;
     }
     if (d.reason === 'limit_reached') {
@@ -1959,7 +2397,7 @@ async function onRfq(rfq, env) {
       logSkip(p, rfq, d, 'declined', size);
       return;
     }
-    logAsync(p, rfq, null, 'declined');
+    logAsync(p, rfq, null, 'declined', d && d.reason ? { skip_reason: String(d.reason) } : {});
     return;
   }
 
@@ -2122,7 +2560,7 @@ async function onRfq(rfq, env) {
         e.message
       );
       if (quoteFailureSkipReason(e.message)) {
-        logFundingSkip(p, rfq, d);
+        logFundingSkip(p, rfq, d, { costDollars: quoteCostDollars(d && d.contracts, noBid) });
       } else if (closed) {
         logAsync(p, rfq, d, 'unfilled', {
           skip_reason: 'rfq_closed',
@@ -2153,6 +2591,10 @@ async function onRfq(rfq, env) {
 }
 
 async function main() {
+  if (workerMode === 'testers') {
+    console.error(`[${MODE}] WORKER_MODE=testers — the supervisor (start-testers.js) starts per-tester children`);
+    process.exit(1);
+  }
   if (workerMode === 'unhedged') {
     console.error(
       `[${MODE}] WORKER_MODE=unhedged — use start-unhedged.js / npm run start:unhedged`
@@ -2165,13 +2607,50 @@ async function main() {
     );
     process.exit(1);
   }
+  if (SCOPE.invalid) {
+    console.error(`[${MODE}] COMBO_WORKER_USER_ID is not a uuid — refusing to start`);
+    process.exit(1);
+  }
   bucketManager = createBucketManager({
     env: process.env,
     alert: (text) => sendAlert(text),
-    appAlerts: createAppAlerts({ client: supabase }),
+    // Kevin's in-app alerts and sub-account bucket only; a tester child never
+    // moves money or writes Kevin's alerts.
+    appAlerts: createAppAlerts({ client: SCOPE.isTester ? null : supabase }),
     signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
   });
-  bucketManager.start();
+  if (!SCOPE.isTester) bucketManager.start();
+  // Read-only: log which scopes this process's Kalshi key has (names only).
+  logOwnKeyScopes({
+    signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
+    keyId: KEY_ID,
+    log: (m) => console.log(`[${MODE}] ${m}`),
+  }).catch(() => {});
+  if (SCOPE.isTester && SCOPE.writeUserId) {
+    testerFunder = createTesterFunder({
+      userId: SCOPE.writeUserId,
+      supabase,
+      signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
+      env: process.env,
+      log: (m) => console.log(`[${MODE}] ${m}`),
+    });
+    testerFunder.start();
+  }
+  // Read-only "Available to trade" for the Combo Locks page (public.combo_balances).
+  try {
+    startBalanceReporter({
+      supabase,
+      scope: SCOPE,
+      env: process.env,
+      signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
+      wrap: unlessQuoteHot,
+      log: (m) => console.log(`[${MODE}] ${m}`),
+    });
+  } catch (e) {
+    console.error(`[${MODE}] balance reporter not started: ${e && e.message}`);
+  }
+  // Low-cash site alerts clear themselves once this scope's cash covers them.
+  { const t = setInterval(() => { userLowCash.tick(SCOPE.userIds).catch(() => {}); }, 60_000); if (t.unref) t.unref(); }
 
   console.log(
     `[${MODE}] starting — latency-optimized. POST first, dedicated quote HTTP, ` +
@@ -2211,7 +2690,17 @@ async function main() {
   setInterval(unlessQuoteHot(() => {
     cancelUnacceptedQuotes().catch((e) => console.error(`[${MODE}] cancel-unaccepted tick`, e.message));
     cancelPendingIfStarted().catch((e) => console.error(`[${MODE}] cancel-on-start tick`, e.message));
+    cancelStragglersForPaused();
+    expireProbePauses();
   }), 2000);
+  // Confirm holds are never dropped on a timer: verify the stale ones against the venue.
+  setInterval(() => {
+    holdResolver.tick().catch((e) => console.error(`[${MODE}] hold resolver`, e && e.message));
+  }, 15000);
+  setInterval(unlessQuoteHot(() => {
+    pollPaused().catch((e) => console.error(`[${MODE}] pause poll`, e.message));
+    pollUserCancels().catch((e) => console.error(`[${MODE}] user-cancel poll`, e.message));
+  }), 5000);
   setInterval(unlessQuoteHot(() => {
     reconcileSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape tick`, e.message));
   }), SKIP_TAPE_TICK_MS);
@@ -2251,17 +2740,24 @@ async function main() {
         ...(snap ? { poly: snap } : {}),
         partial_quote: partialQuote.statsJson(),
         ...(lat ? { latency: lat } : {}),
+        ...(bucketManager && bucketManager.snapshot && bucketManager.snapshot()
+          ? { bucket: bucketManager.snapshot() } : {}),
       };
     }
   );
 
+  const polyAppAlerts = createAppAlerts({ client: SCOPE.isTester ? null : supabase });
+  const polyStallAlerts = createPolyStallAlerts({ appAlerts: polyAppAlerts, log: console.log });
+  { const t = setInterval(() => { polyStallAlerts.tick().catch(() => {}); }, 30000); if (t.unref) t.unref(); }
   const poly = startPolymarketRfqLoop({
     pendingQuotes: polyPendingQuotes,
     kalshiPendingQuotes: pendingQuotes,
     capBook,
     getOutstanding: outstandingFor,
-    getParlays: () => parlays,
+    getParlays: () => comboLocksOnly(parlays),
     filledSoFarFor,
+    freshFilledFor,
+    resolveHolds,
     killEngagedFor,
     startedFor: startedForParlay,
     logAsync: (p, rfq, d, status, extra = {}) =>
@@ -2277,6 +2773,11 @@ async function main() {
     initialFillReconcile: true,
     sendAlert,
     onPolyHeartbeat: (snap) => { polyHeartbeatSnap = snap; },
+    // Silent Poly WS stall (socket open, no messages): the client terminates +
+    // reconnects. A self-healed stall is an INFO row resolved on recovery (hidden
+    // from the banner); 3+ stalls/hour or an unrecovered one escalates to WARN.
+    onWsStall: (info) => polyStallAlerts.onStall(info),
+    onWsRecovered: () => polyStallAlerts.onRecovered(),
     // Poly REST crawl pages wait while a Kalshi quote POST/confirm is in flight.
     shouldPause: () => quoteHot.inFlight,
     counts,
@@ -2294,6 +2795,35 @@ async function main() {
     }).catch((e) => console.error('onQuoteExecuted', e)),
   });
   polyLoop = poly;
+
+  // Single-leg locks: rest the hedge on Kalshi + Polymarket single markets,
+  // capped across venues (single-leg.js). SINGLE_LEG_LIVE=1 to enable.
+  singleLeg = createSingleLegRunner({
+    env: process.env,
+    supabase,
+    kalshiSigned: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
+    polyHttp: (poly && poly.http) || null,
+    seriesFees,
+    getParlays: () => parlays,
+    userIds: SCOPE.userIds,
+    isBlocked: (userId, lock) => killEngagedFor(userId, lock),
+    sendAlert,
+    log: (m) => console.log(`[${MODE}] ${m}`),
+  });
+  singleLeg.start();
+
+  // Polymarket US fills outside Combo Locks (Live Trading Desk) -> Telegram.
+  // Kevin's account only; POLY_DESK_FILL_ALERTS=0 turns it off.
+  if (!SCOPE.isTester && process.env.POLY_DESK_FILL_ALERTS !== '0' && poly && poly.http) {
+    const deskFills = createPolyDeskFillWatcher({
+      http: poly.http,
+      sendAlert,
+      log: (m) => console.log(`[${MODE}] ${m}`),
+      skipSlug: (slug) => !!(singleLeg && singleLeg.ownsSlug(slug)),
+    });
+    deskFills.tick();
+    setInterval(unlessQuoteHot(() => { deskFills.tick(); }), 30000);
+  }
 
   const wsAlerter = createWsStatusAlerter();
   const shardFactor = readShardFactor(undefined, process.env, DEFAULT_LIVE_SHARD_FACTOR);
