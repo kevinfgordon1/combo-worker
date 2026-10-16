@@ -34,18 +34,18 @@ assert.strictEqual(run._delta().out_of_scope, 1);
 // a print BELOW our quote => no win; a print above => win + simulated fill within caps
 const r2 = run.onRfq(rfq('b'));
 const cheap = r2.primary.quoteYes - 0.01;
-run.onTrade({ id: 't1', ticker: 'KXMVE-b', yes: cheap, count: 20, takerSide: 'yes', ms: Date.now() });
+run.onTrade({ id: 't1', ticker: 'KXMVE-b', yes: cheap, count: 20, takerSide: 'yes', ms: Date.now() + 500 });
 assert.strictEqual(r2.primary.beat, 'no'); assert.strictEqual(r2.outcome, 'traded');
 const r3 = run.onRfq(rfq('c'));
-run.onTrade({ id: 't2', ticker: 'KXMVE-c', yes: r3.primary.quoteYes + 0.05, count: 20, takerSide: 'yes', ms: Date.now() });
+run.onTrade({ id: 't2', ticker: 'KXMVE-c', yes: r3.primary.quoteYes + 0.05, count: 20, takerSide: 'yes', ms: Date.now() + 500 });
 assert.strictEqual(r3.primary.beat, 'win'); assert.strictEqual(r3.primary.fill, true);
 assert.ok(r3.primary.position.max_loss > 0 && r3.primary.position.caps_ok === true);
 assert.ok(r3.primary.position.total_after > 0, 'paper position/exposure recorded');
 assert.ok(primary.risk.total() > 0 && lockcf.risk.total() === 0 || r3.lockcf.beat !== 'win' || lockcf.risk.total() >= 0);
 // duplicate trade id ignored; taker NO is not a win candidate
-assert.strictEqual(run.onTrade({ id: 't2', ticker: 'KXMVE-c', yes: 0.9, count: 1, takerSide: 'yes', ms: Date.now() }), null);
+assert.strictEqual(run.onTrade({ id: 't2', ticker: 'KXMVE-c', yes: 0.9, count: 1, takerSide: 'yes', ms: Date.now() + 500 }), null);
 const r4 = run.onRfq(rfq('d'));
-run.onTrade({ id: 't3', ticker: 'KXMVE-d', yes: 0.9, count: 5, takerSide: 'no', ms: Date.now() });
+run.onTrade({ id: 't3', ticker: 'KXMVE-d', yes: 0.9, count: 20, takerSide: 'no', ms: Date.now() + 500 });
 assert.strictEqual(r4.outcome, 'taker_no');
 
 // row shape: American odds columns, no percentages
@@ -62,7 +62,7 @@ assert.strictEqual(row.primary_beat, 'win');
   assert.ok(patches.some((p) => p.rfq_id === 'c' && p.hit === true && p.primary_pnl < 0));
   // unknown results keep the fill open
   const r5 = run.onRfq(rfq('e'));
-  run.onTrade({ id: 't5', ticker: 'KXMVE-e', yes: r5.primary.quoteYes + 0.05, count: 20, takerSide: 'yes', ms: Date.now() });
+  run.onTrade({ id: 't5', ticker: 'KXMVE-e', yes: r5.primary.quoteYes + 0.05, count: 20, takerSide: 'yes', ms: Date.now() + 500 });
   await run.settle(async () => null);
   assert.strictEqual(run.openFills.length, 1);
   const s = run.flushStats();
