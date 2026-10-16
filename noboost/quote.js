@@ -244,6 +244,14 @@ function priceCombo(legs, source, opts = {}) {
     legs: per.length,
     fair, fairMid, fairPromo, fairPromoBest, fairRef, yLock, yTarget, mEff, binding,
     legAgesMs: per.map((p) => (p.ageMs == null ? null : Math.round(p.ageMs))),
+    // Per-leg probabilities used at pricing time (audit). TD legs also carry the
+    // fee-included $500 VWAPs: own = side we price, opp = other side.
+    legFairs: per.map((p) => {
+      const r6 = (v) => (Number.isFinite(v) ? Math.round(v * 1e6) / 1e6 : null);
+      const o = { mid: r6(p.mid), inverse: r6(p.inverse), lockCost: r6(p.lockCost) };
+      if (p.td) { o.ownVwap = r6(p.td.ownVwap); o.oppVwap = r6(p.td.oppVwap); }
+      return o;
+    }),
     maxLegAgeMs: per.reduce((a, p) => { const g = cfg.fairMethod === 'promo' ? (p.promo && p.promo.ageMs) : p.ageMs; return g != null && g > a ? g : a; }, 0),
     quoteYes: yq,
     noBid: r4(1 - yq),
