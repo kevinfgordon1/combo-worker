@@ -105,6 +105,7 @@ async function main(env = process.env) {
   // PM live inverse fair (Combo Sniper): Kalshi public orderbooks + odds-relay Polymarket US / Novig + ProphetX.
   const pmOn = !['0', 'false', 'off', 'no'].includes(String(env.NOBOOST_PM_LIVE || '1').toLowerCase());
   const pmLive = pmOn ? createPmLiveBook({ staleMs: Number(env.NOBOOST_PM_STALE_MS) || 15000 }) : null;
+  if (pmLive && tdBook) pmLive.setTdBook(tdBook);
   const relayBase = env.NOBOOST_ODDS_RELAY_URL || (env.RAILWAY_SERVICE_ODDS_RELAY_URL ? `https://${env.RAILWAY_SERVICE_ODDS_RELAY_URL}` : '');
   const run = createPaperRun({
     book, primary, lockcf, promo, pmLive, margin: primary.cfg.margin, runId,
