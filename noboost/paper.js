@@ -22,6 +22,7 @@
 //   • a pending RFQ is finalized as no_trade once  now > seen + ttl + grace + tradeLagMs  (the lag
 //     only covers trade-feed polling delay; it never widens the match window) and dropped from memory.
 'use strict';
+const { legFairsWithInverse } = require('./leg-fairs');
 const { winsPrint, fmtAm, americanFromProb } = require('./quote');
 const { classifyNfl } = require('./shadow');
 const { createTtlSet } = require('./ttl-set');
@@ -111,6 +112,7 @@ function createPaperRun({
     const pp = d3 && d3.priced && d3.priced.ok ? d3.priced : null;
     const pr = (d1.priced && d1.priced.ok) ? d1.priced : (d2.priced && d2.priced.ok ? d2.priced : null);
     const cls = classifyNfl(rfq, 'kalshi', { td: !!(book && book.hasTd && book.hasTd()) });
+    const pmF = pmFields(pmLive, cls);
     const rec = {
       run_id: runId,
       rfq_id: rfq.rfqId, market_ticker: rfq.marketTicker || null, legs: rfq.legKeys, n_legs: rfq.legKeys.length,
@@ -127,7 +129,7 @@ function createPaperRun({
       fairPromo: pp ? pp.fairPromo : null,
       promo_n_books: pp ? pp.promoBooks : null,
       promo_max_age_ms: pp ? Math.round(pp.promoAgeMs || 0) : null,
-      ...pmFields(pmLive, cls),
+      ...pmF,
       fair_mid_american: pr && pr.fair_mid_american != null ? Math.round(pr.fair_mid_american) : null,
       fair_inverse_american: pr && pr.fair_inverse_american != null ? Math.round(pr.fair_inverse_american) : null,
       fair_ref_american: pr && pr.ref_american != null ? Math.round(pr.ref_american) : null,
@@ -136,7 +138,7 @@ function createPaperRun({
       decision_ms: d1.decisionMs, decision_ms_lockcf: d2.decisionMs,
       max_leg_age_ms: pr ? Math.round(pr.maxLegAgeMs || 0) : null,
       leg_ages_ms: pr ? pr.legAgesMs : null,
-      leg_fairs: legFairsWithInverse(pr, pmFields(pmLive, cls)),
+      leg_fairs: legFairsWithInverse(pr, pmF),
       // classified legs for EVERY in-scope RFQ (not only when PRIMARY/LOCKCF quote) so a PROMO-only
       // quote still runs the per-game / per-team caps and its fill books game/team exposure
       cls: cls.ok ? cls.legs : (d1.legs || d2.legs || (d3 && d3.legs) || null),
@@ -383,21 +385,6 @@ function toRow(rec) {
       promo_pulled: M.pulled ? M.pulled.reason : null, promo_beat: M.beat || null, promo_fill: !!M.fill, promo_position: M.position || null,
     } : {}),
   };
-}
-
-// leg_fairs: Kalshi per-leg values + the live inverse-bet per-leg fair (what Combo Sniper uses).
-function legFairsWithInverse(pr, pm) {
-  const base = pr && pr.legFairs ? pr.legFairs : null;
-  const inv = (pm && pm.pm_inverse_legs) || [];
-  if (!base && !inv.length) return null;
-  const n = Math.max(base ? base.length : 0, inv.length);
-  const out = [];
-  for (let i = 0; i < n; i++) {
-    const f = inv[i] && inv[i].fairAmerican != null ? inv[i].fairAmerican : null;
-    const pInv = inv[i] && inv[i].p != null ? inv[i].p : (f == null ? null : (f < 0 ? -f / (100 - f) : 100 / (100 + f)));
-    out.push({ ...((base && base[i]) || {}), inverseLive: pInv == null ? null : Math.round(pInv * 1e6) / 1e6, inverseLiveAmerican: f, inverseSource: inv[i] ? inv[i].best || null : null });
-  }
-  return out;
 }
 
 // PM live inverse fair (Kalshi / Polymarket US / Novig / ProphetX live books, $500 depth). Audit legs stored.
