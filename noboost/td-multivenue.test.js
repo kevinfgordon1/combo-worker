@@ -10,6 +10,8 @@ assert(samePlayer('A.J. Brown', 'AJ Brown'));
 assert(samePlayer('J. Taylor', 'Jonathan Taylor'));
 assert(!samePlayer('Jonathan Taylor', 'Jamal Taylor'));
 assert(!samePlayer('Bijan Robinson', 'Brian Robinson'));
+assert(samePlayer('Kenny Gainwell', 'Kenneth Gainwell'));
+assert(samePlayer('KC Concepcion Jr.', 'Kevin Concepcion'));
 assert.deepStrictEqual(venueGameKeys('Baltimore Ravens', 'Cleveland Browns', '2026-10-18T17:00:00Z')[0], '2026-10-18|bal+cle');
 
 let now = 1000000;

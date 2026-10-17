@@ -59,13 +59,17 @@ function normalizePlayerName(name) {
   x = x.replace(/\b(jr|sr|ii|iii|iv|v)\b/g, ' ');
   return x.replace(/\s+/g, ' ').trim();
 }
+const NICK = { kenny: 'kenneth', ken: 'kenneth', mike: 'michael', chris: 'christopher', matt: 'matthew', josh: 'joshua', nick: 'nicholas', will: 'william', bill: 'william', rob: 'robert', bob: 'robert', tony: 'anthony', dan: 'daniel', danny: 'daniel', joe: 'joseph', jon: 'jonathan', tom: 'thomas', tommy: 'thomas', zach: 'zachary', jake: 'jacob', alex: 'alexander', ben: 'benjamin', sam: 'samuel', dave: 'david', steve: 'steven', greg: 'gregory', pat: 'patrick', cam: 'cameron', jeff: 'jeffrey', drew: 'andrew', andy: 'andrew', ted: 'theodore', gabe: 'gabriel', nate: 'nathan', tim: 'timothy', ed: 'edward', eddie: 'edward' };
 function samePlayer(a, b) {
   const na = normalizePlayerName(a); const nb = normalizePlayerName(b);
   if (!na || !nb) return false;
   if (na === nb) return true;
   const pa = na.split(' '); const pb = nb.split(' ');
   if (pa.length < 2 || pb.length < 2 || pa[pa.length - 1] !== pb[pb.length - 1]) return false;
-  const ai = pa[0].length === 1; const bi = pb[0].length === 1;
+  const fa = NICK[pa[0]] || pa[0]; const fb = NICK[pb[0]] || pb[0];
+  if (fa === fb) return true; // Kenny / Kenneth
+  // Initials ("J. Taylor", "KC Concepcion"): first letter must match.
+  const ai = pa[0].length <= 2; const bi = pb[0].length <= 2;
   return (ai || bi) && pa[0][0] === pb[0][0];
 }
 const TEAM_ALIAS = { LA: 'LAR', ARZ: 'ARI', WSH: 'WAS', JAC: 'JAX' };
