@@ -88,10 +88,14 @@ async function main(env = process.env) {
   // NFL anytime-TD legs (flag NOBOOST_TD=1). Books come from Kalshi PUBLIC orderbooks
   // (unauthenticated GETs, separate from the shared key's budget), $500 depth gate per side.
   const tdOn = ['1', 'true', 'on', 'yes'].includes(String(env.NOBOOST_TD || '').toLowerCase());
+  // Extra TD venues for the Combo Sniper inverse (pm_inverse only), from the odds relay's /td.
+  // NOBOOST_TD_VENUES=polymarket,novig. Unset = Kalshi only, exactly as before.
+  const tdVenues = String(env.NOBOOST_TD_VENUES || '').toLowerCase().split(',').map((x) => x.trim()).filter((x) => x === 'polymarket' || x === 'novig');
   const tdBook = tdOn ? createTdBook({
     staleMs: Number(env.NOBOOST_TD_STALE_MS) || 15000,
     depthUsd: Number(env.NOBOOST_TD_DEPTH_USD) || 500,
     maxOverround: Number(env.NOBOOST_TD_MAX_OVERROUND) || 0.15,
+    venues: tdVenues,
   }) : null;
   if (tdBook) book.setTdBook(tdBook);
   const logger = (l) => console.log(l);
@@ -147,6 +151,7 @@ async function main(env = process.env) {
     const out = []; let cursor = '';
     for (let i = 0; i < 5; i += 1) {
       const j = await pubGet(`${P}/markets?series_ticker=KXNFLTD&status=open&limit=1000${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`);
+      tdBook.setNames(j.markets || []); // player names for cross-venue matching
       for (const m of j.markets || []) {
         const t = String(m.ticker || '').toUpperCase();
         if (!isTdTicker(t)) continue;
@@ -285,7 +290,25 @@ async function main(env = process.env) {
     loop(refreshTdMarkets, 'td_markets', 60000);
     loop(refreshTdBooks, 'td_books', Number(env.NOBOOST_TD_POLL_MS) || 5000);
     setInterval(() => { console.log(`[NOBOOST] TD book: markets=${tdTickers.length} books=${tdBook.size()} leg_fails=${JSON.stringify(tdBook.takeFails())}`); }, 300000);
-    console.log(`[NOBOOST] TD legs ON: ${tdTickers.length} anytime-TD markets, $${Number(env.NOBOOST_TD_DEPTH_USD) || 500} depth gate, public orderbooks every ${Number(env.NOBOOST_TD_POLL_MS) || 5000}ms`);
+    if (tdVenues.length && relayBase) {
+      // Relay /td per venue. A failed fetch just leaves that venue's books to go stale (>15s),
+      // and the leg falls back to Kalshi alone.
+      const tdRelay = async () => {
+        for (const venue of tdVenues) {
+          const polledAt = Date.now();
+          try {
+            const r = await fetch(`${relayBase}/td?venue=${venue}&league=NFL`);
+            if (!r.ok) continue;
+            const j = await r.json();
+            tdBook.ingestVenue(venue, j.markets || [], { polledAt });
+          } catch (_) { /* relay down: Kalshi-only fallback */ }
+        }
+      };
+      await guard(tdRelay, 'td_relay')();
+      loop(tdRelay, 'td_relay', Number(env.NOBOOST_TD_RELAY_POLL_MS) || 2000);
+      setInterval(() => { console.log(`[NOBOOST] TD venues: ${tdVenues.map((v) => `${v}=${tdBook.venueSize(v)}`).join(' ')} match=${JSON.stringify(tdBook.takeMatchStats())}`); }, 300000);
+    }
+    console.log(`[NOBOOST] TD legs ON: venues=kalshi${tdVenues.map((v) => `+${v}`).join('')} (relay=${relayBase || 'none'}), ${tdTickers.length} anytime-TD markets, $${Number(env.NOBOOST_TD_DEPTH_USD) || 500} depth gate, public orderbooks every ${Number(env.NOBOOST_TD_POLL_MS) || 5000}ms`);
   }
   if (pmLive) {
     let kTickers = [];
