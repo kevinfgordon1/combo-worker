@@ -349,6 +349,107 @@ function usQuotesFromMessage(message, catalog, nowMs) {
   return out;
 }
 
+// ---------------------------------------------------------------- Polymarket US player TDs
+// RELAY_TD=1: anytime-TD markets ("Will X record 1+ touchdowns?", sportsMarketType
+// football_player_touchdowns, line 1) on the same US markets socket, full book
+// (SUBSCRIPTION_TYPE_MARKET_DATA), in subscriptions of <= 100 slugs (documented cap per
+// subscription; several subscriptions per connection are allowed). Discovery reads each NFL
+// game's event payload (CDN-cached 30s) a few seconds apart; the league listing carries
+// moneylines only. REST /book is never polled for these (about 5 calls / 10s per IP, then a
+// 10s lockout, and the reply is CDN-cached 30s).
+const US_TD_TYPE = 'football_player_touchdowns';
+const US_TD_DISCOVER_MS = 5 * 60 * 1000;
+const US_TD_EVENT_GAP_MS = 2500;
+
+function usTdMarketsFromEvent(body, nowMs = Date.now()) {
+  const ev = body && body.event ? body.event : body;
+  if (!ev || ev.closed === true || !Array.isArray(ev.markets)) return [];
+  const start = ev.startTime || ev.startDate || null;
+  const startMs = Date.parse(start || '');
+  if (ev.live === true || (Number.isFinite(startMs) && startMs <= nowMs)) return []; // pregame only
+  const teams = new Map();
+  for (const t of ev.teams || []) {
+    if (t && t.id != null) teams.set(String(t.id), { abbr: String(t.displayAbbreviation || t.abbreviation || '').toUpperCase(), name: String(t.name || '') });
+  }
+  // Slug order is away-home ("nfl-hou-jax-2026-10-18" = Houston @ Jacksonville).
+  const m = String(ev.slug || '').toLowerCase().match(/^nfl-([a-z0-9]+)-([a-z0-9]+)-\d{4}-\d{2}-\d{2}$/);
+  const byAbbr = (a) => [...teams.values()].find((t) => t.abbr.toLowerCase() === a) || null;
+  const awayT = m && byAbbr(m[1]);
+  const homeT = m && byAbbr(m[2]);
+  if (!awayT || !homeT) return [];
+  const out = [];
+  for (const mk of ev.markets) {
+    if (!mk || mk.sportsMarketType !== US_TD_TYPE || Number(mk.line) !== 1) continue;
+    if (mk.closed === true || mk.active === false || !mk.slug) continue;
+    const meta = mk.metadata || {};
+    if (!meta.playerName) continue;
+    const team = teams.get(String(meta.teamId == null ? '' : meta.teamId));
+    const coef = Number(mk.feeCoefficient);
+    out.push({
+      slug: String(mk.slug),
+      eventSlug: String(ev.slug),
+      player: String(meta.playerName),
+      team: team ? team.abbr : '',
+      away: awayT.name,
+      home: homeT.name,
+      start,
+      feeCoefficient: Number.isFinite(coef) ? coef : null,
+    });
+  }
+  return out;
+}
+
+// Stable chunks of <= US_SLUG_CAP slugs (sorted), one subscription each.
+function usTdChunks(slugs) {
+  const list = [...new Set(slugs || [])].sort();
+  const out = [];
+  for (let i = 0; i < list.length; i += US_SLUG_CAP) out.push(list.slice(i, i + US_SLUG_CAP));
+  return out;
+}
+
+// Full-book frames for TD slugs -> [{ slug, ladders, ts }]
+function usTdBooksFromMessage(message, catalog, nowMs = Date.now()) {
+  const list = Array.isArray(message) ? message : [message];
+  const out = [];
+  for (const msg of list) {
+    const book = findUsBook(msg);
+    if (!book) continue;
+    const slug = String(book.marketSlug || book.market_slug || '');
+    if (!slug || !catalog.has(slug)) continue;
+    const ts = Date.parse(book.transactTime || book.transact_time || msg.transactTime || '') || nowMs;
+    out.push({ slug, ladders: usLadders(book.offers || book.asks, book.bids), ts });
+  }
+  return out;
+}
+
+function usTdRows(td, state, nowMs = Date.now()) {
+  if (!td) return [];
+  const alive = !!(state.usSocketUp && state.usLastAliveAt && nowMs - state.usLastAliveAt < US_CONFIRM_MS);
+  const out = [];
+  for (const meta of td.catalog.values()) {
+    const b = td.books.get(meta.slug);
+    if (!b) continue;
+    const confirmed = alive && td.subscribed.has(meta.slug) ? nowMs : b.at;
+    out.push({
+      venue: 'polymarket',
+      market: meta.slug,
+      player: meta.player,
+      team: meta.team,
+      away: meta.away,
+      home: meta.home,
+      start: meta.start,
+      live: false,
+      yes: b.ladders.yes,
+      no: b.ladders.no,
+      fee_coefficient: meta.feeCoefficient,
+      fee_when: 'always',
+      updated_at: new Date(b.ts).toISOString(),
+      confirmed_at: confirmed ? new Date(confirmed).toISOString() : null,
+    });
+  }
+  return out;
+}
+
 function relayPolyCreds(env = process.env) {
   const keyId = String(env.POLYMARKET_KEY_ID || '').trim();
   const secretKey = String(env.POLYMARKET_SECRET_KEY || '').trim();
@@ -1155,6 +1256,54 @@ function startPolymarketUs(state, deps) {
   let backoff = 1000;
   let subscribedKey = '';
   let slugs = [];
+  const tdOn = ['1', 'true', 'on', 'yes'].includes(String(env.RELAY_TD || '').toLowerCase());
+  const td = { on: tdOn, catalog: new Map(), books: new Map(), subs: new Map(), subscribed: new Set(), eventSlugs: [], lastDiscoverAt: 0, discoverErrors: 0, subErrors: 0, lastSubError: null };
+  state.usTd = td;
+
+  const sendTdSubs = () => {
+    if (!tdOn || !ws || ws.readyState !== 1) return;
+    const chunks = usTdChunks([...td.catalog.keys()]);
+    chunks.forEach((chunk, i) => {
+      const key = chunk.join(',');
+      const prev = td.subs.get(i);
+      if (prev && prev.key === key) return;
+      if (prev) { try { ws.send(JSON.stringify({ unsubscribe: { requestId: prev.requestId } })); } catch (_) { /* closing */ } }
+      const requestId = `td-${i}-${Date.now()}`;
+      try { ws.send(JSON.stringify(usSubscribeMessage(chunk, requestId))); } catch (_) { return; }
+      td.subs.set(i, { key, requestId, slugs: chunk });
+    });
+    for (const i of [...td.subs.keys()]) {
+      if (i < chunks.length) continue;
+      try { ws.send(JSON.stringify({ unsubscribe: { requestId: td.subs.get(i).requestId } })); } catch (_) { /* closing */ }
+      td.subs.delete(i);
+    }
+    td.subscribed = new Set([...td.subs.values()].flatMap((x) => x.slugs));
+  };
+
+  const tdDiscover = async () => {
+    if (!tdOn) return;
+    const next = new Map();
+    let ok = 0;
+    for (const evSlug of td.eventSlugs) {
+      if (stopped) return;
+      try {
+        const res = await fetchJson(fetchFn, `${US_GATEWAY}/v1/events/slug/${encodeURIComponent(evSlug)}`, { timeoutMs: 20000 });
+        if (res.status === 429) { td.discoverErrors += 1; break; }
+        if (res.ok && res.body) {
+          ok += 1;
+          for (const m of usTdMarketsFromEvent(res.body, Date.now())) next.set(m.slug, m);
+        }
+      } catch (_) { td.discoverErrors += 1; }
+      await sleep(US_TD_EVENT_GAP_MS, () => stopped);
+    }
+    if (!ok) return; // keep the last good catalog
+    for (const slug of [...td.catalog.keys()]) {
+      if (!next.has(slug)) { td.catalog.delete(slug); td.books.delete(slug); }
+    }
+    for (const [slug, m] of next) td.catalog.set(slug, m);
+    td.lastDiscoverAt = Date.now();
+    sendTdSubs();
+  };
 
   const seed = (markets, mode) => {
     const ranked = rankUsMarkets(markets);
@@ -1209,6 +1358,13 @@ function startPolymarketUs(state, deps) {
           throw new Error(`HTTP ${res.status}${res.body ? '' : ' (non-JSON body)'}`);
         }
         lastGood.set(league, usMarketsFromEvents(res.body.events, league, Date.now()));
+        if (league === 'NFL' && tdOn) {
+          const nowMs = Date.now();
+          td.eventSlugs = res.body.events
+            .filter((ev) => ev && ev.slug && ev.closed !== true && ev.live !== true && eventInWindow(ev, nowMs)
+              && (Date.parse(ev.startTime || ev.startDate || '') || 0) > nowMs)
+            .map((ev) => String(ev.slug));
+        }
       } catch (err) {
         errors.push(`${league}: ${(err && err.message) || err}${err && err.cause ? ` (${err.cause.code || err.cause.message || err.cause})` : ''}`);
       }
@@ -1248,6 +1404,8 @@ function startPolymarketUs(state, deps) {
       state.status.us = 'up';
       subscribedKey = '';
       sendSub();
+      td.subs.clear();
+      sendTdSubs();
       const seeded = [];
       for (const meta of catalog.values()) {
         seeded.push(...usQuotesFromPrices(meta, meta.bestBid, meta.bestAsk, meta.updatedAt || Date.now()));
@@ -1274,6 +1432,18 @@ function startPolymarketUs(state, deps) {
       state.usLastAliveAt = Date.now();
       let parsed;
       try { parsed = JSON.parse(String(data)); } catch (_) { return; }
+      if (tdOn) {
+        const nowMs = Date.now();
+        for (const b of usTdBooksFromMessage(parsed, td.catalog, nowMs)) td.books.set(b.slug, { ladders: b.ladders, ts: b.ts, at: nowMs });
+        for (const msg of Array.isArray(parsed) ? parsed : [parsed]) {
+          const rid = String((msg && (msg.requestId || msg.request_id)) || '');
+          if (msg && msg.error && rid.startsWith('td-')) {
+            td.subErrors += 1;
+            td.lastSubError = String(msg.error).slice(0, 200);
+            console.error(`[odds-relay] polymarket us td subscription ${rid} error: ${td.lastSubError}`);
+          }
+        }
+      }
       const quotes = usQuotesFromMessage(parsed, catalog, Date.now());
       if (!quotes.length) return;
       state.usLastFrameAt = Date.now();
@@ -1288,6 +1458,8 @@ function startPolymarketUs(state, deps) {
       ping = null;
       subscribedKey = '';
       state.usSubscribed = new Set();
+      td.subs.clear();
+      td.subscribed = new Set();
       schedule();
     };
     ws.on('close', reopen);
@@ -1314,6 +1486,15 @@ function startPolymarketUs(state, deps) {
     }
   };
   loop();
+  if (tdOn) {
+    (async () => {
+      await sleep(5000, () => stopped);
+      while (!stopped) {
+        try { await tdDiscover(); } catch (_) { td.discoverErrors += 1; }
+        await sleep(US_TD_DISCOVER_MS, () => stopped);
+      }
+    })();
+  }
   discoverTimer = null;
   return () => {
     stopped = true;
@@ -1679,9 +1860,32 @@ const novigFeed = (() => {
   const EMPTY_BODY_HASH = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
   const WS_WEIGHT_BOOK = 16;
   const WS_UPGRADE_COST = 32;
+  // Stream bucket. Docs (api/throttling, GET /v3/limits example): capacity 512,
+  // refill 32/s, maxWatchedMarkets 8192. The relay used to assume a 4/s refill,
+  // which made a big subscribe take 8x longer than needed. The live schedule is
+  // read from GET /v3/limits (signed, free) at start; these are the fallbacks.
   const WS_STREAM_CAPACITY = 512;
-  const WS_STREAM_REFILL = 4;
+  const WS_STREAM_REFILL = 32;
   const WS_MAX_MARKETS = 2048;
+  const TD_MARKET_TYPE = 'TOUCHDOWNS';
+  const TD_CATALOG_MS = 120000;
+  const TD_DEPTH_LEVELS = 20;
+  const TD_CONFIRM_MS = 15000;
+
+  // GET /v3/limits body -> { capacity, refill, maxWatched } for the stream bucket.
+  function streamLimitsFrom(body, env = process.env) {
+    const st = body && body.stream;
+    const cap = Number(st && st.capacity);
+    const refill = Number(st && st.refillPerSec);
+    const maxW = Number(body && body.maxWatchedMarkets);
+    const envRefill = Number(env.NOVIG_STREAM_REFILL);
+    return {
+      capacity: cap > 0 ? cap : WS_STREAM_CAPACITY,
+      refill: envRefill > 0 ? envRefill : (refill > 0 ? refill : WS_STREAM_REFILL),
+      maxWatched: maxW > 0 ? maxW : null,
+      source: st ? 'limits' : 'default',
+    };
+  }
 
   // ---------------------------------------------------------------- config
 
@@ -2322,6 +2526,15 @@ const novigFeed = (() => {
     const replicaSeqs = new Map(); // marketId -> Map(replica -> last seq)
     let stopped = false;
     let ws = null;
+    // Stream bucket schedule (GET /v3/limits once the key is known; docs defaults until then).
+    const streamLimits = streamLimitsFrom(null, env);
+    // Player anytime-TD lane (RELAY_TD=1): NFL "<player> 0.5 TOUCHDOWNS" markets, held on the
+    // signed websocket only (book channel, pushed). No REST polling for these: the public
+    // REST budget (~2-3 books/s per IP) belongs to the board's moneylines / spreads / totals.
+    const tdOn = opts.td != null ? !!opts.td : ['1', 'true', 'on', 'yes'].includes(String(env.RELAY_TD || '').toLowerCase());
+    const tdMarkets = new Map(); // marketId -> { id, eventId, player, outcomes:[over, under], feeCoefficient, startsTs }
+    const tdBooks = new Map(); // marketId -> book (websocket)
+    const tdStatus = { on: tdOn, markets: 0, lastCatalogAt: 0, catalogErrors: 0, lastBookAt: 0 };
 
     const marketIndex = new Map(); // marketId -> { cat, m }
     const marketById = (id) => marketIndex.get(id) || null;
@@ -2662,7 +2875,95 @@ const novigFeed = (() => {
       }
     }
 
+    // NFL anytime-TD catalog: TOUCHDOWNS strike 0.5 (Over = scores, Under = does not),
+    // pregame events on the NFL board only. Player = description minus " 0.5 TOUCHDOWNS".
+    function tdMarketFrom(raw, ev) {
+      if (!raw || !raw.marketId || !ev) return null;
+      if (String(raw.marketType || '').toUpperCase() !== TD_MARKET_TYPE) return null;
+      if (Number(raw.strike) !== 0.5 || String(raw.status || '').toUpperCase() !== 'OPEN') return null;
+      const outs = (raw.outcomes || []).map((o) => ({ id: String(o.outcomeId || ''), name: String(o.name || '') }));
+      const over = outs.find((o) => /^over/i.test(o.name));
+      const under = outs.find((o) => /^under/i.test(o.name));
+      const player = String(raw.description || '').replace(/\s+[\d.]+\s+TOUCHDOWNS\s*$/i, '').trim();
+      if (!over || !under || !over.id || !under.id || !player) return null;
+      const coef = Number(raw.fee && raw.fee.coefficient);
+      return { id: String(raw.marketId), eventId: String(raw.eventId || ''), player, outcomes: [over, under], feeCoefficient: Number.isFinite(coef) ? coef : null, startsTs: ev.startsTs || null };
+    }
+
+    async function refreshTdCatalog() {
+      if (!tdOn || stopped) return false;
+      const cat = catalogs.get('NFL');
+      if (!cat) return false;
+      const items = [];
+      let after = '';
+      for (let page = 0; page < 4 && !stopped; page += 1) {
+        const res = await limiter.run(() => getJson(`/v3/public/catalog/markets?league=NFL&marketType=${TD_MARKET_TYPE}&limit=5000${after}`), 'low');
+        if (!res.ok || !res.body) { tdStatus.catalogErrors += 1; return false; }
+        for (const it of res.body.items || []) items.push(it);
+        if (!res.body.next) break;
+        after = `&after=${encodeURIComponent(res.body.next)}`;
+      }
+      const next = new Map();
+      for (const raw of items) {
+        const ev = cat.events.get(String(raw && raw.eventId));
+        if (!ev || ev.status !== 'OPEN_PREGAME') continue; // never started games
+        const m = tdMarketFrom(raw, ev);
+        if (m) next.set(m.id, m);
+      }
+      for (const id of [...tdMarkets.keys()]) {
+        if (!next.has(id)) { tdMarkets.delete(id); tdBooks.delete(id); }
+      }
+      for (const [id, m] of next) tdMarkets.set(id, m);
+      tdStatus.markets = tdMarkets.size;
+      tdStatus.lastCatalogAt = Date.now();
+      if (ws) ws.retarget();
+      return true;
+    }
+
+    // One served row per TD market: Yes / No ask ladders (pre-fee price, size = $1
+    // contracts), best first. confirmed_at = now while the socket is alive and owns
+    // the market (any change would have been pushed), else the book's last change.
+    function tdRows(nowMs = Date.now()) {
+      const cat = catalogs.get('NFL');
+      const out = [];
+      const alive = !!(ws && status.ws === 'up' && status.lastWsAliveAt && nowMs - status.lastWsAliveAt < TD_CONFIRM_MS);
+      for (const m of tdMarkets.values()) {
+        const book = tdBooks.get(m.id);
+        if (!book) continue;
+        const ev = cat && cat.events.get(m.eventId);
+        if (!ev) continue;
+        const [over, under] = m.outcomes;
+        const lv = (rows) => rows.map((r) => ({ odds: r.odds, size: r.size }));
+        const changedAt = book.changedAt || 0;
+        const confirmed = alive && wsOwned.has(m.id) ? nowMs : changedAt;
+        out.push({
+          venue: 'novig',
+          market: m.id,
+          player: m.player,
+          team: '',
+          away: ev.away,
+          home: ev.home,
+          start: ev.startsTs ? new Date(ev.startsTs).toISOString() : null,
+          live: ev.status === 'OPEN_INGAME',
+          yes: lv(askLevels(book, m, over.id, TD_DEPTH_LEVELS)),
+          no: lv(askLevels(book, m, under.id, TD_DEPTH_LEVELS)),
+          fee_coefficient: m.feeCoefficient,
+          fee_when: 'live',
+          updated_at: changedAt ? new Date(changedAt).toISOString() : null,
+          confirmed_at: confirmed ? new Date(confirmed).toISOString() : null,
+        });
+      }
+      return out;
+    }
+
     function onWsBook(marketId, book, at) {
+      if (tdMarkets.has(marketId)) {
+        tdBooks.set(marketId, book);
+        book.changedAt = at;
+        status.lastWsMsgAt = at;
+        tdStatus.lastBookAt = at;
+        return;
+      }
       const found = marketById(marketId);
       if (!found) return;
       books.set(marketId, book);
@@ -2673,6 +2974,7 @@ const novigFeed = (() => {
 
     let tickTimer = null;
     let catalogTimer = null;
+    let tdTimer = null;
     async function start() {
       for (const league of leagues) {
         if (stopped) return;
@@ -2681,20 +2983,37 @@ const novigFeed = (() => {
       catalogTimer = setInterval(() => {
         for (const league of leagues) refreshCatalog(league).catch(() => {});
       }, cfg.catalogMs);
+      if (tdOn) {
+        refreshTdCatalog().catch(() => {});
+        tdTimer = setInterval(() => { refreshTdCatalog().catch(() => {}); }, opts.tdCatalogMs || TD_CATALOG_MS);
+        if (tdTimer.unref) tdTimer.unref();
+      }
       tickTimer = setInterval(tick, 200);
       if (catalogTimer.unref) catalogTimer.unref();
       const key = opts.key !== undefined ? opts.key : novigKey(env);
       if (key && key.key && opts.ws !== false) {
+        // Read the live stream schedule (free, signed). Falls back to the documented values.
+        try {
+          const lres = await getJson('/v3/limits', signedHeaders(key, { method: 'GET', path: '/v3/limits' }));
+          if (lres.ok && lres.body) {
+            Object.assign(streamLimits, streamLimitsFrom(lres.body, env));
+            log(`limits: stream capacity=${streamLimits.capacity} refill=${streamLimits.refill}/s maxWatched=${streamLimits.maxWatched}`);
+          } else log(`limits: GET /v3/limits -> ${lres.status}; using capacity=${streamLimits.capacity} refill=${streamLimits.refill}/s`);
+        } catch (err) { log('limits failed', err && err.message); }
         ws = startNovigWs({
+          limits: streamLimits,
           key,
           base,
           WebSocket: opts.WebSocket,
           status,
           log,
-          desired: () => hotMarkets()
-            .sort((a, b) => a.pollMs - b.pollMs)
-            .slice(0, WS_MAX_MARKETS)
-            .map((row) => row.m.id),
+          // Board markets first (moneylines, spreads, totals by urgency), then player TDs by kickoff.
+          desired: () => {
+            const cap = Math.min(WS_MAX_MARKETS, streamLimits.maxWatched || WS_MAX_MARKETS);
+            const board = hotMarkets().sort((a, b) => a.pollMs - b.pollMs).map((row) => row.m.id);
+            const td = tdOn ? [...tdMarkets.values()].sort((a, b) => (a.startsTs || 0) - (b.startsTs || 0)).map((m) => m.id) : [];
+            return [...board, ...td].slice(0, cap);
+          },
           onBook: onWsBook,
           onOwned: (ids) => {
             wsOwned.clear();
@@ -2703,6 +3022,7 @@ const novigFeed = (() => {
           },
           onLifecycle: (marketId, deltas) => {
             if ((deltas || []).includes('CLOSE')) {
+              tdBooks.delete(marketId);
               books.delete(marketId);
               replicaSeqs.delete(marketId);
               const found = marketById(marketId);
@@ -2725,6 +3045,12 @@ const novigFeed = (() => {
       mains,
       catalogs,
       quotesForLeague,
+      tdRows,
+      refreshTdCatalog,
+      tdMarkets,
+      tdBooks,
+      streamLimits,
+      onWsBook,
       depthFor(marketId, outcomeId) {
         const found = marketById(marketId);
         if (!found) return [];
@@ -2733,12 +3059,14 @@ const novigFeed = (() => {
       health() {
         const counts = {};
         for (const league of leagues) counts[league] = quotesForLeague(league).length;
-        return { ...status, limiter: limiter.stats(), counts, mains: mains.size };
+        const td = tdOn ? { ...tdStatus, books: tdBooks.size, owned: [...tdMarkets.keys()].filter((id) => wsOwned.has(id)).length } : { on: false };
+        return { ...status, limiter: limiter.stats(), counts, mains: mains.size, limits: streamLimits, td };
       },
       stop() {
         stopped = true;
         if (tickTimer) clearInterval(tickTimer);
         if (catalogTimer) clearInterval(catalogTimer);
+        if (tdTimer) clearInterval(tdTimer);
         for (const t of publishTimers.values()) clearTimeout(t);
         limiter.clear();
         if (ws) ws.stop();
@@ -2748,7 +3076,8 @@ const novigFeed = (() => {
 
   // ---------------------------------------------------------------- websocket
 
-  function startNovigWs({ key, base, WebSocket, status, log, desired, onBook, onOwned, onLifecycle }) {
+  function startNovigWs({ key, base, WebSocket, status, log, desired, onBook, onOwned, onLifecycle, limits }) {
+    const lim = limits || streamLimitsFrom(null);
     const WS = WebSocket || require('ws');
     const url = novigWsUrl(base);
     let socket = null;
@@ -2759,6 +3088,7 @@ const novigFeed = (() => {
     let attempt = 0;
     let retargetTimer = null;
     let reconnectTimer = null;
+    let pingTimer = null;
     const subscribed = new Set();
     const pending = new Set();
     const books = new Map();
@@ -2766,7 +3096,7 @@ const novigFeed = (() => {
 
     const refill = () => {
       const t = Date.now();
-      tokens = Math.min(WS_STREAM_CAPACITY, tokens + ((t - lastRefill) / 1000) * WS_STREAM_REFILL);
+      tokens = Math.min(lim.capacity, tokens + ((t - lastRefill) / 1000) * lim.refill);
       lastRefill = t;
     };
     const send = (obj) => {
@@ -2883,6 +3213,7 @@ const novigFeed = (() => {
       try { msg = JSON.parse(text); } catch (_) { return; }
       const at = Date.now();
       status.lastWsMsgAt = at;
+      status.lastWsAliveAt = at;
       if (msg.code && !msg.snapshot && !msg.delta) {
         log('ws error', msg.code, msg.message || '');
         if (msg.code === 'SUBSCRIPTION_LIMIT_EXCEEDED' || msg.code === 'RATE_LIMIT_EXCEEDED') {
@@ -2919,15 +3250,25 @@ const novigFeed = (() => {
       socket.on('open', () => {
         attempt = 0;
         status.ws = 'up';
-        tokens = Math.max(0, WS_STREAM_CAPACITY - WS_UPGRADE_COST);
+        tokens = Math.max(0, lim.capacity - WS_UPGRADE_COST);
         lastRefill = Date.now();
         subscribed.clear();
         pending.clear();
         books.clear();
         nonce = 0;
         log('websocket up');
+        status.lastWsAliveAt = Date.now();
+        // Liveness for quiet books (player TDs can sit unchanged for minutes): a
+        // pong proves the socket is alive, so a subscribed book that sent no
+        // delta is still current. Tracked apart from lastWsMsgAt (moneylines).
+        if (pingTimer) clearInterval(pingTimer);
+        pingTimer = setInterval(() => {
+          try { if (socket === me && me.readyState === 1 && me.ping) me.ping(); } catch (_) { /* closing */ }
+        }, 5000);
+        if (pingTimer.unref) pingTimer.unref();
         syncSubscriptions();
       });
+      if (socket.on) socket.on('pong', () => { if (socket === me) status.lastWsAliveAt = Date.now(); });
       socket.on('message', (data) => onMessage(data));
       socket.on('unexpected-response', (req, res) => {
         // With this listener set, ws neither errors nor closes on a refused
@@ -2949,6 +3290,7 @@ const novigFeed = (() => {
         if (socket !== me) return;
         if (status.ws === 'up') status.ws = `closed:${code}`;
         log('websocket closed', code, String(reason || ''));
+        if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
         subscribed.clear();
         pending.clear();
         books.clear();
@@ -2973,6 +3315,7 @@ const novigFeed = (() => {
         stopped = true;
         if (retargetTimer) clearTimeout(retargetTimer);
         if (reconnectTimer) clearTimeout(reconnectTimer);
+        if (pingTimer) clearInterval(pingTimer);
         try { if (socket) socket.close(); } catch (_) { /* closed */ }
       },
       _state: { subscribed, pending, books, gapped },
@@ -2983,6 +3326,7 @@ const novigFeed = (() => {
 
   return {
     NOVIG_BOOK_ID,
+    streamLimitsFrom,
     LEAGUES,
     novigBase,
     novigWsUrl,
@@ -4738,6 +5082,28 @@ function handleRequest(req, res, state) {
     state.underdog.handle(req, res, url);
     return;
   }
+  if (url.pathname === '/td') {
+    // Player anytime-TD Yes / No ask ladders (RELAY_TD=1). Prices are pre-fee; size = $1 contracts.
+    const venue = String(url.searchParams.get('venue') || '');
+    let rows = null;
+    let feed = null;
+    if (venue === 'novig' && state.novigFeed && state.novigFeed.tdRows) {
+      rows = state.novigFeed.tdRows();
+      const st = state.novigFeed.status || {};
+      feed = { ws: st.ws, lastWsAliveAgeMs: st.lastWsAliveAt ? Date.now() - st.lastWsAliveAt : null };
+    } else if (venue === 'polymarket' && state.usTd) {
+      rows = usTdRows(state.usTd, state);
+      feed = { ws: state.usSocketUp ? 'up' : 'down', lastWsAliveAgeMs: state.usLastAliveAt ? Date.now() - state.usLastAliveAt : null };
+    }
+    if (!rows) {
+      res.writeHead(venue === 'novig' || venue === 'polymarket' ? 503 : 400, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ ok: false, error: venue === 'novig' || venue === 'polymarket' ? 'td_off' : 'venue novig|polymarket required' }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    res.end(JSON.stringify({ ok: true, venue, league: 'NFL', feed, markets: rows }));
+    return;
+  }
   if (url.pathname === '/health') {
     const counts = {};
     for (const venue of VENUES) {
@@ -4747,7 +5113,9 @@ function handleRequest(req, res, state) {
     const novig = state.novigFeed ? state.novigFeed.health() : null;
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     const dkfd = state.dkfd && state.dkfd.poller ? state.dkfd.poller.health() : null;
-    res.end(JSON.stringify({ ok: true, status: state.status, counts, polymarketUs: { lastFrameAgeMs: state.usLastFrameAt ? Date.now() - state.usLastFrameAt : null, lastAliveAgeMs: state.usLastAliveAt ? Date.now() - state.usLastAliveAt : null, discoverError: state.usDiscoverError || null }, novig, betstamp: state.betstamp ? state.betstamp.health() : null, underdog: state.underdog ? state.underdog.health() : null, dkfd }));
+    const t = state.usTd;
+    const usTd = t && t.on ? { markets: t.catalog.size, books: t.books.size, subscriptions: t.subs.size, subscribed: t.subscribed.size, events: t.eventSlugs.length, lastDiscoverAgeMs: t.lastDiscoverAt ? Date.now() - t.lastDiscoverAt : null, discoverErrors: t.discoverErrors, subErrors: t.subErrors, lastSubError: t.lastSubError } : { on: false };
+    res.end(JSON.stringify({ ok: true, status: state.status, counts, polymarketUs: { lastFrameAgeMs: state.usLastFrameAt ? Date.now() - state.usLastFrameAt : null, lastAliveAgeMs: state.usLastAliveAt ? Date.now() - state.usLastAliveAt : null, discoverError: state.usDiscoverError || null, td: usTd }, novig, betstamp: state.betstamp ? state.betstamp.health() : null, underdog: state.underdog ? state.underdog.health() : null, dkfd }));
     return;
   }
   if (url.pathname !== '/stream' && url.pathname !== '/board') {
@@ -4875,6 +5243,10 @@ module.exports = {
   usQuotesFromPrices,
   usQuotesFromMessage,
   usSubscribeMessage,
+  usTdMarketsFromEvent,
+  usTdChunks,
+  usTdBooksFromMessage,
+  usTdRows,
   rankUsMarkets,
   relayPolyCreds,
   relayKalshiCreds,

@@ -184,9 +184,18 @@ function createPmLiveBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 
     for (const l of legs || []) {
       if (!l) return { p: null, american: null, reason: 'bad_leg', legs: out };
       if (l.kind === 'td') {
-        // Inverse bet for anytime-TD legs: 1 − fee-included $500 VWAP of the OPPOSITE side.
-        // Kalshi is the only live TD book wired in (Polymarket US TD books rate-limit; Novig /
-        // ProphetX have no TD feed here). Same 15s staleness + $500 depth gate (td-book).
+        // Inverse bet for anytime-TD legs: 1 − fee-included $500 VWAP of the OPPOSITE side,
+        // cheapest across Kalshi + the relay's Polymarket US / Novig TD books (td-book legMulti:
+        // each venue gated on its own by the 15s staleness, $500 depth and 15% overround rules).
+        if (tdBook && typeof tdBook.legMulti === 'function') {
+          const m = tdBook.legMulti(l);
+          const pm = m && m.p != null && m.p > 0 && m.p < 1 ? m.p : null;
+          out.push({ kind: 'td', id: l.id, side: l.side, p: pm, fairAmerican: pm != null ? american(pm) : null, best: pm != null ? m.best : null, sources: (m && m.sources ? m.sources : []).map(({ venue, via, used, reason, costAmerican, topAmerican, topUsd, ageMs }) => ({ venue, via, used, reason, costAmerican: costAmerican != null ? costAmerican : null, topAmerican: topAmerican != null ? topAmerican : null, topUsd: topUsd != null ? topUsd : null, ageMs })) });
+          if (pm == null) return { p: null, american: null, reason: 'td_no_fresh_source', legs: out };
+          p *= pm;
+          continue;
+        }
+        // Kalshi-only fallback (td-book without legMulti).
         const s = tdBook ? tdBook.legStats(l) : null;
         const pi = s && s.inverse > 0 && s.inverse < 1 ? s.inverse : null;
         out.push({ kind: 'td', id: l.id, side: l.side, p: pi, fairAmerican: pi != null ? american(pi) : null, best: pi != null ? 'kalshi' : null, sources: s ? [{ venue: 'kalshi', via: 'td_opposite', used: pi != null, reason: pi != null ? 'ok' : 'bad_price', costAmerican: s.td ? american(s.td.oppVwap) : null, ageMs: Math.round(s.ageMs || 0) }] : [] });
