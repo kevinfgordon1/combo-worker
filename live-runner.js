@@ -124,7 +124,7 @@
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
 const { createKalshiFirehose, readShardFactor, DEFAULT_LIVE_SHARD_FACTOR, summarizeThroughput } = require('./kalshi-ws');
-const { normalizePem, clockOffset, signedRequest } = require('./kalshi-auth');
+const { normalizePem, clockOffset, signedRequest, signedNow } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
 const { decideAtFill, isFreeBetRow, fillView, subcentEnabled, isPriceGridFailure, pennyNoBid, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, isRfqClosedFailure, quotePostFailReason, formatQuoteLatency, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse, isSubcentPrice } = require('./engine');
 const { findStartedEvent } = require('./started');
@@ -189,7 +189,8 @@ const {
   formatRepeatSkipAlert,
   REPEAT_SKIP_REASON,
 } = require('./rfq-repeat');
-const { createKalshiRestPair, QUOTE_WARM_MS, QUOTE_CONNECTIONS } = require('./kalshi-http');
+const { createKalshiRestPair, QUOTE_WARM_MS, QUOTE_CONNECTIONS, QUOTE_TIMEOUT_MS } = require('./kalshi-http');
+const { createQuoteSender, rfqAgeMs, DEFAULT_MAX_RFQ_AGE_MS } = require('./quote-sender');
 const { createQuoteHot, lockNeedlePlan, fastDropDisabled, dropDeletedDisabled, createDeletedFilter } = require('./quote-hot');
 const { resolveWorkerMode, shouldRunUnhedged } = require('./worker-mode');
 const { startUnhedgedSide } = require('./unhedged-boot');
@@ -282,6 +283,7 @@ async function kalshiSigned(method, signPath, opts = {}) {
   return signedRequest(async ({ method: m, path, headers, body }) => {
     const req = { method: m, path, headers };
     if (body != null) req.body = body;
+    if (opts.timeoutMs) { req.headersTimeout = opts.timeoutMs; req.bodyTimeout = opts.timeoutMs; }
     const { statusCode, headers: resHeaders, body: resBody } = await http.request(req);
     const text = await resBody.text();
     return { statusCode, headers: resHeaders, text };
@@ -293,8 +295,18 @@ async function kalshiSigned(method, signPath, opts = {}) {
     path: opts.path,
     headers: opts.headers,
     body: opts.body,
+    shouldRetryExpired: opts.shouldRetryExpired,
+    onSent: opts.onSent,
   });
 }
+
+// Oct 18 hotfix: gate quote POSTs (concurrency = quote sockets, stale drop,
+// duplicate rfq coalescing). See quote-sender.js.
+const quoteSender = createQuoteSender({
+  maxConcurrent: QUOTE_CONNECTIONS,
+  serverNow: () => signedNow(),
+  log: (m) => console.log(`[${MODE}] ${m}`),
+});
 
 const cancelingQuotes = new Set();
 const cancelledQuotes = new Set();
@@ -869,19 +881,28 @@ function unlessQuoteHot(fn) {
   };
 }
 
-async function postQuote(rfqId, noBid, yesBid = YES_DECLINE, restRemainder) {
-  return withQuoteHot(async () => {
-    const body = JSON.stringify(buildQuoteBody(rfqId, noBid, yesBid, restRemainder));
-    const { statusCode, text } = await kalshiSigned('POST', QUOTE_PATH, {
-      headers: { 'Content-Type': 'application/json' },
-      body,
-      http: kalshiQuoteHttp,
-    });
+async function postQuote(rfqId, noBid, yesBid = YES_DECLINE, restRemainder, createdTs) {
+  const body = JSON.stringify(buildQuoteBody(rfqId, noBid, yesBid, restRemainder));
+  const { statusCode, text } = await quoteSender.send(rfqId, createdTs, ({ queueMs }) => withQuoteHot(() => kalshiSigned('POST', QUOTE_PATH, {
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    http: kalshiQuoteHttp,
+    timeoutMs: QUOTE_TIMEOUT_MS,
+    // No second try once the RFQ is past the stale window.
+    shouldRetryExpired: () => {
+      const age = rfqAgeMs(createdTs, signedNow());
+      return age == null || age <= DEFAULT_MAX_RFQ_AGE_MS;
+    },
+    onSent: ({ netMs, statusCode: sc }) => {
+      console.log(`[SENDTIME] rfq=${rfqId} net_ms=${netMs} queue_ms=${Math.round(queueMs)} status=${sc} active=${quoteSender.active} queued=${quoteSender.queued}`);
+    },
+  })));
+  {
     if (statusCode < 200 || statusCode >= 300) {
       throw new Error(`Kalshi quote failed ${statusCode}: ${text}`);
     }
     return JSON.parse(text); // { id: quote_id }
-  });
+  }
 }
 
 // Kalshi RFQ: after quote_accepted the maker must confirm within the window
@@ -2459,7 +2480,7 @@ async function onRfq(rfq, env) {
       let sentNoBid = noBid;
       let sentYesBid = yesBid;
       try {
-        result = await postQuote(rfq.rfqId, sentNoBid, sentYesBid, restRemainder);
+        result = await postQuote(rfq.rfqId, sentNoBid, sentYesBid, restRemainder, rfq.createdTs);
         if (SUBCENT) subcentGridFails = 0;
       } catch (firstErr) {
         // Sub-cent price rejected as off-grid: retry ONCE at the penny floor (never above the
@@ -2470,7 +2491,7 @@ async function onRfq(rfq, env) {
         console.error(
           `[${MODE}] SUBCENT price rejected no_bid=${noBid} yes_bid=${yesBid} — retry penny no_bid=${sentNoBid}: ${firstErr.message}`
         );
-        result = await postQuote(rfq.rfqId, sentNoBid, sentYesBid, restRemainder);
+        result = await postQuote(rfq.rfqId, sentNoBid, sentYesBid, restRemainder, rfq.createdTs);
         counts.subcentFallback = (counts.subcentFallback || 0) + 1;
         latency.noteSubcentFallback();
         subcentGridFails += 1;
