@@ -163,6 +163,7 @@ const {
   CLOSED_LIVE,
   finalizeClosedLive,
 } = require('./skip-tape');
+const tapeBatch = require('./tape-batch');
 const { createSeriesFeeCache } = require('./series-fee');
 const seriesFees = createSeriesFeeCache({ log: (m) => console.log(`[${MODE}] ${m}`) });
 const makerRateFor = (row) => seriesFees.rateForTicker(row && (row.combo_ticker || row.market_ticker));
@@ -416,6 +417,17 @@ let skipTapeBusy = false;
 // for this process's lifetime so it cannot crowd out fresh rows.
 const SKIP_TAPE_MAX_ATTEMPTS = 15;
 const skipTapeGaveUp = new Set();
+// Batched tape matching: one trades call per combo ticker per tick, each print credited
+// to at most one request. Rows need market_ticker + close time (rfq_deleted deleted_ts).
+const SKIP_TAPE_BATCH_TICKERS_PER_TICK = 8;
+const SKIP_TAPE_BATCH_MAX_PAGES = 5;
+const claimedTradeIds = new Map(); // ticker → Map(trade_id → claimedAtMs)
+const CLAIMED_TTL_MS = 24 * 3600 * 1000;
+const BASE_SKIP_COLS = 'id,parlay_id,rfq_id,contracts,remaining,skip_reason,market_ticker,created_at,tape_match';
+function skipSelectCols() {
+  const extra = ['rfq_closed_at', 'rfq_contracts'].filter((c) => !unknownCols.has(c));
+  return extra.length ? `${BASE_SKIP_COLS},${extra.join(',')}` : BASE_SKIP_COLS;
+}
 
 // --- per-lock pause -----------------------------------------------------------
 let pausedParlayIds = new Set();
@@ -1065,14 +1077,34 @@ function markSubmissionNotLive(quoteId) {
 // The RFQ closed while our quote was still live: someone else won it (or the buyer walked).
 // Stamp skip_reason=rfq_closed_live; reconcileSkipTapes resolves it to outbid / no_taker
 // and records the winning YES (tape_yes_price) when the public print is found.
-function markClosedWhileLive(quoteId) {
+function markClosedWhileLive(quoteId, closeEvt = null) {
   if (!quoteId || isReserveKey(quoteId) || unknownCols.has('skip_reason')) return;
-  supabase.from('combo_submissions').update({ skip_reason: CLOSED_LIVE })
+  // We saw the rfq_deleted live: its deleted_ts (or now) is the close time, so the
+  // resolver never has to GET the RFQ again.
+  const closedMs = (closeEvt && tapeBatch.parseMs(closeEvt.deletedTs)) || Date.now();
+  const patch = { skip_reason: CLOSED_LIVE };
+  if (!unknownCols.has('rfq_closed_at')) patch.rfq_closed_at = new Date(closedMs).toISOString();
+  const tickerFromEvt = closeEvt && closeEvt.raw && closeEvt.raw.market_ticker;
+  supabase.from('combo_submissions').update(patch)
     .eq('quote_id', quoteId).neq('status', 'filled').is('skip_reason', null)
-    .select('id,parlay_id,rfq_id,contracts,remaining,skip_reason,market_ticker,created_at,tape_match')
+    .select(skipSelectCols())
     .then(({ data, error }) => {
-      if (error) { console.error(`[${MODE}] closed-live stamp`, error.message); return; }
-      for (const row of data || []) if (row && row.id) pendingSkipTapes.set(row.id, row);
+      if (error) {
+        const m = String(error.message || '').match(COL_ERR);
+        if (m) {
+          unknownCols.add(m[1]);
+          console.warn(`[${MODE}] combo_submissions missing column ${m[1]} — degrading`);
+          return markClosedWhileLive(quoteId, closeEvt);
+        }
+        console.error(`[${MODE}] closed-live stamp`, error.message);
+        return;
+      }
+      for (const row of data || []) {
+        if (!row || !row.id) continue;
+        if (!row.market_ticker && tickerFromEvt) row.market_ticker = tickerFromEvt;
+        row.closedMs = closedMs;
+        pendingSkipTapes.set(row.id, row);
+      }
     })
     .catch((e) => console.error(`[${MODE}] closed-live stamp`, e.message));
 }
@@ -1106,7 +1138,7 @@ function onRfqDeleted(evt, env) {
   const dropped = dropPendingForRfq(pendingQuotes, rfqId, { confirming: confirmingQuotes });
   for (const { id, quote } of dropped) {
     noteReleased(id, quote, 'closed');
-    markClosedWhileLive(id);
+    markClosedWhileLive(id, evt);
   }
   if (unhedgedFills && rfqId) {
     const closedEvt = evt;
@@ -1305,7 +1337,7 @@ async function loadPendingSkipTapes() {
   const cutoff = new Date(Date.now() - SKIP_TAPE_LOOKBACK_MS).toISOString();
   let q = supabase
     .from('combo_submissions')
-    .select('id,parlay_id,rfq_id,contracts,remaining,skip_reason,market_ticker,created_at,tape_match')
+    .select(BASE_SKIP_COLS)
     .in('parlay_id', live.map((p) => p.id))
     .in('skip_reason', ['oversized', 'limit_reached'])
     .is('tape_match', null)
@@ -1337,7 +1369,7 @@ async function loadPendingClosedLive() {
   const cutoff = new Date(Date.now() - CLOSED_LIVE_LOOKBACK_MS).toISOString();
   const { data, error } = await supabase
     .from('combo_submissions')
-    .select('id,parlay_id,rfq_id,contracts,remaining,skip_reason,market_ticker,created_at,tape_match')
+    .select(skipSelectCols())
     .in('user_id', SCOPE.userIds)
     .eq('skip_reason', CLOSED_LIVE)
     .is('tape_match', null)
@@ -1345,6 +1377,11 @@ async function loadPendingClosedLive() {
     .order('created_at', { ascending: false })
     .limit(CLOSED_LIVE_LOAD_LIMIT);
   if (error) {
+    const m = String(error.message || '').match(COL_ERR);
+    if (m && (m[1] === 'rfq_closed_at' || m[1] === 'rfq_contracts')) {
+      unknownCols.add(m[1]);
+      return loadPendingClosedLive();
+    }
     console.error(`[${MODE}] skip-tape closed-live load`, error.message);
     return;
   }
@@ -1399,10 +1436,14 @@ async function reconcileSkipTapesOnce() {
     if (!eligible) pendingSkipTapes.delete(id);
   }
 
-  // Due rows only, closed-live first. A row that answers "not ready" (RFQ still open)
-  // backs off instead of holding a slot every tick — that head-of-line block stalled
-  // resolution for hours.
-  const batch = pickSkipTapeBatch(pendingSkipTapes.values(), now, SKIP_TAPE_MAX_PER_TICK);
+  // Closed-live rows with a ticker + close time: one trades call per ticker.
+  await reconcileBatchedTapes(now);
+
+  // Everything else (oversized / limit rows, legacy closed-live rows without a stored
+  // close time): per-row RFQ GET + trades. A row that answers "not ready" backs off
+  // instead of holding a slot every tick.
+  const legacy = [...pendingSkipTapes.values()].filter((r) => !isBatchable(r));
+  const batch = pickSkipTapeBatch(legacy, now, SKIP_TAPE_MAX_PER_TICK);
   for (const row of batch) {
     const id = row.id;
     try {
@@ -1431,6 +1472,110 @@ async function reconcileSkipTapesOnce() {
       console.error(`[${MODE}] skip-tape`, row.rfq_id, e.message);
       noteSkipTapeRetry(id, row, null);
     }
+  }
+}
+
+function rowClosedMs(row) {
+  if (!row) return null;
+  if (row.closedMs != null) return row.closedMs;
+  return tapeBatch.parseMs(row.rfq_closed_at);
+}
+
+function isBatchable(row) {
+  return !!(row && row.skip_reason === CLOSED_LIVE && row.market_ticker && rowClosedMs(row) != null);
+}
+
+async function fetchTradesPaged(ticker, minTs, maxTs) {
+  const all = [];
+  let cursor = '';
+  for (let page = 0; page < SKIP_TAPE_BATCH_MAX_PAGES; page++) {
+    const qs = new URLSearchParams({
+      ticker: String(ticker), min_ts: String(minTs), max_ts: String(maxTs), limit: '1000',
+    });
+    if (cursor) qs.set('cursor', cursor);
+    const { json } = await kalshiGet('/trade-api/v2/markets/trades', qs.toString());
+    for (const t of (json && json.trades) || []) all.push(t);
+    cursor = (json && json.cursor) || '';
+    if (!cursor) break;
+  }
+  return all;
+}
+
+function claimedFor(ticker, now) {
+  let m = claimedTradeIds.get(ticker);
+  if (!m) { m = new Map(); claimedTradeIds.set(ticker, m); }
+  for (const [id, at] of m) if (now - at > CLAIMED_TTL_MS) m.delete(id);
+  return m;
+}
+
+// Trades already credited to requests resolved earlier (other ticks / before a restart).
+async function loadClaimedFromDb(rows, sinceMs) {
+  if (unknownCols.has('tape_trade_id')) return [];
+  const parlayIds = [...new Set(rows.map((r) => r.parlay_id).filter(Boolean))];
+  if (!parlayIds.length) return [];
+  const { data, error } = await supabase.from('combo_submissions')
+    .select('tape_trade_id')
+    .in('parlay_id', parlayIds)
+    .gte('created_at', new Date(sinceMs).toISOString())
+    .not('tape_trade_id', 'is', null)
+    .limit(1000);
+  if (error) {
+    const m = String(error.message || '').match(COL_ERR);
+    if (m) unknownCols.add(m[1]);
+    else console.error(`[${MODE}] skip-tape claimed load`, error.message);
+    return [];
+  }
+  return (data || []).map((r) => r.tape_trade_id).filter(Boolean);
+}
+
+async function reconcileBatchedTapes(now) {
+  const rows = [...pendingSkipTapes.values()].filter(isBatchable);
+  if (!rows.length) return;
+  for (const r of rows) if (r.closedMs == null) r.closedMs = rowClosedMs(r);
+  const groups = tapeBatch.groupByTicker(rows);
+  const tickers = [...groups.entries()]
+    .map(([ticker, list]) => {
+      const due = list.filter((r) => tapeBatch.isBatchDue(r, now) && !(r._nextAt > now));
+      const oldest = due.reduce((m, r) => Math.min(m, r.closedMs), Infinity);
+      return { ticker, list, due, oldest };
+    })
+    .filter((g) => g.due.length)
+    .sort((a, b) => a.oldest - b.oldest)
+    .slice(0, SKIP_TAPE_BATCH_TICKERS_PER_TICK);
+
+  for (const g of tickers) {
+    const span = tapeBatch.fetchSpan(g.list);
+    if (!span) continue;
+    let trades;
+    try {
+      trades = await fetchTradesPaged(g.ticker, span.minTs, span.maxTs);
+    } catch (e) {
+      console.error(`[${MODE}] skip-tape batch trades`, g.ticker, e.message);
+      for (const r of g.due) noteSkipTapeRetry(r.id, r, null);
+      continue;
+    }
+    const mem = claimedFor(g.ticker, now);
+    const claimed = new Set(mem.keys());
+    for (const id of await loadClaimedFromDb(g.list, span.minTs * 1000 - 120000)) claimed.add(id);
+    const assigned = tapeBatch.assignTrades(g.list, trades, { claimed });
+    let matched = 0;
+    for (const r of g.due) {
+      const trade = assigned.get(r.id) || null;
+      const patch = tapeBatch.patchFor(r, trade, g.ticker);
+      await persistSkipTape(r.id, patch);
+      if (trade) {
+        matched++;
+        counts.tapeMatched++;
+        if (patch.tape_trade_id) mem.set(patch.tape_trade_id, now);
+      } else {
+        counts.tapeNone++;
+      }
+      pendingSkipTapes.delete(r.id);
+    }
+    console.log(
+      `[${MODE}] skip-tape batch ticker=${g.ticker} due=${g.due.length} rows=${g.list.length} ` +
+      `trades=${trades.length} outbid=${matched} not_taken=${g.due.length - matched}`
+    );
   }
 }
 
@@ -2593,6 +2738,9 @@ async function onRfq(rfq, env) {
       logAsync(p, rfq, d, 'quoted', {
         quote_id: result.id, is_live: true, contracts: reservedContracts,
         rfq_fingerprint: quotedFingerprint,
+        // Batched tape matching keys on these (no per-row RFQ GET later).
+        market_ticker: rfq.marketTicker || null,
+        rfq_contracts: rfq.contracts != null && rfq.contracts > 0 ? rfq.contracts : null,
       });
       sendAlert(
         `${formatAlertStatus('✅ QUOTED', 'kalshi')} — ${p.label}\n` +
