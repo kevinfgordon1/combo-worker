@@ -253,13 +253,87 @@ function identitiesFromKeys(keys) {
 //      lock keys vs timed Kalshi RFQ tickers, JAC/JAX aliases.
 //   2. HHMM-stripped ticker set — mixed SPREAD/TOTAL locks that identity
 //      cannot parse.
+// Oct 18 hotfix (Sunday flood): ~99.9% of RFQs miss every lock, and each miss
+// recomputed every lock's keys / identities / canonical keys (~1ms per RFQ at
+// ~90 locks, more CPU than one thread has at ~3.5k RFQs/s).
+//   1. Per-lock derived data is memoized per lock object (WeakMap). The runner
+//      replaces lock objects on every refresh, so the cache resets with them.
+//   2. A per-array index (WeakMap keyed by the parlays array) holds the union of
+//      every lock's normalized keys, identity keys and canonical keys. Every
+//      pass below is a multiset equality, so a lock can only match if EVERY RFQ
+//      leg appears in that lock. If some RFQ leg is in none of the three unions
+//      (normalized / canonical / identity), no pass can match: return null.
+//      Results are identical to the unindexed code (see match-diff test).
+const lockDerivedMemo = new WeakMap();
+function lockDerived(p) {
+  if (!p || typeof p !== 'object') {
+    const keys = parlayKeys(p);
+    const canon = keys.map(canonicalizeLegKey).filter(Boolean);
+    return { keys, ids: identitiesFromParlay(p), canon, canonOk: canon.length === keys.length };
+  }
+  let d = lockDerivedMemo.get(p);
+  if (!d) {
+    const keys = parlayKeys(p);
+    const canon = keys.map(canonicalizeLegKey).filter(Boolean);
+    d = { keys, ids: identitiesFromParlay(p), canon, canonOk: canon.length === keys.length };
+    lockDerivedMemo.set(p, d);
+  }
+  return d;
+}
+
+const matchIndexMemo = new WeakMap();
+function matchIndex(parlays) {
+  let idx = matchIndexMemo.get(parlays);
+  if (idx) return idx;
+  const norm = new Set();
+  const ids = new Set();
+  const canon = new Set();
+  for (const p of parlays) {
+    const d = lockDerived(p);
+    for (const k of d.keys) norm.add(k);
+    if (d.ids && d.ids.ok) for (const k of d.ids.keys) ids.add(k);
+    for (const k of d.canon) canon.add(k);
+  }
+  idx = { norm, ids, canon };
+  matchIndexMemo.set(parlays, idx);
+  return idx;
+}
+
+// Pure per-leg facts, cached by normalized leg key (legs repeat heavily).
+const LEG_FACTS_MAX = 200000;
+let legFacts = new Map();
+function legFactsFor(k) {
+  let f = legFacts.get(k);
+  if (f) return f;
+  const r = identitiesFromParlay({ leg_keys: [k] });
+  f = { canon: canonicalizeLegKey(k), id: r && r.ok && r.keys.length === 1 ? r.keys[0] : null };
+  if (legFacts.size >= LEG_FACTS_MAX) legFacts = new Map();
+  legFacts.set(k, f);
+  return f;
+}
+
+function couldMatchAny(rfqKeys, idx) {
+  for (const k of rfqKeys) {
+    if (idx.norm.has(k)) continue;
+    const f = legFactsFor(k);
+    if (f.canon && idx.canon.has(f.canon)) continue;
+    if (f.id && idx.ids.has(f.id)) continue;
+    return false;
+  }
+  return true;
+}
+
 function matchParlay(rfq, parlays) {
   if (!rfq || !Array.isArray(parlays)) return null;
   const rfqKeys = (rfq.legKeys || []).map(normalizeLegKey).filter(Boolean);
   if (!rfqKeys.length) return null;
+  if (!couldMatchAny(rfqKeys, matchIndex(parlays))) return null;
+  return matchParlayFull(rfqKeys, parlays);
+}
 
+function matchParlayFull(rfqKeys, parlays) {
   for (const p of parlays) {
-    const lk = parlayKeys(p);
+    const lk = lockDerived(p).keys;
     if (lk.length && sameSet(rfqKeys, lk)) return p;
   }
 
@@ -267,7 +341,7 @@ function matchParlay(rfq, parlays) {
   if (rfqIds.ok) {
     const hits = [];
     for (const p of parlays) {
-      const lock = identitiesFromParlay(p);
+      const lock = lockDerived(p).ids;
       if (lock.ok && sameIdentitySet(rfqIds.keys, lock.keys)) hits.push(p);
     }
     if (hits.length === 1) return hits[0];
@@ -277,10 +351,10 @@ function matchParlay(rfq, parlays) {
   if (rfqCanon.length === rfqKeys.length) {
     const hits = [];
     for (const p of parlays) {
-      const lk = parlayKeys(p);
+      const d = lockDerived(p);
+      const lk = d.keys;
       if (!lk.length || lk.length !== rfqCanon.length) continue;
-      const canon = lk.map(canonicalizeLegKey).filter(Boolean);
-      if (canon.length === lk.length && sameSet(rfqCanon, canon)) hits.push(p);
+      if (d.canonOk && sameSet(rfqCanon, d.canon)) hits.push(p);
     }
     if (hits.length === 1) return hits[0];
   }

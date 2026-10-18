@@ -894,7 +894,8 @@ async function postQuote(rfqId, noBid, yesBid = YES_DECLINE, restRemainder, crea
       return age == null || age <= DEFAULT_MAX_RFQ_AGE_MS;
     },
     onSent: ({ netMs, statusCode: sc }) => {
-      console.log(`[SENDTIME] rfq=${rfqId} net_ms=${netMs} queue_ms=${Math.round(queueMs)} status=${sc} active=${quoteSender.active} queued=${quoteSender.queued}`);
+      const wsH = latencyClient && latencyClient.health ? latencyClient.health() : null;
+      console.log(`[SENDTIME] rfq=${rfqId} net_ms=${netMs} queue_ms=${Math.round(queueMs)} status=${sc} active=${quoteSender.active} queued=${quoteSender.queued} ws_loop_lag_ms=${wsH && wsH.loopLagMs != null ? wsH.loopLagMs : 'na'}`);
     },
   })));
   {

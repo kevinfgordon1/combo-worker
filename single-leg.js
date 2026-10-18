@@ -61,8 +61,17 @@ function isSingleLegLock(p) {
   return legsOf(p).length === 1;
 }
 // Combo RFQ matching only ever sees 2+ leg locks.
+// Oct 18 hotfix: cached per parlays array so matchParlay's per-array index is
+// built once per refresh, not once per RFQ. The runner always replaces the array.
+const comboOnlyMemo = new WeakMap();
 function comboLocksOnly(parlays) {
-  return (parlays || []).filter((p) => !isSingleLegLock(p));
+  if (!parlays || typeof parlays !== 'object') return [];
+  let out = comboOnlyMemo.get(parlays);
+  if (!out) {
+    out = parlays.filter((p) => !isSingleLegLock(p));
+    comboOnlyMemo.set(parlays, out);
+  }
+  return out;
 }
 
 // Price the lock pays out net of the maker fee -> nominal price to rest at.
