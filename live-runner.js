@@ -158,6 +158,8 @@ const {
   withVenue,
   isSkipTapeEligible,
   resolveSkipTape,
+  nextRetryAt,
+  pickSkipTapeBatch,
   CLOSED_LIVE,
   finalizeClosedLive,
 } = require('./skip-tape');
@@ -399,8 +401,21 @@ const runUnhedged = shouldRunUnhedged(process.env);
 const unknownCols = new Set();
 const COL_ERR = /Could not find the '([^']+)' column/i;
 const SKIP_TAPE_LOOKBACK_MS = 24 * 3600 * 1000;
-const SKIP_TAPE_TICK_MS = 15000;
-const SKIP_TAPE_MAX_PER_TICK = 5;
+// Closed-live rows ("checking who won") are reloaded from the DB after a restart and for
+// a week back, so rows lost to an old restart or kickoff drop still get resolved.
+const CLOSED_LIVE_LOOKBACK_MS = 7 * 24 * 3600 * 1000;
+const CLOSED_LIVE_LOAD_LIMIT = 100;
+// Backlog loads only while the in-memory queue is short, so fresh rows go first.
+const SKIP_TAPE_QUEUE_SOFT_MAX = 200;
+// 2 Kalshi GETs per row on the REST pool (not the quote pool): 12 rows / 10s ≈ 2.4 GET/s.
+// Was 5 rows / 15s, below the evening arrival rate (~10 rows/min) → hours of backlog.
+const SKIP_TAPE_TICK_MS = 10000;
+const SKIP_TAPE_MAX_PER_TICK = 12;
+let skipTapeBusy = false;
+// A row still unresolved after this many tries (~1h of capped backoff) leaves the queue
+// for this process's lifetime so it cannot crowd out fresh rows.
+const SKIP_TAPE_MAX_ATTEMPTS = 15;
+const skipTapeGaveUp = new Set();
 
 // --- per-lock pause -----------------------------------------------------------
 let pausedParlayIds = new Set();
@@ -644,6 +659,7 @@ async function refresh() {
       polyLoop.cancelStartedQuotes().catch((e) => console.error(`[${MODE}] poly cancel-on-start refresh`, e.message));
     }
     loadPendingSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape load`, e.message));
+    loadPendingClosedLive().catch((e) => console.error(`[${MODE}] skip-tape closed-live load`, e.message));
   } catch (e) {
     console.error(`[${MODE}] refresh failed`, e.message);
   }
@@ -1312,17 +1328,61 @@ async function loadPendingSkipTapes() {
   }
 }
 
-async function reconcileSkipTapes() {
-  if (!pendingSkipTapes.size) return; // idle — no skipped RFQs waiting
-  const now = Date.now();
-  const byId = new Map(parlays.map((p) => [p.id, p]));
-  const live = parlays.filter((p) => !startedForParlay(p).started);
-  if (!live.length) {
-    pendingSkipTapes.clear(); // stop looking; do not guess tape_match=none
+// rfq_closed_live rows only lived in memory: a restart lost them and they sat on
+// "checking who won" forever. Reload them (this worker's users only), newest first.
+async function loadPendingClosedLive() {
+  if (unknownCols.has('skip_reason') || unknownCols.has('tape_match')) return;
+  if (!SCOPE.userIds.length) return;
+  if (pendingSkipTapes.size >= SKIP_TAPE_QUEUE_SOFT_MAX) return;
+  const cutoff = new Date(Date.now() - CLOSED_LIVE_LOOKBACK_MS).toISOString();
+  const { data, error } = await supabase
+    .from('combo_submissions')
+    .select('id,parlay_id,rfq_id,contracts,remaining,skip_reason,market_ticker,created_at,tape_match')
+    .in('user_id', SCOPE.userIds)
+    .eq('skip_reason', CLOSED_LIVE)
+    .is('tape_match', null)
+    .gte('created_at', cutoff)
+    .order('created_at', { ascending: false })
+    .limit(CLOSED_LIVE_LOAD_LIMIT);
+  if (error) {
+    console.error(`[${MODE}] skip-tape closed-live load`, error.message);
     return;
   }
+  for (const row of data || []) {
+    if (!row || !row.id || !row.rfq_id || pendingSkipTapes.has(row.id) || skipTapeGaveUp.has(row.id)) continue;
+    pendingSkipTapes.set(row.id, row);
+  }
+}
 
-  let looked = 0;
+async function reconcileSkipTapes() {
+  if (!pendingSkipTapes.size) return; // idle — no skipped RFQs waiting
+  if (skipTapeBusy) return; // a slow tick must not overlap the next one
+  skipTapeBusy = true;
+  try {
+    await reconcileSkipTapesOnce();
+  } finally {
+    skipTapeBusy = false;
+  }
+}
+
+function noteSkipTapeRetry(id, row, out) {
+  row._attempts = (row._attempts || 0) + 1;
+  if (row._attempts >= SKIP_TAPE_MAX_ATTEMPTS) {
+    pendingSkipTapes.delete(id);
+    skipTapeGaveUp.add(id);
+    console.warn(
+      `[${MODE}] skip-tape gave up rfq=${row.rfq_id} reason=${row.skip_reason} ` +
+      `attempts=${row._attempts} status=${(out && out.status) || '?'}`
+    );
+    return;
+  }
+  row._nextAt = nextRetryAt(out, row._attempts - 1, Date.now());
+}
+
+async function reconcileSkipTapesOnce() {
+  const now = Date.now();
+  const byId = new Map(parlays.map((p) => [p.id, p]));
+
   for (const [id, row] of pendingSkipTapes) {
     const p = byId.get(row.parlay_id);
     const started = p ? startedForParlay(p) : { started: true };
@@ -1334,20 +1394,24 @@ async function reconcileSkipTapes() {
       now,
       startsAt: p && p.starts_at,
     });
+    // Oversized / limit rows stop at kickoff (do not guess tape_match=none);
+    // closed-live rows stay eligible (see isSkipTapeEligible).
+    if (!eligible) pendingSkipTapes.delete(id);
+  }
 
-    if (!eligible) {
-      pendingSkipTapes.delete(id);
-      continue;
-    }
-
-    if (looked >= SKIP_TAPE_MAX_PER_TICK) continue;
-    looked++;
+  // Due rows only, closed-live first. A row that answers "not ready" (RFQ still open)
+  // backs off instead of holding a slot every tick — that head-of-line block stalled
+  // resolution for hours.
+  const batch = pickSkipTapeBatch(pendingSkipTapes.values(), now, SKIP_TAPE_MAX_PER_TICK);
+  for (const row of batch) {
+    const id = row.id;
     try {
       const out = await resolveSkipTape(row, {
         fetchRfq: fetchSkipRfq, fetchTrades: fetchSkipTrades, now,
       });
       if (out.retry) {
         if (out.error) console.error(`[${MODE}] skip-tape`, row.rfq_id, out.error.message);
+        noteSkipTapeRetry(id, row, out);
         continue;
       }
       if (row.skip_reason === CLOSED_LIVE) out.patch.skip_reason = finalizeClosedLive(out.rfq, out.patch, out.windowTrades);
@@ -1365,6 +1429,7 @@ async function reconcileSkipTapes() {
       pendingSkipTapes.delete(id);
     } catch (e) {
       console.error(`[${MODE}] skip-tape`, row.rfq_id, e.message);
+      noteSkipTapeRetry(id, row, null);
     }
   }
 }

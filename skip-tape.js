@@ -72,6 +72,10 @@ function isTrackedSkipReason(reason) {
 function isSkipTapeEligible({ skipReason, tapeMatch, parlayActive, started, now, startsAt }) {
   if (!isTrackedSkipReason(skipReason)) return false;
   if (tapeMatch != null && tapeMatch !== '') return false;
+  // rfq_closed_live: the RFQ already closed BEFORE the game (our quote was live on it), and the
+  // Kalshi RFQ + trade history stay readable afterwards. Dropping these at kickoff / lock end left
+  // the card on "checking who won" forever, so they resolve regardless of lock state.
+  if (skipReason === CLOSED_LIVE) return true;
   if (!parlayActive) return false;
   if (started) return false;
   if (startsAt != null && startsAt !== '') {
@@ -110,6 +114,48 @@ function isTapeReady({ status, closedMs, now, padMs = TAPE_PAD_MS }) {
   return true;
 }
 
+// Retry scheduling so one row that keeps answering "not ready" (an oversized RFQ the requester
+// leaves open for hours) cannot hold a per-tick slot forever and stall every row behind it.
+const RETRY_BASE_MS = 30000;
+const RETRY_MAX_MS = 5 * 60 * 1000;
+
+function retryDelayMs(attempts) {
+  const n = Math.max(0, Math.floor(Number(attempts) || 0));
+  return Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.min(n, 10));
+}
+
+// When to look at a row again after resolveSkipTape said retry.
+function nextRetryAt(out, attempts, now) {
+  const backoff = now + retryDelayMs(attempts);
+  if (out && out.readyAt != null && Number.isFinite(out.readyAt) && out.readyAt > now) {
+    return Math.min(backoff, out.readyAt + 1000);
+  }
+  return backoff;
+}
+
+function createdMs(row) {
+  const t = row && row.created_at ? Date.parse(row.created_at) : NaN;
+  return Number.isFinite(t) ? t : 0;
+}
+
+// Pick up to max due rows: closed-live first (the RFQ is already closed, the UI is waiting on it),
+// then oldest first. Rows still backing off are skipped and do not use a slot.
+function pickSkipTapeBatch(rows, now, max) {
+  const due = [];
+  for (const row of rows) {
+    if (!row) continue;
+    if (row._nextAt != null && row._nextAt > now) continue;
+    due.push(row);
+  }
+  due.sort((a, b) => {
+    const pa = a.skip_reason === CLOSED_LIVE ? 0 : 1;
+    const pb = b.skip_reason === CLOSED_LIVE ? 0 : 1;
+    if (pa !== pb) return pa - pb;
+    return createdMs(a) - createdMs(b);
+  });
+  return due.slice(0, Math.max(0, max));
+}
+
 function rfqCountForTape(rfq, fallbackContracts) {
   const fromRfq = toNum(rfq && (rfq.contracts_fp != null ? rfq.contracts_fp : rfq.contracts));
   if (fromRfq > 0) return fromRfq;
@@ -140,7 +186,8 @@ async function resolveSkipTape(row, { fetchRfq, fetchTrades, now = Date.now(), p
 
   const closedMs = rfqClosedMs(rfq);
   if (!isTapeReady({ status: rfq.status, closedMs, now, padMs })) {
-    return { retry: true };
+    const readyAt = rfq.status !== 'open' && closedMs != null ? closedMs + padMs : null;
+    return { retry: true, readyAt, status: rfq.status || null };
   }
 
   const ticker = tickerOf(rfq, row);
@@ -193,4 +240,9 @@ module.exports = {
   isTapeReady,
   rfqCountForTape,
   resolveSkipTape,
+  RETRY_BASE_MS,
+  RETRY_MAX_MS,
+  retryDelayMs,
+  nextRetryAt,
+  pickSkipTapeBatch,
 };
