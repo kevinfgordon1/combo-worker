@@ -332,6 +332,59 @@ async function testTapeOnSkip() {
   assert.strictEqual(nearCloseMatch([{ ts: 90000, count: 7, yes: 0.08 }], 1500).match, 'none');
 }
 
+// Closed-live rows resolve after kickoff / lock end; retry backoff; batch picking.
+{
+  const { isSkipTapeEligible: el, CLOSED_LIVE, retryDelayMs, nextRetryAt, pickSkipTapeBatch,
+    RETRY_BASE_MS, RETRY_MAX_MS } = require('./skip-tape');
+  // Kickoff / removed lock no longer strands "checking who won".
+  assert.strictEqual(el({ skipReason: CLOSED_LIVE, tapeMatch: null, parlayActive: false, started: true, now: 5, startsAt: 1 }), true);
+  assert.strictEqual(el({ skipReason: CLOSED_LIVE, tapeMatch: 'none', parlayActive: true, started: false, now: 0 }), false);
+  // Oversized still stops at kickoff.
+  assert.strictEqual(el({ skipReason: 'oversized', tapeMatch: null, parlayActive: true, started: true, now: 0 }), false);
+
+  assert.strictEqual(retryDelayMs(0), RETRY_BASE_MS);
+  assert.strictEqual(retryDelayMs(1), RETRY_BASE_MS * 2);
+  assert.strictEqual(retryDelayMs(50), RETRY_MAX_MS);
+  // Pad wait: come back right after the pad, not after the full backoff.
+  assert.strictEqual(nextRetryAt({ retry: true, readyAt: 1000 + 10000 }, 3, 1000), 12000);
+  assert.strictEqual(nextRetryAt({ retry: true }, 0, 1000), 1000 + RETRY_BASE_MS);
+
+  const rows = [
+    { id: 'old-open', skip_reason: 'oversized', created_at: '2026-10-17T14:10:00Z' },
+    { id: 'old-open2', skip_reason: 'oversized', created_at: '2026-10-17T14:11:00Z', _nextAt: 9e15 },
+    { id: 'cl-2', skip_reason: CLOSED_LIVE, created_at: '2026-10-17T21:32:00Z' },
+    { id: 'cl-1', skip_reason: CLOSED_LIVE, created_at: '2026-10-17T21:31:00Z' },
+    { id: 'cl-wait', skip_reason: CLOSED_LIVE, created_at: '2026-10-17T21:30:00Z', _nextAt: 2000 },
+  ];
+  assert.deepStrictEqual(pickSkipTapeBatch(rows, 1000, 3).map((r) => r.id), ['cl-1', 'cl-2', 'old-open']);
+  assert.deepStrictEqual(pickSkipTapeBatch(rows, 3000, 2).map((r) => r.id), ['cl-wait', 'cl-1']);
+  // Head-of-line: rows backing off never take a slot, so the queue keeps moving.
+  const stuck = Array.from({ length: 8 }, (_, i) => ({ id: `s${i}`, skip_reason: 'oversized', created_at: '2026-10-17T10:00:00Z', _nextAt: 5000 }));
+  assert.deepStrictEqual(pickSkipTapeBatch([...stuck, rows[2]], 1000, 5).map((r) => r.id), ['cl-2']);
+}
+
+{
+  // Not ready because of the pad: readyAt is reported so the caller re-checks right after.
+  const { resolveSkipTape: rs, TAPE_PAD_MS: pad } = require('./skip-tape');
+  rs({ rfq_id: 'r1', market_ticker: 'T' }, {
+    fetchRfq: async () => ({ status: 'closed', updated_ts: new Date(100000).toISOString() }),
+    fetchTrades: async () => [],
+    now: 100000 + 1000,
+  }).then((out) => {
+    assert.strictEqual(out.retry, true);
+    assert.strictEqual(out.readyAt, 100000 + pad);
+  });
+  rs({ rfq_id: 'r2', market_ticker: 'T' }, {
+    fetchRfq: async () => ({ status: 'open', updated_ts: new Date(100000).toISOString() }),
+    fetchTrades: async () => [],
+    now: 999999,
+  }).then((out) => {
+    assert.strictEqual(out.retry, true);
+    assert.strictEqual(out.readyAt, null);
+    assert.strictEqual(out.status, 'open');
+  });
+}
+
 testTapeOnSkip().then(() => {
   console.log('skip-tape.test.js ok');
 }).catch((e) => {
