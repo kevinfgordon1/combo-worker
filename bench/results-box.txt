@@ -1,0 +1,9 @@
+== rate 3500
+{"mode":"inline","threads":0,"targetRate":3500,"achievedRate":3500,"locks":90,"mainUsPerRfq":6.3,"mainBusyPct":2.2,"loopLagP50ms":1,"loopLagP99ms":1.04,"loopLagMaxMs":2.54,"matched":14}
+{"mode":"pool","threads":3,"targetRate":3500,"achievedRate":3500,"locks":90,"mainUsPerRfq":3.4,"mainBusyPct":1.2,"loopLagP50ms":1,"loopLagP99ms":1.03,"loopLagMaxMs":2.13,"matched":14,"workerMatched":14}
+== rate 10500
+{"mode":"inline","threads":0,"targetRate":10500,"achievedRate":10500,"locks":90,"mainUsPerRfq":5.4,"mainBusyPct":5.6,"loopLagP50ms":1,"loopLagP99ms":1.06,"loopLagMaxMs":2.16,"matched":42}
+{"mode":"pool","threads":3,"targetRate":10500,"achievedRate":10500,"locks":90,"mainUsPerRfq":3.3,"mainBusyPct":3.4,"loopLagP50ms":1,"loopLagP99ms":1.02,"loopLagMaxMs":7.55,"matched":42,"workerMatched":42}
+== rate 20000
+{"mode":"inline","threads":0,"targetRate":20000,"achievedRate":20000,"locks":90,"mainUsPerRfq":5.4,"mainBusyPct":10.8,"loopLagP50ms":1,"loopLagP99ms":1.04,"loopLagMaxMs":2.45,"matched":80}
+{"mode":"pool","threads":3,"targetRate":20000,"achievedRate":20000,"locks":90,"mainUsPerRfq":2.5,"mainBusyPct":5,"loopLagP50ms":1,"loopLagP99ms":1.02,"loopLagMaxMs":7.99,"matched":80,"workerMatched":80}
