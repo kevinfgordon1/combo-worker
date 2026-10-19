@@ -1,0 +1,4 @@
+{
+  "_source": "docs.polymarket.us/fees (effective 2026-10-07 10 AM ET) and gateway.polymarket.us markets feeCoefficient. Standard taker fee = theta * C * p * (1 - p). Table Tennis uses 0.10.",
+  "takerFeeCoefficient": 0.0695
+}
