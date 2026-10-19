@@ -617,4 +617,23 @@ assert.ok(
   'kickoff check stays before the Kalshi confirm'
 );
 
+assert.ok(
+  /POLY_FILL_DEDUPE_LOOKBACK_MS = POLY_FILL_LOOKBACK_MS \+ 14 \* 24 \* 3600 \* 1000/.test(liveSrc)
+    && /gte\('recorded_at', fillCutoff\)/.test(liveSrc),
+  'booked Poly fills used for dedupe reach 14d past the lock window'
+);
+assert.ok(
+  /return \{ status: 'exists' \}/.test(liveSrc) && /return \{ status: 'twin' \}/.test(liveSrc),
+  'persist reports replays (same fill_id) and economic twins instead of rewriting them'
+);
+{
+  const i = liveSrc.indexOf('const persisted = await persistExecutedFill');
+  const sup = liveSrc.indexOf('FILL REPLAY suppressed', i);
+  const alert = liveSrc.indexOf("formatAlertStatus('✅ FILL CONFIRMED'", i);
+  assert.ok(i > 0 && sup > i && alert > sup, 'a replayed / twin Poly fill returns before the FILL CONFIRMED Telegram');
+  const block = liveSrc.slice(i, sup + 400);
+  assert.ok(/persisted\.status === 'exists' \|\| persisted\.status === 'twin'/.test(block));
+  assert.ok(/return;/.test(liveSrc.slice(sup, sup + 400)), 'suppressed replay returns');
+}
+
 console.log('live-runner.test.js ok');
