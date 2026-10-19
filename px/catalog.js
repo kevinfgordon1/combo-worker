@@ -137,7 +137,7 @@ function createCatalog({ apiBase, parlayBase, session, fetch: f = globalThis.fet
   async function syncRemote() {
     const ids = [];
     let token = '';
-    for (let i = 0; i < 50; i += 1) {
+    for (let i = 0; i < 300; i += 1) {
       const d = await getJson(`${parlayBase}/supported-strikes?limit=100${token ? `&token=${encodeURIComponent(token)}` : ''}`);
       ids.push(...((d && d.supported_strikes) || []));
       token = d && d.token;
