@@ -164,7 +164,7 @@ const src = (f) => fs.readFileSync(path.join(__dirname, f), 'utf8');
   const scoped = live.match(/\.in\('user_id', SCOPE\.userIds\)/g) || [];
   assert.ok(scoped.length >= 7, `submission/fill reads scoped (${scoped.length})`);
   assert.ok(/withScopeUser\(liveRunnerFillRow\(/.test(live) && /const stored = withScopeUser\(/.test(live), 'fill writes carry user_id');
-  assert.ok(/if \(!SCOPE\.isTester\) bucketManager\.start\(\);/.test(live), 'bucket manager never runs for testers');
+  assert.ok(/else if \(!SCOPE\.isTester\) bucketManager\.start\(\);/.test(live), 'bucket manager never runs for testers');
   assert.ok(/createAppAlerts\(\{ client: SCOPE\.isTester \? null : supabase \}\)/.test(live), 'no Kevin app alerts from testers');
   const shadow = src('shadow-runner.js');
   assert.ok(/parlays = liveUsers\.filterParlays\(applyRefreshParlays\(/.test(shadow));

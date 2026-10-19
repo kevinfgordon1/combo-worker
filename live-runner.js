@@ -212,7 +212,12 @@ const { createUserCredits } = require('./user-credits');
 const { createPolyStallAlerts } = require('./poly-stall-alert');
 const { createPartialQuoteDryRun, isPartialQuoteFlagOn } = require('./partial-quote');
 
-const MODE = 'LIVE';
+const { resolveSplit, splitConfigError } = require('./poly-split');
+const { createVenueCoordinator } = require('./venue-coord');
+const { createPolymarketHttp } = require('./polymarket-client');
+// COMBO_ROLE=poly runs this file as the Polymarket-only service (no Kalshi WS).
+const SPLIT = resolveSplit(process.env);
+const MODE = SPLIT.mode;
 const { createTelegramGate } = require('./tg-gate');
 const { createPolyDeskFillWatcher } = require('./poly-desk-fills');
 const { comboLocksOnly } = require('./single-leg');
@@ -325,6 +330,15 @@ const capBook = createCapBook({
   },
 });
 let reserveSeq = 0;
+// Venues in separate processes: confirm holds are coordinated through the DB.
+const venueCoord = SPLIT.coord ? createVenueCoordinator({
+  supabase,
+  venue: SPLIT.venue,
+  failOpen: /^(1|true|yes)$/i.test(String(process.env.COMBO_COORD_FAIL_OPEN || '')),
+  log: (m) => console.log(`[${MODE}] ${m}`),
+  alert: (t) => sendAlert(t).catch(() => {}),
+}) : null;
+if (venueCoord) venueCoord.attach(capBook);
 
 // Telegram: fills (+ failed bucket transfers) only, batched and 429-aware.
 const tgGate = createTelegramGate({ env: process.env, tag: MODE });
@@ -979,6 +993,8 @@ function pendingEntry(p, rfq, contracts, extra) {
 // Cancel leftovers only — not a reserve seed. Window matches TTL so hours-old
 // is_live rows cannot re-enter the cancel path as if they were still live.
 async function loadOpenSubmissionQuotes() {
+  // These rows feed Kalshi cancels; the Polymarket service never cancels on Kalshi.
+  if (!SPLIT.runKalshi) return [];
   const cutoff = new Date(Date.now() - RESERVE_TTL_MS).toISOString();
   try {
     const { data, error } = await supabase
@@ -1159,6 +1175,7 @@ async function cancelUnacceptedQuotes(now = Date.now()) {
 
 async function cancelQuoteAndDrop(quoteId, pending, reason) {
   if (!quoteId) return;
+  if (!SPLIT.runKalshi) return; // Kalshi quotes belong to combo-worker
   if (isReserveKey(quoteId)) {
     pendingQuotes.delete(quoteId);
     return;
@@ -2738,10 +2755,23 @@ async function main() {
     );
     process.exit(1);
   }
-  if (!KEY_ID || !PEM || !process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+  if ((SPLIT.runKalshi && (!KEY_ID || !PEM)) || !process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
     console.error(
       `[${MODE}] missing env: need KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY`
     );
+    process.exit(1);
+  }
+  const splitErr = splitConfigError(SPLIT, process.env);
+  if (splitErr) {
+    console.error(`[${MODE}] ${splitErr} — refusing to start`);
+    process.exit(1);
+  }
+  console.log(
+    `[${MODE}] role=${SPLIT.role} kalshi=${SPLIT.runKalshi ? 'on' : 'off'} ` +
+    `polymarket=${SPLIT.runPoly ? 'on' : 'off'} venueCoord=${SPLIT.coord ? 'on' : 'off'}`
+  );
+  if (SPLIT.role === 'poly' && runUnhedged) {
+    console.error(`[${MODE}] COMBO_ROLE=poly cannot run unhedged (WORKER_MODE=all) — refusing to start`);
     process.exit(1);
   }
   if (SCOPE.invalid) {
@@ -2756,14 +2786,16 @@ async function main() {
     appAlerts: createAppAlerts({ client: SCOPE.isTester ? null : supabase }),
     signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
   });
-  if (!SCOPE.isTester) bucketManager.start();
+  // Kalshi-only: the Polymarket service never moves Kalshi bucket money.
+  if (!SPLIT.runKalshi) bucketManager = null;
+  else if (!SCOPE.isTester) bucketManager.start();
   // Read-only: log which scopes this process's Kalshi key has (names only).
-  logOwnKeyScopes({
+  if (SPLIT.runKalshi) logOwnKeyScopes({
     signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
     keyId: KEY_ID,
     log: (m) => console.log(`[${MODE}] ${m}`),
   }).catch(() => {});
-  if (SCOPE.isTester && SCOPE.writeUserId) {
+  if (SCOPE.isTester && SCOPE.writeUserId && SPLIT.runKalshi) {
     testerFunder = createTesterFunder({
       userId: SCOPE.writeUserId,
       supabase,
@@ -2822,6 +2854,7 @@ async function main() {
     polyUnhedgedHttp = unhedgedSide.polyHttp;
   }
 
+  if (venueCoord) await venueCoord.start();
   await refresh();
   setInterval(unlessQuoteHot(() => { refresh(); }), 30000);
   setInterval(unlessQuoteHot(() => {
@@ -2843,8 +2876,10 @@ async function main() {
   }), SKIP_TAPE_TICK_MS);
 
   // Step 2 — pre-warm + keep warm (15s so LB idle-kill cannot cold-start POST)
-  await warmConnection();
-  setInterval(warmConnection, QUOTE_WARM_MS);
+  if (SPLIT.runKalshi) {
+    await warmConnection();
+    setInterval(warmConnection, QUOTE_WARM_MS);
+  }
 
   if (isPartialQuoteFlagOn()) {
     console.log(
@@ -2877,6 +2912,7 @@ async function main() {
         ...(snap ? { poly: snap } : {}),
         partial_quote: partialQuote.statsJson(),
         ...(lat ? { latency: lat } : {}),
+        ...(venueCoord ? { venue_coord: venueCoord.snapshot() } : {}),
         ...(bucketManager && bucketManager.snapshot && bucketManager.snapshot()
           ? { bucket: bucketManager.snapshot() } : {}),
       };
@@ -2886,7 +2922,7 @@ async function main() {
   const polyAppAlerts = createAppAlerts({ client: SCOPE.isTester ? null : supabase });
   const polyStallAlerts = createPolyStallAlerts({ appAlerts: polyAppAlerts, log: console.log });
   { const t = setInterval(() => { polyStallAlerts.tick().catch(() => {}); }, 30000); if (t.unref) t.unref(); }
-  const poly = startPolymarketRfqLoop({
+  const poly = !SPLIT.runPoly ? null : startPolymarketRfqLoop({
     pendingQuotes: polyPendingQuotes,
     kalshiPendingQuotes: pendingQuotes,
     capBook,
@@ -2932,6 +2968,24 @@ async function main() {
     }).catch((e) => console.error('onQuoteExecuted', e)),
   });
   polyLoop = poly;
+  if (!poly) console.log(`[${MODE}] Polymarket RFQ loop OFF (COMBO_POLY_ENABLED=0) — runs in the combo-poly service`);
+  // Single-leg + desk-fill alerts stay in combo-worker. With the RFQ loop moved
+  // out they get a REST-only Polymarket client (no RFQ stream).
+  const polyRestHttp = (poly && poly.http)
+    || (SPLIT.runKalshi && process.env.POLYMARKET_KEY_ID && process.env.POLYMARKET_SECRET_KEY
+      ? createPolymarketHttp({ keyId: process.env.POLYMARKET_KEY_ID, secretKey: process.env.POLYMARKET_SECRET_KEY })
+      : null);
+  if (!SPLIT.runKalshi) {
+    process.on('SIGINT', () => {
+      try { poly && poly.stop && poly.stop(); } catch (_) {}
+      Promise.resolve(venueCoord && venueCoord.stop()).finally(() => {
+        console.log(`[${MODE}] final`, counts);
+        process.exit(0);
+      });
+    });
+    process.on('SIGTERM', () => process.emit('SIGINT'));
+    return; // Polymarket service: no Kalshi WebSocket, single-leg, or desk fills.
+  }
 
   // Single-leg locks: rest the hedge on Kalshi + Polymarket single markets,
   // capped across venues (single-leg.js). SINGLE_LEG_LIVE=1 to enable.
@@ -2939,7 +2993,7 @@ async function main() {
     env: process.env,
     supabase,
     kalshiSigned: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
-    polyHttp: (poly && poly.http) || null,
+    polyHttp: polyRestHttp,
     seriesFees,
     getParlays: () => parlays,
     userIds: SCOPE.userIds,
@@ -2951,9 +3005,9 @@ async function main() {
 
   // Polymarket US fills outside Combo Locks (Live Trading Desk) -> Telegram.
   // Kevin's account only; POLY_DESK_FILL_ALERTS=0 turns it off.
-  if (!SCOPE.isTester && process.env.POLY_DESK_FILL_ALERTS !== '0' && poly && poly.http) {
+  if (!SCOPE.isTester && process.env.POLY_DESK_FILL_ALERTS !== '0' && polyRestHttp) {
     const deskFills = createPolyDeskFillWatcher({
-      http: poly.http,
+      http: polyRestHttp,
       sendAlert,
       log: (m) => console.log(`[${MODE}] ${m}`),
       skipSlug: (slug) => !!(singleLeg && singleLeg.ownsSlug(slug)),
@@ -3038,6 +3092,7 @@ async function main() {
     try { polyUnhedgedHttp && polyUnhedgedHttp.close && polyUnhedgedHttp.close(); } catch (_) {}
     try { kalshiHttp.close(); } catch (_) {}
     try { kalshiQuoteHttp.close(); } catch (_) {}
+    try { venueCoord && venueCoord.stop(); } catch (_) {}
     console.log(`[${MODE}] final`, counts);
     process.exit(0);
   });

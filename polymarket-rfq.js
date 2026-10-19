@@ -1430,7 +1430,10 @@ function startPolymarketRfqLoop(ctx = {}) {
 
   const enableLocks = ctx.enableLocks !== false;
   const enableUnhedged = ctx.enableUnhedged !== false;
-  const live = enableLocks && isPolymarketRfqLive(env);
+  // POLY_DRY_RUN=1 (poly-worker rollout step 1): stream + evaluate + log only.
+  // Never POSTs quotes/confirms (live forced off) and never writes Miss-tape rows.
+  const dryRun = /^(1|true|yes|on)$/i.test(String((env || {}).POLY_DRY_RUN || '').trim());
+  const live = enableLocks && !dryRun && isPolymarketRfqLive(env);
   const creds = inspectPolymarketCreds({ keyId, secretKey }, env);
   const pendingQuotes = ctx.pendingQuotes || new Map();
   const confirmingQuotes = ctx.confirmingQuotes || new Set();
@@ -1501,6 +1504,11 @@ function startPolymarketRfqLoop(ctx = {}) {
 
   function persistLockTape(evaluation, status, extra) {
     if (!enableLocks || !missTape) return { persisted: false, reason: 'no_logger' };
+    if (dryRun) {
+      console.log(`[POLY-DRY] would ${status} rfq=${(evaluation && evaluation.rfq && evaluation.rfq.id) || '?'} ` +
+        `parlay=${(evaluation && evaluation.parlay && evaluation.parlay.id) || '?'}`);
+      return { persisted: false, reason: 'dry_run' };
+    }
     return missTape.persist(evaluation, status, extra);
   }
 

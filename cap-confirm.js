@@ -271,6 +271,32 @@ async function confirmAgainstCap(book, args) {
       if (typeof args.onExceed === 'function') await args.onExceed(info);
       return info;
     }
+    // Split venues (venue-coord.js): atomically record this hold in the shared
+    // DB and re-check against the OTHER venue's holds as Postgres serialized
+    // them. `held` above already counted the polled snapshot; use the
+    // authoritative number instead. A claim error fails closed (no confirm).
+    if (book && book.enabled && book.remote && args.parlayId != null) {
+      const claim = await book.remote.claim({
+        parlayId: args.parlayId, quoteId: args.quoteId, size, meta: args.meta,
+      });
+      const localHeld = typeof book.localSum === 'function'
+        ? book.localSum(args.parlayId, args.quoteId) : held;
+      const crossHeld = localHeld + positive(claim && claim.other);
+      if (wouldExceedCap(args.maxContracts, filled, crossHeld, size)) {
+        book.remote.unclaim(args.parlayId, args.quoteId);
+        const info = {
+          ok: false,
+          reason: 'cap_exceeded',
+          crossVenue: true,
+          filled,
+          held: crossHeld,
+          size,
+          maxContracts: args.maxContracts,
+        };
+        if (typeof args.onExceed === 'function') await args.onExceed(info);
+        return info;
+      }
+    }
     if (book && book.enabled) book.hold(args.parlayId, args.quoteId, size, undefined, args.meta);
     try {
       await args.confirm();
