@@ -380,7 +380,7 @@ async function main(env = process.env) {
       } catch (e) { out.pm_inverse_reason = 'error'; }
       return { ...out, ...pmFields(pmLive, { ok: true, legs }) };
     };
-    const poly = createPolyRfqTracker({ book, priceFairs, persistRow: store.persistRow, runId });
+    const poly = createPolyRfqTracker({ book, priceFairs, persistRow: store.persistRow, runId, samplePct: Number(env.NOBOOST_SAMPLE_PCT) || 2 });
     const comboCache = new Map(); let lastHydrate = 0;
     async function hydrate(rfq) {
       if (Array.isArray(rfq.comboLegs) && rfq.comboLegs.length) return rfq;
