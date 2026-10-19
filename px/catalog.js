@@ -52,8 +52,9 @@ function isHalf(line) {
 //   * "Spread (Regular Time)" at .5 lines (no push possible). ±0.5 is the
 //     3-way result: A −0.5 = A wins (opponent: A NO); A +0.5 = A wins or
 //     draws (opponent: B wins YES). ±1.5+ priced as spreads.
-// NOT priced (declined): "Moneyline (2 Way)" — ProphetX does not document
-// what a draw does to it; whole / quarter lines (push / split); BTTS; props.
+// "Moneyline (2 Way)": ProphetX does not document draw handling; SANDBOX ONLY
+// it is quoted as draw-no-bet (Kevin's call). NOT priced: whole / quarter
+// lines (push / split), BTTS, props.
 function soccerStrikes(ev, markets, t, base, home, away) {
   const H = soccerName(home.display_name || home.name);
   const A = soccerName(away.display_name || away.name);
@@ -61,6 +62,20 @@ function soccerStrikes(ev, markets, t, base, home, away) {
   const sb = { ...base, game: `${A} @ ${H}`, gameAlt: base.game, soccer: true };
   for (const m of markets || []) {
     if (!m || m.status === 'inactive') continue;
+    // SANDBOX ONLY (Kevin 12:03 PM ET Oct 19): "Moneyline (2 Way)" quoted ASSUMING
+    // a draw voids it (draw no bet). Fair = 1 − P(other team | no draw).
+    if (m.sub_type === 'moneyline' && /2 Way/i.test(m.name || '')) {
+      for (const side of m.selections || []) {
+        const sel = Array.isArray(side) ? side[0] : side;
+        if (!sel || !sel.strike_id) continue;
+        const isHome = sel.competitor_id === home.id || sel.outcome_id === 4;
+        const me = isHome ? H : A;
+        const them = isHome ? A : H;
+        out.push({ ...sb, strikeId: sel.strike_id, kind: 'DNB', market: '2way', team: `${me} 2-way (draw void)`, opp: them,
+          oppLabel: them, drawLabel: 'Draw no', line: null });
+      }
+      continue;
+    }
     if (m.sub_type === 'moneyline_3_way' && /\(90 Min\)/i.test(m.name || '')) {
       const nm = String(m.name).replace(/\s*\(90 Min\)\s*/i, '').trim();
       let who = null;

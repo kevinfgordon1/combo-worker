@@ -53,3 +53,9 @@ Declined: "Moneyline (2 Way)" (ProphetX does not document whether a draw voids, 
 quarter lines (push / split), BTTS, props. Two legs from one match are correlated → declined.
 Club names are cleaned ("Tottenham Hotspur FC" → "Tottenham Hotspur", accents stripped) for venue matching.
 League One / Liga MX / Argentina have no venue mapping in book-depth today, so their legs decline as unpriced.
+
+### Sandbox-only assumption (Kevin, 12:03 PM ET Oct 19)
+"Moneyline (2 Way)" is quoted as **draw no bet** (draw voids). Fair = 1 − P(other team | no draw), where
+P(other) is the inverted best $500 YES ask on the other team and P(draw) is the inverted best $500 "Draw No" ask.
+Whole-goal lines are still declined (pricing push-as-void needs the exact-margin / exact-total probability,
+which the venues don't list as a market).

@@ -28,6 +28,21 @@ function fairFromLadders(byVenue, { target = TARGET_PAYOUT_USD } = {}) {
   return { p, venues, best };
 }
 
+// Pure: draw-no-bet fair from the inverse method. Opponent = the other team's
+// win (best $500 YES ask, fee-included); the draw's probability comes from the
+// best $500 "Draw No" ask, inverted (same inverse rule). P(other | no draw) =
+// pOther / (1 − pDraw); our fair = 1 − that.
+function dnbFair(oppByVenue, drawNoByVenue, opts) {
+  const o = fairFromLadders(oppByVenue, opts); // o.p = 1 − implied(best other-team ask)
+  const d = fairFromLadders(drawNoByVenue, opts); // d.p = 1 − implied(best Draw-No ask) = pDraw
+  if (o.p == null || d.p == null) return { p: null, venues: { opp: o.venues, drawNo: d.venues }, best: null };
+  const pOther = 1 - o.p;
+  const pDraw = d.p;
+  if (!(pDraw > 0 && pDraw < 1) || !(pOther > 0) || pOther >= 1 - pDraw) return { p: null, venues: { opp: o.venues, drawNo: d.venues }, best: null };
+  const p = 1 - pOther / (1 - pDraw);
+  return { p, venues: { opp: o.venues, drawNo: d.venues }, best: { venue: `${o.best.venue}+${d.best.venue}`, american: o.best.american } };
+}
+
 function createPricer({ resolve = resolveLegsDepth, venues = VENUES, staleMs = STALE_MS, now = Date.now, logger = console } = {}) {
   const cache = new Map(); // strikeId → { p, at, best, venues }
   const inflight = new Map();
@@ -38,6 +53,18 @@ function createPricer({ resolve = resolveLegsDepth, venues = VENUES, staleMs = S
       commence_time: info.startMs ? new Date(info.startMs).toISOString() : null,
     });
     const t0 = now();
+    if (info.kind === 'DNB') {
+      const both = await resolve([
+        ...venues.map((v) => ({ ...mk(v, info.game), market: 'ML', bestOppName: info.oppLabel })),
+        ...venues.map((v) => ({ ...mk(v, info.game), market: 'ML', bestOppName: info.drawLabel })),
+      ]);
+      const opp = {};
+      const dn = {};
+      venues.forEach((v, i) => { opp[v] = (both[i] && both[i].levels) || []; dn[v] = (both[i + venues.length] && both[i + venues.length].levels) || []; });
+      const out = { ...dnbFair(opp, dn), at: t0 };
+      cache.set(info.strikeId, out);
+      return out;
+    }
     const res = await resolve(venues.map((v) => mk(v, info.game)));
     const byVenue = {};
     res.forEach((r, i) => { byVenue[venues[i]] = (r && r.levels) || []; });
@@ -70,4 +97,4 @@ function createPricer({ resolve = resolveLegsDepth, venues = VENUES, staleMs = S
   return { legPrice, cache };
 }
 
-module.exports = { createPricer, fairFromLadders, VENUES };
+module.exports = { createPricer, fairFromLadders, dnbFair, VENUES };

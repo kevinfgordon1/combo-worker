@@ -2,7 +2,7 @@
 const assert = require('assert');
 const Q = require('./quote');
 const { checkSandboxEnv, assertSandboxUrl } = require('./guard');
-const { fairFromLadders } = require('./pricer');
+const { fairFromLadders, dnbFair } = require('./pricer');
 const { strikesFromEvent, soccerName, isHalf } = require('./catalog');
 const { createSession, toMs } = require('./auth');
 const { confirmPriceOf, payloadOf } = require('./runner');
@@ -163,11 +163,22 @@ async function t(name, fn) { await fn(); n += 1; }
     assert.deepStrictEqual(m['h-1.5'], ['SPR', 'Slavia Praha +1.5']);
     assert.deepStrictEqual(m['a+1.5'], ['SPR', 'Fenerbahce -1.5']);
     // Not priced: 2-way moneyline, whole-goal handicap, BTTS.
-    for (const k of ['ml2h', 'ml2a', 'h-1', 'a+1', 'bY', 'bN']) assert.ok(!m[k], k);
+    for (const k of ['h-1', 'a+1', 'bY', 'bN']) assert.ok(!m[k], k);
+    // 2-way ML (sandbox): draw-no-bet, opponent = other team's win + draw.
+    assert.deepStrictEqual(m.ml2h, ['DNB', 'Slavia Praha']);
+    assert.deepStrictEqual(m.ml2a, ['DNB', 'Fenerbahce']);
+    assert.strictEqual(s.find((x) => x.strikeId === 'ml2h').drawLabel, 'Draw no');
     assert.strictEqual(s[0].game, 'Slavia Praha @ Fenerbahce');
     // Two legs from this match → correlated → declined.
     const known = new Map(s.map((x) => [x.strikeId, x]));
     assert.strictEqual(Q.screenLegs([{ strike_id: 'hY' }, { strike_id: 'o25' }], { known, nowMs: Date.parse('2026-10-20T00:00:00Z') }), 'correlated_same_game');
+  });
+
+  await t('draw-no-bet fair: 1 − P(other | no draw), both from inverse asks', () => {
+    // Other team YES ask +300 (p .25), Draw-No ask −300 (→ pDraw = 1 − .75 = .25).
+    const r = dnbFair({ kalshi: [{ american: 300, size: 1000 }] }, { kalshi: [{ american: -300, size: 5000 }] });
+    assert.ok(Math.abs(r.p - (1 - 0.25 / 0.75)) < 1e-9);
+    assert.strictEqual(dnbFair({ kalshi: [] }, { kalshi: [{ american: -300, size: 5000 }] }).p, null);
   });
 
   await t('auth: one login, then refresh (no second login)', async () => {
