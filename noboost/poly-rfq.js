@@ -71,9 +71,11 @@ const legKey = (l) => {
   return `${sym}:${side}`;
 };
 
+function hash100(x) { let h = 0; for (let i = 0; i < x.length; i += 1) h = (h * 31 + x.charCodeAt(i)) >>> 0; return h % 100; }
+
 function createPolyRfqTracker({
   book, priceFairs = () => ({}), persistRow = () => {}, now = () => Date.now(), runId = null,
-  closeGraceMs = 5000, maxOpenMs = 120000, finalizeLagMs = 200000, multiFillMs = 3000, log = () => {},
+  samplePct = 2, closeGraceMs = 5000, maxOpenMs = 120000, finalizeLagMs = 200000, multiFillMs = 3000, log = () => {},
 } = {}) {
   const byId = new Map();
   const bySymbol = new Map();
@@ -142,7 +144,8 @@ function createPolyRfqTracker({
     };
     byId.set(rec.rfq_id, rec);
     if (rec.symbol) { if (!bySymbol.has(rec.symbol)) bySymbol.set(rec.symbol, []); bySymbol.get(rec.symbol).push(rec); }
-    save(rec);
+    // Storage trim: no row at request time (was ~99% of the 18 GB). Rows are written when a trade
+    // matches, on accepted_not_filled, and for a samplePct hash sample of no_trade (same as Kalshi).
     return rec;
   }
 
@@ -207,7 +210,8 @@ function createPolyRfqTracker({
       if (t <= windowEnd(rec) + finalizeLagMs) continue;
       if (rec.outcome === 'pending') {
         rec.outcome = rec.close_ms == null || /cancel|expire|delete|reject/i.test(String(rec.close_status || '')) ? 'no_trade' : 'accepted_not_filled';
-        bump(rec.outcome); save(rec);
+        bump(rec.outcome);
+        if (rec.outcome !== 'no_trade' || hash100(id) < samplePct) save(rec);
       }
       byId.delete(id);
       const l = bySymbol.get(rec.symbol);

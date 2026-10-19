@@ -22,9 +22,10 @@ assert.ok(Math.abs(100 * polyComboTakerFee(0.5) - 1.92) < 0.006); // docs table 
   assert.ok(rec);
   assert.deepStrictEqual(rec.legs, ['aec-nfl-buf-mia-2026-10-18:no', 'aec-nfl-kc-lv-2026-10-18:yes']);
   assert.deepStrictEqual(rec.legs_kalshi, ['KXNFLGAME-26OCT18BUFMIA-MIA:yes', 'KXNFLGAME-26OCT18KCLV-KC:yes']);
-  assert.strictEqual(rows[0].venue, 'polymarket'); assert.strictEqual(rows[0].outcome, 'pending');
+  assert.strictEqual(rows.length, 0); // storage trim: nothing written at request time
   T += 1500; p.onClosed({ rfq: { id: 'r1', status: 'RFQ_STATUS_CLOSED' } });
   const m = p.onTrade(trade('t1', T + 100, '0.2', '60'));
+  assert.strictEqual(rows[0].venue, 'polymarket'); assert.strictEqual(rows[0].outcome, 'traded');
   assert.strictEqual(m.outcome, 'traded'); assert.strictEqual(m.traded_yes, 0.2);
   p.onTrade(trade('t1', T + 100, '0.2', '60')); // duplicate (WS + backfill)
   p.onTrade(trade('t2', T + 200, '0.2', '40'));
@@ -53,12 +54,20 @@ assert.ok(Math.abs(100 * polyComboTakerFee(0.5) - 1.92) < 0.006); // docs table 
   p.onRfq(rfq('y')); const m = p.onTrade(trade('t6', T + 200, '0.3', '100', 'SIDE_SELL'));
   assert.strictEqual(m.outcome, 'taker_no');
 }
+{ // no_trade rows are hash-sampled (samplePct); 0% -> none written, 100% -> all written
+  for (const [pct, want] of [[0, 0], [100, 1]]) {
+    const out = []; const p = createPolyRfqTracker({ book, now, persistRow: (r) => out.push(r), samplePct: pct });
+    p.onRfq(rfq(`s${pct}`)); T += 400000; p.sweep();
+    assert.strictEqual(out.length, want);
+  }
+}
 console.log('poly-rfq tests ok');
 { // every persisted row has the same key set even when fairs are missing (PostgREST PGRST102)
   const out = [];
   const p = createPolyRfqTracker({ book, now, persistRow: (r) => out.push(r), priceFairs: () => ({}) });
   const p2 = createPolyRfqTracker({ book, now, persistRow: (r) => out.push(r), priceFairs: () => ({ fair_mid_american: 300, fair_promo_best_american: 310, pm_inverse_legs: [] }) });
   p.onRfq(rfq('k1')); p2.onRfq(rfq('k2'));
+  T += 1000; p.onTrade(trade('tk1', T)); p2.onTrade(trade('tk2', T));
   const keys = (r) => Object.keys(JSON.parse(JSON.stringify(r))).sort().join(',');
   assert.strictEqual(keys(out[0]), keys(out[1]));
   console.log('poly-rfq row keys ok');
