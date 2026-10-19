@@ -191,7 +191,7 @@ function createRunner({ env = process.env, logger = console, fetch: f = globalTh
     if (e.endsWith('order.finalized')) return onFinalized(data);
     if (e.endsWith('order.settled')) return onSettled(data);
     if (e.endsWith('health_check')) { store.bump('health_check'); return undefined; }
-    if (e.endsWith('order.matched')) return undefined; // public broadcast, preliminary
+    if (e.endsWith('order.matched')) { store.bump('public_order_matched'); logShapeOnce('order.matched', payloadOf(data)); return undefined; } // public broadcast: shows whether the bot takes anyone's offers
     store.bump(`event_${e}`);
     return undefined;
   }
