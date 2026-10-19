@@ -41,3 +41,15 @@ any leg unpriced / stale / thin (<$500), price timeout (5 s). Declines are count
 ## Data
 `prophetx_sandbox_quotes` (one row per quoted parlay), `prophetx_sandbox_stats` (daily counters),
 view `prophetx_sandbox_clean` (clean = accepted + finalized + no probability error).
+
+## Soccer (EPL, UCL, Serie A, LaLiga, Bundesliga, Ligue 1, MLS, League One, Liga MX, Argentina)
+Priced only where ProphetX's market definition makes settlement unambiguous:
+- `moneyline_3_way` "Team to Win (90 Min)" / "Draw (90 Min)" YES/NO. Inverse: a YES leg's opponent is that
+  outcome's own NO (venue direct "No", e.g. Kalshi), a NO leg's opponent is its YES. Draw counts as a loss for a team YES.
+- "Total Goals (Regular Time)" at .5 lines only.
+- "Spread (Regular Time)" at .5 lines only. ±0.5 equals the 3-way result (A −0.5 = A wins → opponent A NO;
+  A +0.5 = A win or draw → opponent B wins YES); ±1.5+ priced as spreads where a venue lists them.
+Declined: "Moneyline (2 Way)" (ProphetX does not document whether a draw voids, pushes or loses it), whole /
+quarter lines (push / split), BTTS, props. Two legs from one match are correlated → declined.
+Club names are cleaned ("Tottenham Hotspur FC" → "Tottenham Hotspur", accents stripped) for venue matching.
+League One / Liga MX / Argentina have no venue mapping in book-depth today, so their legs decline as unpriced.

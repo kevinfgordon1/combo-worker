@@ -3,7 +3,7 @@ const assert = require('assert');
 const Q = require('./quote');
 const { checkSandboxEnv, assertSandboxUrl } = require('./guard');
 const { fairFromLadders } = require('./pricer');
-const { strikesFromEvent } = require('./catalog');
+const { strikesFromEvent, soccerName, isHalf } = require('./catalog');
 const { createSession, toMs } = require('./auth');
 const { confirmPriceOf, payloadOf } = require('./runner');
 
@@ -116,6 +116,58 @@ async function t(name, fn) { await fn(); n += 1; }
     ]);
     assert.deepStrictEqual(s.map((x) => [x.strikeId, x.team, x.opp]), [['m1', 'San Francisco 49ers', 'Washington Commanders'], ['m2', 'Washington Commanders', 'San Francisco 49ers']]);
     assert.strictEqual(s[0].game, 'Washington Commanders @ San Francisco 49ers');
+  });
+
+  await t('soccer: names cleaned for venue matching', () => {
+    assert.strictEqual(soccerName('Tottenham Hotspur FC'), 'Tottenham Hotspur');
+    assert.strictEqual(soccerName('Fenerbahçe SK'), 'Fenerbahce');
+    assert.strictEqual(soccerName('AC Milan'), 'Milan');
+    assert.ok(isHalf(2.5) && isHalf(-0.5) && !isHalf(2) && !isHalf(-1) && !isHalf(2.25));
+  });
+
+  await t('soccer: market mapping + draw handling', () => {
+    const ev = { event_id: 9, scheduled: '2026-10-20T16:45:00Z', competitors: [
+      { id: 10, side: 'home', display_name: 'Fenerbahçe SK' }, { id: 20, side: 'away', display_name: 'SK Slavia Praha' }] };
+    const yesNo = (a, b) => [[{ strike_id: a, outcome_id: 1, name: 'YES' }], [{ strike_id: b, outcome_id: 2, name: 'NO' }]];
+    const markets = [
+      // 2-way: draw handling undocumented → never priced
+      { id: 11, type: 'moneyline', sub_type: 'moneyline', name: 'Moneyline (2 Way)', selections: [[{ strike_id: 'ml2h', competitor_id: 10, outcome_id: 4 }], [{ strike_id: 'ml2a', competitor_id: 20, outcome_id: 5 }]] },
+      { id: 1325, type: 'moneyline', sub_type: 'moneyline_3_way', name: 'Fenerbahçe SK to Win (90 Min)', selections: yesNo('hY', 'hN') },
+      { id: 1326, type: 'moneyline', sub_type: 'moneyline_3_way', name: 'SK Slavia Praha to Win (90 Min)', selections: yesNo('aY', 'aN') },
+      { id: 1327, type: 'moneyline', sub_type: 'moneyline_3_way', name: 'Draw (90 Min)', selections: yesNo('dY', 'dN') },
+      { id: 1318, type: 'moneyline', sub_type: 'both_teams_to_score', name: 'Both Teams To Score', selections: yesNo('bY', 'bN') },
+      { id: 18, type: 'total', sub_type: 'total', name: 'Total Goals (Regular Time)', market_strikes: [
+        { selections: [[{ strike_id: 'u25', outcome_id: 13, strike: 2.5, name: 'under 2.5' }], [{ strike_id: 'o25', outcome_id: 12, strike: 2.5, name: 'over 2.5' }]] },
+        { selections: [[{ strike_id: 'u2', outcome_id: 13, strike: 2 }], [{ strike_id: 'o2', outcome_id: 12, strike: 2 }]] }] },
+      { id: 16, type: 'spread', sub_type: 'spread', name: 'Spread (Regular Time)', market_strikes: [
+        { selections: [[{ strike_id: 'h-1', competitor_id: 10, outcome_id: 1714, strike: -1 }], [{ strike_id: 'a+1', competitor_id: 20, outcome_id: 1715, strike: 1 }]] },
+        { selections: [[{ strike_id: 'h-.5', competitor_id: 10, outcome_id: 1714, strike: -0.5 }], [{ strike_id: 'a+.5', competitor_id: 20, outcome_id: 1715, strike: 0.5 }]] },
+        { selections: [[{ strike_id: 'h-1.5', competitor_id: 10, outcome_id: 1714, strike: -1.5 }], [{ strike_id: 'a+1.5', competitor_id: 20, outcome_id: 1715, strike: 1.5 }]] }] },
+    ];
+    const s = strikesFromEvent(ev, markets, { sport: 'soccer_uefa_champs_league', league: 'ucl', soccer: true });
+    const m = Object.fromEntries(s.map((x) => [x.strikeId, [x.kind, x.oppLabel]]));
+    // Inverse for 3-way: YES's opponent is that outcome's own NO; NO's opponent is its YES.
+    assert.deepStrictEqual(m.hY, ['ML', 'Fenerbahce no']);
+    assert.deepStrictEqual(m.hN, ['ML', 'Fenerbahce']);
+    assert.deepStrictEqual(m.aY, ['ML', 'Slavia Praha no']);
+    assert.deepStrictEqual(m.dY, ['ML', 'Draw no']);
+    assert.deepStrictEqual(m.dN, ['ML', 'Draw']);
+    // Half-goal totals only (a whole line can push).
+    assert.deepStrictEqual(m.o25, ['TOT', 'u2.5']);
+    assert.deepStrictEqual(m.u25, ['TOT', 'o2.5']);
+    assert.ok(!m.o2 && !m.u2);
+    // ±0.5 handicap = 3-way result: home −0.5 = home wins → opponent home NO;
+    // away +0.5 = away win or draw → opponent home wins YES.
+    assert.deepStrictEqual(m['h-.5'], ['ML', 'Fenerbahce no']);
+    assert.deepStrictEqual(m['a+.5'], ['ML', 'Fenerbahce']);
+    assert.deepStrictEqual(m['h-1.5'], ['SPR', 'Slavia Praha +1.5']);
+    assert.deepStrictEqual(m['a+1.5'], ['SPR', 'Fenerbahce -1.5']);
+    // Not priced: 2-way moneyline, whole-goal handicap, BTTS.
+    for (const k of ['ml2h', 'ml2a', 'h-1', 'a+1', 'bY', 'bN']) assert.ok(!m[k], k);
+    assert.strictEqual(s[0].game, 'Slavia Praha @ Fenerbahce');
+    // Two legs from this match → correlated → declined.
+    const known = new Map(s.map((x) => [x.strikeId, x]));
+    assert.strictEqual(Q.screenLegs([{ strike_id: 'hY' }, { strike_id: 'o25' }], { known, nowMs: Date.parse('2026-10-20T00:00:00Z') }), 'correlated_same_game');
   });
 
   await t('auth: one login, then refresh (no second login)', async () => {

@@ -9,6 +9,17 @@ const TOURNAMENTS = [
   { id: 31, sport: 'americanfootball_nfl', league: 'nfl' },
   { id: 109, sport: 'baseball_mlb', league: 'mlb' },
   { id: 27653, sport: 'americanfootball_ncaaf', league: 'ncaaf' },
+  // Soccer: venue sport keys as used by aibetbuilder book-depth (Odds API keys).
+  { id: 17, sport: 'soccer_epl', league: 'epl', soccer: true },
+  { id: 7, sport: 'soccer_uefa_champs_league', league: 'ucl', soccer: true },
+  { id: 23, sport: 'soccer_italy_serie_a', league: 'seriea', soccer: true },
+  { id: 8, sport: 'soccer_spain_la_liga', league: 'laliga', soccer: true },
+  { id: 35, sport: 'soccer_germany_bundesliga', league: 'bundesliga', soccer: true },
+  { id: 34, sport: 'soccer_france_ligue_one', league: 'ligue1', soccer: true },
+  { id: 242, sport: 'soccer_usa_mls', league: 'mls', soccer: true },
+  { id: 45, sport: 'soccer_england_league1', league: 'league1', soccer: true },
+  { id: 55, sport: 'soccer_mexico_ligamx', league: 'ligamx', soccer: true },
+  { id: 46, sport: 'soccer_argentina_primera_division', league: 'argentina', soccer: true },
 ];
 const REGISTER_BATCH = 50;
 
@@ -19,6 +30,86 @@ function fullGameMoneyline(markets) {
 function fmtLine(x) {
   const n = Number(x);
   return n > 0 ? `+${n}` : `${n}`;
+}
+
+// Soccer club names: ProphetX uses "Tottenham Hotspur FC" / "Fenerbahçe SK";
+// venues match on "Tottenham Hotspur". Strip club-type tokens and accents.
+const CLUB_TOKENS = /\b(FC|AFC|CF|SC|SK|CD|SSC|FK|AC|AS|CA|CLUB)\b\.?/gi;
+function soccerName(n) {
+  return String(n || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\./g, '')
+    .replace(CLUB_TOKENS, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function isHalf(line) {
+  const n = Number(line);
+  return Number.isFinite(n) && Math.abs(Math.abs(n % 1) - 0.5) < 1e-9;
+}
+
+// Pure: soccer markets → strikes. Only markets whose settlement is unambiguous:
+//   * moneyline_3_way "X to Win (90 Min)" / "Draw (90 Min)" YES/NO
+//     (inverse: YES's opponent is that outcome's NO, and vice versa)
+//   * "Total Goals (Regular Time)" at .5 lines (no push possible)
+//   * "Spread (Regular Time)" at .5 lines (no push possible). ±0.5 is the
+//     3-way result: A −0.5 = A wins (opponent: A NO); A +0.5 = A wins or
+//     draws (opponent: B wins YES). ±1.5+ priced as spreads.
+// NOT priced (declined): "Moneyline (2 Way)" — ProphetX does not document
+// what a draw does to it; whole / quarter lines (push / split); BTTS; props.
+function soccerStrikes(ev, markets, t, base, home, away) {
+  const H = soccerName(home.display_name || home.name);
+  const A = soccerName(away.display_name || away.name);
+  const out = [];
+  const sb = { ...base, game: `${A} @ ${H}`, gameAlt: base.game, soccer: true };
+  for (const m of markets || []) {
+    if (!m || m.status === 'inactive') continue;
+    if (m.sub_type === 'moneyline_3_way' && /\(90 Min\)/i.test(m.name || '')) {
+      const nm = String(m.name).replace(/\s*\(90 Min\)\s*/i, '').trim();
+      let who = null;
+      if (/^draw$/i.test(nm)) who = 'Draw';
+      else {
+        const team = nm.replace(/\s+to Win$/i, '').trim();
+        const st = soccerName(team);
+        if (st === H) who = H; else if (st === A) who = A;
+      }
+      if (!who) continue;
+      for (const side of m.selections || []) {
+        const sel = Array.isArray(side) ? side[0] : side;
+        if (!sel || !sel.strike_id) continue;
+        const yes = sel.outcome_id === 1 || /^yes$/i.test(sel.name || '');
+        const no = sel.outcome_id === 2 || /^no$/i.test(sel.name || '');
+        if (!yes && !no) continue;
+        out.push({ ...sb, strikeId: sel.strike_id, kind: 'ML', market: '3way',
+          team: `${who === 'Draw' ? 'Draw' : `${who} win`} ${yes ? 'YES' : 'NO'}`, opp: null,
+          oppLabel: yes ? `${who} no` : who, line: null });
+      }
+      continue;
+    }
+    if ((m.sub_type === 'total' || m.sub_type === 'spread') && /Regular Time/i.test(m.name || '')) {
+      for (const ms of m.market_strikes || []) {
+        if (!ms || ms.status === 'inactive' || !Array.isArray(ms.selections)) continue;
+        const sels = ms.selections.map((x) => (Array.isArray(x) ? x[0] : x)).filter((x) => x && x.strike_id);
+        if (sels.length !== 2) continue;
+        for (const sel of sels) {
+          const line = Number(sel.strike);
+          if (!isHalf(line)) continue;
+          if (m.sub_type === 'total') {
+            const over = sel.outcome_id === 12 || /^over/i.test(sel.name || '');
+            out.push({ ...sb, strikeId: sel.strike_id, kind: 'TOT', team: `${over ? 'Over' : 'Under'} ${line} goals`, opp: null,
+              oppLabel: `${over ? 'u' : 'o'}${line}`, line });
+          } else {
+            const isHome = sel.competitor_id === home.id || sel.outcome_id === 1714;
+            const me = isHome ? H : A;
+            const them = isHome ? A : H;
+            let kind = 'SPR';
+            let oppLabel = `${them} ${fmtLine(-line)}`;
+            if (line === -0.5) { kind = 'ML'; oppLabel = `${me} no`; }
+            if (line === 0.5) { kind = 'ML'; oppLabel = them; }
+            out.push({ ...sb, strikeId: sel.strike_id, kind, team: `${me} ${fmtLine(line)}`, opp: them, oppLabel, line });
+          }
+        }
+      }
+    }
+  }
+  return out;
 }
 
 // Pure: event + markets → [{strikeId, eventId, kind, team, opp, label, oppLabel, line, game, sport, startMs}]
@@ -33,6 +124,7 @@ function strikesFromEvent(ev, markets, t) {
   const startMs = Date.parse(ev.scheduled) || null;
   const game = `${nameOf(away)} @ ${nameOf(home)}`;
   const base = { eventId: ev.event_id, game, sport: t.sport, league: t.league, startMs };
+  if (t.soccer) return soccerStrikes(ev, markets, t, base, home, away);
   const out = [];
   const ml = fullGameMoneyline(markets);
   if (ml && Array.isArray(ml.selections)) {
@@ -150,4 +242,4 @@ function createCatalog({ apiBase, parlayBase, session, fetch: f = globalThis.fet
   return { known, refresh, syncRemote, registeredCount: () => registered.size };
 }
 
-module.exports = { createCatalog, strikesFromEvent, fullGameMoneyline, TOURNAMENTS };
+module.exports = { createCatalog, strikesFromEvent, soccerStrikes, soccerName, isHalf, fullGameMoneyline, TOURNAMENTS };

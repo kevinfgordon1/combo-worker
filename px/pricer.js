@@ -33,14 +33,24 @@ function createPricer({ resolve = resolveLegsDepth, venues = VENUES, staleMs = S
   const inflight = new Map();
 
   async function fetchLeg(info) {
-    const legs = venues.map((v) => ({
-      bestOppBook: v, market: info.kind || 'ML', bestOppName: info.oppLabel || info.opp, game: info.game, sport: info.sport,
+    const mk = (v, game) => ({
+      bestOppBook: v, market: info.kind || 'ML', bestOppName: info.oppLabel || info.opp, game, sport: info.sport,
       commence_time: info.startMs ? new Date(info.startMs).toISOString() : null,
-    }));
+    });
     const t0 = now();
-    const res = await resolve(legs);
+    const res = await resolve(venues.map((v) => mk(v, info.game)));
     const byVenue = {};
     res.forEach((r, i) => { byVenue[venues[i]] = (r && r.levels) || []; });
+    // Soccer: venues differ on club names ("Tottenham Hotspur" vs "... FC").
+    // Retry empty venues with ProphetX's raw names for game matching (totals only;
+    // team-named labels keep the cleaned name the venue matched on).
+    if (info.gameAlt && info.kind === 'TOT') {
+      const miss = venues.filter((v) => !byVenue[v].length);
+      if (miss.length) {
+        const res2 = await resolve(miss.map((v) => mk(v, info.gameAlt)));
+        res2.forEach((r, i) => { if (r && r.levels && r.levels.length) byVenue[miss[i]] = r.levels; });
+      }
+    }
     const out = { ...fairFromLadders(byVenue), at: t0 };
     cache.set(info.strikeId, out);
     return out;
