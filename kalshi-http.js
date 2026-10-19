@@ -16,7 +16,11 @@ const { Pool } = require('undici');
 const KALSHI_ORIGIN = 'https://external-api.kalshi.com';
 const REST_CONNECTIONS = 4;
 // POST + confirm + spare so a warm GET cannot take the last quote socket.
-const QUOTE_CONNECTIONS = 3;
+// Oct 18 hotfix: 3 sockets serialized Sunday bursts into 20-170s queues.
+const QUOTE_CONNECTIONS = 16;
+// Per-request timeout on the quote pool (POST/confirm/cancel). A quote that
+// has not answered in 3s has lost the auction anyway.
+const QUOTE_TIMEOUT_MS = 3_000;
 // Many LBs idle-kill around 30s. A 45s warm left a dead quote socket —
 // next POST paid TLS+retry (~800ms) and lost the auction.
 const QUOTE_WARM_MS = 15_000;
@@ -44,7 +48,11 @@ function createKalshiClient(overrides, ClientImpl = Pool) {
 function createKalshiRestPair(ClientImpl = Pool) {
   return {
     rest: createKalshiClient({ connections: REST_CONNECTIONS }, ClientImpl),
-    quote: createKalshiClient({ connections: QUOTE_CONNECTIONS }, ClientImpl),
+    quote: createKalshiClient({
+      connections: QUOTE_CONNECTIONS,
+      headersTimeout: QUOTE_TIMEOUT_MS,
+      bodyTimeout: QUOTE_TIMEOUT_MS,
+    }, ClientImpl),
   };
 }
 
@@ -56,6 +64,7 @@ module.exports = {
   KALSHI_ORIGIN,
   REST_CONNECTIONS,
   QUOTE_CONNECTIONS,
+  QUOTE_TIMEOUT_MS,
   QUOTE_WARM_MS,
   CONNECT_TIMEOUT_MS,
   HEADERS_TIMEOUT_MS,

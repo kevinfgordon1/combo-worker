@@ -157,6 +157,9 @@ function createConfirmQueue() {
     const tracked = next.finally(() => {
       if (tails.get(k) === tracked) tails.delete(k);
     });
+    // Oct 18 hotfix: the caller handles next's rejection; the tail copy must not
+    // surface as an unhandledRejection (it crashed live-runner on a 400 confirm expired).
+    tracked.catch(() => {});
     tails.set(k, tracked);
     return next;
   }

@@ -161,6 +161,8 @@ function formatQuoteLatency({
 function isSilentQuoteFailure(message) {
   const msg = String(message || '');
   if (isInsufficientFundsFailure(msg)) return true;
+  // Oct 18 hotfix: stale drops / 3s quote timeouts are console-only (no Telegram flood).
+  if (/STALE_DROP|HeadersTimeout|BodyTimeout|UND_ERR_(HEADERS|BODY)_TIMEOUT|Headers Timeout|Body Timeout/i.test(msg)) return true;
   return /invalid_yes_bid|invalid_dollar_precision/.test(msg);
 }
 

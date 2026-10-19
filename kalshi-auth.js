@@ -119,25 +119,41 @@ function isTimestampExpired(statusCode, text) {
 //
 // requestFn({ method, path, headers, body }) ->
 //   Promise<{ statusCode, headers, text }>
+// Oct 18 hotfix: only trust a response Date header when the round trip was
+// fast. A response handled after a 2s event-loop freeze (or a queued request)
+// made the server Date look seconds "old", produced a bogus -2..-3s offset,
+// and then every request was signed seconds in the past -> 401 expired.
+const MAX_DATE_RTT_MS = 1000;
+
 async function signedRequest(requestFn, {
   keyId, pem, method, signPath, path, headers: extraHeaders, body,
+  shouldRetryExpired, onSent,
 } = {}) {
   const run = async () => {
     const headers = {
       ...(extraHeaders || {}),
       ...authHeaders({ keyId, pem, method, signPath }),
     };
+    const tSend = Date.now();
     const res = await requestFn({
       method,
       path: path || signPath,
       headers,
       body,
     });
-    applyResponseDate(res && res.headers);
+    const netMs = Date.now() - tSend;
+    if (netMs <= MAX_DATE_RTT_MS) applyResponseDate(res && res.headers);
+    if (typeof onSent === 'function') {
+      try { onSent({ netMs, statusCode: res && res.statusCode }); } catch (_) { /* log only */ }
+    }
     return res;
   };
   let res = await run();
   if (isTimestampExpired(res && res.statusCode, res && res.text)) {
+    if (typeof shouldRetryExpired === 'function' && !shouldRetryExpired()) {
+      console.warn(`[kalshi-auth] ${method} ${signPath} header_timestamp_expired — no retry (stale)`);
+      return res;
+    }
     console.warn(`[kalshi-auth] ${method} ${signPath} header_timestamp_expired — resync + retry`);
     res = await run();
   }
@@ -147,5 +163,5 @@ async function signedRequest(requestFn, {
 module.exports = {
   normalizePem, sign, authHeaders, privateKeyObject,
   applyServerDate, applyResponseDate, resetClockOffset, clockOffset, signedNow,
-  headerDate, isTimestampExpired, signedRequest, DATE_NOISE_MS,
+  headerDate, isTimestampExpired, signedRequest, DATE_NOISE_MS, MAX_DATE_RTT_MS,
 };
