@@ -1295,15 +1295,34 @@ function activityFillEvent({ trade, lock, source }) {
   };
 }
 
+// Activity trades older than this are history, not new fills. The lock list
+// reaches back 21 days (any lock with a Polymarket quote in that window), and
+// the boot-time per-slug scan pages old trades, so a trade whose booked row
+// fell outside the dedupe window came back as a brand-new "FILL CONFIRMED"
+// (Oct 18: Sep 23-27 NFL fills and an Oct 13 NHL single-leg hedge re-alerted
+// and re-booked). Real missed fills are recovered within minutes to hours.
+const DEFAULT_ACTIVITY_MAX_AGE_MS = (Number(process.env.POLY_ACT_MAX_AGE_HOURS) > 0
+  ? Number(process.env.POLY_ACT_MAX_AGE_HOURS) : 48) * 3600 * 1000;
+
+function activityTooOld(trade, maxAgeMs, nowMs) {
+  if (!trade || !(maxAgeMs > 0)) return false;
+  const t = timeMsOf(trade.createTime);
+  if (!Number.isFinite(t)) return false;
+  return nowMs - t > maxAgeMs;
+}
+
 function matchActivitiesToLocks(activities, locks, {
   requireMaker = false,
   seenFillIds,
   slugMap,
   bookedFills,
   quotedByLock,
+  maxAgeMs = DEFAULT_ACTIVITY_MAX_AGE_MS,
+  now = Date.now,
 } = {}) {
   const events = [];
   const matchedLockIds = new Set();
+  const nowMs = typeof now === 'function' ? now() : Number(now);
   const booked = seenFillIds && typeof seenFillIds.has === 'function' ? seenFillIds : null;
   const local = new Set();
   const map = slugMap instanceof Map || (slugMap && typeof slugMap === 'object')
@@ -1327,6 +1346,11 @@ function matchActivitiesToLocks(activities, locks, {
     const hit = lockMatchForActivity(locks, trade.hay || trade.title, trade.marketSlug, map);
     const lock = hit.lock;
     if (!lock) continue;
+    if (activityTooOld(trade, maxAgeMs, nowMs)) {
+      // Covered: an old trade must not fall through to the positions path.
+      matchedLockIds.add(lock.id);
+      continue;
+    }
     if (trade.id && bookedFillIds.has(`poly-act:${trade.id}`)) {
       matchedLockIds.add(lock.id);
       continue;
@@ -1651,6 +1675,8 @@ module.exports = {
   activityMarketHay,
   activityFillEvent,
   matchActivitiesToLocks,
+  activityTooOld,
+  DEFAULT_ACTIVITY_MAX_AGE_MS,
   listAllActivities,
   slugYesPrice,
   listActivitiesForMarketSlugs,

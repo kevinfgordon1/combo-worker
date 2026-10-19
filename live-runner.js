@@ -1635,12 +1635,21 @@ function fillKeyOf(evt) {
   return evt.fillId || evt.orderId || evt.quoteId || null;
 }
 
+// Returns { status } so the caller only counts + alerts a fill it really
+// stored for the first time:
+//   'new'    — a new combo_fills row was written
+//   'exists' — this fill_id is already in combo_fills (restart / reconcile
+//              replay). Nothing is rewritten: an upsert used to overwrite the
+//              original kalshi_created_time with "now".
+//   'twin'   — the same economic fill is already booked under another fill_id
+//   'error'  — the write failed (still treated as a fill by the caller)
 async function persistExecutedFill(pending, evt) {
   const quoteId = evt.quoteId;
   const orderId = evt.orderId || evt.fillId || quoteId || null;
   const contracts = evt.contracts != null ? evt.contracts : pending.contracts;
   const ticker = evt.marketTicker || null;
   const venue = fillVenueOf(evt);
+  let status = 'new';
   // Combo Locks "Filled — awaiting settlement" keys off combo_fills.parlay_id.
   // Write fills first so a submissions error cannot hide the position.
   try {
@@ -1653,6 +1662,16 @@ async function persistExecutedFill(pending, evt) {
         .eq('is_combo', true)
         .limit(500);
       if (bookedErr) console.error(`[${MODE}] poly twin lookup`, bookedErr.message);
+      const sameId = evt.fillId
+        ? (booked || []).find((row) => row && row.fill_id === evt.fillId)
+        : null;
+      if (sameId) {
+        console.log(
+          `[${MODE}] skip poly fill — fill_id=${evt.fillId} already booked on ${pending.parlayId} ` +
+          `(replay, recorded ${sameId.recorded_at || '?'})`
+        );
+        return { status: 'exists' };
+      }
       const twin = findPolyEconomicTwin(
         {
           qty: contracts,
@@ -1668,11 +1687,13 @@ async function persistExecutedFill(pending, evt) {
         { live: !!evt.live },
       );
       if (twin && (twin.fill_id || twin.fillId) !== evt.fillId) {
-        skipFill = true;
         console.log(
           `[${MODE}] skip poly fill — economic twin fill_id=${twin.fill_id || twin.fillId} ` +
           `already booked on ${pending.parlayId} ${ticker || ''} size=${contracts}`
         );
+        // Do not stamp a "filled" combo_submissions row for a fill that was
+        // not booked (those phantom rows showed as fills with no combo_fills).
+        return { status: 'twin' };
       }
     } else if (orderId) {
       const { data: sameOrder, error: orderErr } = await supabase
@@ -1704,10 +1725,16 @@ async function persistExecutedFill(pending, evt) {
         })),
         { onConflict: 'fill_id' },
       );
-      if (fillErr) console.error(`[${MODE}] combo_fills upsert failed`, fillErr.message);
+      if (fillErr) {
+        console.error(`[${MODE}] combo_fills upsert failed`, fillErr.message);
+        status = 'error';
+      }
+    } else {
+      status = 'twin';
     }
   } catch (e) {
     console.error(`[${MODE}] combo_fills persist`, e.message);
+    status = 'error';
   }
 
   try {
@@ -1738,6 +1765,7 @@ async function persistExecutedFill(pending, evt) {
   } catch (e) {
     console.error(`[${MODE}] onQuoteExecuted submission`, e.message);
   }
+  return { status };
 }
 
 async function pendingFromSubmission({ quoteId, orderId } = {}) {
@@ -1769,6 +1797,11 @@ async function pendingFromSubmission({ quoteId, orderId } = {}) {
 }
 
 const POLY_FILL_LOOKBACK_MS = 21 * 24 * 3600 * 1000;
+// Booked fills used to dedupe reconcile replays must reach further back than
+// the lock window: a lock stays in loadRecentLocks while it has Polymarket
+// quotes inside 21 days, but its earliest fills can be older (Oct 18 14:27
+// UTC re-booked a fill recorded exactly 21 days earlier).
+const POLY_FILL_DEDUPE_LOOKBACK_MS = POLY_FILL_LOOKBACK_MS + 14 * 24 * 3600 * 1000;
 const POLY_SLUG_CACHE_MS = 15000;
 let polySlugCacheAt = 0;
 let polySlugCacheRows = null;
@@ -1875,6 +1908,7 @@ async function loadRecentLocks() {
 
 async function loadPolySlugRecordsUncached() {
   const cutoff = new Date(Date.now() - POLY_FILL_LOOKBACK_MS).toISOString();
+  const fillCutoff = new Date(Date.now() - POLY_FILL_DEDUPE_LOOKBACK_MS).toISOString();
   try {
     const [fillsQ, subsQ] = await Promise.all([
       supabase
@@ -1882,8 +1916,9 @@ async function loadPolySlugRecordsUncached() {
         .select('ticker,parlay_id,raw,count,fill_id,recorded_at,kalshi_created_time')
         .in('user_id', SCOPE.userIds)
         .eq('is_combo', true)
-        .gte('recorded_at', cutoff)
-        .limit(1000),
+        .gte('recorded_at', fillCutoff)
+        .order('recorded_at', { ascending: false })
+        .limit(2000),
       supabase
         .from('combo_submissions')
         .select('quote_id,parlay_id,market_ticker,contracts')
@@ -2216,7 +2251,22 @@ async function onQuoteExecuted(evt) {
     contracts = confirmed.newContracts;
     partial = confirmed.partial;
   } else {
-    await persistExecutedFill(pending, { ...evt, quoteId, orderId, venue });
+    const persisted = await persistExecutedFill(pending, { ...evt, quoteId, orderId, venue });
+    // Already in combo_fills (same fill_id) or booked under another fill_id:
+    // a replay, not a new fill. No count, no "FILL CONFIRMED" Telegram.
+    // (Oct 18: restart/reconcile replays re-alerted Sep 23-27 fills and
+    // twin-skipped position rows.) The fill is already in the DB count, so
+    // the confirm hold can go.
+    if (persisted && (persisted.status === 'exists' || persisted.status === 'twin')) {
+      console.log(
+        `[${MODE}] FILL REPLAY suppressed (${persisted.status}) POLY ${pending.label || ''} ` +
+        `fill_id=${evt.fillId || '?'} order_id=${orderId || '?'} contracts=${contracts}`
+      );
+      releaseConfirmedFill(capBook, { parlayId: pending.parlayId, quoteId, partial: false, contracts });
+      pendingQuotes.delete(quoteId);
+      polyPendingQuotes.delete(quoteId);
+      return;
+    }
     // Restart replay of the same full fill: persist is idempotent; do not
     // re-count or re-Telegram. Partials keep a distinct fill_id so they add.
     if (!fromMemory && pending.alreadyFilled && !evt.isPartial) {
