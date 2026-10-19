@@ -43,6 +43,8 @@ const {
   resolveQuoteFill,
   reconcilePolymarketLockFills,
   orderFromResponse,
+  activityTooOld,
+  DEFAULT_ACTIVITY_MAX_AGE_MS,
 } = require('./polymarket-fill-reconcile');
 const { claimFillKey } = require('./fills-attr');
 
@@ -404,21 +406,21 @@ function emptyTitleCaocTrade(id, cost, { aggressor = true } = {}) {
     }];
     assert.strictEqual(
       matchActivitiesToLocks([mk('T-near', '2026-10-02T17:46:29.840Z')], [ravensLock], {
-        slugMap: ravensMap, bookedFills: recon('2026-10-02T17:46:35.000Z'),
+        now: () => Date.parse('2026-10-02T18:00:00Z'), slugMap: ravensMap, bookedFills: recon('2026-10-02T17:46:35.000Z'),
       }).length,
       0,
       'activity within the twin window of a same-size recon row is the same fill'
     );
     assert.strictEqual(
       matchActivitiesToLocks([mk('T-far', '2026-10-02T17:46:29.840Z')], [ravensLock], {
-        slugMap: ravensMap, bookedFills: recon('2026-10-02T15:45:47.000Z'),
+        now: () => Date.parse('2026-10-02T18:00:00Z'), slugMap: ravensMap, bookedFills: recon('2026-10-02T15:45:47.000Z'),
       }).length,
       1,
       'same-size recon row booked 2h earlier is a different fill'
     );
     assert.strictEqual(
       matchActivitiesToLocks([mk('T-untimed', '2026-10-02T17:46:29.840Z')], [ravensLock], {
-        slugMap: ravensMap, bookedFills: recon(null),
+        now: () => Date.parse('2026-10-02T18:00:00Z'), slugMap: ravensMap, bookedFills: recon(null),
       }).length,
       0,
       'untimed recon row keeps the conservative size-only match'
@@ -1294,6 +1296,43 @@ function comboTrade(id, qty, { aggressor = false, payout } = {}) {
       null,
       `foreign ${evt.marketTicker} must not inherit BACKFILL_PARLAY_ID`
     );
+  }
+
+
+  // Oct 18 false "FILL CONFIRMED": old activity trades (Sep 23-27, Oct 13)
+  // on a lock still inside the 21-day lock window were re-booked once their
+  // own combo_fills row aged out of the dedupe window. Old trades are history.
+  {
+    assert.strictEqual(DEFAULT_ACTIVITY_MAX_AGE_MS, 48 * 3600 * 1000);
+    const nowMs = Date.parse('2026-10-18T14:27:34Z');
+    assert.ok(activityTooOld({ createTime: '2026-09-27T14:27:15Z' }, DEFAULT_ACTIVITY_MAX_AGE_MS, nowMs));
+    assert.ok(!activityTooOld({ createTime: '2026-10-18T13:49:14Z' }, DEFAULT_ACTIVITY_MAX_AGE_MS, nowMs));
+    assert.ok(!activityTooOld({ createTime: null }, DEFAULT_ACTIVITY_MAX_AGE_MS, nowMs), 'untimed trades keep the old path');
+    const steelersSlug = 'caoc-7ed64e1b591f8540';
+    const steelersLock = {
+      id: '456543fd-6866-4f6d-a2aa-0e5e129bda7c',
+      label: 'Pittsburgh Steelers ML + Jacksonville Jaguars ML + Houston Texans ML',
+      user_id: 'u1',
+      max_contracts: 100,
+    };
+    const map = new Map([[steelersSlug, steelersLock.id]]);
+    const act = (id, iso) => ({
+      type: 'ACTIVITY_TYPE_TRADE',
+      trade: {
+        id, marketSlug: steelersSlug, qtyDecimal: '23.58', isAggressor: true,
+        state: 'TRADE_STATE_CLEARED', createTime: iso,
+        marketMetadata: { title: '', slug: steelersSlug },
+      },
+    });
+    const oldEvents = matchActivitiesToLocks([act('CRGCPDEQ2YAJ', '2026-09-27T14:27:15.943Z')], [steelersLock], {
+      slugMap: map, bookedFills: [], now: () => nowMs,
+    });
+    assert.strictEqual(oldEvents.length, 0, 'a 21-day-old trade is never re-booked as a new fill');
+    assert.ok(oldEvents.matchedLockIds.has(steelersLock.id), 'old trade still covers the lock (no position fallback)');
+    const fresh = matchActivitiesToLocks([act('D60E54KGCZRP', '2026-10-18T13:49:14.117Z')], [steelersLock], {
+      slugMap: map, bookedFills: [], now: () => nowMs,
+    });
+    assert.strictEqual(fresh.length, 1, 'a trade from 40 minutes ago is still recovered');
   }
 
   console.log('polymarket-fill-reconcile.test.js ok');
