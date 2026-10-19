@@ -14,7 +14,7 @@ alter table public.noboost_paper_rfqs_new enable row level security;   -- same a
 -- STEP 2: copy what is worth keeping, one day per statement (small batches, no long lock).
 --   kept = every non-Polymarket row (Kalshi is already sampled) + Polymarket rows that are NOT
 --   no_trade/pending (traded, taker_no, accepted_not_filled) + a 2% hash sample of Polymarket no_trade.
--- Repeat for each ET day from 2026-10-01 to today:
+-- Repeat for each ET day from 2026-10-05 (14-day retention) to today:
 insert into public.noboost_paper_rfqs_new
 select * from public.noboost_paper_rfqs
 where rfq_created_ts >= '2026-10-18 00:00-04' and rfq_created_ts < '2026-10-19 00:00-04'
@@ -40,9 +40,9 @@ commit;
 -- STEP 4 (after a day of checks): DROP frees the 18 GB instantly; a DELETE would not.
 -- drop table public.noboost_paper_rfqs_old;
 
--- STEP 5: retention — raw rows older than 30 days roll off nightly in small batches.
+-- STEP 5: retention — raw rows older than 14 days (Kevin, Oct 19) roll off nightly in small batches.
 -- select cron.schedule('noboost_paper_retention', '15 4 * * *', $$
 --   delete from public.noboost_paper_rfqs where rfq_id in (
 --     select rfq_id from public.noboost_paper_rfqs
---     where rfq_created_ts < now() - interval '30 days' and coalesce(primary_fill,false) = false
+--     where rfq_created_ts < now() - interval '14 days' and coalesce(primary_fill,false) = false
 --     limit 50000) $$);
