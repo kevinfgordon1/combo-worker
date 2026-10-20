@@ -215,6 +215,8 @@ const { createPartialQuoteDryRun, isPartialQuoteFlagOn } = require('./partial-qu
 const { resolveSplit, splitConfigError } = require('./poly-split');
 const { createVenueCoordinator } = require('./venue-coord');
 const { createPolymarketHttp } = require('./polymarket-client');
+const { createPolymarketMarketsWs } = require('./poly-markets-ws');
+const { sharedPolyLimiter } = require('./poly-limiter');
 // COMBO_ROLE=poly runs this file as the Polymarket-only service (no Kalshi WS).
 const SPLIT = resolveSplit(process.env);
 const MODE = SPLIT.mode;
@@ -2991,7 +2993,19 @@ async function main() {
     // only while POLY_DRY_RUN=1; POLY_SINGLE_LEG=0 turns it off.
     const polyDry = /^(1|true|yes|on)$/i.test(String(process.env.POLY_DRY_RUN || '').trim());
     if (String(process.env.POLY_SINGLE_LEG || '1').trim() !== '0') {
+      // Markets WebSocket book cache replaces the 10s REST book reads (poly-worker only).
+      let polyBooks = null;
+      if (String(process.env.POLY_MARKETS_WS || '1').trim() !== '0' && process.env.POLYMARKET_KEY_ID && process.env.POLYMARKET_SECRET_KEY) {
+        polyBooks = createPolymarketMarketsWs({
+          keyId: process.env.POLYMARKET_KEY_ID,
+          secretKey: process.env.POLYMARKET_SECRET_KEY,
+          onStatus: (st, i) => console.log(`[${MODE}] markets-ws:${st}${i && i.message ? ' ' + i.message : ''}${i && i.code != null ? ' code=' + i.code : ''}`),
+        });
+      }
+      const polyLimiter = sharedPolyLimiter();
       singleLeg = createSingleLegRunner({
+        polyBooks,
+        limiter: polyLimiter,
         env: { ...process.env, SINGLE_LEG_LIVE: polyDry ? 'dry' : (process.env.POLY_SINGLE_LEG_LIVE || 'dry') },
         supabase,
         kalshiSigned: async () => { throw new Error('no Kalshi key on poly-worker'); },
@@ -3008,6 +3022,14 @@ async function main() {
         forceDry: polyDry,
       });
       singleLeg.start();
+      if (polyBooks) {
+        const t = setInterval(() => {
+          const st = polyBooks.stats();
+          const bs = singleLeg.bookStats ? singleLeg.bookStats() : {};
+          console.log(`[POLY-BOOKS] open=${st.open} slugs=${st.slugs} books=${st.books} pushes=${st.bookMsgs} reconnects=${st.reconnects} errors=${st.errors} reads_ws=${bs.ws || 0} reads_rest=${bs.rest || 0}`);
+        }, 60000);
+        if (t.unref) t.unref();
+      }
     }
     process.on('SIGINT', () => {
       try { poly && poly.stop && poly.stop(); } catch (_) {}

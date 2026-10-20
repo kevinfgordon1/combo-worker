@@ -51,6 +51,8 @@ function createSingleLegRunner({
   kalshiSigned,           // (method, signPath, {path, body}) => {statusCode, text}
   polyHttp = null,        // createPolymarketHttp(...) or null when no Poly key
   fetchImpl = (typeof fetch === 'function' ? fetch : null), // keyless Poly gateway reads
+  polyBooks = null,       // poly-markets-ws cache (poly-worker); null = REST book reads
+  limiter = null,         // poly-limiter shared budget for gateway reads (poly-worker)
   seriesFees,
   getParlays,             // () => active, unpaused, allowlisted locks
   userIds = null,         // this process's users (worker-scope); null = no filter (tests)
@@ -74,6 +76,7 @@ function createSingleLegRunner({
   const live = mode === 'live';
   const pollMs = Math.max(1000, Number(env.SINGLE_LEG_POLL_MS) || 1500);
   const kalshiShare = env.SINGLE_LEG_KALSHI_SHARE != null && env.SINGLE_LEG_KALSHI_SHARE !== '' ? Number(env.SINGLE_LEG_KALSHI_SHARE) : 0.5;
+  const bookStats = { ws: 0, rest: 0 };
   const orders = new Map();   // rowKey -> row (combo_single_orders shape + runtime)
   const polyMarkets = new Map(); // ticker -> { slug, intent, tick } | { miss: true, at }
   const placeBackoff = new Map(); // `${lock}:${venue}` -> until ms
@@ -96,6 +99,10 @@ function createSingleLegRunner({
   }
   async function gateway(path) {
     if (!fetchImpl) return null;
+    if (limiter) {
+      const slot = await limiter.acquire('GET', `/gateway${path}`);
+      if (!slot.ok) return null;
+    }
     const r = await fetchImpl(`${POLY_GATEWAY}${path}`, { headers: { accept: 'application/json' } });
     if (!r || !r.ok) return null;
     return r.json();
@@ -243,6 +250,12 @@ function createSingleLegRunner({
 
   // Asks on the hedge side, cost per contract, best first. Cached per venue.
   async function asksFor(venue, market, buy) {
+    if (venue === 'polymarket' && polyBooks) {
+      // poly-worker: book from the Markets WebSocket cache; REST only until the first push arrives.
+      polyBooks.ensure(market);
+      const pushed = polyBooks.liveBook(market);
+      if (pushed) { bookStats.ws += 1; return SL.polyAsks({ marketData: pushed.marketData }, buy); }
+    }
     const key = `${venue}:${market}:${buy}`;
     const hit = books.get(key);
     const ttl = venue === 'kalshi' ? KALSHI_BOOK_MS : POLY_BOOK_MS;
@@ -253,6 +266,7 @@ function createSingleLegRunner({
         const r = await kCall('GET', kBookPath(market));
         if (r.statusCode < 300 && r.json) asks = SL.kalshiAsks(r.json, buy);
       } else {
+        bookStats.rest += 1;
         const j = await gateway(`/v1/markets/${encodeURIComponent(market)}/book`);
         if (j) asks = SL.polyAsks(j, buy);
       }
@@ -584,7 +598,7 @@ function createSingleLegRunner({
   const ownsSlug = (slug) => polySlugsUsed.has(String(slug || ''))
     || [...orders.values()].some((r) => r.venue === 'polymarket' && r.market === slug);
 
-  return { start, tick, ownsSlug, _orders: orders, mode, split };
+  return { start, tick, ownsSlug, _orders: orders, mode, split, bookStats: () => ({ ...bookStats }), _asksFor: asksFor };
 }
 
 module.exports = { createSingleLegRunner, kalshiOrderState, polyOrderState, hedgeSide };

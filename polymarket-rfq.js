@@ -81,6 +81,7 @@ const {
   ROTATE_HINT,
 } = require('./polymarket-auth');
 const { createPolymarketHttp, createPolymarketRfqWs } = require('./polymarket-client');
+const { isPolyRole } = require('./poly-limiter');
 const { createMarketCache } = require('./polymarket-market-cache');
 const {
   identitiesFromParlay: identitiesFromParlayRaw,
@@ -157,6 +158,7 @@ function envIntLocal(name, def) {
   return process.env[name] != null && process.env[name] !== '' && Number.isFinite(n) && n >= 0 ? n : def;
 }
 const RECONCILE_MS = 3000;
+const POLY_MIN_PAGE_DELAY_MS = 1200;
 const FILL_RECONCILE_MS = 20000;
 const SEEN_RFQS_MAX = 256;
 const SKIP_SUMMARY_MS = 10000;
@@ -1170,14 +1172,57 @@ function takeHydrateStats() {
   return out;
 }
 
-async function hydrateRfq(http, raw) {
+// poly-worker: per-combo cache of GET /v1/combos results, keyed by symbol.
+// Many RFQs reuse the same combo, and /v1/combos sits under the general
+// 25 req/s limit instead of the 1 req/s GET /v1/rfqs budget.
+const COMBO_TTL_MS = 30 * 60 * 1000;
+const COMBO_MISS_TTL_MS = 60 * 1000;
+function createComboCache({ ttlMs = COMBO_TTL_MS, missTtlMs = COMBO_MISS_TTL_MS, maxEntries = 20000, now = () => Date.now() } = {}) {
+  const map = new Map();
+  const inflight = new Map();
+  const stats = { hits: 0, misses: 0, fetched: 0 };
+  async function get(http, symbol) {
+    const key = String(symbol || '');
+    if (!key) return null;
+    const hit = map.get(key);
+    if (hit && now() - hit.at < (hit.legs ? ttlMs : missTtlMs)) { stats.hits += 1; return hit.legs; }
+    if (inflight.has(key)) { stats.hits += 1; return inflight.get(key); }
+    stats.misses += 1;
+    const p = (async () => {
+      try {
+        const listed = await http.getCombo(key);
+        stats.fetched += 1;
+        const combo = (listed && listed.combo) || ((listed && listed.combos && listed.combos[0]) || null);
+        const legs = combo && Array.isArray(combo.legs) && combo.legs.length ? combo.legs : null;
+        map.set(key, { legs, at: now() });
+        while (map.size > maxEntries) map.delete(map.keys().next().value);
+        return legs;
+      } catch (e) {
+        // 429 / limiter drop: do not cache, let the next RFQ retry.
+        if (!(e && e.statusCode === 429)) map.set(key, { legs: null, at: now() });
+        throw e;
+      } finally {
+        inflight.delete(key);
+      }
+    })();
+    inflight.set(key, p);
+    return p;
+  }
+  function rollStats() { const o = { ...stats, size: map.size }; stats.hits = 0; stats.misses = 0; stats.fetched = 0; return o; }
+  return { get, rollStats, size: () => map.size };
+}
+
+async function hydrateRfq(http, raw, opts = {}) {
   let rfq = normalizePolymarketRfq(raw);
   if (!rfq) return null;
   if (rfq.map && rfq.map.ok) return rfq;
+  const comboCache = opts.comboCache || null;
 
+  // poly-worker skips the single-RFQ GET (1 req/s budget) and goes straight to
+  // the cached combo lookup by symbol.
   const backedOff = !!(http && typeof http.isBackedOff === 'function' && http.isBackedOff('/v1/rfqs'));
-  if (rfq.rfqId && backedOff) hydrateStats.backoffSkips += 1;
-  if (rfq.rfqId && !backedOff) {
+  if (!comboCache && rfq.rfqId && backedOff) hydrateStats.backoffSkips += 1;
+  if (!comboCache && rfq.rfqId && !backedOff) {
     try {
       const listed = await http.listRfqs({ rfqId: rfq.rfqId });
       const rows = (listed && listed.rfqs) || [];
@@ -1193,17 +1238,23 @@ async function hydrateRfq(http, raw) {
 
   if (rfq.symbol) {
     try {
-      const listed = await http.getCombo(rfq.symbol);
-      const combo = (listed && listed.combo)
-        || ((listed && listed.combos && listed.combos[0]) || null);
-      if (combo && Array.isArray(combo.legs) && combo.legs.length) {
+      let legs = null;
+      if (comboCache) {
+        legs = await comboCache.get(http, rfq.symbol);
+      } else {
+        const listed = await http.getCombo(rfq.symbol);
+        const combo = (listed && listed.combo)
+          || ((listed && listed.combos && listed.combos[0]) || null);
+        legs = combo && Array.isArray(combo.legs) && combo.legs.length ? combo.legs : null;
+      }
+      if (legs) {
         rfq = normalizePolymarketRfq({
           id: rfq.rfqId,
           symbol: rfq.symbol,
           status: rfq.status || 'RFQ_STATUS_OPEN',
           qtyDecimal: rfq.qtyDecimal,
           cashOrderQty: rfq.cashOrderQty,
-          comboLegs: combo.legs,
+          comboLegs: legs,
         }) || rfq;
       }
     } catch (e) {
@@ -1479,6 +1530,10 @@ function startPolymarketRfqLoop(ctx = {}) {
   }
 
   const enableLocks = ctx.enableLocks !== false;
+  // poly-worker (COMBO_ROLE=poly) request budget behavior. ctx.polyRole
+  // overrides for tests. combo-worker keeps the old behavior.
+  const polyRole = ctx.polyRole != null ? !!ctx.polyRole : isPolyRole(env);
+  const comboCache = polyRole ? (ctx.comboCache || createComboCache()) : null;
   const enableUnhedged = ctx.enableUnhedged !== false;
   // POLY_DRY_RUN=1 (poly-worker rollout step 1): stream + evaluate + log only.
   // Never POSTs quotes/confirms (live forced off) and never writes Miss-tape rows.
@@ -1819,7 +1874,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
 
     if (needsHydrate(rfq, locks)) {
-      rfq = (await hydrateRfq(http, raw)) || rfq;
+      rfq = (await hydrateRfq(http, raw, { comboCache })) || rfq;
       if (!rfq || !rfq.rfqId) return { action: 'skip', reason: 'bad_rfq' };
     }
 
@@ -2534,7 +2589,7 @@ function startPolymarketRfqLoop(ctx = {}) {
   // 1015 (HTTP 429). While healthy we poll slowly and crawl shallow; the
   // moment the WS goes quiet/stalls we go back to full-rate coverage.
   const wsHealthyMaxSilentMs = envIntLocal('POLY_WS_HEALTHY_SILENT_MS', 15000);
-  const reconcileHealthyMs = envIntLocal('POLY_RECONCILE_HEALTHY_MS', 30000);
+  const reconcileHealthyMs = envIntLocal('POLY_RECONCILE_HEALTHY_MS', polyRole ? 60000 : 30000);
   const crawlHealthyPages = envIntLocal('POLY_CRAWL_HEALTHY_PAGES', 5);
   const stallRecoveryMs = envIntLocal('POLY_WS_STALL_RECOVERY_MS', 10 * 60 * 1000);
   let lastWsStallAt = 0;
@@ -2604,9 +2659,12 @@ function startPolymarketRfqLoop(ctx = {}) {
   // already delivered are skipped. Runs ≪ every 3s and yields to the event
   // loop so the Kalshi WS is never starved.
   let crawling = false;
-  async function crawlAllOpenRfqs() {
+  let crawlSkippedHealthy = 0;
+  async function crawlAllOpenRfqs(opts = {}) {
     if (crawling || stopped) return null;
     if (restBackedOff()) { restBackoffSkips += 1; return null; }
+    // poly-worker: the WS delivers ~all RFQs; the deep scan only runs while it is unhealthy.
+    if (polyRole && !opts.force && wsHealthy()) { crawlSkippedHealthy += 1; return null; }
     crawling = true;
     const t0 = Date.now();
     try {
@@ -2776,6 +2834,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       onStatus: (s, i) => console.log(`[${MODE}] ws:${s}`, i && i.message ? i.message : (i && i.wait != null ? `wait=${i.wait}` : '')),
       onEvent: onWsEvent,
       subscribeOrders: live,
+      subscribePositions: live && polyRole,
       onStall: (info) => {
         lastWsStallAt = Date.now();
         console.error(
@@ -2792,7 +2851,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         }
         // REST is the only intake until the WS is back: crawl deep right now.
         if (crawlEnabled && !restBackedOff()) {
-          crawlAllOpenRfqs().catch((e) => console.error(`[${MODE}] stall crawl`, e.message));
+          crawlAllOpenRfqs({ force: true }).catch((e) => console.error(`[${MODE}] stall crawl`, e.message));
         }
       },
       onRecovered: (info) => {
@@ -2829,7 +2888,9 @@ function startPolymarketRfqLoop(ctx = {}) {
   const crawlEnabled = !!http && ctx.crawl !== false && (ctx.crawlMs == null || ctx.crawlMs > 0);
   const crawlMs = ctx.crawlMs != null ? ctx.crawlMs : envIntLocal('POLY_CRAWL_MS', DEFAULT_CRAWL_MS);
   const crawlMaxPages = ctx.crawlMaxPages != null ? ctx.crawlMaxPages : envIntLocal('POLY_CRAWL_MAX_PAGES', DEFAULT_MAX_PAGES);
-  const crawlPageDelayMs = ctx.crawlPageDelayMs != null ? ctx.crawlPageDelayMs : envIntLocal('POLY_CRAWL_PAGE_DELAY_MS', DEFAULT_PAGE_DELAY_MS);
+  const crawlPageDelayRaw = ctx.crawlPageDelayMs != null ? ctx.crawlPageDelayMs : envIntLocal('POLY_CRAWL_PAGE_DELAY_MS', DEFAULT_PAGE_DELAY_MS);
+  // GET /v1/rfqs is 1 req/s per IP: never page faster than 1.2s on poly-worker.
+  const crawlPageDelayMs = polyRole ? Math.max(POLY_MIN_PAGE_DELAY_MS, crawlPageDelayRaw) : crawlPageDelayRaw;
   const heartbeatMs = ctx.polyHeartbeatMs != null ? ctx.polyHeartbeatMs : envIntLocal('POLY_HEARTBEAT_MS', DEFAULT_HEARTBEAT_MS);
 
   function emitPolyHeartbeat() {
@@ -2843,6 +2904,15 @@ function startPolymarketRfqLoop(ctx = {}) {
       snap.ws_silent_s = st.silentMs != null ? Math.round(st.silentMs / 1000) : -1;
       snap.ws_stalls = st.stalls;
       snap.ws_reconnects = st.reconnects;
+    }
+    if (comboCache) {
+      const cc = comboCache.rollStats();
+      snap.combo_cache = `hit=${cc.hits} miss=${cc.misses} fetched=${cc.fetched} size=${cc.size}`;
+    }
+    if (polyRole) snap.crawl_skipped_healthy = crawlSkippedHealthy;
+    if (http && http.limiter && typeof http.limiter.rollStats === 'function') {
+      const ls = http.limiter.rollStats();
+      snap.limiter = `rfq=${ls.rfq.ok}/${ls.rfq.waited}w/${ls.rfq.dropped}d general=${ls.general.ok}/${ls.general.waited}w/${ls.general.dropped}d write=${ls.write.ok}`;
     }
     if (http && typeof http.backoffSnapshot === 'function') {
       const bo = http.backoffSnapshot();
@@ -2867,13 +2937,25 @@ function startPolymarketRfqLoop(ctx = {}) {
     return snap;
   }
 
-  reconcileOpenRfqs().catch((e) => console.error(`[${MODE}] initial reconcile`, e.message));
+  // poly-worker staggers startup: account check at 0s, first list check at
+  // 10s, first deep scan at 20s (skipped if the WS is healthy), market warmup
+  // from 15s spread over ~60s.
+  const startTimers = [];
+  if (polyRole && ctx.startWs !== false) {
+    const t = setTimeout(() => {
+      reconcileOpenRfqs().catch((e) => console.error(`[${MODE}] initial reconcile`, e.message));
+    }, ctx.reconcileFirstMs != null ? ctx.reconcileFirstMs : 10000);
+    if (t.unref) t.unref();
+    startTimers.push(t);
+  } else {
+    reconcileOpenRfqs().catch((e) => console.error(`[${MODE}] initial reconcile`, e.message));
+  }
   let crawlTimer = null;
   if (crawlEnabled && ctx.startWs !== false) {
     // Stagger the first crawl so it does not collide with startup work.
     const first = setTimeout(() => {
       crawlAllOpenRfqs().catch((e) => console.error(`[${MODE}] crawl`, e.message));
-    }, ctx.crawlFirstMs != null ? ctx.crawlFirstMs : 5000);
+    }, ctx.crawlFirstMs != null ? ctx.crawlFirstMs : (polyRole ? 20000 : 5000));
     if (first.unref) first.unref();
     crawlTimer = setInterval(() => {
       crawlAllOpenRfqs().catch((e) => console.error(`[${MODE}] crawl`, e.message));
@@ -2907,12 +2989,12 @@ function startPolymarketRfqLoop(ctx = {}) {
       if (stopped) break;
       if (marketCache.peek(sym) && marketCache.peek(sym).market) continue;
       try { await marketCache.get(sym); n += 1; } catch (_) { /* cache stores the miss */ }
-      await new Promise((r) => setTimeout(r, 250)); // gentle on the REST limiter
+      await new Promise((r) => setTimeout(r, polyRole ? 1000 : 250)); // gentle on the REST limiter
     }
     return n;
   }
   if (enableLocks && ctx.startWs !== false && ctx.prewarmMarkets !== false) {
-    const first = setTimeout(() => { prewarmMarkets().catch(() => {}); }, 8000);
+    const first = setTimeout(() => { prewarmMarkets().catch(() => {}); }, polyRole ? 15000 : 8000);
     if (first.unref) first.unref();
     prewarmTimer = setInterval(() => { prewarmMarkets().catch(() => {}); }, 5 * 60 * 1000);
     if (prewarmTimer.unref) prewarmTimer.unref();
@@ -2926,7 +3008,13 @@ function startPolymarketRfqLoop(ctx = {}) {
   if (ctx.initialFillReconcile) {
     reconcileLockFills().catch((e) => console.error(`[${MODE}] initial fill reconcile`, e.message));
   }
+  const fillSafetyMs = ctx.fillSafetyMs != null ? ctx.fillSafetyMs : envIntLocal('POLY_FILL_SAFETY_MS', 5 * 60 * 1000);
+  let lastFillReconcileAt = 0;
   const fillReconcileTimer = setInterval(() => {
+    // poly-worker: fills arrive on the private WS (quote/order events). While
+    // it is healthy the REST fill check is only a 5-minute safety net.
+    if (polyRole && wsHealthy() && Date.now() - lastFillReconcileAt < fillSafetyMs) return;
+    lastFillReconcileAt = Date.now();
     reconcileLockFills().catch((e) => console.error(`[${MODE}] fill reconcile`, e.message));
   }, fillReconcileMs);
   const ttlTimer = setInterval(() => {
@@ -2950,6 +3038,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     stop() {
       stopped = true;
       clearInterval(reconcileTimer);
+      for (const t of startTimers) clearTimeout(t);
       if (crawlTimer) clearInterval(crawlTimer);
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (warmTimer) clearInterval(warmTimer);
@@ -3001,6 +3090,8 @@ function startPolymarketRfqLoop(ctx = {}) {
 }
 
 module.exports = {
+  hydrateRfq,
+  createComboCache,
   MODE,
   SEEN_RFQS_MAX,
   normalizePolymarketSide,
