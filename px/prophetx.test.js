@@ -67,13 +67,27 @@ async function t(name, fn) { await fn(); n += 1; }
     assert.strictEqual(Q.priceParlay([{ strike_id: 'a', p: null, at: now }], { nowMs: now }).decline, 'leg_unpriced');
   });
 
-  await t('probabilities rounded to 6dp, last leg makes product exact (2:36 AM case)', () => {
+  const sixdp = (out, target) => {
+    for (const x of out) assert.strictEqual(x.probability, Math.round(x.probability * 1e6) / 1e6);
+    assert.ok(out.every((x) => x.probability > 0 && x.probability < 1));
+    assert.ok(Math.abs(out.reduce((a, x) => a * x.probability, 1) - target) < 1e-6);
+  };
+  await t('ALL leg probabilities 6dp, product within 1e-6 (2:36 AM case)', () => {
     const legs = [0.59016, 0.76019, 0.65035].map((p, i) => ({ strike_id: `s${i}`, p }));
     const target = Q.mirrorTarget(-226);
-    const out = Q.legProbabilities(legs, target);
-    for (const x of out.slice(0, -1)) assert.strictEqual(x.probability, Math.round(x.probability * 1e6) / 1e6);
-    assert.ok(out.every((x) => x.probability > 0 && x.probability < 1));
-    assert.ok(Math.abs(out.reduce((a, x) => a * x.probability, 1) - target) < 1e-12);
+    sixdp(Q.legProbabilities(legs, target), target);
+  });
+  await t('invalid-probability order 01a15a1f (Volkanovski/Merab, -436): all legs 6dp', () => {
+    const legs = [0.47393, 0.37453].map((p, i) => ({ strike_id: `s${i}`, p }));
+    const target = 100 / 536;
+    assert.ok(Math.abs(Q.mirrorTarget(-436) - target) < 1e-12);
+    sixdp(Q.legProbabilities(legs, target), target);
+  });
+  await t('invalid-probability order 01a15b69 (Brewers -1.5/Over 43.5, -376): all legs 6dp', () => {
+    const legs = [0.38023, 0.52607].map((p, i) => ({ strike_id: `s${i}`, p }));
+    const target = 100 / 476;
+    assert.ok(Math.abs(Q.mirrorTarget(-376) - target) < 1e-12);
+    sixdp(Q.legProbabilities(legs, target), target);
   });
 
   await t('probabilities reconstruct the mirror of confirmed price (docs +4146 case)', () => {
@@ -85,7 +99,7 @@ async function t(name, fn) { await fn(); n += 1; }
     assert.ok(Math.abs(target - 100 / 4246) < 1e-12);
     const out = Q.legProbabilities(legs, target);
     const prod = out.reduce((a, x) => a * x.probability, 1);
-    assert.ok(Math.abs(prod - target) < 1e-12);
+    assert.ok(Math.abs(prod - target) < 1e-6);
     // ratios between legs preserved
     assert.ok(Math.abs(out[0].probability / out[1].probability - 0.5 / 0.45) < 1e-4);
     assert.strictEqual(Q.legProbabilities(legs, 0.99), null); // impossible target → null, never > 1

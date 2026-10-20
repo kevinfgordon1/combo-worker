@@ -98,10 +98,20 @@ function legProbabilities(legs, target) {
   const r6 = (x) => Math.round(x * 1e6) / 1e6;
   const out = legs.map((l) => ({ strike_id: l.strike_id, probability: r6(l.p * k) }));
   if (out.some((x) => !(x.probability > 0 && x.probability < 1))) return null;
-  // Last leg absorbs the rounding so the product hits the target exactly.
-  const prodButLast = out.slice(0, -1).reduce((a, x) => a * x.probability, 1);
-  out[out.length - 1].probability = t / prodButLast;
-  if (!(out[out.length - 1].probability > 0 && out[out.length - 1].probability < 1)) return null;
+  // Every leg stays at 6dp. Nudge one leg by multiples of 1e-6 so the product
+  // is as close as possible to the target (ProphetX rejects unrounded values).
+  let best = { err: Math.abs(out.reduce((a, x) => a * x.probability, 1) - t), i: -1, v: null };
+  for (let i = 0; i < out.length; i++) {
+    const others = out.reduce((a, x, j) => (j === i ? a : a * x.probability), 1);
+    const ideal = Math.round((t / others) * 1e6);
+    for (let n = ideal - 2; n <= ideal + 2; n++) {
+      const v = n / 1e6;
+      if (!(v > 0 && v < 1)) continue;
+      const err = Math.abs(others * v - t);
+      if (err < best.err) best = { err, i, v };
+    }
+  }
+  if (best.i >= 0) out[best.i].probability = best.v;
   return out;
 }
 
