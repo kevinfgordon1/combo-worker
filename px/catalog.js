@@ -1,4 +1,4 @@
-// ProphetX sandbox catalog: full-game moneyline / spread / total strikes for NFL, MLB and
+// ProphetX sandbox catalog: full-game moneyline / spread / total strikes for NFL, NBA, MLB and
 // college football. Sandbox events mirror real games, so each strike maps to a
 // real team / opponent that we can price from public Kalshi / Polymarket /
 // Novig books. Only these strikes are registered (POST /supported-strikes), so
@@ -9,6 +9,7 @@ const TOURNAMENTS = [
   { id: 31, sport: 'americanfootball_nfl', league: 'nfl' },
   { id: 109, sport: 'baseball_mlb', league: 'mlb' },
   { id: 27653, sport: 'americanfootball_ncaaf', league: 'ncaaf' },
+  { id: 132, sport: 'basketball_nba', league: 'nba' },
   // Soccer: venue sport keys as used by aibetbuilder book-depth (Odds API keys).
   { id: 17, sport: 'soccer_epl', league: 'epl', soccer: true },
   { id: 7, sport: 'soccer_uefa_champs_league', league: 'ucl', soccer: true },

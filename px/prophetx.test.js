@@ -204,5 +204,34 @@ async function t(name, fn) { await fn(); n += 1; }
     assert.deepStrictEqual(payloadOf({ a: 1 }), { a: 1 });
   });
 
+  await t('nba: tournament + Kalshi series; full-game spread/total only, exact lines', () => {
+    const { TOURNAMENTS } = require('./catalog');
+    const { KALSHI_SERIES, lineEqual } = require('./vendor/book-depth');
+    const T = TOURNAMENTS.find((x) => x.id === 132);
+    assert.strictEqual(T.sport, 'basketball_nba');
+    assert.deepStrictEqual(KALSHI_SERIES.basketball_nba, { ML: 'KXNBAGAME', SPR: 'KXNBASPREAD', TOT: 'KXNBATOTAL' });
+    const ev = { event_id: 9, scheduled: '2026-10-21T01:30:00Z', competitors: [{ id: 1, side: 'home', name: 'San Antonio Spurs' }, { id: 2, side: 'away', name: 'Oklahoma City Thunder' }] };
+    const pair = (a, b) => ({ selections: [[a], [b]] });
+    const markets = [
+      { type: 'moneyline', sub_type: 'moneyline', selections: [[{ strike_id: 'm1', competitor_id: 1 }], [{ strike_id: 'm2', competitor_id: 2 }]] },
+      { type: 'spread', sub_type: 'spread', market_strikes: [pair({ strike_id: 's1', competitor_id: 1, strike: 6.5 }, { strike_id: 's2', competitor_id: 2, strike: -6.5 })] },
+      { type: 'total', sub_type: 'total', market_strikes: [pair({ strike_id: 't1', outcome_id: 12, name: 'over 224.5', strike: 224.5 }, { strike_id: 't2', outcome_id: 13, name: 'under 224.5', strike: 224.5 })] },
+      { type: 'spread', sub_type: 'first_half_spread', market_strikes: [pair({ strike_id: 'h1', competitor_id: 1, strike: 3.5 }, { strike_id: 'h2', competitor_id: 2, strike: -3.5 })] },
+      { type: 'total', sub_type: 'team_total_points', market_strikes: [pair({ strike_id: 'tt1', outcome_id: 12, strike: 110.5 }, { strike_id: 'tt2', outcome_id: 13, strike: 110.5 })] },
+    ];
+    const ss = strikesFromEvent(ev, markets, T);
+    assert.deepStrictEqual(ss.map((x) => x.strikeId).sort(), ['m1', 'm2', 's1', 's2', 't1', 't2']);
+    const s1 = ss.find((x) => x.strikeId === 's1');
+    assert.strictEqual(s1.oppLabel, 'Oklahoma City Thunder -6.5');
+    assert.strictEqual(ss.find((x) => x.strikeId === 't1').oppLabel, 'u224.5');
+    assert.ok(lineEqual(224.5, 224.5) && !lineEqual(224.5, 225.5));
+  });
+
+  await t('screen: same-game ML+spread / spread+total declined', () => {
+    const known = new Map([['a', { eventId: 1 }], ['b', { eventId: 1 }], ['c', { eventId: 2 }]]);
+    assert.strictEqual(Q.screenLegs([{ strike_id: 'a', sport_event_id: 1 }, { strike_id: 'b', sport_event_id: 1 }], { known, nowMs: now }), 'correlated_same_game');
+    assert.strictEqual(Q.screenLegs([{ strike_id: 'a', sport_event_id: 1 }, { strike_id: 'c', sport_event_id: 2 }], { known, nowMs: now }), null);
+  });
+
   console.log(`px tests ok (${n})`);
 })().catch((e) => { console.error(e); process.exit(1); });

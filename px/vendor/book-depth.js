@@ -62,6 +62,8 @@ const KALSHI_SERIES = {
   baseball_mlb: { ML: 'KXMLBGAME', SPR: 'KXMLBSPREAD', TOT: 'KXMLBTOTAL' },
   americanfootball_nfl: { ML: 'KXNFLGAME', SPR: 'KXNFLSPREAD', TOT: 'KXNFLTOTAL' },
   americanfootball_ncaaf: { ML: 'KXNCAAFGAME', SPR: 'KXNCAAFSPREAD', TOT: 'KXNCAAFTOTAL' },
+  // prophetx-worker addition (not in aibetbuilder's copy yet): NBA, same series as Combo Locks #453.
+  basketball_nba: { ML: 'KXNBAGAME', SPR: 'KXNBASPREAD', TOT: 'KXNBATOTAL' },
   soccer_epl: { ML: 'KXEPLGAME' },
   soccer_usa_mls: { ML: 'KXMLSGAME' },
   mma_mixed_martial_arts: { ML: 'KXUFCFIGHT' },
