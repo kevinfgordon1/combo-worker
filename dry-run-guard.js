@@ -15,10 +15,19 @@ function note(kind, method, url) {
   counts.set(k, n);
   if (n <= 3 || n % 500 === 0) console.log(`[POLY-DRY] blocked ${k} n=${n}`);
 }
+// Telegram alerts (the existing tg-gate path) still go out in dry run so the
+// service can page Kevin; POLY_DRY_ALLOW_TELEGRAM=0 blocks them too. Only
+// api.telegram.org sendMessage is exempt: no exchange or DB write ever is.
+const ALLOW_TG = String(process.env.POLY_DRY_ALLOW_TELEGRAM || '1').trim() !== '0';
+function isTelegramSend(url) {
+  try { const u = new URL(String(url || '')); return u.host === 'api.telegram.org' && /\/sendMessage$/.test(u.pathname); } catch (_) { return false; }
+}
 const realFetch = globalThis.fetch;
 globalThis.fetch = async function guardedFetch(input, init = {}) {
   const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
   if (SAFE.has(method)) return realFetch(input, init);
+  const url = typeof input === 'string' ? input : (input && input.url);
+  if (ALLOW_TG && method === 'POST' && isTelegramSend(url)) return realFetch(input, init);
   note('fetch', method, typeof input === 'string' ? input : (input && input.url));
   return new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } });
 };
@@ -39,4 +48,4 @@ try {
     C.prototype.request = wrapped;
   }
 } catch (_) {}
-module.exports = { counts };
+module.exports = { counts, isTelegramSend };

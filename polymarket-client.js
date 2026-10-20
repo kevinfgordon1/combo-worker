@@ -108,7 +108,11 @@ function createPolymarketHttp({
   // growing window (honoring Retry-After). Writes (POST/PUT/DELETE: quote,
   // confirm, delete) are NEVER blocked here.
   const getBackoff = new Map(); // path -> { until, step, hits, last }
-  const BACKOFF_BASE_MS = Number(process.env.POLY_429_BASE_MS) || 5000;
+  const BACKOFF_BASE_MS = Number(process.env.POLY_429_BASE_MS) || 10000;
+  // Cloudflare 1015 is an account/IP-wide ban, not per path: after one, every
+  // GET path waits (POLY_1015_COOLDOWN_MS, doubling on repeats, capped at max).
+  const CF_COOLDOWN_MS = Number(process.env.POLY_1015_COOLDOWN_MS) || 30000;
+  const globalBan = { until: 0, step: 0, hits: 0, skipped: 0 };
   const BACKOFF_MAX_MS = Number(process.env.POLY_429_MAX_MS) || 120000;
   const nowMs = () => Date.now();
 
@@ -128,6 +132,12 @@ function createPolymarketHttp({
     const wait = Math.round(base * (0.75 + Math.random() * 0.5)); // +/-25% jitter
     b.until = nowMs() + wait;
     b.last = nowMs();
+    if (/\b1015\b/.test(String((res && res.text) || ''))) {
+      globalBan.hits += 1;
+      globalBan.step = Math.min(globalBan.step + 1, 6);
+      const g = Math.min(BACKOFF_MAX_MS, CF_COOLDOWN_MS * (2 ** (globalBan.step - 1)));
+      globalBan.until = Math.max(globalBan.until, nowMs() + Math.round(g * (0.75 + Math.random() * 0.5)));
+    }
     return wait;
   }
 
@@ -185,7 +195,10 @@ function createPolymarketHttp({
   async function request(method, path, { query, body, ts, signMode } = {}) {
     const isGet = method === 'GET';
     if (isGet) {
-      const b = getBackoff.get(path);
+      const b0 = getBackoff.get(path);
+      const b = (globalBan.until > nowMs() && (!b0 || b0.until < globalBan.until))
+        ? Object.assign(backoffFor(path), { until: globalBan.until }) : b0;
+      if (globalBan.until > nowMs()) globalBan.skipped += 1;
       if (b && b.until > nowMs()) {
         b.skipped += 1;
         // Synthetic 429: no network call, so we stop feeding the rate limiter.
@@ -208,6 +221,7 @@ function createPolymarketHttp({
       } else if (res.statusCode >= 200 && res.statusCode < 300) {
         const b = getBackoff.get(path);
         if (b && b.step) { b.step = 0; b.until = 0; }
+        if (globalBan.step && globalBan.until <= nowMs()) globalBan.step = 0;
       }
     }
     if (res.statusCode >= 200 && res.statusCode < 300) {
@@ -248,11 +262,13 @@ function createPolymarketHttp({
     for (const [path, b] of getBackoff) {
       out[path] = { hits: b.hits, skipped: b.skipped, blockedMs: Math.max(0, b.until - t), step: b.step };
     }
+    if (globalBan.hits) out['*cf1015'] = { hits: globalBan.hits, skipped: globalBan.skipped, blockedMs: Math.max(0, globalBan.until - t), step: globalBan.step };
     return out;
   }
 
   // True when any GET on `path` is currently inside a 429 backoff window.
   function isBackedOff(path) {
+    if (globalBan.until > nowMs()) return true;
     const b = getBackoff.get(path);
     return !!(b && b.until > nowMs());
   }

@@ -1125,19 +1125,68 @@ function logSkip(evaluation, extra) {
   console.log(bits.join(' '));
 }
 
+function americanFromProb(x) {
+  const p = Number(x);
+  if (!(p > 0 && p < 1)) return null;
+  return p >= 0.5 ? Math.round(-100 * p / (1 - p)) : Math.round(100 * (1 - p) / p);
+}
+function fmtAm(a) {
+  const n = Number(a);
+  if (a == null || !Number.isFinite(n)) return '?';
+  return n > 0 ? `+${Math.round(n)}` : `${Math.round(n)}`;
+}
+// Per-minute dry-run tallies: status:reason counts + distinct RFQs/locks.
+function createDryAgg() {
+  let counts = new Map();
+  let details = new Map();
+  return {
+    note(status, reason) {
+      const k = `${status}:${reason}`;
+      counts.set(k, (counts.get(k) || 0) + 1);
+    },
+    noteSkipDetail(ev, rfq) {
+      const lab = (ev && ev.parlay && ev.parlay.label) || '';
+      const k = `${ev && ev.reason}${lab ? ` [${lab}]` : ''}`;
+      const cur = details.get(k) || { n: 0, rfq: rfq && rfq.rfqId, lock: ev && ev.parlay && ev.parlay.id };
+      cur.n += 1;
+      details.set(k, cur);
+    },
+    flush(out) {
+      const parts = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k}=${n}`);
+      out(parts.length ? parts.join(' ') : 'idle');
+      for (const [k, d] of details) {
+        out(`detail ${k} n=${d.n} last_rfq=${d.rfq || '?'} lock=${d.lock || '-'}`);
+      }
+      counts = new Map();
+      details = new Map();
+    },
+  };
+}
+
+const hydrateStats = { http429: 0, backoffSkips: 0 };
+function takeHydrateStats() {
+  const out = { ...hydrateStats };
+  hydrateStats.http429 = 0; hydrateStats.backoffSkips = 0;
+  return out;
+}
+
 async function hydrateRfq(http, raw) {
   let rfq = normalizePolymarketRfq(raw);
   if (!rfq) return null;
   if (rfq.map && rfq.map.ok) return rfq;
 
-  if (rfq.rfqId) {
+  const backedOff = !!(http && typeof http.isBackedOff === 'function' && http.isBackedOff('/v1/rfqs'));
+  if (rfq.rfqId && backedOff) hydrateStats.backoffSkips += 1;
+  if (rfq.rfqId && !backedOff) {
     try {
       const listed = await http.listRfqs({ rfqId: rfq.rfqId });
       const rows = (listed && listed.rfqs) || [];
       const hit = rows.find((x) => (x.id || x.rfqId) === rfq.rfqId) || rows[0];
       if (hit) rfq = normalizePolymarketRfq(hit) || rfq;
     } catch (e) {
-      console.error(`[${MODE}] GET rfq ${rfq.rfqId}`, e.message);
+      // 429s are counted (minute summary / heartbeat), not logged per RFQ.
+      if (e && e.statusCode === 429) hydrateStats.http429 += 1;
+      else console.error(`[${MODE}] GET rfq ${rfq.rfqId}`, e.message);
     }
   }
   if (rfq.map && rfq.map.ok) return rfq;
@@ -1502,13 +1551,48 @@ function startPolymarketRfqLoop(ctx = {}) {
     ? createPolyMissTape({ logAsync: ctx.logAsync })
     : null;
 
+  // Kalshi side for the same lock: latest Kalshi quote row (combo_submissions,
+  // read-only), else the lock's own odds (what the Kalshi quoter quotes at).
+  const kalCache = new Map();
+  async function kalshiCompare(p) {
+    const hit = kalCache.get(p.id);
+    if (hit && Date.now() - hit.at < 60000) return hit.v;
+    let v = null;
+    try {
+      if (ctx.supabase && ctx.supabase.from) {
+        const { data } = await ctx.supabase.from('combo_submissions')
+          .select('fill_american,created_at,status').eq('parlay_id', p.id).eq('venue', 'kalshi')
+          .in('status', ['unfilled', 'filled']).order('created_at', { ascending: false }).limit(1);
+        const r = data && data[0];
+        if (r && r.fill_american != null) v = { american: Number(r.fill_american), src: `last kalshi quote ${r.created_at}` };
+      }
+    } catch (_) { v = null; }
+    if (!v && p.fill_american != null) v = { american: Number(p.fill_american), src: 'lock odds' };
+    kalCache.set(p.id, { at: Date.now(), v });
+    return v;
+  }
+
+  // Dry run: declines are only counted (one summary line a minute); every
+  // would-quote gets one line (see dryWouldQuote).
+  const dryAgg = createDryAgg();
+  if (dryRun) {
+    const t = setInterval(() => {
+      const hs = takeHydrateStats();
+      const bo = http && typeof http.backoffSnapshot === 'function' ? http.backoffSnapshot() : {};
+      const ban = bo['*cf1015'];
+      dryAgg.flush((line) => console.log(
+        `[POLY-DRY] summary 60s ${line} rfq_get_429=${hs.http429} rfq_get_backoff_skips=${hs.backoffSkips}` +
+        ` cf1015_blocked_ms=${ban ? ban.blockedMs : 0}`
+      ));
+    }, 60000);
+    if (t.unref) t.unref();
+  }
   function persistLockTape(evaluation, status, extra) {
-    if (!enableLocks || !missTape) return { persisted: false, reason: 'no_logger' };
     if (dryRun) {
-      console.log(`[POLY-DRY] would ${status} rfq=${(evaluation && evaluation.rfq && evaluation.rfq.id) || '?'} ` +
-        `parlay=${(evaluation && evaluation.parlay && evaluation.parlay.id) || '?'}`);
+      dryAgg.note(status, lockSkipReasonOf(evaluation || {}) || (evaluation && evaluation.reason) || '-');
       return { persisted: false, reason: 'dry_run' };
     }
+    if (!enableLocks || !missTape) return { persisted: false, reason: 'no_logger' };
     return missTape.persist(evaluation, status, extra);
   }
 
@@ -1748,7 +1832,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         parlay: (overlap && overlap.parlay) || null,
       };
       persistUnhedgedShadow(rfq, { skipReason: lockSkipReasonOf(evaluation) });
-      if (overlap && isNearMissCode(overlap.code)) {
+      if (overlap && isNearMissCode(overlap.code) && !dryRun) {
         logSkip(evaluation);
       }
       persistLockTape(evaluation, 'declined', { locks });
@@ -1788,7 +1872,8 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
 
     if (evaluation.action !== 'quoteable') {
-      logSkip(evaluation);
+      if (dryRun) dryAgg.noteSkipDetail(evaluation, rfq);
+      else logSkip(evaluation);
       if (
         evaluation.reason === 'unmatched'
         || evaluation.reason === 'unmatched_leg'
@@ -1819,6 +1904,18 @@ function startPolymarketRfqLoop(ctx = {}) {
     const q = evaluation.quote;
     const d = evaluation.decision;
 
+    if (!gate.post && dryRun) {
+      const kal = await kalshiCompare(p).catch(() => null);
+      console.log(
+        `[POLY-DRY] WOULD-QUOTE rfq=${rfq.rfqId} lock=${p.id} "${p.label}" ` +
+        `price=${fmtAm(d.quotedEffAmerican)} (buy ${q.buyPrice} = ${fmtAm(americanFromProb(q.buyPrice))}) ` +
+        `size=${d.contracts != null ? d.contracts : q.estimatedContracts} lock=${fmtAm(p.fill_american)} ` +
+        `kalshi=${kal ? `${fmtAm(kal.american)} (${kal.src})` : 'n/a'} ` +
+        `${exposureBit(outstandingFor(p.id))}/${d.totalLimit} reason=${gate.reason}`
+      );
+      persistLockTape(evaluation, 'shadow');
+      return { ...evaluation, post: false, reason: gate.reason };
+    }
     if (!gate.post) {
       console.log(
         `[${MODE}] WOULD-QUOTE ${p.label} rfq=${rfq.rfqId} ` +
@@ -2436,7 +2533,7 @@ function startPolymarketRfqLoop(ctx = {}) {
   // 1015 (HTTP 429). While healthy we poll slowly and crawl shallow; the
   // moment the WS goes quiet/stalls we go back to full-rate coverage.
   const wsHealthyMaxSilentMs = envIntLocal('POLY_WS_HEALTHY_SILENT_MS', 15000);
-  const reconcileHealthyMs = envIntLocal('POLY_RECONCILE_HEALTHY_MS', 15000);
+  const reconcileHealthyMs = envIntLocal('POLY_RECONCILE_HEALTHY_MS', 30000);
   const crawlHealthyPages = envIntLocal('POLY_CRAWL_HEALTHY_PAGES', 5);
   const stallRecoveryMs = envIntLocal('POLY_WS_STALL_RECOVERY_MS', 10 * 60 * 1000);
   let lastWsStallAt = 0;

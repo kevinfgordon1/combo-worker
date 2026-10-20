@@ -31,7 +31,10 @@ const src = fs.readFileSync(path.join(__dirname, 'live-runner.js'), 'utf8');
 const ret = src.indexOf('return; // Polymarket service: no Kalshi WebSocket');
 const fire = src.indexOf('createKalshiFirehose({');
 assert.ok(ret > 0 && fire > ret, 'poly role returns before the Kalshi WS is created');
-assert.ok(/if \(!SPLIT\.runKalshi\) \{\s*process\.on\('SIGINT'/.test(src));
+assert.ok(/if \(!SPLIT\.runKalshi\) \{[\s\S]{0,2500}?process\.on\('SIGINT'/.test(src));
+// Poly role: Kalshi skip-tape never scheduled; single-leg runner is Polymarket-only.
+assert.ok(/if \(SPLIT\.runKalshi\) \{\s*setInterval\(unlessQuoteHot\(\(\) => \{\s*reconcileSkipTapes/.test(src));
+assert.ok(/venues: \['polymarket'\],\s*forceDry: polyDry/.test(src));
 const startPoly = fs.readFileSync(path.join(__dirname, 'start-poly.js'), 'utf8');
 assert.ok(startPoly.includes("COMBO_ROLE: 'poly'") && !startPoly.includes('fills-reader') && !startPoly.includes('desk-protect'));
 

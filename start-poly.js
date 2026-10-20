@@ -4,6 +4,8 @@
 const { spawn } = require('child_process');
 
 const env = { ...process.env, COMBO_ROLE: 'poly' };
+// NBA spreads/totals mapping (leg-identity.js) is on for poly-worker unless POLY_NBA_LINES=0.
+if (env.POLY_NBA_LINES === undefined) env.POLY_NBA_LINES = '1';
 // Dry run: no Polymarket POSTs, no Miss-tape rows, no cross-venue hold rows.
 if (/^(1|true|yes|on)$/i.test(String(env.POLY_DRY_RUN || '').trim())) {
   env.POLYMARKET_RFQ_LIVE = '0';
