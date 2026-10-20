@@ -10,6 +10,8 @@ const TOURNAMENTS = [
   { id: 109, sport: 'baseball_mlb', league: 'mlb' },
   { id: 27653, sport: 'americanfootball_ncaaf', league: 'ncaaf' },
   { id: 132, sport: 'basketball_nba', league: 'nba' },
+  // UFC: fight-winner moneyline only (2-way; draw / no contest void, as at Kalshi/books). No rounds/props.
+  { id: 1500000003, sport: 'mma_mixed_martial_arts', league: 'ufc', mlOnly: true },
   // Soccer: venue sport keys as used by aibetbuilder book-depth (Odds API keys).
   { id: 17, sport: 'soccer_epl', league: 'epl', soccer: true },
   { id: 7, sport: 'soccer_uefa_champs_league', league: 'ucl', soccer: true },
@@ -155,6 +157,7 @@ function strikesFromEvent(ev, markets, t) {
     }
     if (pair.length === 2) out.push(...pair);
   }
+  if (t.mlOnly) return out;
   for (const m of markets || []) {
     if (!m || (m.sub_type !== 'spread' && m.sub_type !== 'total') || m.status === 'inactive') continue;
     for (const ms of m.market_strikes || []) {

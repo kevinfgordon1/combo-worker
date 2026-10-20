@@ -235,3 +235,15 @@ async function t(name, fn) { await fn(); n += 1; }
 
   console.log(`px tests ok (${n})`);
 })().catch((e) => { console.error(e); process.exit(1); });
+
+{ // UFC: fight-winner ML only, no rounds/props
+  const { strikesFromEvent, TOURNAMENTS } = require('./catalog');
+  const t = TOURNAMENTS.find((x) => x.league === 'ufc');
+  const ev = { event_id: 1, scheduled: '2026-10-24T04:00:00Z', competitors: [{ id: 10, side: 'home', name: 'A' }, { id: 20, side: 'away', name: 'B' }] };
+  const mk = [
+    { type: 'moneyline', sub_type: 'moneyline', selections: [[{ strike_id: 's1', competitor_id: 10 }], [{ strike_id: 's2', competitor_id: 20 }]] },
+    { type: 'total', sub_type: 'total', market_strikes: [{ selections: [[{ strike_id: 's3', strike: 1.5, outcome_id: 12 }], [{ strike_id: 's4', strike: 1.5 }]] }] },
+  ];
+  const ss = strikesFromEvent(ev, mk, t);
+  assert.deepStrictEqual(ss.map((s) => [s.kind, s.team, s.opp]), [['ML', 'A', 'B'], ['ML', 'B', 'A']]);
+}
