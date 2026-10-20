@@ -35,11 +35,12 @@ function createRunner({ env = process.env, logger = console, fetch: f = globalTh
   if (!g.ok) throw new Error(`[PX-GUARD] refusing to start: ${g.problems.join('; ')}`);
   const cfg = {
     maxRisk: num(env.PX_MAX_RISK, 10),
-    validMs: num(env.PX_VALID_MS, 15_000),
+    validMs: Math.min(9 * 60_000, Math.max(6_000, num(env.PX_VALID_MS, 60_000))), // ProphetX bounds: >5s, <10m; UI users take >15s to accept
     priceTimeoutMs: num(env.PX_PRICE_TIMEOUT_MS, 5000),
     catalogEveryMs: num(env.PX_CATALOG_EVERY_MS, 10 * 60_000),
-    // 'participant': offer price = the participant's American (e.g. +1180).
-    // 'mm': offer price = the mirror (−1180). Set from the first sandbox confirms.
+    // 'participant' (default, per docs example + matcher "higher price wins"): offer price = the
+    // participant's American (e.g. +1180). 'mm' sends the mirror (−1180), which the matcher reads as
+    // a −1180 price for the bettor, so it never wins and the UI shows "couldn't price".
     offerSign: env.PX_OFFER_SIGN === 'mm' ? 'mm' : 'participant',
   };
   const session = createSession({ apiBase: g.apiBase, accessKey: env.PROPHETX_SANDBOX_API_KEY, secretKey: env.PROPHETX_SANDBOX_SECRET_KEY, fetch: f, logger });
@@ -78,6 +79,7 @@ function createRunner({ env = process.env, logger = console, fetch: f = globalTh
     const p = payloadOf(data);
     logShapeOnce('price.ask.new', p);
     store.bump('rfq');
+    logger.log(`[PX-RFQ] ${p.parlay_id} creator_id=${p.creator_id || '?'} legs=${(p.market_strikes || p.market_lines || p.lines || []).length} qty=${p.quantity ?? p.stake}`);
     const lines = p.market_strikes || p.market_lines || p.lines || [];
     const reason = Q.screenLegs(lines, { known: catalog.known });
     if (reason) {
@@ -111,7 +113,7 @@ function createRunner({ env = process.env, logger = console, fetch: f = globalTh
     store.bump('quoted');
     quotes.set(p.parlay_id, { legs, priced, price, at: Date.now() });
     const legTxt = legs.map((l) => `${l.info.team} ${Q.participantAmericanFloor(l.p) > 0 ? '+' : ''}${Q.participantAmericanFloor(l.p)}(${l.best.venue})`).join(' | ');
-    logger.log(`[PX] QUOTE ${p.parlay_id} ${legs.length}L fair ${priced.fairAmerican > 0 ? '+' : ''}${priced.fairAmerican} → offer ${priced.participantAmerican > 0 ? '+' : ''}${priced.participantAmerican} max_risk $${cfg.maxRisk} qty $${p.quantity ?? p.stake} :: ${legTxt}`);
+    logger.log(`[PX] QUOTE ${p.parlay_id} ${legs.length}L fair ${priced.fairAmerican > 0 ? '+' : ''}${priced.fairAmerican} → offer ${priced.participantAmerican > 0 ? '+' : ''}${priced.participantAmerican} (sent price=${price} valid=${Math.round(cfg.validMs / 1000)}s) max_risk $${cfg.maxRisk} qty $${p.quantity ?? p.stake} :: ${legTxt}`);
     store.insertQuote({
       parlay_id: p.parlay_id,
       n_legs: legs.length,
