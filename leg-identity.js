@@ -368,9 +368,20 @@ const POLY_LINE_SPORT = {
 // Poly slug league token -> identity league.
 const POLY_SLUG_TO_LEAGUE = { nfl: 'nfl', mlb: 'mlb', nhl: 'nhl', cfb: 'ncaaf' };
 
+// NBA spreads/totals (KXNBASPREAD/KXNBATOTAL <-> Poly asc-/tsc-nba-…). Behind
+// POLY_NBA_LINES=1 (start-poly.js sets it for poly-worker) so combo-worker's
+// identity code is unchanged until it is turned on there too.
+if (/^(1|true|yes|on)$/i.test(String(process.env.POLY_NBA_LINES || '').trim())) {
+  LINE_SERIES.KXNBASPREAD = { league: 'nba', kind: 'spread', teamLen: 3 };
+  LINE_SERIES.KXNBATOTAL = { league: 'nba', kind: 'total', teamLen: 3 };
+  POLY_LINE_SPORT.basketball_team_full_game_spread = { league: 'nba', slugLeagues: ['nba'], kind: 'spread' };
+  POLY_LINE_SPORT.basketball_team_full_game_total = { league: 'nba', slugLeagues: ['nba'], kind: 'total' };
+  POLY_SLUG_TO_LEAGUE.nba = 'nba';
+}
+
 const NCAAF_ML_SERIES = 'KXNCAAFGAME';
 const POLY_LINE_SLUG_RE =
-  /^(asc|tsc)-(nfl|mlb|nhl|cfb)-([a-z0-9]+)-([a-z0-9]+)-(\d{4})-(\d{2})-(\d{2})-(?:(neg|pos)-|(?:total-)?)(\d{1,3})pt(\d)$/;
+  /^(asc|tsc)-(nfl|mlb|nhl|cfb|nba)-([a-z0-9]+)-([a-z0-9]+)-(\d{4})-(\d{2})-(\d{2})-(?:(neg|pos)-|(?:total-)?)(\d{1,3})pt(\d)$/;
 
 function isPolyLineSlug(symbol) {
   return /^(asc|tsc)-/.test(String(symbol || '').trim().toLowerCase());

@@ -31,17 +31,17 @@ async function test429Breaker() {
   // inside the window: no network call, synthetic local 429
   await assert.rejects(() => http.listRfqs({ status: 'RFQ_STATUS_OPEN' }), (e) => e.statusCode === 429 && e.localBackoff === true);
   assert.strictEqual(calls.length, 1, 'no upstream call while backed off');
-  // other GET paths and all writes are unaffected
-  await http.listActivities({});
+  // Cloudflare 1015 is account-wide: other GET paths wait too; writes are never blocked
+  await assert.rejects(() => http.listActivities({}), (e) => e.statusCode === 429 && e.localBackoff === true);
   await http.createQuote({ x: 1 });
   await http.confirmQuote('r', 'q');
   await http.deleteQuote('r', 'q');
-  assert.strictEqual(calls.length, 5);
+  assert.strictEqual(calls.length, 4);
   // window expires -> real call again; success clears the breaker
   await sleep(300);
   mode = 'ok';
   await http.listRfqs({ status: 'RFQ_STATUS_OPEN' });
-  assert.strictEqual(calls.length, 6);
+  assert.strictEqual(calls.length, 5);
   assert.ok(!http.isBackedOff('/v1/rfqs'));
   assert.strictEqual(http.backoffSnapshot()['/v1/rfqs'].step, 0);
   // Retry-After honored (capped by max) and backoff grows

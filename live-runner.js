@@ -684,8 +684,11 @@ async function refresh() {
     if (polyLoop && typeof polyLoop.cancelStartedQuotes === 'function') {
       polyLoop.cancelStartedQuotes().catch((e) => console.error(`[${MODE}] poly cancel-on-start refresh`, e.message));
     }
-    loadPendingSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape load`, e.message));
-    loadPendingClosedLive().catch((e) => console.error(`[${MODE}] skip-tape closed-live load`, e.message));
+    // Skip-tape resolves Kalshi RFQs/trades with the Kalshi key: combo-worker only.
+    if (SPLIT.runKalshi) {
+      loadPendingSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape load`, e.message));
+      loadPendingClosedLive().catch((e) => console.error(`[${MODE}] skip-tape closed-live load`, e.message));
+    }
   } catch (e) {
     console.error(`[${MODE}] refresh failed`, e.message);
   }
@@ -2811,7 +2814,8 @@ async function main() {
       supabase,
       scope: SCOPE,
       env: process.env,
-      signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
+      // poly-worker has no Kalshi key: report Polymarket only there.
+      signed: SPLIT.runKalshi ? (method, signPath, opts) => kalshiSigned(method, signPath, opts) : null,
       wrap: unlessQuoteHot,
       log: (m) => console.log(`[${MODE}] ${m}`),
     });
@@ -2871,9 +2875,14 @@ async function main() {
     pollPaused().catch((e) => console.error(`[${MODE}] pause poll`, e.message));
     pollUserCancels().catch((e) => console.error(`[${MODE}] user-cancel poll`, e.message));
   }), 5000);
-  setInterval(unlessQuoteHot(() => {
-    reconcileSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape tick`, e.message));
-  }), SKIP_TAPE_TICK_MS);
+  // Kalshi skip-tape lookups need the Kalshi key; poly-worker (COMBO_ROLE=poly) has none.
+  if (SPLIT.runKalshi) {
+    setInterval(unlessQuoteHot(() => {
+      reconcileSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape tick`, e.message));
+    }), SKIP_TAPE_TICK_MS);
+  } else {
+    console.log(`[${MODE}] Kalshi skip-tape OFF (COMBO_ROLE=poly, no Kalshi key)`);
+  }
 
   // Step 2 — pre-warm + keep warm (15s so LB idle-kill cannot cold-start POST)
   if (SPLIT.runKalshi) {
@@ -2976,6 +2985,30 @@ async function main() {
       ? createPolymarketHttp({ keyId: process.env.POLYMARKET_KEY_ID, secretKey: process.env.POLYMARKET_SECRET_KEY })
       : null);
   if (!SPLIT.runKalshi) {
+    // Polymarket single-leg hedges live here now (rest on Polymarket, cancel /
+    // shrink on fill). Kalshi rests stay in combo-worker; the two coordinate
+    // through combo_single_orders (own share of remaining size each). Dry run
+    // only while POLY_DRY_RUN=1; POLY_SINGLE_LEG=0 turns it off.
+    const polyDry = /^(1|true|yes|on)$/i.test(String(process.env.POLY_DRY_RUN || '').trim());
+    if (String(process.env.POLY_SINGLE_LEG || '1').trim() !== '0') {
+      singleLeg = createSingleLegRunner({
+        env: { ...process.env, SINGLE_LEG_LIVE: polyDry ? 'dry' : (process.env.POLY_SINGLE_LEG_LIVE || 'dry') },
+        supabase,
+        kalshiSigned: async () => { throw new Error('no Kalshi key on poly-worker'); },
+        polyHttp: polyRestHttp || (process.env.POLYMARKET_KEY_ID && process.env.POLYMARKET_SECRET_KEY
+          ? createPolymarketHttp({ keyId: process.env.POLYMARKET_KEY_ID, secretKey: process.env.POLYMARKET_SECRET_KEY })
+          : null),
+        seriesFees: null,
+        getParlays: () => parlays,
+        userIds: SCOPE.userIds,
+        isBlocked: (userId, lock) => killEngagedFor(userId, lock),
+        sendAlert,
+        log: (m) => console.log(`[${MODE}] ${m}`),
+        venues: ['polymarket'],
+        forceDry: polyDry,
+      });
+      singleLeg.start();
+    }
     process.on('SIGINT', () => {
       try { poly && poly.stop && poly.stop(); } catch (_) {}
       Promise.resolve(venueCoord && venueCoord.stop()).finally(() => {
@@ -2995,6 +3028,11 @@ async function main() {
     kalshiSigned: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
     polyHttp: polyRestHttp,
     seriesFees,
+    // SINGLE_LEG_SPLIT=1: Polymarket single-leg rests run in poly-worker; this
+    // process rests Kalshi only and reads Polymarket's rows from the shared
+    // table. Default off = unchanged one-process behaviour.
+    ...(/^(1|true|yes|on)$/i.test(String(process.env.SINGLE_LEG_SPLIT || '').trim())
+      ? { venues: ['kalshi'] } : {}),
     getParlays: () => parlays,
     userIds: SCOPE.userIds,
     isBlocked: (userId, lock) => killEngagedFor(userId, lock),

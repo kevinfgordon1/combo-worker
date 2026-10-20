@@ -58,8 +58,19 @@ function createSingleLegRunner({
   sendAlert,
   log = console.log,
   now = Date.now,
+  // Venues THIS process places on. Default both (one-process setup). When the
+  // venues are split across services (combo-worker = kalshi, poly-worker =
+  // polymarket) the other venue's orders are read from combo_single_orders
+  // each tick, counted as immovable exposure, and this process only ever uses
+  // its own share of the remaining size, so the two can't double-fill past cap.
+  venues: ownList = ['kalshi', 'polymarket'],
+  forceDry = false,       // poly-worker dry run: never place/cancel, log only
 } = {}) {
-  const mode = SL.readMode(env);
+  const own = new Set(ownList);
+  const split = !(own.has('kalshi') && own.has('polymarket'));
+  const foreign = ['kalshi', 'polymarket'].filter((v) => !own.has(v));
+  const baseMode = SL.readMode(env);
+  const mode = forceDry ? 'dry' : baseMode;
   const live = mode === 'live';
   const pollMs = Math.max(1000, Number(env.SINGLE_LEG_POLL_MS) || 1500);
   const kalshiShare = env.SINGLE_LEG_KALSHI_SHARE != null && env.SINGLE_LEG_KALSHI_SHARE !== '' ? Number(env.SINGLE_LEG_KALSHI_SHARE) : 0.5;
@@ -109,7 +120,7 @@ function createSingleLegRunner({
       if (userIds && q.in) q = q.in('user_id', [...userIds]);
       const { data, error } = await q;
       if (error) { L(`load: ${error.message}`); return false; }
-      for (const r of (data || []).filter((x) => !userIds || userIds.includes(x.user_id))) {
+      for (const r of (data || []).filter((x) => (!userIds || userIds.includes(x.user_id)) && own.has(x.venue))) {
         const row = { ...r, pending: String(r.last_error || '').startsWith(CANCEL_FAILED) };
         orders.set(`${r.venue}:${r.order_id}`, row);
         if (r.venue === 'polymarket') polySlugsUsed.add(r.market);
@@ -124,6 +135,7 @@ function createSingleLegRunner({
     if (filledTotals.has(key)) return;
     const { data } = await supabase.from(TABLE).select('venue,filled,status,order_id').eq('parlay_id', lockId);
     for (const r of data || []) {
+      if (!own.has(r.venue)) continue; // other service's venue: read fresh each tick
       if (r.status === 'resting' && orders.has(`${r.venue}:${r.order_id}`)) continue;
       const k = `${lockId}:${r.venue}`;
       filledTotals.set(k, (filledTotals.get(k) || 0) + (Number(r.filled) || 0));
@@ -402,8 +414,28 @@ function createSingleLegRunner({
     };
   }
 
+  // Other venue's live exposure for this lock (split mode). null = read failed.
+  async function foreignState(lockId) {
+    const out = {};
+    if (!foreign.length) return out;
+    try {
+      const { data, error } = await supabase.from(TABLE)
+        .select('venue,filled,open,size,status').eq('parlay_id', lockId).in('venue', foreign);
+      if (error) return null;
+      for (const v of foreign) out[v] = { filled: 0, open: 0 };
+      for (const r of data || []) {
+        const o = out[r.venue]; if (!o) continue;
+        o.filled += Number(r.filled) || 0;
+        if (r.status === 'resting') o.open += Math.max(Number(r.open) || 0, Math.max(0, (Number(r.size) || 0) - (Number(r.filled) || 0)));
+      }
+      return out;
+    } catch (_) { return null; }
+  }
+
   async function processLock(lockId, lock) {
     const plan = [];
+    const fs = split ? await foreignState(lockId) : {};
+    if (split && !fs) plan.push(`${foreign.join('+')} state unreadable: no new orders this tick`);
     await loadClosedFilled(lockId);
     for (const r of [...orders.values()].filter((x) => x.parlay_id === lockId)) await refreshOrder(r, lock);
     // Retry cancels that failed before (the order stays tracked meanwhile).
@@ -416,13 +448,21 @@ function createSingleLegRunner({
 
     const quotes = {};
     if (active) {
-      quotes.kalshi = await venueQuote(lock, 'kalshi').catch(() => null);
-      quotes.polymarket = polyHttp ? await venueQuote(lock, 'polymarket').catch(() => null) : null;
+      quotes.kalshi = own.has('kalshi') ? await venueQuote(lock, 'kalshi').catch(() => null) : null;
+      quotes.polymarket = (own.has('polymarket') && polyHttp) ? await venueQuote(lock, 'polymarket').catch(() => null) : null;
     }
     const build = () => {
       const liveRows = [...orders.values()].filter((r) => r.parlay_id === lockId);
       const venues = {};
       for (const v of ['kalshi', 'polymarket']) {
+        if (!own.has(v)) {
+          // Other service's orders: counted in full and never touched here
+          // (pending = open keeps the plan from "moving" them); assumed enabled
+          // so this process only takes its own share of the remaining size.
+          const f = (fs && fs[v]) || { filled: 0, open: 0 };
+          venues[v] = { filled: f.filled, open: f.open, pending: f.open, price: null, wantPrice: null, enabled: true };
+          continue;
+        }
         const q = quotes[v];
         venues[v] = venueState(lockId, v, liveRows.filter((r) => r.venue === v), q ? q.restCost : null, !!(q && q.restCost != null));
       }
@@ -440,7 +480,9 @@ function createSingleLegRunner({
       const takers = ['kalshi', 'polymarket'].map((v) => quotes[v]).filter((q) => q && q.take && q.take.qty >= 1)
         .sort((a, b) => a.take.avgNet - b.take.avgNet);
       if (takers.length) {
-        const pendingAny = Object.values(venues).some((s) => s.pending > 0);
+        const pendingAny = split
+          ? [...own].some((v) => venues[v] && venues[v].pending > 0) || !fs
+          : Object.values(venues).some((s) => s.pending > 0);
         if (pendingAny) plan.push('taker skipped: an order is waiting on a failed cancel');
         else {
           // Pull our resting orders first so take + resting never exceeds the cap.
@@ -448,7 +490,12 @@ function createSingleLegRunner({
           ({ liveRows, venues } = build());
           plan0 = SL.planCrossVenue({ cap: lock.max_contracts, venues, active: false });
           let room = plan0.remaining - Object.values(venues).reduce((n, s) => n + s.open, 0);
-          if (!Object.values(venues).some((s) => s.pending > 0)) {
+          if (split) {
+            // Own share only: the other service may be taking at the same moment.
+            const share = SL.allocate(plan0.remaining, { kalshi: true, polymarket: true }, kalshiShare);
+            room = Math.min(room, [...own].reduce((n, v) => n + (share[v] || 0), 0));
+          }
+          if (!(split ? [...own].some((v) => venues[v].pending > 0) : Object.values(venues).some((s) => s.pending > 0))) {
             for (const q of takers) {
               if (room < 1) break;
               const qty = Math.min(q.take.qty, room);
@@ -462,6 +509,7 @@ function createSingleLegRunner({
     }
 
     // 2) Maker rests, split across venues so a double fill can't pass the cap.
+    if (split) plan0.actions = plan0.actions.filter((a) => own.has(a.venue) && (fs || a.op !== 'place'));
     for (const a of plan0.actions) {
       const rows = liveRows.filter((r) => r.venue === a.venue && r.status === 'resting' && !r.pending && !r.stale);
       if (a.op === 'cancel') {
@@ -481,12 +529,22 @@ function createSingleLegRunner({
     if (plan0.actions.some((a) => a.op !== 'place')) {
       ({ liveRows, venues } = build());
       plan0 = SL.planCrossVenue({ cap: lock ? lock.max_contracts : 0, venues, active, kalshiShare });
+      if (split) plan0.actions = plan0.actions.filter((a) => own.has(a.venue) && (fs || a.op !== 'place'));
     }
     for (const a of plan0.actions.filter((x) => x.op === 'place')) {
       const q = quotes[a.venue];
       if (q) await placeVenue(lock, q, a.size, 'rest', plan);
     }
-    if (active && !quotes.polymarket && polyHttp) plan.push('polymarket: no matching market');
+    if (active && own.has('polymarket') && !quotes.polymarket && polyHttp) plan.push('polymarket: no matching market');
+    if (split && fs && active) {
+      const f = foreign.map((v) => `${v} filled ${fs[v] ? fs[v].filled : 0} open ${fs[v] ? fs[v].open : 0}`).join(', ');
+      plan.push(`other venue: ${f}`);
+      if (own.has('polymarket') && !own.has('kalshi')) {
+        const leg = lock.legs.filter((l) => l && l.ticker)[0];
+        const kh = leg ? SL.kalshiHedge(leg, lock.fill_american, 0.035) : null;
+        if (kh) plan.push(`kalshi would rest ${kh.ticker} ${String(kh.side).toUpperCase()} @ ${kh.priceCents}¢ (${am(kh.priceCents / 100)})`);
+      }
+    }
     return finish(lockId, lock, plan);
   }
 
@@ -517,7 +575,7 @@ function createSingleLegRunner({
 
   function start() {
     if (mode === 'off') { L('SINGLE_LEG_LIVE off — 1-leg locks are not rested'); return; }
-    L(`started mode=${mode} poll=${pollMs}ms poly=${polyHttp ? 'on' : 'off (no key)'} kalshiShare=${kalshiShare}`);
+    L(`started mode=${mode} poll=${pollMs}ms venues=${[...own].join('+')}${split ? ' (split: other venue read from ' + TABLE + ')' : ''} poly=${polyHttp ? 'on' : 'off (no key)'} kalshiShare=${kalshiShare}`);
     timer = setInterval(() => { tick().catch((e) => L(`tick ${e && e.message}`)); }, pollMs);
     if (timer.unref) timer.unref();
   }
@@ -526,7 +584,7 @@ function createSingleLegRunner({
   const ownsSlug = (slug) => polySlugsUsed.has(String(slug || ''))
     || [...orders.values()].some((r) => r.venue === 'polymarket' && r.market === slug);
 
-  return { start, tick, ownsSlug, _orders: orders, mode };
+  return { start, tick, ownsSlug, _orders: orders, mode, split };
 }
 
 module.exports = { createSingleLegRunner, kalshiOrderState, polyOrderState, hedgeSide };
