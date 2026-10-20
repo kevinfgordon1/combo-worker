@@ -1207,7 +1207,8 @@ async function hydrateRfq(http, raw) {
         }) || rfq;
       }
     } catch (e) {
-      console.error(`[${MODE}] GET combo ${rfq.symbol}`, e.message);
+      if (e && e.statusCode === 429) hydrateStats.http429 += 1; // counted, not logged per RFQ
+      else console.error(`[${MODE}] GET combo ${rfq.symbol}`, e.message);
     }
   }
   return rfq;

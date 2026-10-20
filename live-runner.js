@@ -2814,7 +2814,8 @@ async function main() {
       supabase,
       scope: SCOPE,
       env: process.env,
-      signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
+      // poly-worker has no Kalshi key: report Polymarket only there.
+      signed: SPLIT.runKalshi ? (method, signPath, opts) => kalshiSigned(method, signPath, opts) : null,
       wrap: unlessQuoteHot,
       log: (m) => console.log(`[${MODE}] ${m}`),
     });
