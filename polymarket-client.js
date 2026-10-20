@@ -11,6 +11,7 @@ const {
   classifyPolymarketAuthError,
 } = require('./polymarket-auth');
 
+const { sharedPolyLimiter } = require('./poly-limiter');
 const DEFAULT_BASE = 'https://api.polymarket.us';
 const DEFAULT_WS = 'wss://api.polymarket.us/v1/ws/private';
 const WS_SIGN_PATH = '/v1/ws/private';
@@ -81,7 +82,12 @@ function createPolymarketHttp({
   baseUrl = DEFAULT_BASE,
   requestFn,
   poolFactory,
+  // Shared Polymarket limiter (poly-limiter.js). Defaults to the process-wide
+  // limiter on poly-worker (COMBO_ROLE=poly) and null elsewhere. Pass false to
+  // force it off.
+  limiter,
 } = {}) {
+  const lim = limiter === false ? null : (limiter || sharedPolyLimiter());
   const origin = String(baseUrl || DEFAULT_BASE).replace(/\/$/, '');
   const accessKey = normalizeCred(keyId);
   const secret = normalizeCred(secretKey);
@@ -212,6 +218,21 @@ function createPolymarketHttp({
         };
       }
     }
+    if (lim) {
+      const slot = await lim.acquire(method, path);
+      if (!slot.ok) {
+        // Over our own budget: drop locally instead of queueing or hitting Polymarket.
+        return {
+          statusCode: 429,
+          text: 'local limiter drop',
+          json: null,
+          signMode: signMode || signModeLatched || 'path',
+          localBackoff: true,
+          limiterDrop: true,
+          retryInMs: 1000,
+        };
+      }
+    }
     const mode = signMode || signModeLatched || 'path';
     const res = await requestOnce(method, path, { query, body, ts, signMode: mode });
     if (isGet) {
@@ -275,6 +296,7 @@ function createPolymarketHttp({
 
   return {
     request,
+    limiter: lim,
     backoffSnapshot,
     isBackedOff,
     getUserId: () => getJson('/v1/rfqs/user-id'),
@@ -352,6 +374,12 @@ function createPolymarketHttp({
     async warmQuotePool(fanout = QUOTE_CONNECTIONS) {
       if (!http) return { ok: false, sockets: 0, reason: 'no_http' };
       if (isBackedOff(QUOTE_WARM_PATH)) return { ok: false, sockets: 0, reason: 'backoff' };
+      // poly-worker: the warm path shares the 1 req/s RFQ budget; warm one socket per free slot only.
+      if (lim) {
+        const slot = await lim.acquire('GET', QUOTE_WARM_PATH, { maxWaitMs: 0 });
+        if (!slot.ok) return { ok: false, sockets: 0, reason: 'backoff' };
+        fanout = 1;
+      }
       const t0 = nowMs();
       try {
         const results = await Promise.all(
@@ -511,6 +539,8 @@ function createPolymarketRfqWs({
   onStall,
   onRecovered,
   subscribeOrders = false,
+  // poly-worker live: position pushes replace polling /v1/portfolio/positions.
+  subscribePositions = false,
   // Silent-stall watchdog: the RFQ firehose normally delivers tens of
   // messages/s. A socket that stays "open" (pings still answered) but delivers
   // nothing for stallMs is dead; terminate it so the close handler reconnects.
@@ -559,6 +589,9 @@ function createPolymarketRfqWs({
           market_slugs: [],
         },
       });
+    }
+    if (subscribePositions) {
+      reqs.push({ subscribe: { requestId: 'position-sub-1', subscriptionType: 'SUBSCRIPTION_TYPE_POSITION' } });
     }
     for (const body of reqs) {
       try { ws.send(JSON.stringify(body)); } catch (_) {}
