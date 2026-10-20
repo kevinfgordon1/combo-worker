@@ -2921,6 +2921,9 @@ function startPolymarketRfqLoop(ctx = {}) {
       if (top.length) snap.rest_429_paths = top.map(([k, x]) => `${k}:${x.hits}`).join('|');
     }
     console.log(formatPolyHeartbeat(snap));
+    if (polyRole) {
+      console.log(`[POLY-RL] limiter ${snap.limiter || 'off'} combo_cache ${snap.combo_cache || 'off'} crawl_skipped_healthy=${snap.crawl_skipped_healthy || 0}`);
+    }
     try {
       snap.latency = latency.rollInterval();
       const L = snap.latency;
