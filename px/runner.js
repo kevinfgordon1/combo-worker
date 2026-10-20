@@ -158,11 +158,15 @@ function createRunner({ env = process.env, logger = console, fetch: f = globalTh
     const probErr = /probab/i.test(errTxt) ? errTxt.slice(0, 200) : null;
     store.bump(action === 'accept' ? 'confirm_accept' : 'confirm_reject');
     if (probErr) store.bump('prob_error');
+    const probProduct = strikes ? strikes.reduce((acc, x) => acc * x.probability, 1) : null;
+    const probSent = strikes ? strikes.map((x) => ({ s: x.strike_id, p: x.probability })) : null;
+    logger.log(`[PX] CONFIRM-PROB ${p.parlay_id} target=${target != null ? target.toFixed(8) : null} product=${probProduct != null ? probProduct.toFixed(8) : null} legs=${probSent ? probSent.map((x) => `${x.s}:${x.p}`).join(',') : 'none'}`);
     logger.log(`[PX] CONFIRM ${p.parlay_id} ${action}${why ? ` (${why})` : ''} confirmed_price=${body.confirmed_price} qty=${body.confirmed_quantity} target_p=${target && target.toFixed(5)} http=${r.status}${errTxt ? ` resp="${errTxt.slice(0, 200)}"` : ''}`);
     if (q) {
       store.patchQuote(p.parlay_id, {
         confirm_at: new Date().toISOString(), confirm_action: action, confirm_reason: why,
         confirmed_price: body.confirmed_price, confirmed_qty: body.confirmed_quantity,
+        prob_sent: probSent, prob_target: target, prob_product: probProduct,
         confirm_http: r.status, prob_error: probErr || (r.status !== 200 ? errTxt.slice(0, 200) || `http_${r.status}` : null),
       });
     }

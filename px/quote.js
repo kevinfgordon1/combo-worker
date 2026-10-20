@@ -95,9 +95,10 @@ function legProbabilities(legs, target) {
   const fair = legs.reduce((a, l) => a * l.p, 1);
   if (!(fair > 0)) return null;
   const k = (t / fair) ** (1 / legs.length);
-  const out = legs.map((l) => ({ strike_id: l.strike_id, probability: l.p * k }));
+  const r6 = (x) => Math.round(x * 1e6) / 1e6;
+  const out = legs.map((l) => ({ strike_id: l.strike_id, probability: r6(l.p * k) }));
   if (out.some((x) => !(x.probability > 0 && x.probability < 1))) return null;
-  // Remove floating drift on the last leg so the product is exact.
+  // Last leg absorbs the rounding so the product hits the target exactly.
   const prodButLast = out.slice(0, -1).reduce((a, x) => a * x.probability, 1);
   out[out.length - 1].probability = t / prodButLast;
   if (!(out[out.length - 1].probability > 0 && out[out.length - 1].probability < 1)) return null;
