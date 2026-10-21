@@ -1,0 +1,157 @@
+// Live quote lifecycle for the sniper (only reachable when the live gate is open; in dry run
+// the same flow stops after the DB reservation). Mirrors combo-worker's live-runner order:
+//   decide → Combo-Locks check → DB reserve (atomic caps) → re-price → POST quote
+//   → 20s unaccepted TTL cancel → quote_accepted: shouldConfirmAccept + re-price (≥ min ROI)
+//   + cap-at-confirm (DB) + lock check → PUT confirm, else decline (cancel)
+//   → quote_executed: book confirmed portfolio fills for that order_id → ledger
+//   → settlement loop: market result → realized P&L → release; daily loss stop.
+'use strict';
+const { snipeEconomics, minQuotePrice } = require('../auto-sniper');
+const { shouldConfirmAccept } = require('../engine');
+const { RESERVE_TTL_MS } = require('../reserve');
+
+function createLiveSniper({
+  config, trader, store, coord, caps, reprice, alert = () => {}, log = console.log,
+  now = () => Date.now(), ttlMs = RESERVE_TTL_MS, fillRetries = 4, fillRetryMs = 1500,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)), onHalt = () => {},
+} = {}) {
+  const pending = new Map(); // quoteId -> { d, rfq, accepted, timer }
+  const byRfq = new Map(); // rfqId -> quoteId
+  const confirming = new Set();
+  const stats = { posted: 0, postFail: 0, accepted: 0, confirmed: 0, declined: {}, fills: 0, cancelled: 0, settled: 0, aborted: {} };
+  let halted = false;
+  const bump = (o, k) => { o[k] = (o[k] || 0) + 1; };
+  const live = () => !!trader.live && !halted;
+
+  // ROI of OUR quoted price against a freshly computed fair (null fair => fails).
+  function roiAt(d, fair, contracts = d.contracts) {
+    if (!(fair > 0 && fair < 1)) return null;
+    return snipeEconomics({ fair, q: d.quoteYes, n: contracts, makerRate: d.makerRate });
+  }
+
+  // Called after decide() returned a quote AND the DB reservation succeeded.
+  async function send(rfq, d) {
+    const abort = async (reason) => { bump(stats.aborted, reason); await store.release(d.rfqId, 'cancelled', {}); return { sent: false, reason }; };
+    if (!live()) return abort(halted ? 'halted' : 'not_live');
+    const b = coord.blockReason(rfq); if (b) return abort(b);
+    const cw = await coord.comboWorkerQuoting(rfq.rfqId); if (cw) return abort(cw);
+    // Re-price at send time with the freshest books.
+    const fresh = reprice(rfq);
+    const e = roiAt(d, fresh);
+    if (!e || e.roi < config.minRoi - 1e-12) return abort('reprice_below_min');
+    let res;
+    try { res = await trader.postQuote(rfq, d.quoteYes, config.tick); } catch (err) {
+      stats.postFail += 1; log(`[SNIPER] quote POST failed rfq=${rfq.rfqId}: ${err.message}`);
+      await store.release(d.rfqId, 'failed', {}); return { sent: false, reason: 'post_failed' };
+    }
+    if (!res.quoteId) { await store.release(d.rfqId, 'failed', {}); return { sent: false, reason: 'no_quote_id' }; }
+    stats.posted += 1;
+    await store.update(d.rfqId, { phase: 'quoted', quote_id: res.quoteId, no_bid: res.noBid });
+    const entry = { d, rfq, accepted: false, yesBid: res.yesBid, timer: null };
+    entry.timer = setTimeout(() => { expire(res.quoteId).catch(() => {}); }, ttlMs);
+    if (entry.timer.unref) entry.timer.unref();
+    pending.set(res.quoteId, entry); byRfq.set(rfq.rfqId, res.quoteId);
+    log(`[SNIPER] LIVE QUOTE rfq=${rfq.rfqId} quote_id=${res.quoteId} no_bid=${res.noBid} yes=${d.quoteYes} fair=${fresh.toFixed(4)} roi=${(e.roi * 100).toFixed(2)}%`);
+    return { sent: true, quoteId: res.quoteId };
+  }
+
+  async function dropQuote(quoteId, phase, reason) {
+    const p = pending.get(quoteId); if (!p) return;
+    clearTimeout(p.timer); pending.delete(quoteId); byRfq.delete(p.rfq.rfqId);
+    try { await trader.cancel(quoteId); } catch (e) { log(`[SNIPER] cancel ${quoteId} failed: ${e.message}`); }
+    await store.release(p.d.rfqId, phase, {});
+    if (phase === 'declined') { bump(stats.declined, reason); log(`[SNIPER] DECLINE quote_id=${quoteId} rfq=${p.rfq.rfqId} reason=${reason}`); } else stats.cancelled += 1;
+  }
+  async function expire(quoteId) {
+    const p = pending.get(quoteId);
+    if (!p || p.accepted || confirming.has(quoteId)) return;
+    await dropQuote(quoteId, 'cancelled', 'ttl');
+  }
+  async function onRfqClosed(evt) {
+    const qid = evt && byRfq.get(evt.rfqId);
+    const p = qid && pending.get(qid);
+    if (!p || p.accepted || confirming.has(qid)) return;
+    clearTimeout(p.timer); pending.delete(qid); byRfq.delete(p.rfq.rfqId);
+    await store.release(p.d.rfqId, 'cancelled', {}); stats.cancelled += 1;
+  }
+
+  async function onAccepted(evt) {
+    const quoteId = evt && evt.quoteId; const p = quoteId && pending.get(quoteId);
+    if (!p) return { confirmed: false, reason: 'not_ours' };
+    if (confirming.has(quoteId)) return { confirmed: false, reason: 'in_flight' };
+    confirming.add(quoteId); p.accepted = true; clearTimeout(p.timer); stats.accepted += 1;
+    try {
+      const { d, rfq } = p;
+      const decline = async (reason) => { await dropQuote(quoteId, 'declined', reason); return { confirmed: false, reason }; };
+      if (!live()) return decline(halted ? 'halted' : 'not_live');
+      if (!shouldConfirmAccept(p.yesBid, evt.acceptedSide)) return decline('yes_side_accept');
+      const n = Number(evt.contractsAccepted) > 0 ? Number(evt.contractsAccepted) : d.contracts;
+      if (n > config.maxPayout + 1e-9) return decline('payout_over_cap');
+      const b = coord.blockReason(rfq); if (b) return decline(b);
+      const fresh = reprice(rfq);
+      const e = roiAt(d, fresh, n);
+      if (!e || e.roi < config.minRoi - 1e-12) return decline('reprice_below_min');
+      const cap = await store.confirmCheck(d.rfqId, Math.round(e.risk * 100) / 100, caps());
+      if (!cap.ok) return decline(`cap_${cap.reason}`);
+      try { await trader.confirm(evt.rfqId || rfq.rfqId, quoteId); } catch (err) {
+        await store.release(d.rfqId, 'failed', {}); pending.delete(quoteId); byRfq.delete(rfq.rfqId);
+        log(`[SNIPER] confirm failed quote_id=${quoteId}: ${err.message}`);
+        return { confirmed: false, reason: 'confirm_failed' };
+      }
+      stats.confirmed += 1;
+      alert(`✅ SNIPER quote ACCEPTED+confirmed rfq=${rfq.rfqId} ${n} @ YES ${d.quoteYes} (fair ${fresh.toFixed(4)}, ROI ${(e.roi * 100).toFixed(1)}%, risk $${e.risk.toFixed(2)})`);
+      return { confirmed: true };
+    } finally { confirming.delete(quoteId); }
+  }
+
+  async function onExecuted(evt) {
+    const quoteId = evt && evt.quoteId; const p = quoteId && pending.get(quoteId);
+    if (!p) return { booked: false, reason: 'not_ours' };
+    let book = null;
+    for (let i = 0; i < fillRetries; i += 1) {
+      try { book = await trader.fillsForOrder(evt.orderId); } catch (e) { log(`[SNIPER] fills read failed: ${e.message}`); }
+      if (book && book.reason === 'confirmed') break;
+      await sleep(fillRetryMs);
+    }
+    if (!book || book.reason !== 'confirmed') {
+      await store.update(p.d.rfqId, { order_id: evt.orderId || null });
+      alert(`⚠️ SNIPER executed but fills not yet visible rfq=${p.rfq.rfqId} order=${evt.orderId} — exposure stays reserved`);
+      return { booked: false, reason: book ? book.reason : 'fills_unreadable' };
+    }
+    const cost = book.book.reduce((s, r) => s + r.count * (Number(r.no_price) || 0), 0);
+    const fee = book.book.reduce((s, r) => s + (Number(r.fee) || 0), 0);
+    await store.update(p.d.rfqId, {
+      phase: 'filled', order_id: evt.orderId, filled_contracts: book.contracts,
+      filled_cost: Math.round(cost * 1e4) / 1e4, filled_fee: Math.round(fee * 1e4) / 1e4,
+      fill_ids: book.book.map((r) => r.fill_id), market_ticker: p.rfq.marketTicker || (book.book[0] && book.book[0].ticker) || null,
+    });
+    stats.fills += 1; pending.delete(quoteId); byRfq.delete(p.rfq.rfqId);
+    alert(`💰 SNIPER FILL rfq=${p.rfq.rfqId} ${book.contracts} NO @ avg ${(cost / book.contracts).toFixed(3)} cost $${cost.toFixed(2)} fee $${fee.toFixed(2)} ticker=${p.rfq.marketTicker || '?'}`);
+    return { booked: true, contracts: book.contracts };
+  }
+
+  // Settlement: result per market from Kalshi (public market data). We hold NO.
+  async function settleOnce(marketResult, dayStartIso) {
+    const rows = await store.openFilled();
+    for (const r of rows) {
+      if (!r.market_ticker) continue;
+      let res; try { res = await marketResult(r.market_ticker); } catch (_) { continue; }
+      if (res !== 'yes' && res !== 'no') { if (res === 'void' || res === 'cancelled') await store.release(r.rfq_id, 'settled', { market_result: res, realized_pnl: 0, settled_at: new Date(now()).toISOString() }); continue; }
+      const n = Number(r.filled_contracts) || 0; const cost = Number(r.filled_cost) || 0; const fee = Number(r.filled_fee) || 0;
+      const pnl = (res === 'no' ? n : 0) - cost - fee;
+      await store.release(r.rfq_id, 'settled', { market_result: res, realized_pnl: Math.round(pnl * 1e4) / 1e4, settled_at: new Date(now()).toISOString() });
+      stats.settled += 1;
+    }
+    const day = await store.dayRealized(dayStartIso);
+    if (!halted && -day >= config.dailyLossCap) {
+      halted = true; onHalt('daily_loss');
+      alert(`🛑 SNIPER AUTO-DISABLED: realized loss today $${(-day).toFixed(2)} ≥ $${config.dailyLossCap} daily stop. No new quotes until next ET day + restart.`);
+    }
+    return day;
+  }
+
+  function halt(reason) { if (!halted) { halted = true; onHalt(reason); } }
+  return { send, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, halted: () => halted, pending, stats: () => ({ ...stats, pending: pending.size }), _minQuotePrice: minQuotePrice };
+}
+
+module.exports = { createLiveSniper };
