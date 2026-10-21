@@ -35,6 +35,27 @@ function polyExactTargetEnabled(env = process.env) {
   return !/^(0|false|off|no)$/i.test(String(raw).trim());
 }
 
+// POLY_FINE_TICK (default ON): price on the RFQ's own tickSize (combos are 0.0001) instead of the
+// hard-coded 0.001. 0/false/off/no restores the 0.001 grid. Only ticks in [0.0001, 0.01] on the
+// 0.0001 lattice are trusted; anything missing or odd falls back to 0.001.
+const FINEST_TICK = 0.0001;
+function polyFineTickEnabled(env = process.env) {
+  const raw = env && env.POLY_FINE_TICK;
+  if (raw == null || raw === '') return true;
+  return !/^(0|false|off|no)$/i.test(String(raw).trim());
+}
+function resolveTick(tickSize, env = process.env) {
+  if (!polyFineTickEnabled(env)) return TICK;
+  const t = Number(tickSize);
+  if (!Number.isFinite(t) || t < FINEST_TICK - 1e-12 || t > 0.01 + 1e-12) return TICK;
+  const units = Math.round(t / FINEST_TICK);
+  if (Math.abs(units * FINEST_TICK - t) > 1e-12) return TICK;
+  return units * FINEST_TICK;
+}
+function tickDecimals(tick) {
+  return tick < 0.001 - 1e-12 ? 4 : 3;
+}
+
 function envNum(env, key, dflt) {
   const raw = env && env[key];
   if (raw == null || raw === '') return dflt;
@@ -84,7 +105,7 @@ function rebateCreditPerContract(price, qty, { theta = DEFAULT_REBATE_THETA, min
 // Exact-target price: the lowest tick whose price + guaranteed rebate is still >= the lock target (the most
 // competitive quote that never nets worse than the target). With no creditable rebate this is ceil(target).
 // Returns { buyPrice, credit, target } or null (no valid tick).
-function fillAmericanToExactQuote(fillAmerican, { contracts = 0, env = process.env, theta, minContracts } = {}) {
+function fillAmericanToExactQuote(fillAmerican, { contracts = 0, env = process.env, theta, minContracts, tickSize } = {}) {
   const a = parseAmerican(fillAmerican);
   if (a == null) return null;
   const target = impliedProb(a);
@@ -92,12 +113,19 @@ function fillAmericanToExactQuote(fillAmerican, { contracts = 0, env = process.e
   const th = theta != null ? theta : envNum(env, 'POLY_MAKER_REBATE_THETA', DEFAULT_REBATE_THETA);
   const minC = minContracts != null ? minContracts : envNum(env, 'POLY_REBATE_MIN_CONTRACTS', DEFAULT_REBATE_MIN_CONTRACTS);
   // The rebate can never exceed theta/4 per contract, so no tick below target - theta/4 can qualify.
-  let k = Math.max(MIN_TICKS, Math.ceil((target - th / 4 - 1e-6) / TICK - 1e-9));
-  for (; k <= MAX_TICKS; k++) {
-    const price = k * TICK;
+  // Work in integer ticks so 0.0001 grids never drift. Same rule on any tick: the lowest tick whose
+  // price (+ creditable rebate) is >= target, i.e. the closest price that never beats the lock.
+  const tick = resolveTick(tickSize, env);
+  const perUnit = Math.round(1 / tick);
+  const dp = tickDecimals(tick);
+  const minK = Math.round(MIN_TICKS * TICK / tick);
+  const maxK = perUnit - minK;
+  let k = Math.max(minK, Math.ceil((target - th / 4 - 1e-6) * perUnit - 1e-9));
+  for (; k <= maxK; k++) {
+    const price = k / perUnit;
     const credit = rebateCreditPerContract(price, contracts, { theta: th, minContracts: minC });
     if (price + credit + 1e-12 >= target) {
-      return { buyPrice: (k / 1000).toFixed(3), credit, target };
+      return { buyPrice: price.toFixed(dp), credit, target, tick };
     }
   }
   return null;
@@ -105,7 +133,7 @@ function fillAmericanToExactQuote(fillAmerican, { contracts = 0, env = process.e
 
 // qtyDecimal RFQ: that quantity on the offered (buy) side.
 // cashOrderQty RFQ: floor(cash / buyPrice) — venue derives this server-side too.
-function buildPolymarketQuote({ fillAmerican, cashOrderQty, qtyDecimal, exact, env } = {}) {
+function buildPolymarketQuote({ fillAmerican, cashOrderQty, qtyDecimal, exact, env, tickSize } = {}) {
   const useExact = exact != null ? !!exact : polyExactTargetEnabled(env || process.env);
   const qty = parsePositive(qtyDecimal);
   const cash = parsePositive(cashOrderQty);
@@ -120,12 +148,12 @@ function buildPolymarketQuote({ fillAmerican, cashOrderQty, qtyDecimal, exact, e
   } else {
     // Contracts decide whether the rebate may be credited, and for a cash RFQ the contracts depend on the
     // price: size it off the no-rebate price (highest, so fewest contracts), then haircut it.
-    const base = fillAmericanToExactQuote(fillAmerican, { contracts: 0, env });
+    const base = fillAmericanToExactQuote(fillAmerican, { contracts: 0, env, tickSize });
     if (!base) return null;
     const creditQty = qty != null
       ? qty
       : (cash != null ? Math.floor((cash / parseFloat(base.buyPrice)) * CASH_QTY_CREDIT_FACTOR) : 0);
-    const q = fillAmericanToExactQuote(fillAmerican, { contracts: creditQty, env });
+    const q = fillAmericanToExactQuote(fillAmerican, { contracts: creditQty, env, tickSize });
     if (!q) return null;
     buyPrice = q.buyPrice;
     rebateCredit = q.credit;
@@ -162,6 +190,8 @@ module.exports = {
   DEFAULT_REBATE_MIN_CONTRACTS,
   CASH_QTY_CREDIT_FACTOR,
   polyExactTargetEnabled,
+  polyFineTickEnabled,
+  resolveTick,
   rebateCreditPerContract,
   fillAmericanToExactQuote,
   SELL_PRICE_DECLINE,

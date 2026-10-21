@@ -292,6 +292,8 @@ function normalizePolymarketRfq(raw) {
     map: mapped,
     createdTime: r.createdTime || r.created_time || null,
     restRemainder: r.restRemainder === true || r.rest_remainder === true,
+    // Instrument min price increment (docs.polymarket.us RFQ overview). Combos carry 0.0001.
+    tickSize: r.tickSize != null ? r.tickSize : (r.tick_size != null ? r.tick_size : null),
   };
 }
 
@@ -764,6 +766,7 @@ function evaluatePolymarketRfq({
     cashOrderQty: rfq.cashOrderQty,
     qtyDecimal: rfq.qtyDecimal,
     exact: exactTarget,
+    tickSize: rfq.tickSize,
   });
   if (!shouldPostPolymarketQuote(quote)) {
     return { action: 'skip', reason: 'bad_size', rfq, parlay, quote };
@@ -1255,6 +1258,7 @@ async function hydrateRfq(http, raw, opts = {}) {
           qtyDecimal: rfq.qtyDecimal,
           cashOrderQty: rfq.cashOrderQty,
           comboLegs: legs,
+          tickSize: rfq.tickSize,
         }) || rfq;
       }
     } catch (e) {
