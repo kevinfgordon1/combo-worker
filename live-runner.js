@@ -271,6 +271,7 @@ function noteInsufficientBalance(venue, info = null) {
 const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const sniperGuard = require('./sniper-guard').createSniperGuard({ supabase });
 
 // Step 2 — two persistent HTTP clients. Quote mutations must not queue
 // behind unhedged /markets pagination or skip-tape GETs (undici Client
@@ -1549,6 +1550,12 @@ async function onQuoteAccepted(evt) {
       return;
     }
     if (!pending) {
+      // Never confirm the isolated sniper's quotes (same account, own key) — fail closed if unsure.
+      const sg = await sniperGuard.isSniperQuote(quoteId);
+      if (sg.sniper || sg.unknown) {
+        console.warn(`[${MODE}] CONFIRM SKIPPED unknown quote is ${sg.sniper ? 'a sniper quote' : 'unverifiable (sniper_ledger read failed)'} quote_id=${quoteId} rfq_id=${rfqId}`);
+        return;
+      }
       await confirmQuote(rfqId, quoteId);
       const ms = (performance.now() - t0).toFixed(1);
       console.log(
