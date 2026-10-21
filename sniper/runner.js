@@ -20,7 +20,7 @@ const { createLimiter, createRateBreaker } = require('./limiter');
 const { createLedgerStore } = require('./ledger-store');
 const { venuesFromEnv } = require('./fair');
 const { decide, repriceFair } = require('./engine');
-const { liveGate } = require('./gates');
+const { liveGate, sniperSubaccount } = require('./gates');
 const { createSniperTrader } = require('./trader');
 const { createLockCoord } = require('./coord');
 const { createLiveSniper } = require('./live');
@@ -41,7 +41,9 @@ async function main(env = process.env) {
   const venues = venuesFromEnv(env);
   const depth = num(env.SNIPER_FAIR_DEPTH_USD, 1000);
   const tg = createTelegramNotifier(env);
-  const alert = (m) => { log(m); if (tg) tg(m); };
+  // Every sniper Telegram message is labelled so it can never be read as a Combo Locks alert.
+  const tgLabel = (m) => (/^🎯 SNIPER/.test(m) ? m : `🎯 SNIPER (not Combo Locks) — ${String(m).replace(/^\[SNIPER\]\s*/, '')}`);
+  const alert = (m) => { log(m); if (tg) tg(tgLabel(m)); };
   if (!config.enabled) { log('[SNIPER] SNIPER_ENABLED is off — idling (kill switch).'); setInterval(() => {}, 1 << 30); return; }
   const gate = liveGate(env);
   config.dryRun = !gate.live;
@@ -159,7 +161,7 @@ async function main(env = process.env) {
   coord.start();
   const trader = createSniperTrader({
     gate, keyId: env.SNIPER_KALSHI_KEY_ID, pem: normalizePem(env.SNIPER_KALSHI_PRIVATE_KEY || ''),
-    limiter: lim.kalshiTrade, log,
+    subaccount: sniperSubaccount(env), limiter: lim.kalshiTrade, log,
   });
   // Releasing in the DB also frees the in-memory reservation (cancelled/declined/failed/settled).
   const liveStore = {
@@ -174,7 +176,7 @@ async function main(env = process.env) {
   const liveSniper = createLiveSniper({
     config, trader, store: liveStore, coord, caps, log,
     reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues }),
-    alert: (m) => { log(m); if (tg) tg(m); },
+    alert,
     onHalt: () => { /* halted flag inside liveSniper blocks new sends/confirms */ },
   });
   liveSniperRef = () => liveSniper.halt('rate_limit');
@@ -212,7 +214,7 @@ async function main(env = process.env) {
     log(formatDecision(d));
     if (!gate.live) {
       store.decision({ rfq_id: d.rfqId, action: 'would_quote', reason: null, details: d });
-      if (config.tgAlerts && tg) tg(formatDecision(d));
+      if (config.tgAlerts && tg) tg(tgLabel(formatDecision(d)));
       return;
     }
     const sent = await liveSniper.send(rfq, d);

@@ -30,7 +30,7 @@ const sizeSource = (rfq) => (Number(rfq && rfq.contracts) > 0 ? 'contracts' : 'd
 
 class LiveGateClosed extends Error { constructor(op) { super(`LIVE_GATE_CLOSED ${op}`); this.liveGateClosed = true; } }
 
-function createSniperTrader({ gate, keyId, pem, limiter = null, request = null, log = console.log } = {}) {
+function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = null, request = null, log = console.log } = {}) {
   const live = !!(gate && gate.live);
   let pair = null;
   const pools = () => { if (!pair) pair = createKalshiRestPair(); return pair; };
@@ -57,9 +57,10 @@ function createSniperTrader({ gate, keyId, pem, limiter = null, request = null, 
 
   async function postQuote(rfq, quoteYes, tick) {
     mustBeLive('quote');
+    if (!(subaccount >= 1)) throw new LiveGateClosed('quote_no_subaccount');
     const noBid = noBidFor(quoteYes, tick);
     const yesBid = quoteYesBid(sizeSource(rfq), noBid);
-    const body = JSON.stringify(buildQuoteBody(rfq.rfqId, noBid, yesBid, false));
+    const body = JSON.stringify({ ...buildQuoteBody(rfq.rfqId, noBid, yesBid, false), subaccount });
     const { statusCode, text } = await sender.send(rfq.rfqId, rfq.createdTs, () => raw('POST', QUOTE_PATH, {
       body, quote: true, timeoutMs: QUOTE_TIMEOUT_MS,
       shouldRetryExpired: () => { const a = rfqAgeMs(rfq.createdTs, signedNow()); return a == null || a <= DEFAULT_MAX_RFQ_AGE_MS; },
@@ -88,7 +89,7 @@ function createSniperTrader({ gate, keyId, pem, limiter = null, request = null, 
     if (!orderId) return { book: [], contracts: 0, reason: 'no-order-id' };
     const out = []; let cursor = '';
     for (let page = 0; page < 10; page += 1) {
-      const qs = fillsQuery({ orderId, limit: 200, cursor });
+      const qs = fillsQuery({ orderId, limit: 200, cursor }) + (subaccount >= 1 ? `&subaccount=${subaccount}` : '');
       const res = await raw('GET', FILLS_PATH, { path: `${FILLS_PATH}?${qs}` });
       stats.fillReads += 1;
       if (!res || res.statusCode !== 200) throw new Error(`fills read ${res && res.statusCode}`);
