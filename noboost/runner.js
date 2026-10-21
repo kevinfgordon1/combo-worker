@@ -30,6 +30,7 @@ const { createTtlSet } = require('./ttl-set');
 const { createTdBook, isTdTicker } = require('./td-book');
 const { espnKickoffs, oddsKickoffs } = require('./kickoffs');
 const { createPmLiveBook } = require('./pm-live');
+const { createNoboostSniper, teeIngest } = require('./sniper-hook');
 const { createProphetXClient, hasProphetXCreds } = require('./prophetx-live');
 const { priceCombo } = require('./quote');
 const { pmFields } = require('./paper');
@@ -91,13 +92,18 @@ async function main(env = process.env) {
   // Extra TD venues for the Combo Sniper inverse (pm_inverse only), from the odds relay's /td.
   // NOBOOST_TD_VENUES=polymarket,novig. Unset = Kalshi only, exactly as before.
   const tdVenues = String(env.NOBOOST_TD_VENUES || '').toLowerCase().split(',').map((x) => x.trim()).filter((x) => x === 'polymarket' || x === 'novig');
-  const tdBook = tdOn ? createTdBook({
+  let tdBook = tdOn ? createTdBook({
     staleMs: Number(env.NOBOOST_TD_STALE_MS) || 15000,
     depthUsd: Number(env.NOBOOST_TD_DEPTH_USD) || 500,
     maxOverround: Number(env.NOBOOST_TD_MAX_OVERROUND) || 0.15,
     venues: tdVenues,
   }) : null;
   if (tdBook) book.setTdBook(tdBook);
+  // Auto-Sniper (DRY RUN, SNIPER_ENABLED=1): its own $1,000-depth copies of the TD / moneyline books.
+  const sniperOn = ['1', 'true', 'on', 'yes'].includes(String(env.SNIPER_ENABLED || '').toLowerCase());
+  const sniperDepth = Number(env.SNIPER_FAIR_DEPTH_USD) || 1000;
+  const tdBookS = sniperOn && tdOn ? createTdBook({ staleMs: Number(env.NOBOOST_TD_STALE_MS) || 15000, depthUsd: sniperDepth, maxOverround: Number(env.NOBOOST_TD_MAX_OVERROUND) || 0.15, venues: tdVenues }) : null;
+  if (tdBook && tdBookS) tdBook = teeIngest(tdBook, tdBookS, ['ingest', 'setNames', 'ingestVenue']);
   const logger = (l) => console.log(l);
   const primary = createNoBoostShadow({ book, env, log: logger, label: 'PRIMARY' });
   const lockcf = createNoBoostShadow({ book, env: { ...env, NOBOOST_GUARDRAIL: 'lock' }, log: logger, label: 'LOCKCF' });
@@ -110,9 +116,17 @@ async function main(env = process.env) {
   const pmOn = !['0', 'false', 'off', 'no'].includes(String(env.NOBOOST_PM_LIVE || '1').toLowerCase());
   const pmLive = pmOn ? createPmLiveBook({ staleMs: Number(env.NOBOOST_PM_STALE_MS) || 15000 }) : null;
   if (pmLive && tdBook) pmLive.setTdBook(tdBook);
+  const pmLiveS = sniperOn ? createPmLiveBook({ staleMs: Number(env.NOBOOST_PM_STALE_MS) || 15000, depthUsd: sniperDepth }) : null;
+  if (pmLiveS && tdBookS) pmLiveS.setTdBook(tdBookS);
+  const pmLiveFed = pmLive && pmLiveS ? teeIngest(pmLive, pmLiveS, ['ingestKalshiOrderbooks', 'ingestRelay', 'ingestProphetX']) : pmLive;
+  const snipe = sniperOn ? createNoboostSniper({ env, pmLive: pmLiveS, tdBook: tdBookS, log: (l) => console.log(l) }) : null;
+  if (snipe) {
+    snipe.checkTdFee();
+    console.log(`[SNIPER] ON (dryRun=${snipe.sniper.config.dryRun}) depth=$${sniperDepth} venues=${snipe.venues.join('+')} prophetx=${hasProphetXCreds(env) ? 'on' : 'off (no PROPHETX key)'} maxLegs=${snipe.sniper.config.maxLegs}`);
+  }
   const relayBase = env.NOBOOST_ODDS_RELAY_URL || (env.RAILWAY_SERVICE_ODDS_RELAY_URL ? `https://${env.RAILWAY_SERVICE_ODDS_RELAY_URL}` : '');
   const run = createPaperRun({
-    book, primary, lockcf, promo, pmLive, margin: primary.cfg.margin, runId,
+    book, primary, lockcf, promo, pmLive, snipe, margin: primary.cfg.margin, runId,
     persist: store.persist, persistStats: store.persistStats,
     samplePct: Number(env.NOBOOST_SAMPLE_PCT) || 2,
     graceMs: env.NOBOOST_MATCH_GRACE_MS != null && env.NOBOOST_MATCH_GRACE_MS !== '' ? Number(env.NOBOOST_MATCH_GRACE_MS) : 2000,
@@ -320,7 +334,7 @@ async function main(env = process.env) {
       for (let i = 0; i < kTickers.length; i += 100) {
         const chunk = kTickers.slice(i, i + 100);
         const j = await pubGet(`${P}/markets/orderbooks?${chunk.map((t) => `tickers=${encodeURIComponent(t)}`).join('&')}`);
-        pmLive.ingestKalshiOrderbooks(j.orderbooks || []);
+        pmLiveFed.ingestKalshiOrderbooks(j.orderbooks || []);
       }
     };
     const pmRelay = async () => {
@@ -336,7 +350,7 @@ async function main(env = process.env) {
         const nv = (h && h.novig) || {};
         const novigLive = /ws:up/.test(String(st.novig || '')) && Number(nv.lastWsMsgAt) > 0 && polledAt - Number(nv.lastWsMsgAt) < 15000;
         const feedLive = venue === 'polymarket' ? false : novigLive;
-        pmLive.ingestRelay(venue, j.quotes || [], { feedLive, polledAt });
+        pmLiveFed.ingestRelay(venue, j.quotes || [], { feedLive, polledAt });
       }
     };
     await guard(pmKalshi, 'pm_kalshi')(); await guard(pmRelay, 'pm_relay')();
@@ -344,7 +358,7 @@ async function main(env = process.env) {
     loop(pmRelay, 'pm_relay', Number(env.NOBOOST_PM_RELAY_POLL_MS) || 2000);
     if (hasProphetXCreds(env)) {
       const px = createProphetXClient({ env });
-      const pmPx = async () => { pmLive.ingestProphetX(await px.nflMoneylines()); };
+      const pmPx = async () => { pmLiveFed.ingestProphetX(await px.nflMoneylines()); };
       await guard(pmPx, 'pm_prophetx')();
       loop(pmPx, 'pm_prophetx', Number(env.NOBOOST_PM_PX_POLL_MS) || 5000);
     }

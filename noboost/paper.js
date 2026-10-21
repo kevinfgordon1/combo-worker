@@ -66,7 +66,7 @@ function bump(o, k, d = 1) { o[k] = (o[k] || 0) + d; }
 function hash100(s) { let h = 0; for (let i = 0; i < s.length; i += 1) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h % 100; }
 
 function createPaperRun({
-  book, primary, lockcf, promo = null, pmLive = null, now = () => Date.now(), persist = () => {}, persistStats = () => {},
+  book, primary, lockcf, promo = null, pmLive = null, snipe = null, now = () => Date.now(), persist = () => {}, persistStats = () => {},
   samplePct = 2, margin = null, runId = null,
   quoteTtlMs = null, graceMs = 2000, tradeLagMs = 15000, minPrintYes = 0.001, sizeTol = {},
 } = {}) {
@@ -113,6 +113,7 @@ function createPaperRun({
     const pr = (d1.priced && d1.priced.ok) ? d1.priced : (d2.priced && d2.priced.ok ? d2.priced : null);
     const cls = classifyNfl(rfq, 'kalshi', { td: !!(book && book.hasTd && book.hasTd()) });
     const pmF = pmFields(pmLive, cls);
+    if (snipe) { try { snipe.onRfq(rfq, cls, d1); } catch (_) { /* never break the paper run */ } }
     const rec = {
       run_id: runId,
       rfq_id: rfq.rfqId, market_ticker: rfq.marketTicker || null, legs: rfq.legKeys, n_legs: rfq.legKeys.length,
