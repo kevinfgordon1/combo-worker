@@ -1551,7 +1551,8 @@ async function onQuoteAccepted(evt) {
     }
     if (!pending) {
       // Never confirm the isolated sniper's quotes (same account, own key) — fail closed if unsure.
-      const sg = await sniperGuard.isSniperQuote(quoteId);
+      const sg = require('./sniper-guard').isNonPrimarySubaccount(evt && evt.raw)
+        ? { sniper: true } : await sniperGuard.isSniperQuote(quoteId);
       if (sg.sniper || sg.unknown) {
         console.warn(`[${MODE}] CONFIRM SKIPPED unknown quote is ${sg.sniper ? 'a sniper quote' : 'unverifiable (sniper_ledger read failed)'} quote_id=${quoteId} rfq_id=${rfqId}`);
         return;

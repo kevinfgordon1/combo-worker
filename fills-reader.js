@@ -195,7 +195,7 @@ async function poll() {
       if (!row.fill_id) continue;
       if (raw.ts && raw.ts > maxTs) maxTs = raw.ts;
       // Same Kalshi account as the isolated sniper: its fills are not Combo Locks fills.
-      if (row.is_combo && await sniperGuard.isSniperFill(row)) {
+      if (require('./sniper-guard').isNonPrimarySubaccount(raw) || (row.is_combo && await sniperGuard.isSniperFill({ ...row, raw }))) {
         console.log(`[${MODE}] skip sniper fill ${row.fill_id} order_id=${row.order_id} ticker=${row.ticker}`);
         continue;
       }

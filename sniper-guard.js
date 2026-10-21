@@ -26,6 +26,7 @@ function createSniperGuard({ supabase, ttlMs = 60_000, now = Date.now } = {}) {
     try { return { sniper: await lookup('quote_id', quoteId) }; } catch (e) { return { sniper: false, unknown: true, error: e.message }; }
   }
   async function isSniperFill(row) {
+    if (isNonPrimarySubaccount(row)) return true;
     try {
       if (row && row.order_id && await lookup('order_id', row.order_id)) return true;
       if (row && row.ticker && await lookup('market_ticker', row.ticker)) return true;
@@ -35,4 +36,13 @@ function createSniperGuard({ supabase, ttlMs = 60_000, now = Date.now } = {}) {
   return { isSniperQuote, isSniperFill };
 }
 
-module.exports = { createSniperGuard };
+// Kalshi fills carry subaccount_number (null/absent for primary). Combo Locks trade ONLY the
+// primary subaccount (0); the sniper trades a numbered subaccount (SNIPER_KALSHI_SUBACCOUNT >= 1).
+function isNonPrimarySubaccount(obj) {
+  if (!obj) return false;
+  const v = obj.subaccount_number ?? obj.subaccount ?? (obj.raw && (obj.raw.subaccount_number ?? obj.raw.subaccount));
+  const n = Number(v);
+  return v != null && v !== '' && Number.isFinite(n) && n > 0;
+}
+
+module.exports = { createSniperGuard, isNonPrimarySubaccount };
