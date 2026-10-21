@@ -42,6 +42,7 @@
 // bigger than the quote is a warning plus Telegram. COMBO_CAP_AT_CONFIRM
 // (default off) is what stops open quotes from reserving; these checks stay on.
 'use strict';
+const { createPolyFillScheduler, isPositionPush } = require('./poly-fill-scheduler');
 const { matchParlay } = require('./rfq');
 const { decideAtFill, isFreeBetRow, quoteFailureSkipReason, isRfqClosedFailure } = require('./engine');
 const { createLatencyStats } = require('./latency-stats');
@@ -2822,6 +2823,9 @@ function startPolymarketRfqLoop(ctx = {}) {
       } else if (id) {
         closedContext.drop(id);
       }
+    } else if (evt.type === 'other' && polyRole && isPositionPush(evt)) {
+      // Position changed: let the (debounced) fill check book it.
+      fillScheduler.trigger('position-push');
     } else if (evt.type === 'orderExecution') {
       const list = Array.isArray(evt.executions) && evt.executions.length
         ? evt.executions
@@ -2830,12 +2834,25 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
   }
 
+  const fillScheduler = createPolyFillScheduler({
+    safetyMs: ctx.fillSafetyMs != null ? ctx.fillSafetyMs : envIntLocal('POLY_FILL_SAFETY_MS', 5 * 60 * 1000),
+    downMs: ctx.fillDownMs != null ? ctx.fillDownMs : envIntLocal('POLY_FILL_WS_DOWN_MS', 60 * 1000),
+    minGapMs: ctx.fillMinGapMs != null ? ctx.fillMinGapMs : envIntLocal('POLY_FILL_MIN_GAP_MS', 15 * 1000),
+  });
+  let wsEverSubscribed = false;
   let ws = null;
   if (!ctx.http || ctx.startWs !== false) {
     ws = ctx.ws || createPolymarketRfqWs({
       keyId,
       secretKey,
-      onStatus: (s, i) => console.log(`[${MODE}] ws:${s}`, i && i.message ? i.message : (i && i.wait != null ? `wait=${i.wait}` : '')),
+      onStatus: (s, i) => {
+        console.log(`[${MODE}] ws:${s}`, i && i.message ? i.message : (i && i.wait != null ? `wait=${i.wait}` : ''));
+        // A reconnect may have missed order/position pushes: check REST once.
+        if (s === 'subscribed') {
+          if (wsEverSubscribed && polyRole) fillScheduler.trigger('ws-reconnect');
+          wsEverSubscribed = true;
+        }
+      },
       onEvent: onWsEvent,
       subscribeOrders: live,
       subscribePositions: live && polyRole,
@@ -2860,6 +2877,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       },
       onRecovered: (info) => {
         console.log(`[${MODE}] WS recovered after stall (stalls=${info.stalls})`);
+        if (polyRole) fillScheduler.trigger('ws-recovered');
         if (typeof ctx.onWsRecovered === 'function') {
           try { Promise.resolve(ctx.onWsRecovered(info)).catch(() => {}); } catch (_) { /* observability only */ }
         }
@@ -3015,13 +3033,17 @@ function startPolymarketRfqLoop(ctx = {}) {
   if (ctx.initialFillReconcile) {
     reconcileLockFills().catch((e) => console.error(`[${MODE}] initial fill reconcile`, e.message));
   }
-  const fillSafetyMs = ctx.fillSafetyMs != null ? ctx.fillSafetyMs : envIntLocal('POLY_FILL_SAFETY_MS', 5 * 60 * 1000);
-  let lastFillReconcileAt = 0;
   const fillReconcileTimer = setInterval(() => {
-    // poly-worker: fills arrive on the private WS (quote/order events). While
-    // it is healthy the REST fill check is only a 5-minute safety net.
-    if (polyRole && wsHealthy() && Date.now() - lastFillReconcileAt < fillSafetyMs) return;
-    lastFillReconcileAt = Date.now();
+    // poly-worker: fills arrive on the private WS (quote/order executions and
+    // position pushes). REST is a backstop only: 5 min while the socket is
+    // live, 60s while it is down, plus one prompt check after a reconnect or
+    // position push. See poly-fill-scheduler.js.
+    if (polyRole) {
+      const st = ws && typeof ws.stats === 'function' ? ws.stats() : null;
+      fillScheduler.tick(st, () => reconcileLockFills())
+        .catch((e) => console.error(`[${MODE}] fill reconcile`, e.message));
+      return;
+    }
     reconcileLockFills().catch((e) => console.error(`[${MODE}] fill reconcile`, e.message));
   }, fillReconcileMs);
   const ttlTimer = setInterval(() => {
