@@ -1,0 +1,26 @@
+# Fly app for the sniper service. Deploy: flyctl deploy . -c fly/sniper.toml
+# Secrets are set with `fly secrets` per app, never in this file.
+app = "kaygo-sniper"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "../Dockerfile"
+
+[processes]
+  app = "npm run start:sniper"
+
+[deploy]
+  # never rolling/bluegreen: no overlap of two copies
+  strategy = "immediate"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+
+# One machine. Stays dry-run until Kevin flips it.
+[env]
+  SNIPER_DRY_RUN = "1"
+  SNIPER_KALSHI_SUBACCOUNT = "1"
+  SNIPER_ODDS_RELAY_URL = "http://kaygo-odds-relay.internal:8787"

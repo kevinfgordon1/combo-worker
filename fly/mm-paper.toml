@@ -1,0 +1,21 @@
+# Fly app for the mm-paper service. Deploy: flyctl deploy . -c fly/mm-paper.toml
+# Secrets are set with `fly secrets` per app, never in this file.
+app = "kaygo-mm-paper"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "../Dockerfile"
+
+[processes]
+  app = "npm run start:mm-paper"
+
+[deploy]
+  # never rolling/bluegreen: no overlap of two copies
+  strategy = "immediate"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+

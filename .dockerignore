@@ -1,0 +1,12 @@
+node_modules
+.git
+.github
+.env
+.env.*
+*.jsonl
+*.log
+fly/
+docs/
+patches/
+migrations/
+sql/
