@@ -39,6 +39,7 @@ const { toNum: tapeNum, normalizeTrade, matchTapeTrades, formatLostAlert, should
 const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const sniperGuard = require('./sniper-guard').createSniperGuard({ supabase });
 const REST = process.env.KALSHI_REST_BASE || 'https://api.elections.kalshi.com/trade-api/v2';
 const LOST_AFTER_MS = 30000;         // no acceptance within this window → mark 'lost' (classify later)
 const TAPE_PAD_MS = 45000;           // RFQ close → public print delay
@@ -231,7 +232,8 @@ async function fetchFills() {
   const res = await fetch(`${REST}/portfolio/fills?limit=200`, { headers });
   if (!res.ok) throw new Error(`fills ${res.status}: ${await res.text()}`);
   const j = await res.json();
-  return j.fills || [];
+  // Combo Locks = primary subaccount only; the sniper's numbered subaccount is never Combo Locks.
+  return (j.fills || []).filter((f) => !require('./sniper-guard').isNonPrimarySubaccount(f));
 }
 
 // Confirm executed quotes against the real account fills (best-effort by order_id).
@@ -529,6 +531,8 @@ async function reconcileSelfQuotes() {
     const quotes = await fetchSelfQuotes();
     for (const qq of quotes) {
       const qid = qq.id || qq.quote_id; if (!qid) continue;
+      // Sniper quotes (numbered subaccount / sniper_ledger) are never Combo Locks outcomes.
+      if (require('./sniper-guard').isNonPrimarySubaccount(qq) || (await sniperGuard.isSniperQuote(qid)).sniper) continue;
       const st = qq.status;
       let outcome = null;                                        // only set on a terminal Kalshi status
       if (st === 'executed' || st === 'confirmed') outcome = 'executed';

@@ -99,7 +99,7 @@ function createLiveSniper({
         return { confirmed: false, reason: 'confirm_failed' };
       }
       stats.confirmed += 1;
-      alert(`✅ SNIPER quote ACCEPTED+confirmed rfq=${rfq.rfqId} ${n} @ YES ${d.quoteYes} (fair ${fresh.toFixed(4)}, ROI ${(e.roi * 100).toFixed(1)}%, risk $${e.risk.toFixed(2)})`);
+      alert(`🎯 SNIPER (not Combo Locks) — quote ACCEPTED+confirmed rfq=${rfq.rfqId} ${n} @ YES ${d.quoteYes} (fair ${fresh.toFixed(4)}, ROI ${(e.roi * 100).toFixed(1)}%, risk $${e.risk.toFixed(2)})`);
       return { confirmed: true };
     } finally { confirming.delete(quoteId); }
   }
@@ -107,6 +107,8 @@ function createLiveSniper({
   async function onExecuted(evt) {
     const quoteId = evt && evt.quoteId; const p = quoteId && pending.get(quoteId);
     if (!p) return { booked: false, reason: 'not_ours' };
+    // Record the order id first so Combo Locks' fill readers can recognize it as a sniper order.
+    if (evt.orderId) await store.update(p.d.rfqId, { order_id: evt.orderId });
     let book = null;
     for (let i = 0; i < fillRetries; i += 1) {
       try { book = await trader.fillsForOrder(evt.orderId); } catch (e) { log(`[SNIPER] fills read failed: ${e.message}`); }
@@ -115,7 +117,7 @@ function createLiveSniper({
     }
     if (!book || book.reason !== 'confirmed') {
       await store.update(p.d.rfqId, { order_id: evt.orderId || null });
-      alert(`⚠️ SNIPER executed but fills not yet visible rfq=${p.rfq.rfqId} order=${evt.orderId} — exposure stays reserved`);
+      alert(`🎯 SNIPER (not Combo Locks) ⚠️ executed but fills not yet visible rfq=${p.rfq.rfqId} order=${evt.orderId} — exposure stays reserved`);
       return { booked: false, reason: book ? book.reason : 'fills_unreadable' };
     }
     const cost = book.book.reduce((s, r) => s + r.count * (Number(r.no_price) || 0), 0);
@@ -126,7 +128,7 @@ function createLiveSniper({
       fill_ids: book.book.map((r) => r.fill_id), market_ticker: p.rfq.marketTicker || (book.book[0] && book.book[0].ticker) || null,
     });
     stats.fills += 1; pending.delete(quoteId); byRfq.delete(p.rfq.rfqId);
-    alert(`💰 SNIPER FILL rfq=${p.rfq.rfqId} ${book.contracts} NO @ avg ${(cost / book.contracts).toFixed(3)} cost $${cost.toFixed(2)} fee $${fee.toFixed(2)} ticker=${p.rfq.marketTicker || '?'}`);
+    alert(`🎯 SNIPER (not Combo Locks) — FILL rfq=${p.rfq.rfqId} ${book.contracts} NO @ avg ${(cost / book.contracts).toFixed(3)} cost $${cost.toFixed(2)} fee $${fee.toFixed(2)} ticker=${p.rfq.marketTicker || '?'}`);
     return { booked: true, contracts: book.contracts };
   }
 
@@ -145,7 +147,7 @@ function createLiveSniper({
     const day = await store.dayRealized(dayStartIso);
     if (!halted && -day >= config.dailyLossCap) {
       halted = true; onHalt('daily_loss');
-      alert(`🛑 SNIPER AUTO-DISABLED: realized loss today $${(-day).toFixed(2)} ≥ $${config.dailyLossCap} daily stop. No new quotes until next ET day + restart.`);
+      alert(`🎯 SNIPER (not Combo Locks) 🛑 AUTO-DISABLED: realized loss today $${(-day).toFixed(2)} ≥ $${config.dailyLossCap} daily stop. No new quotes until next ET day + restart.`);
     }
     return day;
   }

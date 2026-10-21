@@ -9,13 +9,13 @@ const S = require('../auto-sniper');
 
 const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
 const PEM = privateKey.export({ type: 'pkcs8', format: 'pem' });
-const ALL = { SNIPER_ENABLED: '1', SNIPER_DRY_RUN: '0', SNIPER_LIVE_CONFIRM: LIVE_CONFIRM_TOKEN, SNIPER_KALSHI_KEY_ID: 'k', SNIPER_KALSHI_PRIVATE_KEY: PEM };
+const ALL = { SNIPER_ENABLED: '1', SNIPER_DRY_RUN: '0', SNIPER_LIVE_CONFIRM: LIVE_CONFIRM_TOKEN, SNIPER_KALSHI_KEY_ID: 'k', SNIPER_KALSHI_PRIVATE_KEY: PEM, SNIPER_KALSHI_SUBACCOUNT: '7' };
 
 (async () => {
   // ── gates: live only when every gate is set ──
   assert.strictEqual(liveGate(ALL).live, true);
   for (const [k, bad] of [['SNIPER_ENABLED', '0'], ['SNIPER_ENABLED', undefined], ['SNIPER_DRY_RUN', undefined], ['SNIPER_DRY_RUN', '1'], ['SNIPER_DRY_RUN', 'false'],
-    ['SNIPER_LIVE_CONFIRM', undefined], ['SNIPER_LIVE_CONFIRM', 'yes'], ['SNIPER_KALSHI_KEY_ID', undefined], ['SNIPER_KALSHI_PRIVATE_KEY', '']]) {
+    ['SNIPER_LIVE_CONFIRM', undefined], ['SNIPER_LIVE_CONFIRM', 'yes'], ['SNIPER_KALSHI_KEY_ID', undefined], ['SNIPER_KALSHI_PRIVATE_KEY', ''], ['SNIPER_KALSHI_SUBACCOUNT', undefined], ['SNIPER_KALSHI_SUBACCOUNT', '0'], ['SNIPER_KALSHI_SUBACCOUNT', '64']]) {
     const env = { ...ALL, [k]: bad }; if (bad === undefined) delete env[k];
     assert.strictEqual(liveGate(env).live, false, `${k}=${bad} must keep dry run`);
   }
@@ -33,7 +33,7 @@ const ALL = { SNIPER_ENABLED: '1', SNIPER_DRY_RUN: '0', SNIPER_LIVE_CONFIRM: LIV
 
   // ── live trader: same Kalshi calls as combo-worker ──
   const sent = [];
-  const t = createSniperTrader({ gate: liveGate(ALL), keyId: 'k', pem: PEM, log: () => {}, request: async (req) => {
+  const t = createSniperTrader({ gate: liveGate(ALL), keyId: 'k', pem: PEM, subaccount: 7, log: () => {}, request: async (req) => {
     sent.push(req);
     if (req.method === 'POST') return { statusCode: 201, headers: {}, text: '{"id":"Q1"}' };
     if (req.method === 'PUT') return { statusCode: 200, headers: {}, text: '{}' };
@@ -43,12 +43,16 @@ const ALL = { SNIPER_ENABLED: '1', SNIPER_DRY_RUN: '0', SNIPER_LIVE_CONFIRM: LIV
   const q = await t.postQuote({ rfqId: 'R1', contracts: 20, createdTs: Date.now() }, 0.581, 0.001);
   assert.strictEqual(q.quoteId, 'Q1'); assert.strictEqual(q.noBid, '0.419'); assert.strictEqual(q.yesBid, '0.00');
   assert.strictEqual(sent[0].path, '/trade-api/v2/communications/quotes');
-  assert.deepStrictEqual(JSON.parse(sent[0].body), { rfq_id: 'R1', yes_bid: '0.00', no_bid: '0.419', rest_remainder: false });
+  assert.deepStrictEqual(JSON.parse(sent[0].body), { rfq_id: 'R1', yes_bid: '0.00', no_bid: '0.419', rest_remainder: false, subaccount: 7 });
   assert.ok(sent[0].headers['KALSHI-ACCESS-SIGNATURE'] || sent[0].headers['kalshi-access-signature']);
   await t.confirm('R1', 'Q1');
   assert.strictEqual(sent[1].method, 'PUT'); assert.strictEqual(sent[1].path, '/trade-api/v2/communications/rfqs/R1/quotes/Q1/confirm'); assert.strictEqual(sent[1].body, '{}');
   assert.strictEqual((await t.cancel('Q1')).statusCode, 404);
   const fb = await t.fillsForOrder('O1'); assert.strictEqual(fb.reason, 'confirmed'); assert.strictEqual(fb.contracts, 20);
+  assert.ok(/subaccount=7/.test(sent[3].path), 'fills read scoped to the sniper subaccount');
+  // a trader without a subaccount refuses to quote even with the gate open
+  const t0 = createSniperTrader({ gate: { live: true }, keyId: 'k', pem: PEM, request: async () => { throw new Error('network'); }, log: () => {} });
+  await assert.rejects(t0.postQuote({ rfqId: 'r', contracts: 1, createdTs: Date.now() }, 0.6, 0.001), /quote_no_subaccount/);
   assert.strictEqual(noBidFor(0.6, 0.01), '0.40'); assert.strictEqual(noBidFor(0.5815, 0.001), '0.418');
 
   // ── coordination: Combo Locks priority, fail closed ──
@@ -86,9 +90,10 @@ const ALL = { SNIPER_ENABLED: '1', SNIPER_DRY_RUN: '0', SNIPER_LIVE_CONFIRM: LIV
   assert.deepStrictEqual(await r.L.send(rfq, d), { sent: true, quoteId: 'Q1' });
   assert.strictEqual((await r.L.onAccepted({ quoteId: 'Q1', rfqId: 'R1', acceptedSide: 'no', contractsAccepted: 20 })).confirmed, true);
   assert.deepStrictEqual(r.calls, ['post', 'confirm']);
-  assert.ok(r.alerts.some((m) => /ACCEPTED/.test(m)));
+  assert.ok(r.alerts.some((m) => /^🎯 SNIPER \(not Combo Locks\).*ACCEPTED/.test(m)));
   assert.strictEqual((await r.L.onExecuted({ quoteId: 'Q1', orderId: 'O1' })).booked, true);
-  assert.ok(r.alerts.some((m) => /FILL/.test(m)));
+  assert.ok(r.alerts.some((m) => /^🎯 SNIPER \(not Combo Locks\).*FILL/.test(m)));
+  assert.ok(r.ledgerOps.some((o) => o[0] === 'update' && o[2].order_id === 'O1' && !o[2].phase), 'order id recorded before fills lookup');
   const up = r.ledgerOps.find((o) => o[0] === 'update' && o[2].phase === 'filled'); assert.strictEqual(up[2].filled_contracts, 20);
   const original = createLiveSniper; void original;
   await r.L.settleOnce(async () => 'yes', '2026-10-21T04:00:00Z');

@@ -53,6 +53,7 @@ const liveUsers = createLiveUserGate({ env: process.env, scope: SCOPE, log: (m) 
 const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const sniperGuard = require('./sniper-guard').createSniperGuard({ supabase });
 const { createTelegramGate } = require('./tg-gate');
 const POLL_MS = parseInt(process.env.FILLS_POLL_MS || '20000', 10);
 const LOOKBACK = parseInt(process.env.FILLS_LOOKBACK_SEC || '86400', 10);
@@ -193,6 +194,11 @@ async function poll() {
       const row = normalizeFill(raw);
       if (!row.fill_id) continue;
       if (raw.ts && raw.ts > maxTs) maxTs = raw.ts;
+      // Same Kalshi account as the isolated sniper: its fills are not Combo Locks fills.
+      if (require('./sniper-guard').isNonPrimarySubaccount(raw) || (row.is_combo && await sniperGuard.isSniperFill({ ...row, raw }))) {
+        console.log(`[${MODE}] skip sniper fill ${row.fill_id} order_id=${row.order_id} ticker=${row.ticker}`);
+        continue;
+      }
 
       let attr = null;
       if (row.is_combo && !row.is_taker) {

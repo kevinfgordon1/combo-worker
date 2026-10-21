@@ -66,7 +66,8 @@ async function fetchFillEndpoint(signPath, { minTs, orderId, allowNotFound, keyI
     let body;
     try { body = JSON.parse(res.text || '{}'); }
     catch (e) { return { ok: false, error: e.message }; }
-    return { ok: true, fills: body.fills || [], cursor: body.cursor || '' };
+    // Combo Locks = primary subaccount only (sniper trades a numbered subaccount).
+    return { ok: true, fills: (body.fills || []).filter((f) => !require('../sniper-guard').isNonPrimarySubaccount(f)), cursor: body.cursor || '' };
   });
 }
 
