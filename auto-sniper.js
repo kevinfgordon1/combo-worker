@@ -95,11 +95,12 @@ function minQuotePrice({ fair, contracts, cash, makerRate, minRoi, tick = 0.01 }
 function legKey(leg) {
   return `${String(leg.ticker || leg.symbol || '').toUpperCase()}:${String(leg.side || 'yes').toLowerCase()}`;
 }
-// KXNFLGAME-26OCT25BUFNYJ-BUF → KXNFLGAME-26OCT25BUFNYJ
+// Game = date+teams blob shared by every market on that game:
+// KXNFLGAME-26OCT25BUFNYJ-BUF and KXNFLTD-26OCT25BUFNYJ-BUFJCOOK4-1 → 26OCT25BUFNYJ
 function gameKey(leg) {
   const t = String(leg.ticker || leg.symbol || '').toUpperCase();
-  const i = t.lastIndexOf('-');
-  return i > 0 ? t.slice(0, i) : t;
+  const parts = t.split('-');
+  return parts.length >= 3 ? parts[1] : t;
 }
 function independentGames(legs) {
   const g = legs.map(gameKey);
