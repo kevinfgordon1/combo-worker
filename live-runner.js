@@ -2052,9 +2052,9 @@ async function bookConfirmedKalshiFills(pending, evt) {
   // Only fills on this lock's own market belong to it (an order_id that maps
   // to another lock's market must not book or stamp this quote).
   const lockRow = pending && pending.parlayId ? (parlays || []).find((x) => x && x.id === pending.parlayId) : null;
-  if (lockRow && lockRow.combo_ticker) {
+  if (lockRow && /^KX/i.test(String(lockRow.combo_ticker || ''))) {
     const before = apiFills.length;
-    apiFills = apiFills.filter((f) => !(f && (f.ticker || f.market_ticker)) || String(f.ticker || f.market_ticker) === String(lockRow.combo_ticker));
+    apiFills = apiFills.filter((f) => !(f && (f.ticker || f.market_ticker)) || !/^KX/i.test(String(f.ticker || f.market_ticker)) || String(f.ticker || f.market_ticker) === String(lockRow.combo_ticker));
     if (apiFills.length < before) console.log(`[${MODE}] dropped ${before - apiFills.length} fill(s) on another market for order_id=${orderId} lock=${pending.parlayId}`);
   }
   const booked = bookFromQuoteExecution({ orderId, fills: apiFills });
