@@ -120,6 +120,7 @@ async function main(env = process.env) {
     await books(mlTickers, (o) => pmLive.ingestKalshiOrderbooks(o)); health.ml = Date.now();
     await books(tdTickers, (o) => tdBook.ingest(o, Object.fromEntries([...kick].filter(([t]) => t.startsWith('KXNFLTD'))))); health.td = Date.now();
   }
+  const relayErr = {}; const tdOff = new Map();
   async function pollRelay() {
     if (!relayBase) return;
     const h = await getJson(lim.relay, `${relayBase}/health`);
@@ -127,11 +128,23 @@ async function main(env = process.env) {
     for (const venue of ['polymarket', 'novig']) {
       if (!venues.includes(venue)) continue;
       const polledAt = Date.now();
-      const j = await getJson(lim.relay, `${relayBase}/board?venue=${venue}&league=NFL`);
-      const novigLive = /ws:up/.test(String(st.novig || '')) && Number(nv.lastWsMsgAt) > 0 && polledAt - Number(nv.lastWsMsgAt) < 15000;
-      pmLive.ingestRelay(venue, j.quotes || [], { feedLive: venue === 'novig' ? novigLive : false, polledAt });
-      const t = await getJson(lim.relay, `${relayBase}/td?venue=${venue}&league=NFL`);
-      tdBook.ingestVenue(venue, t.markets || [], { polledAt });
+      // Each venue/feed independently: one feed being off (e.g. relay td_off → 503) must not
+      // starve the others (it used to skip Novig entirely when Polymarket TD was off).
+      try {
+        const j = await getJson(lim.relay, `${relayBase}/board?venue=${venue}&league=NFL`);
+        const novigLive = /ws:up/.test(String(st.novig || '')) && Number(nv.lastWsMsgAt) > 0 && polledAt - Number(nv.lastWsMsgAt) < 15000;
+        pmLive.ingestRelay(venue, j.quotes || [], { feedLive: venue === 'novig' ? novigLive : false, polledAt });
+      } catch (e) { if (/disabled/.test(e.message)) throw e; relayErr[`${venue}_board`] = (relayErr[`${venue}_board`] || 0) + 1; }
+      if (tdOff.has(venue) && Date.now() - tdOff.get(venue) < 10 * 60 * 1000) continue; // relay says td_off: re-check every 10 min
+      try {
+        const t = await getJson(lim.relay, `${relayBase}/td?venue=${venue}&league=NFL`);
+        tdOff.delete(venue);
+        tdBook.ingestVenue(venue, t.markets || [], { polledAt });
+      } catch (e) {
+        if (/disabled/.test(e.message)) throw e;
+        if (/HTTP 503/.test(e.message)) tdOff.set(venue, Date.now());
+        relayErr[`${venue}_td`] = (relayErr[`${venue}_td`] || 0) + 1;
+      }
     }
     health.relay = Date.now();
   }
@@ -245,7 +258,7 @@ async function main(env = process.env) {
     const t = ledger.totals();
     const s = Object.entries(counts.skips).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, v]) => `${k}=${v}`).join(' ');
     const ls = Object.values(lim).map((l) => { const x = l.stats(); return `${x.name}:${x.requests}req/${x.r429}x429`; }).join(' ');
-    log(`[SNIPER] summary mode=${gate.live ? 'LIVE' : 'dry'}${liveSniper.halted() ? ' HALTED' : ''} live=${JSON.stringify(liveSniper.stats())} trade=${JSON.stringify(trader.stats())} locks=${JSON.stringify(coord.stats())} rfqs=${counts.rfqs} would_quote=${counts.quotes} open=$${t.total.toFixed(2)} positions=${ledger.positions.size} dayRisk=$${ledger.day.risk.toFixed(2)} breaker429=${breaker.count()} ${disabled ? 'DISABLED' : ''} load: ${ls} skips: ${s || 'none'}`);
+    log(`[SNIPER] summary mode=${gate.live ? 'LIVE' : 'dry'}${liveSniper.halted() ? ' HALTED' : ''} live=${JSON.stringify(liveSniper.stats())} trade=${JSON.stringify(trader.stats())} locks=${JSON.stringify(coord.stats())} rfqs=${counts.rfqs} would_quote=${counts.quotes} open=$${t.total.toFixed(2)} positions=${ledger.positions.size} dayRisk=$${ledger.day.risk.toFixed(2)} breaker429=${breaker.count()} relayErr=${JSON.stringify(relayErr)} tdOff=${[...tdOff.keys()].join(',') || 'none'} ${disabled ? 'DISABLED' : ''} load: ${ls} skips: ${s || 'none'}`);
     store.decision({ rfq_id: null, action: 'summary', reason: null, details: { counts, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
     counts.rfqs = 0; counts.quotes = 0; counts.skips = {};
   }, 60000);
