@@ -96,11 +96,16 @@ const QUOTE_AFTER_FILL_SKEW_MS = 2000;
 // A lock with a known combo_ticker can only own fills on that exact market.
 function parlayTickerConflicts(parlay, ticker) {
   if (!parlay || !parlay.combo_ticker || !ticker) return false;
+  // Only compare Kalshi to Kalshi. A lock may store a Polymarket slug (caoc-…)
+  // as combo_ticker while its Kalshi fills carry KXMVE… tickers.
+  if (!isKalshiTicker(parlay.combo_ticker) || !isKalshiTicker(ticker)) return false;
   return String(parlay.combo_ticker) !== String(ticker);
 }
 
+function isKalshiTicker(t) { return /^KX/i.test(String(t || '')); }
+
 function parlaysByComboTicker(parlays, ticker) {
-  if (!ticker || !Array.isArray(parlays)) return [];
+  if (!ticker || !isKalshiTicker(ticker) || !Array.isArray(parlays)) return [];
   return parlays.filter((p) => p && p.combo_ticker && String(p.combo_ticker) === String(ticker));
 }
 

@@ -25,4 +25,8 @@ assert.strictEqual(A.canStampSubmission(subs[0], fill, 'cel'), true);
 assert.strictEqual(A.submissionFilledPatch(fill, { filledContracts: 7 }).filled_contracts, 7);
 // Unknown combo_ticker locks still attribute as before (shard tickers).
 assert.strictEqual(A.parlayTickerConflicts({ id: 'x' }, fill.ticker), false);
+// Lock storing a Polymarket slug still owns its Kalshi fills.
+const POLYLOCK = { id: 'pl', combo_ticker: 'caoc-d0f39fbb8444abd5', mve_collection: 'KXMVESPORTSMULTIGAMEEXTENDED-R', active: true, fill_american: 325 };
+assert.strictEqual(A.parlayTickerConflicts(POLYLOCK, 'KXMVECROSSCATEGORY0-S2026E57DF40B830-4AD83C37EE0'), false);
+assert.strictEqual(A.attributeParlay('KXMVECROSSCATEGORY0-S2026E57DF40B830-4AD83C37EE0', { no_price: 0.758 }, [POLYLOCK]).id, 'pl');
 console.log('fill-attribution tests ok');
