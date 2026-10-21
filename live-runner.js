@@ -2049,6 +2049,14 @@ async function bookConfirmedKalshiFills(pending, evt) {
     console.error(`[${MODE}] quote_executed fill confirm failed`, e.message);
     return { contracts: 0, newContracts: 0, reason: 'confirm-failed', partial: false };
   }
+  // Only fills on this lock's own market belong to it (an order_id that maps
+  // to another lock's market must not book or stamp this quote).
+  const lockRow = pending && pending.parlayId ? (parlays || []).find((x) => x && x.id === pending.parlayId) : null;
+  if (lockRow && lockRow.combo_ticker) {
+    const before = apiFills.length;
+    apiFills = apiFills.filter((f) => !(f && (f.ticker || f.market_ticker)) || String(f.ticker || f.market_ticker) === String(lockRow.combo_ticker));
+    if (apiFills.length < before) console.log(`[${MODE}] dropped ${before - apiFills.length} fill(s) on another market for order_id=${orderId} lock=${pending.parlayId}`);
+  }
   const booked = bookFromQuoteExecution({ orderId, fills: apiFills });
   if (booked.reason !== 'confirmed') {
     return { contracts: 0, newContracts: 0, reason: booked.reason, partial: false };
@@ -2082,9 +2090,13 @@ async function bookConfirmedKalshiFills(pending, evt) {
   const partial = Number.isFinite(quoted) && quoted > 0 && booked.contracts + 1e-9 < quoted;
   if (quoteId && booked.contracts > 0) {
     try {
-      const patch = { status: 'filled', order_id: orderId, is_live: true };
+      const patch = { status: 'filled', order_id: orderId, is_live: true, filled_contracts: Math.round(booked.contracts * 100) / 100 };
       if (evt.marketTicker) patch.market_ticker = evt.marketTicker;
-      const { error } = await supabase.from('combo_submissions').update(patch).eq('quote_id', quoteId);
+      let { error } = await supabase.from('combo_submissions').update(patch).eq('quote_id', quoteId);
+      if (error && /filled_contracts/.test(error.message || '')) {
+        delete patch.filled_contracts;
+        ({ error } = await supabase.from('combo_submissions').update(patch).eq('quote_id', quoteId));
+      }
       if (error) console.error(`[${MODE}] stamp confirmed fill failed`, error.message);
     } catch (e) {
       console.error(`[${MODE}] stamp confirmed fill failed`, e.message);

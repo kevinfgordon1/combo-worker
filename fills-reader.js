@@ -133,11 +133,20 @@ async function findExistingFill(fillId) {
 async function stampSubmissionFilled(attr, fill) {
   if (!attr || !fill) return;
   const sub = attr.submission;
-  if (!canStampSubmission(sub, fill)) return;
-  const { error } = await supabase
-    .from('combo_submissions')
-    .update(submissionFilledPatch(fill))
-    .eq('id', sub.id);
+  if (!canStampSubmission(sub, fill, attr.parlay && attr.parlay.id)) return;
+  let filledContracts = null;
+  if (fill.order_id) {
+    const rows = await loadFillsByOrderId(fill.order_id);
+    const sum = rows.filter((r) => r && r.count != null && !(r.raw && r.raw.source === 'live-runner'))
+      .reduce((a, r) => a + Number(r.count || 0), 0);
+    filledContracts = Math.max(sum, Number(fill.count) || 0);
+  }
+  const patch = submissionFilledPatch(fill, { filledContracts });
+  let { error } = await supabase.from('combo_submissions').update(patch).eq('id', sub.id);
+  if (error && /filled_contracts/.test(error.message || '')) {
+    delete patch.filled_contracts;
+    ({ error } = await supabase.from('combo_submissions').update(patch).eq('id', sub.id));
+  }
   if (error) console.error(`[${MODE}] stamp submission failed`, error.message);
 }
 
@@ -209,10 +218,17 @@ async function poll() {
           existingFills,
         });
       }
-      const parlay = attr && attr.parlay ? attr.parlay : null;
+      let parlay = attr && attr.parlay ? attr.parlay : null;
+      const existing = await findExistingFill(row.fill_id);
+      // A fill already booked on a lock (e.g. by the quote's own order_id) keeps
+      // that lock. Never stamp another lock's quote with it.
+      if (existing && existing.parlay_id && (!parlay || parlay.id !== existing.parlay_id)) {
+        if (parlay) console.log(`[${MODE}] keep ${row.fill_id} on ${existing.parlay_id} (attribution said ${parlay.id})`);
+        parlay = activeParlays.find((p) => p && p.id === existing.parlay_id) || { id: existing.parlay_id };
+        attr = { parlay, submission: (submissions || []).find((s) => s && s.order_id && s.order_id === row.order_id && s.parlay_id === existing.parlay_id) || null, reason: 'existing' };
+      }
       row.parlay_id = parlay ? parlay.id : null;
 
-      const existing = await findExistingFill(row.fill_id);
       if (!existing) {
         // A tester's account fills belong to that tester even when unattributed.
         const { error } = await supabase.from('combo_fills').insert(SCOPE.writeUserId ? { ...row, user_id: SCOPE.writeUserId } : row);

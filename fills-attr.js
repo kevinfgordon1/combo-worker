@@ -35,6 +35,10 @@ function noBidMatchesFill(fillNoPrice, fillAmerican) {
 // Best-effort only. Never guess when more than one parlay still fits.
 function attributeParlay(ticker, fill, parlays) {
   if (!Array.isArray(parlays) || !parlays.length) return null;
+  const exact = parlaysByComboTicker(parlays, ticker);
+  if (exact.length === 1) return exact[0];
+  parlays = parlays.filter((p) => !parlayTickerConflicts(p, ticker));
+  if (!parlays.length) return null;
   const collectionHits = parlays.filter((p) => tickerMatchesCollection(ticker, p.mve_collection));
   if (collectionHits.length === 1) return collectionHits[0];
 
@@ -85,6 +89,21 @@ function contractsCoverFill(subContracts, fillCount) {
   return have + 1e-9 >= need * PARTIAL_FILL_RATIO;
 }
 
+// A quote cannot produce a fill that happened before it was posted. Small
+// clock skew allowance only.
+const QUOTE_AFTER_FILL_SKEW_MS = 2000;
+
+// A lock with a known combo_ticker can only own fills on that exact market.
+function parlayTickerConflicts(parlay, ticker) {
+  if (!parlay || !parlay.combo_ticker || !ticker) return false;
+  return String(parlay.combo_ticker) !== String(ticker);
+}
+
+function parlaysByComboTicker(parlays, ticker) {
+  if (!ticker || !Array.isArray(parlays)) return [];
+  return parlays.filter((p) => p && p.combo_ticker && String(p.combo_ticker) === String(ticker));
+}
+
 function parlayById(parlays, id) {
   if (!id || !Array.isArray(parlays)) return null;
   return parlays.find((p) => p && p.id === id) || null;
@@ -98,7 +117,7 @@ function attributeFromSubmissions(fill, submissions, parlays = []) {
   if (fill.order_id) {
     const byOrder = submissions.filter((s) => s && s.order_id && s.order_id === fill.order_id);
     const ids = uniqueParlayIds(byOrder);
-    if (ids.length === 1) {
+    if (ids.length === 1 && !parlayTickerConflicts(parlayById(parlays, ids[0]), fill.ticker)) {
       return {
         parlay: parlayById(parlays, ids[0]) || { id: ids[0] },
         submission: byOrder[0],
@@ -114,7 +133,8 @@ function attributeFromSubmissions(fill, submissions, parlays = []) {
     if (!isQuoteCandidate(s)) return false;
     const t = tsMs(s.created_at);
     if (!t) return false;
-    if (t < fillTs - QUOTE_WINDOW_BEFORE_MS || t > fillTs + QUOTE_WINDOW_AFTER_MS) return false;
+    if (t < fillTs - QUOTE_WINDOW_BEFORE_MS || t > fillTs + Math.min(QUOTE_WINDOW_AFTER_MS, QUOTE_AFTER_FILL_SKEW_MS)) return false;
+    if (parlayTickerConflicts(parlayById(parlays, s.parlay_id), fill.ticker)) return false;
     return contractsCoverFill(s.contracts, fill.count);
   });
   const ids = uniqueParlayIds(windowed);
@@ -150,6 +170,12 @@ function attributeFromExistingFills(fill, existingFills, parlays = []) {
 // Collection / no_bid first (unchanged). Quote/order rows recover shard
 // tickers and the case where several locks share a no_bid.
 function attributeComboFill(ticker, fill, parlays, extras = {}) {
+  const exact = parlaysByComboTicker(parlays, ticker || (fill && fill.ticker));
+  if (exact.length === 1) {
+    const stamp = attributeFromSubmissions({ ...fill, ticker: ticker || fill.ticker }, extras.submissions, parlays);
+    const submission = stamp && stamp.parlay && stamp.parlay.id === exact[0].id ? stamp.submission : null;
+    return { parlay: exact[0], submission, reason: 'combo_ticker' };
+  }
   const fromOrder = attributeFromSubmissions(fill, extras.submissions, parlays);
   if (fromOrder && fromOrder.reason === 'order_id') return fromOrder;
 
@@ -170,15 +196,23 @@ function attributeComboFill(ticker, fill, parlays, extras = {}) {
 
 function submissionFilledPatch(fill, extra = {}) {
   const orderId = (fill && fill.order_id) || extra.orderId || null;
-  return {
+  const patch = {
     status: 'filled',
     order_id: orderId,
     is_live: true,
   };
+  // Actual confirmed size for this order (partials add); quoted size stays in contracts.
+  const n = Number(extra.filledContracts != null ? extra.filledContracts : (fill && fill.count));
+  if (Number.isFinite(n) && n > 0) patch.filled_contracts = Math.round(n * 100) / 100;
+  return patch;
 }
 
-function canStampSubmission(sub, fill) {
+function canStampSubmission(sub, fill, parlayId) {
   if (!sub || !sub.id) return false;
+  if (parlayId && sub.parlay_id && String(sub.parlay_id) !== String(parlayId)) return false;
+  const subTs = tsMs(sub.created_at);
+  const fillTs = tsMs(fill && (fill.kalshi_created_time || fill.created_time));
+  if (subTs && fillTs && subTs > fillTs + QUOTE_AFTER_FILL_SKEW_MS) return false;
   const st = String(sub.status || '').toLowerCase();
   if (st === 'shadow') return false;
   if (sub.order_id && fill && fill.order_id && sub.order_id !== fill.order_id) return false;
@@ -430,6 +464,8 @@ module.exports = {
   findPendingFill,
   submissionAlreadyFilled,
   existingFillNeedsParlay,
+  parlayTickerConflicts,
+  parlaysByComboTicker,
   isLiveRunnerTwin,
   isQuoteExecutionStub,
   countsTowardCap,
