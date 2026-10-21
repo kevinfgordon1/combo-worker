@@ -178,6 +178,7 @@ const {
   applyRefreshKillByUser,
   applyRefreshFilledByParlay,
 } = require('./refresh-state');
+const { confirmedFullFill } = require('./full-fill');
 const { liveRunnerFillRow, resolveFillLookup, findPendingFill, submissionAlreadyFilled, claimFillKey, isKalshiTradeFill, countsTowardCap } = require('./fills-attr');
 const { bookFromQuoteExecution, fillsQuery, fillReferencesOrder } = require('./kalshi-fill-confirm');
 const { findPolyEconomicTwin } = require('./polymarket-fill-reconcile');
@@ -2326,7 +2327,21 @@ async function onQuoteExecuted(evt) {
     ? Number(parlay.max_contracts)
     : (pending.maxContracts > 0 ? Number(pending.maxContracts) : null);
   const filledNow = filledSoFarFor(pending.parlayId);
-  const fullyFilled = isCapExhausted(ceiling, filledNow);
+  // In-memory count may include sizes from the quote event (offered/accepted),
+  // not just confirmed fills. Only confirmed combo_fills rows may deactivate.
+  let fullyFilled = false;
+  let confirmedFilled = null;
+  if (isCapExhausted(ceiling, filledNow)) {
+    const gate = await confirmedFullFill({ supabase, parlayId: pending.parlayId, ceiling });
+    fullyFilled = gate.full;
+    confirmedFilled = gate.confirmed;
+    if (!gate.full) {
+      console.log(
+        `[${MODE}] FULL-FILL HOLD ${pending.label} memory=${filledNow}/${ceiling} ` +
+        `confirmed=${gate.confirmed == null ? '?' : gate.confirmed} (${gate.reason}) — staying active`
+      );
+    }
+  }
 
   // Full hedge → stop matching this parlay. Combo Locks still lists it; combo_fills moves it to Filled.
   if (fullyFilled) {
@@ -2339,12 +2354,12 @@ async function onQuoteExecuted(evt) {
       else {
         parlays = parlays.filter((x) => x.id !== pending.parlayId);
         delete staged[pending.parlayId];
-        console.log(`[${MODE}] FULL FILL — deactivated ${pending.label} (${sessionTotal}/${ceiling})`);
+        console.log(`[${MODE}] FULL FILL — deactivated ${pending.label} (confirmed ${confirmedFilled}/${ceiling}, session ${sessionTotal})`);
       }
     } catch (e) {
       console.error(`[${MODE}] deactivate error`, e.message);
     }
-    cancelCapLeftovers(pending.parlayId, { filled: filledNow, max: ceiling }).catch((e) => {
+    cancelCapLeftovers(pending.parlayId, { filled: confirmedFilled, max: ceiling }).catch((e) => {
       console.error(`[${MODE}] cancel leftover`, e.message);
     });
   }
