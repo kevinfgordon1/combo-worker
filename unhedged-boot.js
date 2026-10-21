@@ -5,7 +5,18 @@
 // Paper/shadow only. UNHEDGED_RFQ_LIVE stays off. No Combo Lock quote
 // POST/confirm. Own Kalshi /markets cache + Poly last-trade fill lookup.
 'use strict';
-const { matchParlay } = require('./rfq');
+const { matchParlay, canonicalizeLegKey, parlayKeys } = require('./rfq');
+
+// Leg-level overlap with any active Combo Lock (canonical ticker+side).
+function lockLegOverlap(rfq, locks) {
+  const rk = new Set(((rfq && rfq.legKeys) || []).map(canonicalizeLegKey).filter(Boolean));
+  if (!rk.size || !Array.isArray(locks)) return 0;
+  let n = 0;
+  for (const p of locks) {
+    for (const k of parlayKeys(p) || []) if (rk.has(canonicalizeLegKey(k))) n += 1;
+  }
+  return n;
+}
 const { createPolymarketHttp } = require('./polymarket-client');
 const {
   fetchPolymarketUnhedgedRfq,
@@ -79,6 +90,15 @@ function handleKalshiUnhedgedCreated(rfq, opts = {}) {
     onPersisted: (row) => {
       if (typeof opts.onPersisted === 'function') {
         try { opts.onPersisted(row); } catch (_) {}
+      }
+      // Auto-Sniper (dry run by default). Never blocks the shadow path.
+      if (opts.sniper && typeof opts.sniper.consider === 'function') {
+        Promise.resolve()
+          .then(() => opts.sniper.consider(row, {
+            lockOverlap: lockLegOverlap(missRfq, locks),
+            marketTicker: missRfq.marketTicker || missRfq.market_ticker || null,
+          }))
+          .catch((e) => console.error('[SNIPER] consider failed', e && e.message));
       }
       if (opts.fills) {
         opts.fills.remember({
@@ -185,6 +205,7 @@ function startUnhedgedSide(opts = {}) {
 }
 
 module.exports = {
+  lockLegOverlap,
   createPolyUnhedgedHttp,
   createUnhedgedVenueFetchers,
   persistUnhedgedRow,
