@@ -34,6 +34,16 @@ const {
 const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
 
 const MODE = 'UNHEDGED';
+const { createAutoSniper } = require('./auto-sniper');
+// Auto-Sniper: SNIPER_ENABLED=1 to evaluate; SNIPER_DRY_RUN defaults to 1.
+// No postQuote is wired here, so this job can never send a sniper order.
+const { createSniperFair } = require('./sniper-fair');
+let sniperFair = null; // built once kalshiGet + price cache exist (see below)
+const sniper = createAutoSniper({
+  env: process.env,
+  fairProvider: { apply: (legs) => (sniperFair ? sniperFair.apply(legs) : Promise.resolve(legs.map((l) => ({ ...l, fair_yes: null })))) },
+});
+console.log(`[SNIPER] enabled=${sniper.config.enabled} dryRun=${sniper.config.dryRun} minRoi=${sniper.config.minRoi} maxPayout=${sniper.config.maxPayout} cap=${sniper.config.totalExposureCap}`);
 const { createLiveUserGate } = require('./live-users');
 // Only allowlisted users' locks count (COMBO_LIVE_USER_IDS, default Kevin).
 const liveUsers = createLiveUserGate({ env: process.env, log: (m) => console.log(`[${MODE}] ${m}`) });
@@ -125,6 +135,7 @@ function onRfq(rfq, env) {
     priceCache: side && side.prices,
     fills: side && side.fills,
     extra: env && env.msg ? { msg: env.msg } : null,
+    sniper,
   });
   if (rfq && rfq.isCombo) counts.combos++;
   if (out.action === 'skip' && out.reason === 'combo_lock') counts.lockSkip++;
@@ -177,6 +188,7 @@ async function main() {
     env: process.env,
     kalshiGet,
   });
+  sniperFair = createSniperFair({ kalshiGet, priceCache: side.prices, depthUsd: sniper.config.fairDepthUsd });
 
   await refresh();
   setInterval(refresh, 30000);
