@@ -8,7 +8,9 @@ const fs = require('fs');
 const S = require('../auto-sniper');
 const raw = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 let rows = Array.isArray(raw) && Array.isArray(raw[0]) ? raw : raw;
-const lo = Number(process.argv[3] || 2); const hi = Number(process.argv[4] || 4);
+const lo = Number(process.argv[3] || 2); const hi = Number(process.argv[4] || 10);
+// Confirmed fee by RFQ series (GET /series fee_type + our fills).
+const SERIES_RATE = { KXMVECROSSCATEGORY0: 0, KXMVECROSSCATEGORY: 0.035 };
 const MON = { JAN: '01', FEB: '02', MAR: '03', APR: '04', MAY: '05', JUN: '06', JUL: '07', AUG: '08', SEP: '09', OCT: '10', NOV: '11', DEC: '12' };
 function legDate(t) { const m = /-(\d\d)([A-Z]{3})(\d\d)/.exec(t); return m ? `20${m[1]}-${MON[m[2]]}-${m[3]}` : null; }
 const env = { SNIPER_ENABLED: '1', SNIPER_MIN_LEG_FAIR: '0', SNIPER_MAX_LEG_FAIR: '1', ...Object.fromEntries(Object.entries(process.env).filter(([k]) => k.startsWith('SNIPER_'))) };
@@ -16,7 +18,7 @@ const config = S.sniperConfig(env);
 const ledger = S.createSniperLedger();
 const out = { scanned: 0, inScope: 0, wouldQuote: 0, fills: 0, lostRace: 0, risk: 0, ev: 0, payout: 0, capBinds: 0, skips: {}, peakOpen: 0, roi: [], qAm: [] };
 for (const r of rows) {
-  const [id, ts, c, tc, ty, nl, fp, legsRaw] = r;
+  const [id, ts, c, tc, ty, nl, fp, legsRaw, series] = r;
   out.scanned++;
   if (nl < lo || nl > hi) continue;
   const nowMs = ts * 1000;
@@ -25,7 +27,9 @@ for (const r of rows) {
   if (legs.some((l) => l.date && l.date < etDay)) { out.skips.started = (out.skips.started || 0) + 1; continue; }
   if (legs.some((l) => !/^KX(NFL|MLB)GAME-/.test(l.ticker))) { out.skips.not_ml_scope = (out.skips.not_ml_scope || 0) + 1; continue; }
   out.inScope++;
-  const d = S.evaluateSnipe({ rfq_id: id, venue: 'kalshi', status: 'seen', legs, contracts: c, cash_size: c == null ? tc : null }, { config, ledger, nowMs });
+  const d = S.evaluateSnipe({ rfq_id: id, venue: 'kalshi', status: 'seen', legs, contracts: c, cash_size: c == null ? tc : null }, { config, ledger, nowMs, makerRate: SERIES_RATE[series] != null ? SERIES_RATE[series] : 0.035 });
+  if (d.reason === 'combo_fair_too_low' && nl >= 5) out.longCap5plus = (out.longCap5plus || 0) + 1;
+  if (nl >= 5) out.inScope5plus = (out.inScope5plus || 0) + 1;
   if (d.action !== 'quote') { out.skips[d.reason] = (out.skips[d.reason] || 0) + 1; if (d.reason === 'total_cap') out.capBinds++; continue; }
   out.wouldQuote++;
   if (!(d.quoteYes < Number(ty))) { // lost the race: release reservation
@@ -37,4 +41,4 @@ for (const r of rows) {
 const med = (a) => { const s = [...a].sort((x, y) => x - y); return s.length ? s[Math.floor(s.length / 2)] : null; };
 console.log(JSON.stringify({ legs: `${lo}-${hi}`, scanned: out.scanned, inScope: out.inScope, wouldQuote: out.wouldQuote, fills: out.fills, lostRace: out.lostRace,
   riskUsd: Math.round(out.risk), evUsd: Math.round(out.ev), payoutUsd: Math.round(out.payout), avgRoi: out.fills ? +(out.ev / out.risk * 100).toFixed(2) : null,
-  medianQuoteAmerican: med(out.qAm), peakOpenUsd: Math.round(out.peakOpen), totalCapBinds: out.capBinds, skips: out.skips }));
+  medianQuoteAmerican: med(out.qAm), peakOpenUsd: Math.round(out.peakOpen), totalCapBinds: out.capBinds, inScope5plus: out.inScope5plus || 0, cap4900Blocks5plus: out.longCap5plus || 0, skips: out.skips }));

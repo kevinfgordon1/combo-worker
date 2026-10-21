@@ -18,14 +18,16 @@ t('defaults: dry run on, kill switch off', () => {
 t('quotes lowest price clearing 3% ROI after fee', () => {
   const c = S.sniperConfig(env()); const d = ev(row('a', L1), c, S.createSniperLedger());
   assert.strictEqual(d.action, 'quote');
-  assert.ok(d.roi >= 0.03); assert.strictEqual(d.quoteYes, 0.28);
-  const lower = S.snipeEconomics({ fair: 0.25, q: 0.27, n: 50, makerRate: 0.0175 });
+  assert.ok(d.roi >= 0.03); assert.strictEqual(d.quoteYes, 0.279); assert.strictEqual(d.makerRate, 0.035);
+  const lower = S.snipeEconomics({ fair: 0.25, q: 0.278, n: 50, makerRate: 0.035 });
   assert.ok(lower.roi < 0.03);
 });
 t('maker fee counted for non-NFL legs', () => {
   const c = S.sniperConfig(env());
   const d = ev(row('a', L1), c, S.createSniperLedger());
-  assert.strictEqual(d.fee, Math.ceil(0.0175 * 50 * d.quoteYes * (1 - d.quoteYes) * 100 - 1e-9) / 100);
+  assert.strictEqual(d.fee, Math.ceil(0.035 * 50 * d.quoteYes * (1 - d.quoteYes) * 1e4 - 1e-7) / 1e4);
+  const nfl0 = ev(row('z', L1), c, S.createSniperLedger(), { makerRate: 0 });
+  assert.strictEqual(nfl0.fee, 0); assert.ok(nfl0.quoteYes <= d.quoteYes);
   assert.ok(d.fee > 0); assert.ok(d.ev / d.risk >= 0.03);
 });
 t('payout over $100 skipped (no partial quotes)', () => {
@@ -98,5 +100,22 @@ t('sniper fair: inverse of depth-weighted opponent ask with taker fee', async ()
   const p = await f.legFair({ ticker: 'KXNFLGAME-26OCT25BUFNYJ-BUF', side: 'yes' });
   const am = require('./engine').americanFromProb(0.4 * (1 + 0.07 * 0.6));
   assert.ok(Math.abs(p - (1 - 100 / (am + 100))) < 1e-9);
+});
+t('series fee: fee_type mapping matches our fills', () => {
+  const { makerRateFromSeries } = require('./series-fee');
+  assert.strictEqual(makerRateFromSeries('quadratic_with_combo_maker_fees', 1), 0.035);
+  assert.strictEqual(makerRateFromSeries('quadratic', 1), 0);
+  // Real fill 2026-10-20: 158.94 @ 0.206 charged $0.90994
+  const f = S.snipeEconomics({ fair: 0.2, q: 0.206, n: 158.94, makerRate: 0.035 }).fee;
+  assert.ok(Math.abs(f - 0.90994) < 0.0002);
+});
+t('max legs 10 + independent games', () => {
+  const c = S.sniperConfig(env());
+  const many = (k) => Array.from({ length: k }, (_, i) => leg(`KXNFLGAME-26OCT25G${i}-T${i}`, 'yes', 0.7));
+  assert.strictEqual(ev(row('m10', many(10), { contracts: 10 }), c, S.createSniperLedger()).action, 'quote');
+  assert.strictEqual(ev(row('m11', many(11), { contracts: 10 }), c, S.createSniperLedger()).reason, 'too_many_legs');
+  assert.strictEqual(ev(row('sg', [L1[0], { ...L1[0], ticker: 'KXNFLGAME-26OCT25BUFNYJ-NYJ' }]), c, S.createSniperLedger()).reason, 'same_game');
+  const { unhedgedMaxLegs } = require('./unhedged-rfq');
+  assert.strictEqual(unhedgedMaxLegs({}), 4); assert.strictEqual(unhedgedMaxLegs({ SNIPER_ENABLED: '1' }), 10);
 });
 console.log(`auto-sniper.test.js: ${n} passed`);

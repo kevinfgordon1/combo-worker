@@ -403,6 +403,16 @@ function collectPmLegs(rfq) {
   return out;
 }
 
+// Default 2–4 legs. When the Auto-Sniper is enabled, widen to SNIPER_MAX_LEGS
+// (default 10) so it can see 5–10 leg parlays; the tape grows with it.
+function unhedgedMaxLegs(env = process.env) {
+  const e = env || {};
+  const on = /^(1|true|yes|on)$/i.test(String(e.SNIPER_ENABLED || '').trim());
+  if (!on) return 4;
+  const n = Number(e.SNIPER_MAX_LEGS);
+  return Number.isFinite(n) && n >= 4 && n <= 12 ? Math.floor(n) : 10;
+}
+
 function fail(reason) {
   return { persist: false, inScope: false, reason, status: null, row: null };
 }
@@ -483,7 +493,7 @@ function classifyUnhedgedRfq(rfq, opts = {}) {
 
   const rawLegs = venue === 'kalshi' ? collectKalshiLegs(rfq) : collectPmLegs(rfq);
   if (rawLegs.length < 2) return fail('not_combo');
-  if (rawLegs.length > 4) return fail('too_many_legs');
+  if (rawLegs.length > unhedgedMaxLegs(opts.env)) return fail('too_many_legs');
 
   const parsed = [];
   for (const leg of rawLegs) {
@@ -1680,6 +1690,7 @@ function shadowUnhedgedFill(opts = {}) {
 }
 
 module.exports = {
+  unhedgedMaxLegs,
   SCOPE_LEAGUES,
   FILL_TAPE_PAD_MS,
   DEFAULT_FILL_MAX_PER_TICK,

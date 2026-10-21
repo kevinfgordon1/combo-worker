@@ -22,6 +22,7 @@
 'use strict';
 const { productFair, validProb } = require('./unhedged-quote');
 const { americanFromProb } = require('./engine');
+const { seriesOfTicker } = require('./series-fee');
 
 function num(v, dflt) {
   if (v == null || String(v).trim() === '') return dflt;
@@ -55,19 +56,24 @@ function sniperConfig(env = process.env) {
     requireBothVenues: flag(env.SNIPER_REQUIRE_BOTH_VENUES, false),
     skipLockOverlap: flag(env.SNIPER_SKIP_LOCK_OVERLAP, true),
     tgAlerts: flag(env.SNIPER_TG_ALERTS, false),
-    // Kalshi maker fee: ceil_cent(rate·C·P·(1−P)). Kevin: 0.0175 on fee-charging
-    // markets. Applied to every combo (conservative; NFL not assumed fee-free).
-    makerRate: num(env.SNIPER_KALSHI_MAKER_RATE, 0.0175),
+    // Kalshi combo maker fee = round_up_centicent(rate·C·P·(1−P)), rate read per
+    // RFQ series from GET /series fee_type × fee_multiplier (series-fee.js):
+    //   KXMVECROSSCATEGORY  quadratic_with_combo_maker_fees → 0.035
+    //   KXMVECROSSCATEGORY0 quadratic (uncorrelated NFL)     → 0
+    // Verified on our own maker fills. Unknown series → 0.035 (conservative).
+    // SNIPER_KALSHI_MAKER_RATE forces a rate (testing only).
+    makerRateOverride: num(env.SNIPER_KALSHI_MAKER_RATE, null),
+    maxLegs: num(env.SNIPER_MAX_LEGS, 10),
     fairDepthUsd: num(env.SNIPER_FAIR_DEPTH_USD, 1000),
     venues: String(env.SNIPER_VENUES || 'kalshi').toLowerCase().split(',').map((v) => v.trim()).filter(Boolean),
-    tick: num(env.SNIPER_TICK, 0.01), // 0.001 only if Kalshi sub-cent quoting is confirmed
+    tick: num(env.SNIPER_TICK, 0.001), // KALSHI_SUBCENT confirmed on in prod
   };
 }
 
-function ceilCent(x) { return Math.ceil(x * 100 - 1e-9) / 100; }
+function ceilCentiCent(x) { return Math.max(0, Math.ceil(x * 1e4 - 1e-7) / 1e4); }
 
 function snipeEconomics({ fair, q, n, makerRate }) {
-  const fee = ceilCent(makerRate * q * (1 - q) * n);
+  const fee = ceilCentiCent(makerRate * q * (1 - q) * n);
   const risk = n * (1 - q) + fee;
   const ev = n * (q - fair) - fee;
   return { fee, risk, ev, roi: risk > 0 ? ev / risk : -Infinity };
@@ -94,6 +100,10 @@ function gameKey(leg) {
   const t = String(leg.ticker || leg.symbol || '').toUpperCase();
   const i = t.lastIndexOf('-');
   return i > 0 ? t.slice(0, i) : t;
+}
+function independentGames(legs) {
+  const g = legs.map(gameKey);
+  return new Set(g).size === g.length;
 }
 function comboKey(legs) { return legs.map(legKey).sort().join('|'); }
 
@@ -140,7 +150,7 @@ function createSniperLedger() {
 function skip(reason, extra) { return { action: 'skip', reason, ...(extra || {}) }; }
 
 // row: unhedged_rfqs row (legs w/ fair_yes, contracts, cash_size, rfq_id, venue)
-function evaluateSnipe(row, { config, ledger, nowMs = Date.now(), lockOverlap = 0 } = {}) {
+function evaluateSnipe(row, { config, ledger, nowMs = Date.now(), lockOverlap = 0, makerRate: seriesRate = null } = {}) {
   const c = config;
   if (!c.enabled) return skip('kill_switch');
   // Ledger is venue-agnostic (shared $ cap + no-double-dip); Kalshi only today.
@@ -155,6 +165,8 @@ function evaluateSnipe(row, { config, ledger, nowMs = Date.now(), lockOverlap = 
   if (row.status && row.status !== 'seen') return skip(`status_${row.status}`);
   const legs = Array.isArray(row.legs) ? row.legs : [];
   if (legs.length < 2) return skip('not_combo');
+  if (legs.length > c.maxLegs) return skip('too_many_legs');
+  if (!independentGames(legs)) return skip('same_game');
   if (c.skipLockOverlap && lockOverlap > 0) return skip('overlaps_combo_lock');
 
   const probs = [];
@@ -173,7 +185,8 @@ function evaluateSnipe(row, { config, ledger, nowMs = Date.now(), lockOverlap = 
   const contracts = row.contracts != null && Number(row.contracts) > 0 ? Number(row.contracts) : null;
   const cash = row.cash_size != null && Number(row.cash_size) > 0 ? Number(row.cash_size) : null;
   if (contracts == null && cash == null) return skip('no_size');
-  const makerRate = c.makerRate;
+  const makerRate = c.makerRateOverride != null ? c.makerRateOverride
+    : (seriesRate != null ? seriesRate : 0.035);
   const px = minQuotePrice({ fair, contracts, cash, makerRate, minRoi: c.minRoi, tick: c.tick });
   if (!px) return skip('roi_below_min');
   if (px.n > c.maxPayout + 1e-9) return skip('payout_over_cap', { payout: px.n });
@@ -206,6 +219,7 @@ function evaluateSnipe(row, { config, ledger, nowMs = Date.now(), lockOverlap = 
     contracts: px.n,
     payout: px.n,
     fee: px.fee,
+    makerRate,
     risk: Math.round(px.risk * 100) / 100,
     ev: Math.round(px.ev * 100) / 100,
     roi: px.roi,
@@ -219,7 +233,7 @@ function fmtAm(a) { return a == null ? '?' : (a > 0 ? `+${a}` : `${a}`); }
 function formatDecision(d) {
   return `[SNIPER] ${d.dryRun ? 'WOULD_QUOTE' : 'QUOTE'} rfq=${d.rfqId} legs=${d.legs.length} ` +
     `fair=${fmtAm(d.fairAmerican)} quote=${fmtAm(d.quoteAmerican)} n=${d.contracts} ` +
-    `risk=$${d.risk.toFixed(2)} ev=$${d.ev.toFixed(2)} roi=${(d.roi * 100).toFixed(1)}%`;
+    `fee=$${d.fee.toFixed(4)}@${d.makerRate} risk=$${d.risk.toFixed(2)} ev=$${d.ev.toFixed(2)} roi=${(d.roi * 100).toFixed(1)}%`;
 }
 
 function createTelegramNotifier(env = process.env, fetchImpl = globalThis.fetch) {
@@ -233,7 +247,7 @@ function createTelegramNotifier(env = process.env, fetchImpl = globalThis.fetch)
   }).catch(() => {});
 }
 
-function createAutoSniper({ env = process.env, log = console.log, notify, postQuote, fairProvider, now = () => Date.now() } = {}) {
+function createAutoSniper({ env = process.env, log = console.log, notify, postQuote, fairProvider, feeCache, now = () => Date.now() } = {}) {
   const config = sniperConfig(env);
   const ledger = createSniperLedger();
   const notifier = notify !== undefined ? notify : (config.tgAlerts ? createTelegramNotifier(env) : null);
@@ -258,7 +272,11 @@ function createAutoSniper({ env = process.env, log = console.log, notify, postQu
         skips.set('fair_error', (skips.get('fair_error') || 0) + 1); return skip('fair_error');
       }
     }
-    const d = evaluateSnipe(row, { config, ledger, nowMs: now(), lockOverlap: opts.lockOverlap || 0 });
+    let makerRate = null;
+    if (feeCache && opts.marketTicker) {
+      try { const e = await feeCache.prefetch(seriesOfTicker(opts.marketTicker)); makerRate = e ? e.rate : null; } catch (_) { makerRate = null; }
+    }
+    const d = evaluateSnipe(row, { config, ledger, nowMs: now(), lockOverlap: opts.lockOverlap || 0, makerRate });
     if (d.action !== 'quote') {
       skips.set(d.reason, (skips.get(d.reason) || 0) + 1);
       maybeSummary();

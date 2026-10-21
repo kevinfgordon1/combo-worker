@@ -39,8 +39,10 @@ const { createAutoSniper } = require('./auto-sniper');
 // No postQuote is wired here, so this job can never send a sniper order.
 const { createSniperFair } = require('./sniper-fair');
 let sniperFair = null; // built once kalshiGet + price cache exist (see below)
+const { createSeriesFeeCache } = require('./series-fee');
 const sniper = createAutoSniper({
   env: process.env,
+  feeCache: createSeriesFeeCache({ log: (m) => console.log(`[SNIPER] ${m}`) }),
   fairProvider: { apply: (legs) => (sniperFair ? sniperFair.apply(legs) : Promise.resolve(legs.map((l) => ({ ...l, fair_yes: null })))) },
 });
 console.log(`[SNIPER] enabled=${sniper.config.enabled} dryRun=${sniper.config.dryRun} minRoi=${sniper.config.minRoi} maxPayout=${sniper.config.maxPayout} cap=${sniper.config.totalExposureCap}`);

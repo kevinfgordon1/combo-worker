@@ -94,7 +94,10 @@ function handleKalshiUnhedgedCreated(rfq, opts = {}) {
       // Auto-Sniper (dry run by default). Never blocks the shadow path.
       if (opts.sniper && typeof opts.sniper.consider === 'function') {
         Promise.resolve()
-          .then(() => opts.sniper.consider(row, { lockOverlap: lockLegOverlap(missRfq, locks) }))
+          .then(() => opts.sniper.consider(row, {
+            lockOverlap: lockLegOverlap(missRfq, locks),
+            marketTicker: missRfq.marketTicker || missRfq.market_ticker || null,
+          }))
           .catch((e) => console.error('[SNIPER] consider failed', e && e.message));
       }
       if (opts.fills) {
