@@ -1,0 +1,38 @@
+# Fly app for the odds-relay service. Deploy: flyctl deploy . -c fly/odds-relay.toml
+# Secrets are set with `fly secrets` per app, never in this file.
+app = "kaygo-odds-relay"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "../Dockerfile"
+
+[processes]
+  app = "npm run start:odds-relay"
+
+[deploy]
+  # never rolling/bluegreen: no overlap of two copies
+  strategy = "immediate"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+
+[env]
+  PORT = "8787"
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+  processes = ["app"]
+
+[[http_service.checks]]
+  method = "GET"
+  path = "/health"
+  interval = "15s"
+  timeout = "5s"
+  grace_period = "30s"

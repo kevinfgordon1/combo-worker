@@ -1,0 +1,22 @@
+# Manual-only Fly deploy. No push trigger until the Railway -> Fly cutover is approved.
+name: Fly deploy (manual)
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: Service to deploy
+        required: true
+        type: choice
+        options: [combo-worker, poly-worker, sniper, odds-relay, mm-paper, noboost-paper]
+concurrency:
+  group: fly-deploy-${{ inputs.service }}
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy . --config fly/${{ inputs.service }}.toml --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
