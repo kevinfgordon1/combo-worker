@@ -16,7 +16,7 @@ create table if not exists public.sniper_ledger (
   release_at timestamptz not null
 );
 -- no double dipping: one OPEN position per combo
-create unique index if not exists sniper_ledger_open_combo_uq on public.sniper_ledger (combo_key) where status = 'open';
+create unique index if not exists sniper_ledger_open_combo_uq on public.sniper_ledger (combo_key, dry_run) where status = 'open';
 create index if not exists sniper_ledger_open_idx on public.sniper_ledger (status, release_at);
 create table if not exists public.sniper_decisions (
   id bigserial primary key,

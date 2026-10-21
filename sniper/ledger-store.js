@@ -1,48 +1,85 @@
-// Persistent exposure ledger for the isolated sniper (Supabase tables sniper_ledger /
-// sniper_decisions, written by NOTHING else and read by nothing else).
-// Idempotent: rfq_id is the primary key; a second open position on the same combo is
-// blocked by a partial unique index (combo_key where status='open').
+// Persistent exposure ledger for the isolated sniper (sniper_ledger / sniper_decisions; no other
+// job reads or writes them). Caps are enforced IN THE DATABASE by sniper_reserve /
+// sniper_confirm_check (one advisory lock, so concurrent RFQs cannot both pass). Any DB error
+// fails closed (no quote / no confirm).
 'use strict';
+
+function capsFrom(config, dayStartIso, live = false) {
+  return {
+    live: !!live,
+    total: config.totalExposureCap, game: config.perGameCap, leg: config.perLegCap,
+    daily_risk: config.dailyRiskCap, daily_loss: config.dailyLossCap,
+    per_hour: config.maxQuotesPerHour, day_start: dayStartIso,
+  };
+}
 
 function createLedgerStore({ supabase, log = console.log, now = () => Date.now() } = {}) {
   if (!supabase) throw new Error('ledger store needs supabase');
-  // Load open positions (not yet released) + today's opened risk, to rebuild the in-memory ledger.
-  async function hydrate(ledger, etDayStartIso) {
-    const nowIso = new Date(now()).toISOString();
+  async function hydrate(ledger, etDayStartIso, { live = false } = {}) {
     const { data, error } = await supabase.from('sniper_ledger')
-      .select('rfq_id,combo_key,games,legs,risk,release_at,created_at')
-      .eq('status', 'open').gt('release_at', nowIso).limit(20000);
+      .select('rfq_id,combo_key,games,legs,risk,release_at,created_at,phase,quote_id,market_ticker,contracts,filled_contracts,filled_cost,filled_fee,dry_run')
+      .eq('status', 'open').eq('dry_run', !live).limit(20000);
     if (error) throw new Error(`hydrate: ${error.message}`);
+    const rows = [];
+    const t = now();
     for (const r of data || []) {
-      ledger.positions.set(r.rfq_id, { combo: r.combo_key, games: r.games || [], legs: r.legs || [], risk: Number(r.risk) || 0, releaseAt: Date.parse(r.release_at) });
+      const rel = Date.parse(r.release_at);
+      if (!(rel > t) && r.phase !== 'accepted' && r.phase !== 'filled') continue;
+      ledger.positions.set(r.rfq_id, { combo: r.combo_key, games: r.games || [], legs: r.legs || [], risk: Number(r.risk) || 0, releaseAt: Math.max(rel, r.phase === 'filled' || r.phase === 'accepted' ? t + 7 * 864e5 : rel) });
       ledger.seenRfqs.add(r.rfq_id);
       if (r.created_at >= etDayStartIso) ledger.day.risk += Number(r.risk) || 0;
+      rows.push(r);
     }
-    return (data || []).length;
+    return rows;
   }
-  // -> { ok:true } | { ok:false, reason:'duplicate'|'db_error' }
-  async function reserve(d, { releaseAt, dryRun }) {
+  // -> { ok:true } | { ok:false, reason }
+  async function reserve(d, { releaseAt, dryRun, caps, marketTicker = null }) {
     const row = {
-      rfq_id: d.rfqId, combo_key: d.combo, games: d.games, legs: d.legs, status: 'open', dry_run: !!dryRun,
+      rfq_id: d.rfqId, combo_key: d.combo, games: d.games, legs: d.legs, dry_run: !!dryRun,
+      phase: dryRun ? 'dry_run' : 'reserved',
       risk: d.risk, ev: d.ev, roi: d.roi, quote_yes: d.quoteYes, quote_american: d.quoteAmerican,
       fair_yes: d.fairYes, fair_american: d.fairAmerican, contracts: d.contracts, fee: d.fee, maker_rate: d.makerRate,
-      release_at: new Date(releaseAt).toISOString(),
+      market_ticker: marketTicker, release_at: new Date(releaseAt).toISOString(),
     };
-    // free an expired open row on the same combo so the unique index doesn't block forever
     try {
-      await supabase.from('sniper_ledger').update({ status: 'released' })
-        .eq('combo_key', d.combo).eq('status', 'open').lt('release_at', new Date(now()).toISOString());
-    } catch (_) { /* best effort */ }
-    const { error } = await supabase.from('sniper_ledger').insert(row);
-    if (!error) return { ok: true };
-    if (error.code === '23505' || /duplicate|unique/i.test(error.message || '')) return { ok: false, reason: 'duplicate' };
-    log(`[SNIPER] ledger insert failed: ${error.message}`);
-    return { ok: false, reason: 'db_error' };
+      const { data, error } = await supabase.rpc('sniper_reserve', { p_row: row, p_caps: caps });
+      if (error) { log(`[SNIPER] sniper_reserve failed: ${error.message}`); return { ok: false, reason: 'db_error' }; }
+      return data === 'ok' ? { ok: true } : { ok: false, reason: String(data || 'db_unknown') };
+    } catch (e) { log(`[SNIPER] sniper_reserve threw: ${e.message}`); return { ok: false, reason: 'db_error' }; }
+  }
+  async function confirmCheck(rfqId, risk, caps) {
+    try {
+      const { data, error } = await supabase.rpc('sniper_confirm_check', { p_rfq: rfqId, p_risk: risk, p_caps: caps });
+      if (error) return { ok: false, reason: 'db_error' };
+      return data === 'ok' ? { ok: true } : { ok: false, reason: String(data || 'db_unknown') };
+    } catch (_) { return { ok: false, reason: 'db_error' }; }
+  }
+  async function update(rfqId, patch) {
+    try {
+      const { error } = await supabase.from('sniper_ledger').update({ ...patch, updated_at: new Date(now()).toISOString() }).eq('rfq_id', rfqId);
+      if (error) { log(`[SNIPER] ledger update ${rfqId} failed: ${error.message}`); return false; }
+      return true;
+    } catch (e) { log(`[SNIPER] ledger update ${rfqId} threw: ${e.message}`); return false; }
+  }
+  // Release = exposure stops counting (cancelled / declined / failed / settled).
+  const release = (rfqId, phase, extra = {}) => update(rfqId, { status: 'released', phase, ...extra });
+  async function openFilled() {
+    const { data, error } = await supabase.from('sniper_ledger')
+      .select('rfq_id,market_ticker,filled_contracts,filled_cost,filled_fee,risk,phase')
+      .eq('status', 'open').eq('phase', 'filled').eq('dry_run', false).limit(5000);
+    if (error) throw new Error(error.message);
+    return data || [];
+  }
+  async function dayRealized(dayStartIso) {
+    const { data, error } = await supabase.from('sniper_ledger').select('realized_pnl')
+      .gte('settled_at', dayStartIso).eq('dry_run', false).limit(20000);
+    if (error) throw new Error(error.message);
+    return (data || []).reduce((s, r) => s + (Number(r.realized_pnl) || 0), 0);
   }
   async function decision(rec) {
     try { await supabase.from('sniper_decisions').insert(rec); } catch (_) { /* audit only */ }
   }
-  return { hydrate, reserve, decision };
+  return { hydrate, reserve, confirmCheck, update, release, openFilled, dayRealized, decision };
 }
 
-module.exports = { createLedgerStore };
+module.exports = { createLedgerStore, capsFrom };

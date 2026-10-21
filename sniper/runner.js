@@ -3,7 +3,10 @@
 // Isolation: own Railway service/process; reads Kalshi RFQs from its own WebSocket
 // (no REST polling of /communications), prices from Kalshi PUBLIC orderbooks
 // (unauthenticated) + our odds-relay (/board, /td) + optional ProphetX, each behind its own
-// rate limiter; writes ONLY sniper_ledger / sniper_decisions. No order path exists.
+// rate limiter; writes ONLY sniper_ledger / sniper_decisions; reads combo_parlays /
+// combo_submissions to give Combo Locks priority.
+// LIVE only when sniper/gates.liveGate passes (SNIPER_ENABLED=1, SNIPER_DRY_RUN=0,
+// SNIPER_LIVE_CONFIRM token, own key). Otherwise every quote/confirm/cancel is refused.
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
 const { createKalshiWs } = require('../kalshi-ws');
@@ -16,7 +19,12 @@ const { sniperConfig, createSniperLedger, formatDecision, createTelegramNotifier
 const { createLimiter, createRateBreaker } = require('./limiter');
 const { createLedgerStore } = require('./ledger-store');
 const { venuesFromEnv } = require('./fair');
-const { decide } = require('./engine');
+const { decide, repriceFair } = require('./engine');
+const { liveGate } = require('./gates');
+const { createSniperTrader } = require('./trader');
+const { createLockCoord } = require('./coord');
+const { createLiveSniper } = require('./live');
+const { capsFrom } = require('./ledger-store');
 
 const ORIGIN = 'https://api.elections.kalshi.com';
 const P = '/trade-api/v2';
@@ -34,9 +42,12 @@ async function main(env = process.env) {
   const depth = num(env.SNIPER_FAIR_DEPTH_USD, 1000);
   const tg = createTelegramNotifier(env);
   const alert = (m) => { log(m); if (tg) tg(m); };
-  log(`[SNIPER] boot enabled=${config.enabled} dryRun=${config.dryRun} depth=$${depth} venues=${venues.join('+')} prophetx=${hasProphetXCreds(env) ? 'on' : 'off'}`);
   if (!config.enabled) { log('[SNIPER] SNIPER_ENABLED is off — idling (kill switch).'); setInterval(() => {}, 1 << 30); return; }
-  if (!config.dryRun) { alert('[SNIPER] SNIPER_DRY_RUN=0 requested but this service has no order path — staying dry run.'); config.dryRun = true; }
+  const gate = liveGate(env);
+  config.dryRun = !gate.live;
+  if (String(env.SNIPER_DRY_RUN) === '0' && !gate.live) alert(`[SNIPER] SNIPER_DRY_RUN=0 but live gate closed (${gate.why.join(', ')}) — staying DRY RUN.`);
+  log(`[SNIPER] boot enabled=${config.enabled} mode=${gate.live ? 'LIVE' : 'DRY_RUN'} depth=$${depth} venues=${venues.join('+')} prophetx=${hasProphetXCreds(env) ? 'on' : 'off'}`);
+  if (gate.live) alert('[SNIPER] ⚠️ LIVE MODE: all gates set — this service will send and confirm real Kalshi RFQ quotes.');
 
   // ── Request budgets (well under venue limits) ──
   const lim = {
@@ -44,11 +55,15 @@ async function main(env = process.env) {
     relay: createLimiter({ name: 'odds_relay', ratePerSec: num(env.SNIPER_RELAY_RPS, 1), burst: 2 }),
     prophetx: createLimiter({ name: 'prophetx', ratePerSec: num(env.SNIPER_PROPHETX_RPS, 0.2), burst: 1 }),
     kalshiSeries: createLimiter({ name: 'kalshi_series', ratePerSec: 0.2, burst: 2 }),
+    // signed calls on the sniper's own key (quote POST/confirm/cancel, fills reads)
+    kalshiTrade: createLimiter({ name: 'kalshi_trade', ratePerSec: num(env.SNIPER_KALSHI_TRADE_RPS, 5), burst: 5 }),
+    kalshiSettle: createLimiter({ name: 'kalshi_settle', ratePerSec: 0.5, burst: 2 }),
   };
   let disabled = false;
+  let liveSniperRef = null; // set once the live sniper exists, so a 429 trip also halts quoting
   const breaker = createRateBreaker({
     max: num(env.SNIPER_MAX_429, 5), windowMs: num(env.SNIPER_429_WINDOW_MS, 10 * 60 * 1000),
-    onTrip: (venue, n) => { disabled = true; alert(`[SNIPER] AUTO-DISABLED: ${n} rate-limit (429) errors in window (last: ${venue}). All polling stopped. Restart the sniper service to re-enable.`); },
+    onTrip: (venue, n) => { disabled = true; if (typeof liveSniperRef === 'function') liveSniperRef(); alert(`[SNIPER] AUTO-DISABLED: ${n} rate-limit (429) errors in window (last: ${venue}). All polling stopped. Restart the sniper service to re-enable.`); },
   });
   const getJson = async (limiter, url) => {
     if (disabled) throw new Error('disabled');
@@ -137,22 +152,56 @@ async function main(env = process.env) {
   const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
   const store = createLedgerStore({ supabase, log });
   const ledger = createSniperLedger();
-  const n = await store.hydrate(ledger, etDayStartIso(Date.now()));
-  log(`[SNIPER] ledger hydrated: ${n} open position(s), dayRisk=$${ledger.day.risk.toFixed(2)}`);
+  const hydrated = await store.hydrate(ledger, etDayStartIso(Date.now()), { live: gate.live });
+  log(`[SNIPER] ledger hydrated (${gate.live ? 'live' : 'dry'} book): ${hydrated.length} open position(s), dayRisk=$${ledger.day.risk.toFixed(2)}`);
+  const caps = () => capsFrom(config, etDayStartIso(Date.now()), gate.live);
+  const coord = createLockCoord({ supabase, log });
+  coord.start();
+  const trader = createSniperTrader({
+    gate, keyId: env.SNIPER_KALSHI_KEY_ID, pem: normalizePem(env.SNIPER_KALSHI_PRIVATE_KEY || ''),
+    limiter: lim.kalshiTrade, log,
+  });
+  // Releasing in the DB also frees the in-memory reservation (cancelled/declined/failed/settled).
+  const liveStore = {
+    ...store,
+    release: async (rfqId, phase, extra) => {
+      const p = ledger.positions.get(rfqId);
+      if (p) { ledger.positions.delete(rfqId); if (phase !== 'settled') ledger.day.risk = Math.max(0, ledger.day.risk - p.risk); }
+      if (phase === 'settled' && extra && Number(extra.realized_pnl) < 0) ledger.recordRealizedLoss(-Number(extra.realized_pnl));
+      return store.release(rfqId, phase, extra);
+    },
+  };
+  const liveSniper = createLiveSniper({
+    config, trader, store: liveStore, coord, caps, log,
+    reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues }),
+    alert: (m) => { log(m); if (tg) tg(m); },
+    onHalt: () => { /* halted flag inside liveSniper blocks new sends/confirms */ },
+  });
+  liveSniperRef = () => liveSniper.halt('rate_limit');
+  async function marketResult(ticker) {
+    const j = await getJson(lim.kalshiSettle, `${ORIGIN}${P}/markets/${encodeURIComponent(ticker)}`);
+    const m = (j && j.market) || {};
+    if (!/settled|finalized|determined/.test(String(m.status || ''))) return null;
+    return String(m.result || '').toLowerCase() || null;
+  }
+  if (gate.live) loop(() => liveSniper.settleOnce(marketResult, etDayStartIso(Date.now())), 'settle', num(env.SNIPER_SETTLE_POLL_MS, 60000));
   const fees = createSeriesFeeCache({ fetchImpl: (u, o) => lim.kalshiSeries.run(() => fetch(u, o)), log: (m) => log(`[SNIPER] ${m}`) });
 
   // ── RFQ intake: own Kalshi WebSocket (push; no REST polling) ──
   const counts = { rfqs: 0, quotes: 0, skips: {}, ledgerFail: 0 };
   const pricesHealthy = () => Date.now() - health.ml < 30000;
   async function onRfq(rfq) {
-    if (disabled || !rfq || !rfq.isCombo) return;
+    if (disabled || liveSniper.halted() || !rfq || !rfq.isCombo) return;
+    // Combo Locks priority before anything else (read-only check of active locks).
+    const blocked = coord.blockReason(rfq);
+    if (blocked) { counts.skips[blocked] = (counts.skips[blocked] || 0) + 1; return; }
     counts.rfqs += 1;
     let makerRate = null;
     try { const e = await fees.prefetch(seriesOfTicker(rfq.marketTicker)); makerRate = e ? e.rate : null; } catch (_) { makerRate = null; }
     const nowMs = Date.now();
     const { decision: d } = decide(rfq, { config, ledger, pmLive, tdBook, venues, kickoffFor, makerRate, nowMs, pricesHealthy: pricesHealthy() });
     if (d.action !== 'quote') { counts.skips[d.reason] = (counts.skips[d.reason] || 0) + 1; return; }
-    const res = await store.reserve(d, { releaseAt: d.releaseAt, dryRun: config.dryRun });
+    const res = await store.reserve(d, { releaseAt: d.releaseAt, dryRun: config.dryRun, caps: caps(), marketTicker: rfq.marketTicker || null });
     if (!res.ok) {
       // roll back the in-memory reservation; a DB problem fails closed (no quote)
       ledger.positions.delete(d.rfqId); ledger.day.risk -= d.risk; ledger.hour.pop();
@@ -161,8 +210,16 @@ async function main(env = process.env) {
     }
     counts.quotes += 1;
     log(formatDecision(d));
-    store.decision({ rfq_id: d.rfqId, action: 'would_quote', reason: null, details: d });
-    if (config.tgAlerts && tg) tg(formatDecision(d));
+    if (!gate.live) {
+      store.decision({ rfq_id: d.rfqId, action: 'would_quote', reason: null, details: d });
+      if (config.tgAlerts && tg) tg(formatDecision(d));
+      return;
+    }
+    const sent = await liveSniper.send(rfq, d);
+    if (!sent.sent) {
+      counts.skips[`live_${sent.reason}`] = (counts.skips[`live_${sent.reason}`] || 0) + 1;
+    }
+    store.decision({ rfq_id: d.rfqId, action: sent.sent ? 'quoted' : 'aborted', reason: sent.reason || null, details: { ...d, quoteId: sent.quoteId || null } });
   }
   // Its OWN read-only Kalshi key (never the combo-worker key), used only for the RFQ socket.
   if (!env.SNIPER_KALSHI_KEY_ID || !env.SNIPER_KALSHI_PRIVATE_KEY) {
@@ -173,6 +230,9 @@ async function main(env = process.env) {
     keyId: env.SNIPER_KALSHI_KEY_ID,
     pem: normalizePem(env.SNIPER_KALSHI_PRIVATE_KEY),
     onRfqCreated: (rfq) => { onRfq(rfq).catch((e) => log(`[SNIPER] onRfq error: ${e.message}`)); },
+    onRfqDeleted: (evt) => { liveSniper.onRfqClosed(evt).catch((e) => log(`[SNIPER] rfq closed error: ${e.message}`)); },
+    onQuoteAccepted: (evt) => { liveSniper.onAccepted(evt).catch((e) => log(`[SNIPER] accept error: ${e.message}`)); },
+    onQuoteExecuted: (evt) => { liveSniper.onExecuted(evt).catch((e) => log(`[SNIPER] executed error: ${e.message}`)); },
     onStatus: (s) => log(`[SNIPER] ws ${typeof s === 'string' ? s : JSON.stringify(s)}`),
   });
   if (ws && typeof ws.start === 'function') ws.start(); else if (ws && typeof ws.connect === 'function') ws.connect();
@@ -183,7 +243,7 @@ async function main(env = process.env) {
     const t = ledger.totals();
     const s = Object.entries(counts.skips).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, v]) => `${k}=${v}`).join(' ');
     const ls = Object.values(lim).map((l) => { const x = l.stats(); return `${x.name}:${x.requests}req/${x.r429}x429`; }).join(' ');
-    log(`[SNIPER] summary rfqs=${counts.rfqs} would_quote=${counts.quotes} open=$${t.total.toFixed(2)} positions=${ledger.positions.size} dayRisk=$${ledger.day.risk.toFixed(2)} breaker429=${breaker.count()} ${disabled ? 'DISABLED' : ''} load: ${ls} skips: ${s || 'none'}`);
+    log(`[SNIPER] summary mode=${gate.live ? 'LIVE' : 'dry'}${liveSniper.halted() ? ' HALTED' : ''} live=${JSON.stringify(liveSniper.stats())} trade=${JSON.stringify(trader.stats())} locks=${JSON.stringify(coord.stats())} rfqs=${counts.rfqs} would_quote=${counts.quotes} open=$${t.total.toFixed(2)} positions=${ledger.positions.size} dayRisk=$${ledger.day.risk.toFixed(2)} breaker429=${breaker.count()} ${disabled ? 'DISABLED' : ''} load: ${ls} skips: ${s || 'none'}`);
     store.decision({ rfq_id: null, action: 'summary', reason: null, details: { counts, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
     counts.rfqs = 0; counts.quotes = 0; counts.skips = {};
   }, 60000);

@@ -45,4 +45,17 @@ function decide(rfq, { config, ledger, pmLive, tdBook, venues, kickoffFor, maker
   return { decision: d, row };
 }
 
-module.exports = { decide, pregameCheck, legDate };
+// Fresh combo fair (product of per-leg best-of-venues $depth fairs) for send/confirm-time re-pricing.
+function repriceFair(rfq, { pmLive, tdBook, venues }) {
+  const cls = classifyNfl(rfq, 'kalshi', { td: !!tdBook });
+  if (!cls.ok || cls.legs.length !== (rfq.legKeys || []).length) return null;
+  let fair = 1;
+  for (const leg of cls.legs) {
+    const f = legFairDepth(leg, { pmLive, tdBook, venues });
+    if (!(f.p > 0 && f.p < 1)) return null;
+    fair *= f.p;
+  }
+  return fair;
+}
+
+module.exports = { decide, pregameCheck, legDate, repriceFair };
