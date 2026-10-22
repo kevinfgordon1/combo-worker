@@ -94,10 +94,18 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
     if (fl.error) throw new Error(fl.error.message);
     return { quotes: dq.count || 0, rows: fl.data || [] };
   }
+  // Book-arb re-check: open live fills with their legs.
+  async function openFilledWithLegs() {
+    const { data, error } = await supabase.from('sniper_ledger')
+      .select('rfq_id,legs,filled_contracts,filled_cost,filled_fee')
+      .eq('status', 'open').eq('phase', 'filled').eq('dry_run', false).gt('filled_contracts', 0).limit(500);
+    if (error) throw new Error(error.message);
+    return data || [];
+  }
   async function decision(rec) {
     try { await supabase.from('sniper_decisions').insert(rec); } catch (_) { /* audit only */ }
   }
-  return { hydrate, dayExposure, reserve, confirmCheck, update, release, openFilled, dayRealized, dayRecap, decision };
+  return { hydrate, dayExposure, reserve, confirmCheck, update, release, openFilled, openFilledWithLegs, dayRealized, dayRecap, decision };
 }
 
 module.exports = { createLedgerStore, capsFrom };

@@ -18,6 +18,8 @@ const { createSeriesFeeCache, seriesOfTicker } = require('../series-fee');
 const { sniperConfig, createSniperLedger, formatDecision, createTelegramNotifier } = require('../auto-sniper');
 const { createLimiter, createRateBreaker } = require('./limiter');
 const { createLedgerStore } = require('./ledger-store');
+const { createBookArbWatch } = require('./book-arb-watch');
+const { loadBookData } = require('./book-arb');
 const { venuesFromEnv } = require('./fair');
 const { decide, repriceFair, pregameCheck } = require('./engine');
 const { liveGate, sniperSubaccount } = require('./gates');
@@ -218,10 +220,18 @@ async function main(env = process.env) {
       return store.release(rfqId, phase, extra);
     },
   };
+  // Sportsbook arb check on fills (alert-only; reads player_prop_cache + odds_cache). SNIPER_BOOK_ARB=0 turns it off.
+  const bookArb = String(env.SNIPER_BOOK_ARB) === '0' ? null : createBookArbWatch({
+    loadData: () => loadBookData({ url: env.SUPABASE_URL, key: env.SUPABASE_SERVICE_KEY }), store, alert, log,
+    kickoffOf: (t) => { const r = kickoffs.resolve(t); return r ? r.kickoffMs : null; },
+    minImprove: num(env.SNIPER_BOOK_ARB_REALERT_USD, 1),
+  });
+  if (bookArb && gate.live) loop(() => bookArb.recheckOpen(), 'book_arb', num(env.SNIPER_BOOK_ARB_POLL_MS, 300000));
   const liveSniper = createLiveSniper({
     config, trader, store: liveStore, coord, caps, log,
     reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues }),
     alert,
+    onFilled: (f) => (bookArb ? bookArb.check(f, 'fill') : null),
     // Rule 9 at commence time (no buffer here; decide() already stops new quotes 30 min early).
     kickoffOf: (t) => { const r = kickoffs.resolve(t); return r ? r.kickoffMs : null; },
     startedReason: (rfq) => pregameCheck(rfq.legKeys || [], kickoffFor, Date.now(), 0),
