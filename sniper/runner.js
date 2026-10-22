@@ -196,9 +196,11 @@ async function main(env = process.env) {
   // ── Ledger (persistent) ──
   const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
   const store = createLedgerStore({ supabase, log });
-  const ledger = createSniperLedger();
+  const ledger = createSniperLedger({ dayRiskOnAdd: false });
   const hydrated = await store.hydrate(ledger, etDayStartIso(Date.now()), { live: gate.live });
-  log(`[SNIPER] ledger hydrated (${gate.live ? 'live' : 'dry'} book): ${hydrated.length} open position(s), dayRisk=$${ledger.day.risk.toFixed(2)}`);
+  log(`[SNIPER] ledger hydrated (${gate.live ? 'live' : 'dry'} book): ${hydrated.length} open position(s), filled_today=$${ledger.day.risk.toFixed(2)} (${ledger.day.fills} fills) pending=$${ledger.day.pending.toFixed(2)}`);
+  // Daily cap = filled cost today, from the same DB function the cap check uses.
+  loop(async () => { ledger.setDayExposure(await store.dayExposure(etDayStartIso(Date.now()), { live: gate.live })); }, 'day_exposure', num(env.SNIPER_DAY_EXPOSURE_POLL_MS, 15000));
   const caps = () => capsFrom(config, etDayStartIso(Date.now()), gate.live);
   const coord = createLockCoord({ supabase, log });
   coord.start();
@@ -211,7 +213,7 @@ async function main(env = process.env) {
     ...store,
     release: async (rfqId, phase, extra) => {
       const p = ledger.positions.get(rfqId);
-      if (p) { ledger.positions.delete(rfqId); if (phase !== 'settled') ledger.day.risk = Math.max(0, ledger.day.risk - p.risk); }
+      if (p) ledger.positions.delete(rfqId);
       if (phase === 'settled' && extra && Number(extra.realized_pnl) < 0) ledger.recordRealizedLoss(-Number(extra.realized_pnl));
       return store.release(rfqId, phase, extra);
     },
@@ -259,7 +261,7 @@ async function main(env = process.env) {
     if (d.action !== 'quote') { counts.skips[d.reason] = (counts.skips[d.reason] || 0) + 1; return; }
     // Re-check age right before the DB reserve (fees prefetch can await on a cold series).
     if (tooOld(rfq, signedNow(), maxAgeMs) != null) {
-      ledger.positions.delete(d.rfqId); ledger.day.risk -= d.risk; ledger.hour.pop();
+      ledger.positions.delete(d.rfqId); ledger.hour.pop();
       lat.staleIntake(); counts.skips.stale_before_reserve = (counts.skips.stale_before_reserve || 0) + 1; return;
     }
     const t0 = Date.now();
@@ -267,7 +269,7 @@ async function main(env = process.env) {
     lat.reserve(Date.now() - t0);
     if (!res.ok) {
       // roll back the in-memory reservation; a DB problem fails closed (no quote)
-      ledger.positions.delete(d.rfqId); ledger.day.risk -= d.risk; ledger.hour.pop();
+      ledger.positions.delete(d.rfqId); ledger.hour.pop();
       counts.ledgerFail += 1; counts.skips[`ledger_${res.reason}`] = (counts.skips[`ledger_${res.reason}`] || 0) + 1;
       return;
     }
@@ -331,7 +333,7 @@ async function main(env = process.env) {
     const t = ledger.totals();
     const s = Object.entries(counts.skips).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, v]) => `${k}=${v}`).join(' ');
     const ls = Object.values(lim).map((l) => { const x = l.stats(); return `${x.name}:${x.requests}req/${x.r429}x429`; }).join(' ');
-    log(`[SNIPER] summary mode=${gate.live ? 'LIVE' : 'dry'}${liveSniper.halted() ? ' HALTED' : ''} live=${JSON.stringify(liveSniper.stats())} trade=${JSON.stringify(trader.stats())} locks=${JSON.stringify(coord.stats())} kickoffs=${JSON.stringify(kickoffs.stats())} rfqs=${counts.rfqs} would_quote=${counts.quotes} open=$${t.total.toFixed(2)} positions=${ledger.positions.size} dayRisk=$${ledger.day.risk.toFixed(2)} breaker429=${breaker.count()} relayErr=${JSON.stringify(relayErr)} tdOff=${[...tdOff.keys()].join(',') || 'none'} ${disabled ? 'DISABLED' : ''} load: ${ls} skips: ${s || 'none'}`);
+    log(`[SNIPER] summary mode=${gate.live ? 'LIVE' : 'dry'}${liveSniper.halted() ? ' HALTED' : ''} live=${JSON.stringify(liveSniper.stats())} trade=${JSON.stringify(trader.stats())} locks=${JSON.stringify(coord.stats())} kickoffs=${JSON.stringify(kickoffs.stats())} rfqs=${counts.rfqs} would_quote=${counts.quotes} open=$${t.total.toFixed(2)} positions=${ledger.positions.size} filled_today=$${ledger.day.risk.toFixed(2)} (${ledger.day.fills} fills) pending=$${ledger.day.pending.toFixed(2)} breaker429=${breaker.count()} relayErr=${JSON.stringify(relayErr)} tdOff=${[...tdOff.keys()].join(',') || 'none'} ${disabled ? 'DISABLED' : ''} load: ${ls} skips: ${s || 'none'}`);
     const latency = lat.snapshot();
     const wsThroughput = () => { try { if (!ws || typeof ws.takeThroughput !== 'function') return null; const t = summarizeThroughput(ws.takeThroughput()); delete t.perShard; return t; } catch (_) { return null; } };
     log(`[SNIPER] latency ${JSON.stringify(latency)} ws=${JSON.stringify(wsThroughput())}`);

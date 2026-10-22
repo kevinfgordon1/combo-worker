@@ -121,15 +121,16 @@ function releaseAtMs(legs, nowMs) {
   return (Number.isFinite(base) ? base : nowMs) + 36 * 3600 * 1000;
 }
 
-function createSniperLedger() {
+function createSniperLedger({ dayRiskOnAdd = true } = {}) {
   const positions = new Map(); // rfqId → { combo, games, legs, risk, releaseAt }
   const seenRfqs = new Set();
-  const day = { key: null, risk: 0, loss: 0 };
+  // dayRiskOnAdd=false: day.risk is set from the DB (filled cost today) by the caller.
+  const day = { key: null, risk: 0, loss: 0, pending: 0, fills: 0 };
   const hour = [];
   function prune(nowMs) {
     for (const [id, p] of positions) if (p.releaseAt <= nowMs) positions.delete(id);
     const k = etDay(nowMs);
-    if (day.key !== k) { day.key = k; day.risk = 0; day.loss = 0; }
+    if (day.key !== k) { day.key = k; day.risk = 0; day.loss = 0; day.pending = 0; day.fills = 0; }
     while (hour.length && hour[0] < nowMs - 3600e3) hour.shift();
   }
   function totals() {
@@ -142,9 +143,13 @@ function createSniperLedger() {
     return { total, games, legs, combos };
   }
   return {
-    prune, totals, seenRfqs, day, hour, positions,
+    prune, totals, seenRfqs, day, hour, positions, dayRiskOnAdd,
+    // Day totals from the DB (same query as the cap). Marks the ET day so prune() won't zero it.
+    setDayExposure({ filled, pending, fills }, nowMs = Date.now()) {
+      prune(nowMs); day.risk = Number(filled) || 0; day.pending = Number(pending) || 0; day.fills = Number(fills) || 0;
+    },
     add(rfqId, pos, nowMs) {
-      positions.set(rfqId, pos); day.risk += pos.risk; hour.push(nowMs);
+      positions.set(rfqId, pos); if (dayRiskOnAdd) day.risk += pos.risk; hour.push(nowMs);
     },
     recordRealizedLoss(amount, nowMs = Date.now()) { prune(nowMs); if (amount > 0) day.loss += amount; },
   };
@@ -305,7 +310,7 @@ function createAutoSniper({ env = process.env, log = console.log, notify, postQu
   return { config, ledger, consider };
 }
 
-module.exports = {
+module.exports = { etDay,
   sniperConfig, snipeEconomics, minQuotePrice, evaluateSnipe, createSniperLedger,
   createAutoSniper, createTelegramNotifier, formatDecision, comboKey, gameKey, legKey, releaseAtMs,
 };

@@ -27,10 +27,17 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
       if (!(rel > t) && r.phase !== 'accepted' && r.phase !== 'filled') continue;
       ledger.positions.set(r.rfq_id, { combo: r.combo_key, games: r.games || [], legs: r.legs || [], risk: Number(r.risk) || 0, releaseAt: Math.max(rel, r.phase === 'filled' || r.phase === 'accepted' ? t + 7 * 864e5 : rel) });
       ledger.seenRfqs.add(r.rfq_id);
-      if (r.created_at >= etDayStartIso) ledger.day.risk += Number(r.risk) || 0;
       rows.push(r);
     }
+    if (ledger.setDayExposure) ledger.setDayExposure(await dayExposure(etDayStartIso, { live }), t);
     return rows;
+  }
+  // Same function the DB daily cap uses: { filled, fills, pending }. Throws on error.
+  async function dayExposure(dayStartIso, { live = false } = {}) {
+    const { data, error } = await supabase.rpc('sniper_day_exposure', { p_day_start: dayStartIso, p_live: !!live });
+    if (error) throw new Error(`day exposure: ${error.message}`);
+    const o = data || {};
+    return { filled: Number(o.filled) || 0, fills: Number(o.fills) || 0, pending: Number(o.pending) || 0 };
   }
   // -> { ok:true } | { ok:false, reason }
   async function reserve(d, { releaseAt, dryRun, caps, marketTicker = null }) {
@@ -90,7 +97,7 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
   async function decision(rec) {
     try { await supabase.from('sniper_decisions').insert(rec); } catch (_) { /* audit only */ }
   }
-  return { hydrate, reserve, confirmCheck, update, release, openFilled, dayRealized, dayRecap, decision };
+  return { hydrate, dayExposure, reserve, confirmCheck, update, release, openFilled, dayRealized, dayRecap, decision };
 }
 
 module.exports = { createLedgerStore, capsFrom };
