@@ -5214,7 +5214,7 @@ function startOddsRelay(opts = {}) {
     },
     listen(port, host) {
       const listenPort = port == null ? (Number(process.env.PORT) || 8787) : port;
-      const listenHost = host || '0.0.0.0';
+      const listenHost = host || '::';
       return new Promise((resolve, reject) => {
         server.once('error', reject);
         server.listen(listenPort, listenHost, () => {
