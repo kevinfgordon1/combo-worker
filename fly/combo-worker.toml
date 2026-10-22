@@ -16,7 +16,7 @@ kill_timeout = "30s"
   strategy = "immediate"
 
 [[vm]]
-  size = "shared-cpu-2x"
+  size = "performance-1x"
   memory = "2gb"
 
 # EXACTLY ONE machine, ever. No [http_service], so Fly never auto-starts/stops it.

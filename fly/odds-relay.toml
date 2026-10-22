@@ -16,8 +16,8 @@ kill_timeout = "30s"
   strategy = "immediate"
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "1gb"
+  size = "performance-1x"
+  memory = "2gb"
 
 [env]
   PORT = "8787"
