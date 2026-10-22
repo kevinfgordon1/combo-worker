@@ -548,9 +548,10 @@ function createKalshiWs({
       noteHandler(started);
     });
 
-    ws.on('close', (c) => {
+    ws.on('close', (c, reason) => {
       clearTimers();
-      status('closed', { code: c });
+      const r = reason ? String(reason).slice(0, 200) : '';
+      status('closed', r ? { code: c, reason: r, commAgeMs: lastCommAt ? Date.now() - lastCommAt : null } : { code: c, commAgeMs: lastCommAt ? Date.now() - lastCommAt : null });
       if (!closedByUs) scheduleReconnect(c != null ? `close_${c}` : 'close');
     });
     ws.on('error', (e) => status('error', { message: e && e.message }));

@@ -9,7 +9,7 @@
 // SNIPER_LIVE_CONFIRM token, own key). Otherwise every quote/confirm/cancel is refused.
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
-const { createKalshiWs } = require('../kalshi-ws');
+const { createKalshiFirehose, readShardFactor, DEFAULT_LIVE_SHARD_FACTOR } = require('../kalshi-ws');
 const { normalizePem } = require('../kalshi-auth');
 const { createPmLiveBook } = require('../noboost/pm-live');
 const { createTdBook, isTdTicker } = require('../noboost/td-book');
@@ -241,14 +241,19 @@ async function main(env = process.env) {
     alert('[SNIPER] SNIPER_KALSHI_KEY_ID / SNIPER_KALSHI_PRIVATE_KEY not set — no RFQ feed, idling.');
     return;
   }
-  const ws = createKalshiWs({
+  // One unsharded communications socket overflows Kalshi's per-subscription
+  // buffer (error code 25 "Subscription buffer overflow") roughly every 30s at
+  // current RFQ volume. Shard it like combo-worker (KALSHI_WS_SHARD_FACTOR, default 8).
+  const ws = createKalshiFirehose({
+    env,
+    shardFactor: readShardFactor(env.SNIPER_WS_SHARD_FACTOR, env, DEFAULT_LIVE_SHARD_FACTOR),
     keyId: env.SNIPER_KALSHI_KEY_ID,
     pem: normalizePem(env.SNIPER_KALSHI_PRIVATE_KEY),
     onRfqCreated: (rfq) => { onRfq(rfq).catch((e) => log(`[SNIPER] onRfq error: ${e.message}`)); },
     onRfqDeleted: (evt) => { liveSniper.onRfqClosed(evt).catch((e) => log(`[SNIPER] rfq closed error: ${e.message}`)); },
     onQuoteAccepted: (evt) => { liveSniper.onAccepted(evt).catch((e) => log(`[SNIPER] accept error: ${e.message}`)); },
     onQuoteExecuted: (evt) => { liveSniper.onExecuted(evt).catch((e) => log(`[SNIPER] executed error: ${e.message}`)); },
-    onStatus: (s) => log(`[SNIPER] ws ${typeof s === 'string' ? s : JSON.stringify(s)}`),
+    onStatus: (s, info) => log(`[SNIPER] ws ${typeof s === 'string' ? s : JSON.stringify(s)}${info ? ` ${JSON.stringify(info)}` : ''}`),
   });
   if (ws && typeof ws.start === 'function') ws.start(); else if (ws && typeof ws.connect === 'function') ws.connect();
 
