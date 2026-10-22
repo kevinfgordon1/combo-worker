@@ -90,9 +90,9 @@ const ALL = { SNIPER_ENABLED: '1', SNIPER_DRY_RUN: '0', SNIPER_LIVE_CONFIRM: LIV
   assert.deepStrictEqual(await r.L.send(rfq, d), { sent: true, quoteId: 'Q1' });
   assert.strictEqual((await r.L.onAccepted({ quoteId: 'Q1', rfqId: 'R1', acceptedSide: 'no', contractsAccepted: 20 })).confirmed, true);
   assert.deepStrictEqual(r.calls, ['post', 'confirm']);
-  assert.ok(r.alerts.some((m) => /^🎯 SNIPER \(not Combo Locks\).*ACCEPTED/.test(m)));
+  assert.strictEqual(r.alerts.length, 0, 'no separate ACCEPTED message');
   assert.strictEqual((await r.L.onExecuted({ quoteId: 'Q1', orderId: 'O1' })).booked, true);
-  assert.ok(r.alerts.some((m) => /^🎯 SNIPER \(not Combo Locks\).*FILL/.test(m)));
+  assert.strictEqual(r.alerts.length, 1, 'one message per fill'); assert.ok(/^🎯 SNIPER FILL/.test(r.alerts[0]));
   assert.ok(r.ledgerOps.some((o) => o[0] === 'update' && o[2].order_id === 'O1' && !o[2].phase), 'order id recorded before fills lookup');
   const up = r.ledgerOps.find((o) => o[0] === 'update' && o[2].phase === 'filled'); assert.strictEqual(up[2].filled_contracts, 20);
   const original = createLiveSniper; void original;

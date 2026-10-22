@@ -10,12 +10,13 @@ const { snipeEconomics, minQuotePrice } = require('../auto-sniper');
 const { shouldConfirmAccept } = require('../engine');
 const { RESERVE_TTL_MS } = require('../reserve');
 const { formatFillAlert } = require('./fill-alert');
+const usdS = (x) => `$${(Number(x) || 0).toFixed(2)}`;
 
 function createLiveSniper({
   config, trader, store, coord, caps, reprice, alert = () => {}, log = console.log,
   now = () => Date.now(), ttlMs = RESERVE_TTL_MS, fillRetries = 4, fillRetryMs = 1500,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)), onHalt = () => {},
-  startedReason = () => null, // (rfq) -> 'game_started' | 'no_kickoff' | null (rule 9)
+  startedReason = () => null, kickoffOf = () => null, // kickoffOf: ticker -> kickoff ms (fill alert); startedReason: (rfq) -> 'game_started' | 'no_kickoff' | null (rule 9)
 } = {}) {
   const pending = new Map(); // quoteId -> { d, rfq, accepted, timer }
   const byRfq = new Map(); // rfqId -> quoteId
@@ -115,7 +116,8 @@ function createLiveSniper({
         return { confirmed: false, reason: 'confirm_failed' };
       }
       stats.confirmed += 1;
-      alert(`🎯 SNIPER (not Combo Locks) — quote ACCEPTED+confirmed rfq=${rfq.rfqId} ${n} @ YES ${d.quoteYes} (fair ${fresh.toFixed(4)}, ROI ${(e.roi * 100).toFixed(1)}%, risk $${e.risk.toFixed(2)})`);
+      // One Telegram message per fill: sent from onExecuted once fills are confirmed.
+      log(`[SNIPER] ACCEPTED+confirmed rfq=${rfq.rfqId} quote_id=${quoteId} n=${n} yes=${d.quoteYes} fair=${fresh.toFixed(4)} roi=${(e.roi * 100).toFixed(1)}% risk=$${e.risk.toFixed(2)}`);
       return { confirmed: true };
     } finally { confirming.delete(quoteId); }
   }
@@ -133,7 +135,8 @@ function createLiveSniper({
     }
     if (!book || book.reason !== 'confirmed') {
       await store.update(p.d.rfqId, { order_id: evt.orderId || null });
-      alert(`🎯 SNIPER (not Combo Locks) ⚠️ executed but fills not yet visible rfq=${p.rfq.rfqId} order=${evt.orderId} — exposure stays reserved`);
+      log(`[SNIPER] executed but fills not yet visible rfq=${p.rfq.rfqId} order=${evt.orderId}`);
+      alert(`🎯 SNIPER ⚠️ A quote was taken but Kalshi hasn't shown the fill yet (${p.d.legs.length}-leg parlay, about ${usdS(p.d.risk)} risk). The money stays reserved; the dashboard will update when it shows.`);
       return { booked: false, reason: book ? book.reason : 'fills_unreadable' };
     }
     const cost = book.book.reduce((s, r) => s + r.count * (Number(r.no_price) || 0), 0);
@@ -144,7 +147,7 @@ function createLiveSniper({
       fill_ids: book.book.map((r) => r.fill_id), market_ticker: p.rfq.marketTicker || (book.book[0] && book.book[0].ticker) || null,
     });
     stats.fills += 1; pending.delete(quoteId); byRfq.delete(p.rfq.rfqId);
-    alert(formatFillAlert({ d: p.d, rfq: p.rfq, contracts: book.contracts, cost, fee }));
+    alert(formatFillAlert({ d: p.d, contracts: book.contracts, cost, fee, kickoffOf }));
     return { booked: true, contracts: book.contracts };
   }
 

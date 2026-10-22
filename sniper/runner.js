@@ -221,6 +221,7 @@ async function main(env = process.env) {
     reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues }),
     alert,
     // Rule 9 at commence time (no buffer here; decide() already stops new quotes 30 min early).
+    kickoffOf: (t) => { const r = kickoffs.resolve(t); return r ? r.kickoffMs : null; },
     startedReason: (rfq) => pregameCheck(rfq.legKeys || [], kickoffFor, Date.now(), 0),
     onHalt: () => { /* halted flag inside liveSniper blocks new sends/confirms */ },
   });
