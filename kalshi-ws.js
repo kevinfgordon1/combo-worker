@@ -283,6 +283,9 @@ function createKalshiWs({
   function dropSocket(socket) {
     if (!socket) return;
     try { socket.removeAllListeners(); } catch (_) {}
+    // terminate() on a CONNECTING socket emits 'error' ("closed before the
+    // connection was established"); with no listener that is an uncaught crash.
+    try { socket.on('error', () => {}); } catch (_) {}
     try { socket.terminate(); } catch (_) {}
   }
 
