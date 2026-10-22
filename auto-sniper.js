@@ -42,6 +42,7 @@ function sniperConfig(env = process.env) {
     enabled: flag(env.SNIPER_ENABLED, false),          // kill switch: off = evaluate nothing
     dryRun: flag(env.SNIPER_DRY_RUN, true),            // default dry run
     minRoi: num(env.SNIPER_MIN_ROI, 0.03),             // 3% after maker fee
+    minRoiTd: num(env.SNIPER_MIN_ROI_TD, 0.04),        // 4% after maker fee when any leg is a player TD
     maxPayout: num(env.SNIPER_MAX_PAYOUT, 100),        // $ per quote (contracts × $1)
     maxRisk: num(env.SNIPER_MAX_RISK, 100),            // $ worst-case loss per quote (NO cost + maker fee)
     totalExposureCap: num(env.SNIPER_TOTAL_EXPOSURE_CAP, 10000), // $ open worst-case risk

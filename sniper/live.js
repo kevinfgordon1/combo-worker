@@ -44,7 +44,7 @@ function createLiveSniper({
     // Re-price at send time with the freshest books.
     const fresh = reprice(rfq);
     const e = roiAt(d, fresh);
-    if (!e || e.roi < config.minRoi - 1e-12) return abort('reprice_below_min');
+    if (!e || e.roi < (d.minRoi != null ? d.minRoi : config.minRoi) - 1e-12) return abort('reprice_below_min');
     let res;
     try { res = await trader.postQuote(rfq, d.quoteYes, config.tick); } catch (err) {
       stats.postFail += 1; log(`[SNIPER] quote POST failed rfq=${rfq.rfqId}: ${err.message}`);
@@ -107,7 +107,7 @@ function createLiveSniper({
       const b = coord.blockReason(rfq); if (b) return decline(b);
       const fresh = reprice(rfq);
       const e = roiAt(d, fresh, n);
-      if (!e || e.roi < config.minRoi - 1e-12) return decline('reprice_below_min');
+      if (!e || e.roi < (d.minRoi != null ? d.minRoi : config.minRoi) - 1e-12) return decline('reprice_below_min');
       const cap = await store.confirmCheck(d.rfqId, Math.round(e.risk * 100) / 100, caps());
       if (!cap.ok) return decline(`cap_${cap.reason}`);
       try { await trader.confirm(evt.rfqId || rfq.rfqId, quoteId); } catch (err) {

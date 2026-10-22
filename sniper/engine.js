@@ -40,9 +40,14 @@ function decide(rfq, { config, ledger, pmLive, tdBook, venues, kickoffFor, maker
     contracts: Number(rfq.contracts) > 0 ? Number(rfq.contracts) : null,
     cash_size: Number(rfq.targetCostDollars) > 0 ? Number(rfq.targetCostDollars) : null,
   };
-  const d = evaluateSnipe(row, { config, ledger, nowMs, makerRate });
+  // Player-TD combos need a higher edge (SNIPER_MIN_ROI_TD, default 4%).
+  const hasTd = cls.legs.some((l) => l && l.kind === 'td');
+  const minRoi = hasTd ? Math.max(config.minRoi, config.minRoiTd != null ? config.minRoiTd : 0.04) : config.minRoi;
+  const d = evaluateSnipe(row, { config: { ...config, minRoi }, ledger, nowMs, makerRate });
+  if (d.action === 'skip' && d.reason === 'roi_below_min' && hasTd) d.reason = 'roi_below_min_td';
   if (d.action === 'quote') {
     d.releaseAt = releaseAtMs(legs, nowMs);
+    d.minRoi = minRoi; d.hasTd = hasTd;
     // Per-leg detail for the fill alert + audit (sniper_decisions.details.legDetail).
     d.legDetail = legs.map((l) => ({ ticker: l.ticker, side: l.side, fair: l.fair_yes, venue: l.venue, depthUsd: l.depth_usd, name: l.name }));
   }
