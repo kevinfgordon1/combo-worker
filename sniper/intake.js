@@ -11,7 +11,7 @@
 'use strict';
 const { rfqAgeMs } = require('../quote-sender');
 
-const NFL_NEEDLES = [Buffer.from('KXNFLGAME'), Buffer.from('KXNFLTD')];
+const NFL_NEEDLES = [Buffer.from('KXNFLGAME'), Buffer.from('KXNFLTD'), Buffer.from('KXNCAAFGAME')]; // + college football ML
 
 function frameHas(raw, needles) {
   if (Buffer.isBuffer(raw)) return needles.some((n) => raw.indexOf(n) !== -1);

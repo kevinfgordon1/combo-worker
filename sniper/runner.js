@@ -33,6 +33,7 @@ const { signedNow } = require('../kalshi-auth');
 const { rfqAgeMs } = require('../quote-sender');
 const { createKickoffResolver, ESPN_NFL } = require('./kickoff');
 const { espnKickoffs, oddsKickoffs } = require('../noboost/kickoffs');
+const { createNcaafBook, espnNcaafKickoffs, oddsNcaafKickoffs, ESPN_NCAAF } = require('./ncaaf');
 
 const ORIGIN = 'https://api.elections.kalshi.com';
 const P = '/trade-api/v2';
@@ -62,13 +63,13 @@ async function main(env = process.env) {
   const gate = liveGate(env);
   config.dryRun = !gate.live;
   if (String(env.SNIPER_DRY_RUN) === '0' && !gate.live) alert(`[SNIPER] SNIPER_DRY_RUN=0 but live gate closed (${gate.why.join(', ')}) — staying DRY RUN.`);
-  log(`[SNIPER] boot enabled=${config.enabled} mode=${gate.live ? 'LIVE' : 'DRY_RUN'} depth=$${depth} venues=${venues.join('+')} prophetx=${hasProphetXCreds(env) ? 'on' : 'off'}`);
+  log(`[SNIPER] boot enabled=${config.enabled} mode=${gate.live ? 'LIVE' : 'DRY_RUN'} depth=$${depth} venues=${venues.join('+')} prophetx=${hasProphetXCreds(env) ? 'on' : 'off'} ncaaf=${config.ncaaf ? `on(min ${(config.minRoiNcaaf * 100).toFixed(1)}%)` : 'off'}`);
   if (gate.live) alert('[SNIPER] ⚠️ LIVE MODE: all gates set — this service will send and confirm real Kalshi RFQ quotes.');
 
   // ── Request budgets (well under venue limits) ──
   const lim = {
     kalshi: createLimiter({ name: 'kalshi_public', ratePerSec: num(env.SNIPER_KALSHI_RPS, 2), burst: 3 }),
-    relay: createLimiter({ name: 'odds_relay', ratePerSec: num(env.SNIPER_RELAY_RPS, 1), burst: 2 }),
+    relay: createLimiter({ name: 'odds_relay', ratePerSec: num(env.SNIPER_RELAY_RPS, config.ncaaf ? 2 : 1), burst: 2 }), // our own relay; 2/s when NCAAF boards are polled too
     prophetx: createLimiter({ name: 'prophetx', ratePerSec: num(env.SNIPER_PROPHETX_RPS, 0.2), burst: 1 }),
     kalshiSeries: createLimiter({ name: 'kalshi_series', ratePerSec: 0.2, burst: 2 }),
     // signed calls on the sniper's own key (quote POST/confirm/cancel, fills reads)
@@ -94,6 +95,8 @@ async function main(env = process.env) {
   const tdBook = createTdBook({ staleMs: 15000, depthUsd: depth, maxOverround: 0.15, venues: tdVenues });
   const pmLive = createPmLiveBook({ staleMs: 15000, depthUsd: depth });
   pmLive.setTdBook(tdBook);
+  // College football ML book (same inverse-bet fair, own crosswalk identity). SNIPER_NCAAF=0 = off.
+  const ncaafBook = config.ncaaf ? createNcaafBook({ staleMs: 15000, depthUsd: depth }) : null;
   // Real kickoffs (ESPN > odds_cache > Kalshi occurrence−3h fallback, logged). `kick` keeps the
   // Kalshi estimate per ticker for the td-book's own staleness use.
   const kick = new Map();
@@ -116,12 +119,18 @@ async function main(env = process.env) {
     }
     return out;
   }
-  let mlTickers = []; let tdTickers = []; let listedAt = 0;
+  let mlTickers = []; let tdTickers = []; let ncaafTickers = []; let listedAt = 0;
   async function refreshLists() {
     const ml = await listMarkets('KXNFLGAME'); mlTickers = ml.map((m) => String(m.ticker).toUpperCase());
     if (venues.length) {
       const td = await listMarkets('KXNFLTD'); tdBook.setNames(td);
       tdTickers = td.map((m) => String(m.ticker).toUpperCase()).filter(isTdTicker);
+    }
+    // College football: only games kicking off within SNIPER_NCAAF_DAYS (default 8) to keep the
+    // public-orderbook budget small (~450 open KXNCAAFGAME markets span 2+ weeks).
+    if (ncaafBook) {
+      const horizon = Date.now() + num(env.SNIPER_NCAAF_DAYS, 8) * 864e5;
+      ncaafTickers = (await listMarkets('KXNCAAFGAME')).filter((m) => { const o = Date.parse(m.occurrence_datetime || ''); return !Number.isFinite(o) || o <= horizon; }).map((m) => String(m.ticker).toUpperCase());
     }
     listedAt = Date.now();
   }
@@ -135,6 +144,7 @@ async function main(env = process.env) {
   async function pollKalshi() {
     if (!listedAt || Date.now() - listedAt > 120000) await refreshLists();
     await books(mlTickers, (o) => pmLive.ingestKalshiOrderbooks(o)); health.ml = Date.now();
+    if (ncaafBook) await books(ncaafTickers, (o) => ncaafBook.ingestKalshiOrderbooks(o));
     await books(tdTickers, (o) => tdBook.ingest(o, Object.fromEntries([...kick].filter(([t]) => t.startsWith('KXNFLTD'))))); health.td = Date.now();
   }
   const relayErr = {}; const tdOff = new Map();
@@ -151,6 +161,10 @@ async function main(env = process.env) {
         const j = await getJson(lim.relay, `${relayBase}/board?venue=${venue}&league=NFL`);
         const novigLive = /ws:up/.test(String(st.novig || '')) && Number(nv.lastWsMsgAt) > 0 && polledAt - Number(nv.lastWsMsgAt) < 15000;
         pmLive.ingestRelay(venue, j.quotes || [], { feedLive: venue === 'novig' ? novigLive : false, polledAt });
+        if (ncaafBook) {
+          const c = await getJson(lim.relay, `${relayBase}/board?venue=${venue}&league=NCAAF`);
+          ncaafBook.ingestRelay(venue, c.quotes || [], { feedLive: venue === 'novig' ? novigLive : false, polledAt });
+        }
       } catch (e) { if (/disabled/.test(e.message)) throw e; relayErr[`${venue}_board`] = (relayErr[`${venue}_board`] || 0) + 1; }
       if (tdOff.has(venue) && Date.now() - tdOff.get(venue) < 10 * 60 * 1000) continue; // relay says td_off: re-check every 10 min
       try {
@@ -182,6 +196,13 @@ async function main(env = process.env) {
     const r = await fetch(ESPN_NFL, { headers: { accept: 'application/json' } });
     if (!r.ok) throw new Error(`espn scoreboard ${r.status}`);
     kickoffs.setKickoffs(espnKickoffs(await r.json()));
+    if (ncaafBook) {
+      for (const u of ESPN_NCAAF) { // FBS + FCS scoreboards (current week)
+        const c = await fetch(u, { headers: { accept: 'application/json' } });
+        if (!c.ok) throw new Error(`espn cfb scoreboard ${c.status}`);
+        kickoffs.setKickoffs(espnNcaafKickoffs(await c.json()));
+      }
+    }
   }
   async function pollOddsKickoffs() {
     if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) return;
@@ -190,6 +211,11 @@ async function main(env = process.env) {
     if (!r.ok) throw new Error(`odds_cache ${r.status}`);
     const j = await r.json();
     kickoffs.setKickoffs(oddsKickoffs(j[0] && j[0].data));
+    if (ncaafBook) {
+      const c = await fetch(`${env.SUPABASE_URL}/rest/v1/odds_cache?sport=eq.americanfootball_ncaaf&select=data,fetched_at&order=fetched_at.desc&limit=1`,
+        { headers: { apikey: env.SUPABASE_SERVICE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}` } });
+      if (c.ok) { const cj = await c.json(); kickoffs.setKickoffs(oddsNcaafKickoffs(cj[0] && cj[0].data)); }
+    }
   }
   loop(pollKickoffs, 'espn_kickoffs', num(env.SNIPER_ESPN_POLL_MS, 60000));
   loop(pollOddsKickoffs, 'odds_kickoffs', num(env.SNIPER_ODDS_KICKOFF_POLL_MS, 300000));
@@ -229,7 +255,7 @@ async function main(env = process.env) {
   if (bookArb && gate.live) loop(() => bookArb.recheckOpen(), 'book_arb', num(env.SNIPER_BOOK_ARB_POLL_MS, 300000));
   const liveSniper = createLiveSniper({
     config, trader, store: liveStore, coord, caps, log,
-    reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues }),
+    reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues, ncaafBook, ncaaf: !!ncaafBook }),
     alert,
     onFilled: (f) => (bookArb ? bookArb.check(f, 'fill') : null),
     // Rule 9 at commence time (no buffer here; decide() already stops new quotes 30 min early).
@@ -267,7 +293,7 @@ async function main(env = process.env) {
     let makerRate = null;
     try { const e = await fees.prefetch(seriesOfTicker(rfq.marketTicker)); makerRate = e ? e.rate : null; } catch (_) { makerRate = null; }
     const nowMs = Date.now();
-    const { decision: d } = decide(rfq, { config, ledger, pmLive, tdBook, venues, kickoffFor, makerRate, nowMs, pricesHealthy: pricesHealthy() });
+    const { decision: d } = decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook, venues, kickoffFor, makerRate, nowMs, pricesHealthy: pricesHealthy() });
     if (d.action !== 'quote') { counts.skips[d.reason] = (counts.skips[d.reason] || 0) + 1; return; }
     // Re-check age right before the DB reserve (fees prefetch can await on a cold series).
     if (tooOld(rfq, signedNow(), maxAgeMs) != null) {

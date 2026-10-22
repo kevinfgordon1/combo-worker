@@ -1,6 +1,7 @@
 // Phone-friendly Telegram FILL alert for the sniper. Pure formatter (tested in fill-alert.test.js).
 // We SELL the taker's parlay: they buy YES at q, we hold NO at (1 − q). We win when any leg loses.
 'use strict';
+const { parseNcaafMl, teamName } = require('./ncaaf');
 const VENUE = { kalshi: 'Kalshi', polymarket: 'Polymarket', novig: 'Novig', prophetx: 'ProphetX' };
 function american(p) {
   const x = Number(p);
@@ -34,6 +35,10 @@ function legParts(ticker, side, name) {
     if (!who) { const m = /^[A-Z]{2,3}([A-Z])([A-Z]+?)\d*$/.exec(code); who = m ? `${m[1]}. ${title(m[2])}` : code; }
     const tm = gameOf(parts[1], code.slice(0, 3)).includes('@') ? code.slice(0, 3) : code.slice(0, 2);
     return { bet: `${who} anytime TD${no ? ' (No)' : ''}`, game: gameOf(parts[1], tm) };
+  }
+  if (t.startsWith('KXNCAAFGAME-')) {
+    const g = parseNcaafMl(t);
+    if (g) return { bet: `${teamName(g.selection)} to win${no ? ' (No)' : ''}`, game: `${teamName(g.codes[0])} @ ${teamName(g.codes[1])}` };
   }
   if (t.startsWith('KXNFLGAME')) {
     const pick = parts[2] || '';

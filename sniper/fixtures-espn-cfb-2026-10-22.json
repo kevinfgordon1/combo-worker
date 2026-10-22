@@ -1,0 +1,104 @@
+{
+ "note": "Trimmed real ESPN college-football scoreboard (groups=80), captured 2026-10-22",
+ "events": [
+  {
+   "date": "2026-10-22T23:00Z",
+   "status": {
+    "type": {
+     "state": "pre"
+    }
+   },
+   "competitions": [
+    {
+     "date": "2026-10-22T23:00Z",
+     "competitors": [
+      {
+       "homeAway": "home",
+       "team": {
+        "location": "Kennesaw State",
+        "displayName": "Kennesaw State Owls",
+        "shortDisplayName": "Kennesaw St",
+        "abbreviation": "KENN"
+       }
+      },
+      {
+       "homeAway": "away",
+       "team": {
+        "location": "Liberty",
+        "displayName": "Liberty Flames",
+        "shortDisplayName": "Liberty",
+        "abbreviation": "LIB"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "date": "2026-10-24T22:30Z",
+   "status": {
+    "type": {
+     "state": "pre"
+    }
+   },
+   "competitions": [
+    {
+     "date": "2026-10-24T22:30Z",
+     "competitors": [
+      {
+       "homeAway": "home",
+       "team": {
+        "location": "Colorado State",
+        "displayName": "Colorado State Rams",
+        "shortDisplayName": "Colorado St",
+        "abbreviation": "CSU"
+       }
+      },
+      {
+       "homeAway": "away",
+       "team": {
+        "location": "San Diego State",
+        "displayName": "San Diego State Aztecs",
+        "shortDisplayName": "San Diego St",
+        "abbreviation": "SDSU"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "date": "2026-10-24T23:30Z",
+   "status": {
+    "type": {
+     "state": "pre"
+    }
+   },
+   "competitions": [
+    {
+     "date": "2026-10-24T23:30Z",
+     "competitors": [
+      {
+       "homeAway": "home",
+       "team": {
+        "location": "Texas State",
+        "displayName": "Texas State Bobcats",
+        "shortDisplayName": "Texas St",
+        "abbreviation": "TXST"
+       }
+      },
+      {
+       "homeAway": "away",
+       "team": {
+        "location": "Utah State",
+        "displayName": "Utah State Aggies",
+        "shortDisplayName": "Utah State",
+        "abbreviation": "USU"
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}
