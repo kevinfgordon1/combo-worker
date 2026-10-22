@@ -33,7 +33,7 @@ const { signedNow } = require('../kalshi-auth');
 const { rfqAgeMs } = require('../quote-sender');
 const { createKickoffResolver, ESPN_NFL } = require('./kickoff');
 const { espnKickoffs, oddsKickoffs } = require('../noboost/kickoffs');
-const { createNcaafBook, espnNcaafKickoffs, oddsNcaafKickoffs, ESPN_NCAAF } = require('./ncaaf');
+const { createNcaafBook, espnNcaafKickoffs, oddsNcaafKickoffs, ESPN_NCAAF, isFbsGame } = require('./ncaaf');
 
 const ORIGIN = 'https://api.elections.kalshi.com';
 const P = '/trade-api/v2';
@@ -130,7 +130,7 @@ async function main(env = process.env) {
     // public-orderbook budget small (~450 open KXNCAAFGAME markets span 2+ weeks).
     if (ncaafBook) {
       const horizon = Date.now() + num(env.SNIPER_NCAAF_DAYS, 8) * 864e5;
-      ncaafTickers = (await listMarkets('KXNCAAFGAME')).filter((m) => { const o = Date.parse(m.occurrence_datetime || ''); return !Number.isFinite(o) || o <= horizon; }).map((m) => String(m.ticker).toUpperCase());
+      ncaafTickers = (await listMarkets('KXNCAAFGAME')).filter((m) => isFbsGame(m.ticker)).filter((m) => { const o = Date.parse(m.occurrence_datetime || ''); return !Number.isFinite(o) || o <= horizon; }).map((m) => String(m.ticker).toUpperCase());
     }
     listedAt = Date.now();
   }
@@ -197,7 +197,7 @@ async function main(env = process.env) {
     if (!r.ok) throw new Error(`espn scoreboard ${r.status}`);
     kickoffs.setKickoffs(espnKickoffs(await r.json()));
     if (ncaafBook) {
-      for (const u of ESPN_NCAAF) { // FBS + FCS scoreboards (current week)
+      for (const u of ESPN_NCAAF) { // FBS scoreboard (current week)
         const c = await fetch(u, { headers: { accept: 'application/json' } });
         if (!c.ok) throw new Error(`espn cfb scoreboard ${c.status}`);
         kickoffs.setKickoffs(espnNcaafKickoffs(await c.json()));

@@ -4,6 +4,7 @@
 // Team identity: the Kalshi code, translated ONLY through the verified ncaaf-crosswalk
 // (Kalshi codes ≠ Polymarket abbreviations ≠ Novig/ESPN names). A blob that does not split
 // into exactly two known codes, or a name not in the table, is UNMAPPED => no fair => skip.
+// FBS ONLY: a leg is quoted only when BOTH teams are on the FBS list (sniper/ncaaf-fbs.json).
 // gameId = ncaaf|<ET date>|<KALSHI CODES sorted, joined by +>.
 //
 // Fair = the same inverse-bet method as NFL (noboost/pm-live.js): for team T vs O,
@@ -14,6 +15,9 @@
 'use strict';
 const X = require('../ncaaf-crosswalk');
 const XDATA = require('../ncaaf-crosswalk.json');
+// FBS only: explicit list from ESPN's FBS group (groups=80). Any FCS/unknown team => skip.
+const FBS = new Set(Object.keys(require('./ncaaf-fbs.json').teams));
+const isFbs = (code) => FBS.has(String(code || '').toUpperCase());
 const { walk, american, FEES } = require('../noboost/pm-live');
 const { etDate } = require('../mm-paper-odds');
 
@@ -55,6 +59,9 @@ function parseNcaafMl(ticker) {
   return { ticker: t, date, codes: sp.codes.slice(), selection: p[2], gameId: `ncaaf|${date}|${[...sp.codes].sort().join('+')}` };
 }
 
+// Both teams FBS (Kalshi ML ticker) — used to keep FCS games out of polling and quoting.
+const isFbsGame = (ticker) => { const g = parseNcaafMl(ticker); return !!g && g.codes.every(isFbs); };
+
 // One RFQ leg key -> classified leg, or { reason } when it cannot be priced.
 function classifyNcaafLeg(key) {
   const [tk, sideRaw] = String(key || '').split(':');
@@ -62,6 +69,7 @@ function classifyNcaafLeg(key) {
   if (!isNcaafTicker(tk)) return { reason: 'not_ncaaf' };
   const g = parseNcaafMl(tk);
   if (!g) return { reason: 'ncaaf_unmapped' };
+  if (!g.codes.every(isFbs)) return { reason: 'ncaaf_fcs' };
   const other = g.codes.find((c) => c !== g.selection);
   return { kind: 'ncaaf', gameId: g.gameId, team: side === 'yes' ? g.selection : other, id: g.ticker, side };
 }
@@ -176,7 +184,7 @@ function oddsNcaafKickoffs(gamesArr) {
   return out;
 }
 
-const ESPN_NCAAF = [80, 81].map((g) => `https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?groups=${g}&limit=500`); // FBS + FCS
+const ESPN_NCAAF = ['https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?groups=80&limit=500']; // FBS only
 const teamName = (code) => { const t = X.teamByCode(code); return t ? t.name : code; };
 
-module.exports = { SERIES, isNcaafTicker, parseNcaafMl, classifyNcaafLeg, createNcaafBook, espnNcaafKickoffs, oddsNcaafKickoffs, codeForName, codeForPoly, teamName, ESPN_NCAAF };
+module.exports = { isFbs, isFbsGame, FBS_COUNT: FBS.size, SERIES, isNcaafTicker, parseNcaafMl, classifyNcaafLeg, createNcaafBook, espnNcaafKickoffs, oddsNcaafKickoffs, codeForName, codeForPoly, teamName, ESPN_NCAAF };

@@ -115,4 +115,15 @@ assert.strictEqual(makerRateFromSeries(undefined), 0.035, 'unknown => conservati
 // ── fill alert label ──
 assert.strictEqual(legLabel(LIB, 'yes'), 'Liberty to win · Liberty @ Kennesaw St.');
 assert.strictEqual(legLabel(LIB, 'no'), 'Liberty to win (No) · Liberty @ Kennesaw St.');
+// ── FBS only: any leg with an FCS team is skipped (explicit ESPN FBS list) ──
+const FCS = 'KXNCAAFGAME-26OCT31GRAMTXSO-TXSO'; // Grambling vs Texas Southern (both FCS, both in crosswalk)
+assert.ok(N.parseNcaafMl(FCS), 'FCS ticker parses through the crosswalk');
+assert.strictEqual(N.isFbsGame(FCS), false); assert.strictEqual(N.isFbsGame(LIB), true);
+assert.strictEqual(N.classifyNcaafLeg(`${FCS}:yes`).reason, 'ncaaf_fcs');
+assert.strictEqual(classifyLegs({ legKeys: [`${LIB}:yes`, `${FCS}:no`] }, { ncaaf: true }).reason, 'ncaaf_fcs');
+assert.strictEqual(decide({ ...rq, rfqId: 'f1', legKeys: [`${NFL}:yes`, `${FCS}:yes`] }, ctx()).decision.reason, 'scope_ncaaf_fcs');
+assert.ok(N.isFbs('LIB') && N.isFbs('MIA') && N.isFbs('KENN') && N.isFbs('SAC') && !N.isFbs('GRAM') && !N.isFbs('TXSO') && !N.isFbs('NICH'));
+assert.ok(N.FBS_COUNT >= 134 && N.FBS_COUNT <= 140, `FBS list size ${N.FBS_COUNT}`);
+// a hypothetical FBS-vs-FCS game is also skipped (one team off the list)
+assert.strictEqual(['LIB', 'GRAM'].every(N.isFbs), false);
 console.log('sniper/ncaaf.test.js ok');
