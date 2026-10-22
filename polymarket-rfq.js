@@ -383,16 +383,18 @@ function identityHitsTokens(id, tokens) {
   return teams.every((team) => teamInTokens(id.league, team, tokens));
 }
 
-function cheapDirectMatch(rfq, parlays) {
-  if (!rfq || !rfq.legKeys || !rfq.legKeys.length || !Array.isArray(parlays)) return null;
-  const asRfq = { ...rfq, legKeys: upperKeys(rfq.legKeys) };
+// Per-lock-list derived views, built once per parlays() snapshot (live-runner
+// replaces the array on every refresh) instead of once per RFQ. Copying the
+// locks per RFQ defeated rfq.js's WeakMap memos (lockDerived/matchIndex) and
+// re-parsed every lock identity for every firehose RFQ (~55% CPU at 700 RFQ/s).
+const directViewMemo = new WeakMap();
+function directViews(parlays) {
+  let v = directViewMemo.get(parlays);
+  if (v && v.n === parlays.length) return v;
   const withUpper = parlays.map((p) => {
     const lk = upperKeys(p.leg_keys || p.legKeys);
     return { ...p, leg_keys: lk, legKeys: lk };
   });
-  const direct = matchParlay(asRfq, withUpper);
-  if (direct) return parlays.find((x) => x.id === direct.id) || direct;
-
   const rewritten = [];
   for (const p of parlays) {
     const keys = [];
@@ -402,6 +404,17 @@ function cheapDirectMatch(rfq, parlays) {
     }
     if (keys.length) rewritten.push({ ...p, leg_keys: keys, legKeys: keys });
   }
+  v = { n: parlays.length, withUpper, rewritten };
+  directViewMemo.set(parlays, v);
+  return v;
+}
+
+function cheapDirectMatch(rfq, parlays) {
+  if (!rfq || !rfq.legKeys || !rfq.legKeys.length || !Array.isArray(parlays)) return null;
+  const asRfq = { ...rfq, legKeys: upperKeys(rfq.legKeys) };
+  const { withUpper, rewritten } = directViews(parlays);
+  const direct = matchParlay(asRfq, withUpper);
+  if (direct) return parlays.find((x) => x.id === direct.id) || direct;
   if (!rewritten.length) return null;
   const viaLegs = matchParlay(asRfq, rewritten);
   if (!viaLegs) return null;
