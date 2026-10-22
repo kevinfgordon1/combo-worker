@@ -14,12 +14,15 @@ function createLiveSniper({
   config, trader, store, coord, caps, reprice, alert = () => {}, log = console.log,
   now = () => Date.now(), ttlMs = RESERVE_TTL_MS, fillRetries = 4, fillRetryMs = 1500,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)), onHalt = () => {},
+  startedReason = () => null, // (rfq) -> 'game_started' | 'no_kickoff' | null (rule 9)
 } = {}) {
   const pending = new Map(); // quoteId -> { d, rfq, accepted, timer }
   const byRfq = new Map(); // rfqId -> quoteId
   const confirming = new Set();
   const stats = { posted: 0, postFail: 0, accepted: 0, confirmed: 0, declined: {}, fills: 0, cancelled: 0, settled: 0, aborted: {} };
   let halted = false;
+  let haltReason = null; let haltDay = null;
+  const etDayKey = (ms) => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
   const bump = (o, k) => { o[k] = (o[k] || 0) + 1; };
   const live = () => !!trader.live && !halted;
 
@@ -33,6 +36,7 @@ function createLiveSniper({
   async function send(rfq, d) {
     const abort = async (reason) => { bump(stats.aborted, reason); await store.release(d.rfqId, 'cancelled', {}); return { sent: false, reason }; };
     if (!live()) return abort(halted ? 'halted' : 'not_live');
+    const st = startedReason(rfq); if (st) return abort(st);
     const b = coord.blockReason(rfq); if (b) return abort(b);
     const cw = await coord.comboWorkerQuoting(rfq.rfqId); if (cw) return abort(cw);
     // Re-price at send time with the freshest books.
@@ -61,6 +65,17 @@ function createLiveSniper({
     try { await trader.cancel(quoteId); } catch (e) { log(`[SNIPER] cancel ${quoteId} failed: ${e.message}`); }
     await store.release(p.d.rfqId, phase, {});
     if (phase === 'declined') { bump(stats.declined, reason); log(`[SNIPER] DECLINE quote_id=${quoteId} rfq=${p.rfq.rfqId} reason=${reason}`); } else stats.cancelled += 1;
+  }
+  // Rule 9: pull every open (unconfirmed) quote touching a game that has reached commence time.
+  async function pullStarted() {
+    let n = 0;
+    for (const [qid, p] of [...pending]) {
+      if (confirming.has(qid)) continue;
+      const r = startedReason(p.rfq); if (!r) continue;
+      await dropQuote(qid, p.accepted ? 'declined' : 'cancelled', r); n += 1;
+      log(`[SNIPER] PULLED quote_id=${qid} rfq=${p.rfq.rfqId} reason=${r}`);
+    }
+    return n;
   }
   async function expire(quoteId) {
     const p = pending.get(quoteId);
@@ -146,14 +161,23 @@ function createLiveSniper({
     }
     const day = await store.dayRealized(dayStartIso);
     if (!halted && -day >= config.dailyLossCap) {
-      halted = true; onHalt('daily_loss');
-      alert(`🎯 SNIPER (not Combo Locks) 🛑 AUTO-DISABLED: realized loss today $${(-day).toFixed(2)} ≥ $${config.dailyLossCap} daily stop. No new quotes until next ET day + restart.`);
+      halted = true; haltReason = 'daily_loss'; haltDay = etDayKey(now()); onHalt('daily_loss');
+      alert(`🎯 SNIPER (not Combo Locks) 🛑 AUTO-DISABLED: realized loss today $${(-day).toFixed(2)} ≥ $${config.dailyLossCap} daily stop. No new quotes until the next ET day (auto-resumes after midnight ET).`);
     }
     return day;
   }
 
-  function halt(reason) { if (!halted) { halted = true; onHalt(reason); } }
-  return { send, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, halted: () => halted, pending, stats: () => ({ ...stats, pending: pending.size }), _minQuotePrice: minQuotePrice };
+  function halt(reason) { if (!halted) { halted = true; haltReason = reason; haltDay = etDayKey(now()); onHalt(reason); } }
+  // Daily-loss stop lifts at the next ET day. Other halts (rate limit) still need a restart.
+  function resumeIfNewDay() {
+    if (halted && haltReason === 'daily_loss' && etDayKey(now()) !== haltDay) {
+      halted = false; haltReason = null; haltDay = null;
+      alert('🎯 SNIPER (not Combo Locks) — new ET day: daily loss stop lifted, quoting resumes.');
+      return true;
+    }
+    return false;
+  }
+  return { send, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => ({ ...stats, pending: pending.size }), _minQuotePrice: minQuotePrice };
 }
 
 module.exports = { createLiveSniper };

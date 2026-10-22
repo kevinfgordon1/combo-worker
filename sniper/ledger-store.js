@@ -76,10 +76,21 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
     if (error) throw new Error(error.message);
     return (data || []).reduce((s, r) => s + (Number(r.realized_pnl) || 0), 0);
   }
+  // Day recap inputs: quotes (decisions) + ledger rows touched since dayStartIso, for one book.
+  async function dayRecap(dayStartIso, { live = false } = {}) {
+    const acts = live ? ['quoted'] : ['would_quote'];
+    const dq = await supabase.from('sniper_decisions').select('action', { count: 'exact', head: true })
+      .gte('created_at', dayStartIso).in('action', acts);
+    if (dq.error) throw new Error(dq.error.message);
+    const fl = await supabase.from('sniper_ledger').select('rfq_id,phase,status,risk,filled_contracts,filled_cost,filled_fee,realized_pnl,settled_at,updated_at,created_at')
+      .eq('dry_run', !live).or(`updated_at.gte.${dayStartIso},settled_at.gte.${dayStartIso}`).limit(20000);
+    if (fl.error) throw new Error(fl.error.message);
+    return { quotes: dq.count || 0, rows: fl.data || [] };
+  }
   async function decision(rec) {
     try { await supabase.from('sniper_decisions').insert(rec); } catch (_) { /* audit only */ }
   }
-  return { hydrate, reserve, confirmCheck, update, release, openFilled, dayRealized, decision };
+  return { hydrate, reserve, confirmCheck, update, release, openFilled, dayRealized, dayRecap, decision };
 }
 
 module.exports = { createLedgerStore, capsFrom };

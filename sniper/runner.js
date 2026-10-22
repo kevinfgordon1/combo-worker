@@ -19,21 +19,30 @@ const { sniperConfig, createSniperLedger, formatDecision, createTelegramNotifier
 const { createLimiter, createRateBreaker } = require('./limiter');
 const { createLedgerStore } = require('./ledger-store');
 const { venuesFromEnv } = require('./fair');
-const { decide, repriceFair } = require('./engine');
+const { decide, repriceFair, pregameCheck } = require('./engine');
 const { liveGate, sniperSubaccount } = require('./gates');
 const { createSniperTrader } = require('./trader');
 const { createLockCoord } = require('./coord');
 const { createLiveSniper } = require('./live');
 const { capsFrom } = require('./ledger-store');
+const { createNightlyRecap } = require('./recap');
+const { createKickoffResolver, ESPN_NFL } = require('./kickoff');
+const { espnKickoffs, oddsKickoffs } = require('../noboost/kickoffs');
 
 const ORIGIN = 'https://api.elections.kalshi.com';
 const P = '/trade-api/v2';
 const num = (v, d) => (v == null || v === '' || !Number.isFinite(Number(v)) ? d : Number(v));
 const log = (m) => console.log(m);
 
+// Midnight ET for the ET day containing ms (DST-correct: EDT -04:00 / EST -05:00).
 function etDayStartIso(ms) {
   const d = new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
-  return new Date(`${d}T00:00:00-04:00`).toISOString();
+  for (const off of ['-04:00', '-05:00']) {
+    const t = new Date(`${d}T00:00:00${off}`);
+    const h = new Date(t).toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', hourCycle: 'h23' });
+    if (Number(h) === 0 && new Date(t).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }) === d) return t.toISOString();
+  }
+  return new Date(`${d}T00:00:00-05:00`).toISOString();
 }
 
 async function main(env = process.env) {
@@ -80,8 +89,11 @@ async function main(env = process.env) {
   const tdBook = createTdBook({ staleMs: 15000, depthUsd: depth, maxOverround: 0.15, venues: tdVenues });
   const pmLive = createPmLiveBook({ staleMs: 15000, depthUsd: depth });
   pmLive.setTdBook(tdBook);
-  const kick = new Map(); // ticker -> estimated kickoff ms (Kalshi occurrence_datetime − 3h)
-  const kickoffFor = (t) => (kick.has(String(t).toUpperCase()) ? kick.get(String(t).toUpperCase()) : null);
+  // Real kickoffs (ESPN > odds_cache > Kalshi occurrence−3h fallback, logged). `kick` keeps the
+  // Kalshi estimate per ticker for the td-book's own staleness use.
+  const kick = new Map();
+  const kickoffs = createKickoffResolver({ log });
+  const kickoffFor = (t) => kickoffs.kickoffFor(t);
   const health = { ml: 0, td: 0, relay: 0 };
   const relayBase = env.SNIPER_ODDS_RELAY_URL || (env.RAILWAY_SERVICE_ODDS_RELAY_URL ? `https://${env.RAILWAY_SERVICE_ODDS_RELAY_URL}` : '');
 
@@ -92,7 +104,7 @@ async function main(env = process.env) {
       for (const m of j.markets || []) {
         const t = String(m.ticker || '').toUpperCase();
         const occ = Date.parse(m.occurrence_datetime || '');
-        if (t && Number.isFinite(occ)) kick.set(t, occ - 3 * 3600 * 1000);
+        if (t && Number.isFinite(occ)) { kick.set(t, occ - 3 * 3600 * 1000); kickoffs.setKalshiOccurrence(t, occ); }
         out.push(m);
       }
       cursor = j.cursor || ''; if (!cursor) break;
@@ -161,6 +173,21 @@ async function main(env = process.env) {
   };
   loop(pollKalshi, 'kalshi_books', num(env.SNIPER_KALSHI_POLL_MS, 5000));
   loop(pollRelay, 'relay', num(env.SNIPER_RELAY_POLL_MS, 3000));
+  async function pollKickoffs() {
+    const r = await fetch(ESPN_NFL, { headers: { accept: 'application/json' } });
+    if (!r.ok) throw new Error(`espn scoreboard ${r.status}`);
+    kickoffs.setKickoffs(espnKickoffs(await r.json()));
+  }
+  async function pollOddsKickoffs() {
+    if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) return;
+    const r = await fetch(`${env.SUPABASE_URL}/rest/v1/odds_cache?sport=eq.americanfootball_nfl&select=data,fetched_at&order=fetched_at.desc&limit=1`,
+      { headers: { apikey: env.SUPABASE_SERVICE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}` } });
+    if (!r.ok) throw new Error(`odds_cache ${r.status}`);
+    const j = await r.json();
+    kickoffs.setKickoffs(oddsKickoffs(j[0] && j[0].data));
+  }
+  loop(pollKickoffs, 'espn_kickoffs', num(env.SNIPER_ESPN_POLL_MS, 60000));
+  loop(pollOddsKickoffs, 'odds_kickoffs', num(env.SNIPER_ODDS_KICKOFF_POLL_MS, 300000));
   if (px) loop(pollPx, 'prophetx', num(env.SNIPER_PROPHETX_POLL_MS, 10000));
 
   // ── Ledger (persistent) ──
@@ -190,6 +217,8 @@ async function main(env = process.env) {
     config, trader, store: liveStore, coord, caps, log,
     reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues }),
     alert,
+    // Rule 9 at commence time (no buffer here; decide() already stops new quotes 30 min early).
+    startedReason: (rfq) => pregameCheck(rfq.legKeys || [], kickoffFor, Date.now(), 0),
     onHalt: () => { /* halted flag inside liveSniper blocks new sends/confirms */ },
   });
   liveSniperRef = () => liveSniper.halt('rate_limit');
@@ -206,6 +235,7 @@ async function main(env = process.env) {
   const counts = { rfqs: 0, quotes: 0, skips: {}, ledgerFail: 0 };
   const pricesHealthy = () => Date.now() - health.ml < 30000;
   async function onRfq(rfq) {
+    if (liveSniper.halted()) liveSniper.resumeIfNewDay();
     if (disabled || liveSniper.halted() || !rfq || !rfq.isCombo) return;
     // Combo Locks priority before anything else (read-only check of active locks).
     const blocked = coord.blockReason(rfq);
@@ -257,13 +287,22 @@ async function main(env = process.env) {
   });
   if (ws && typeof ws.start === 'function') ws.start(); else if (ws && typeof ws.connect === 'function') ws.connect();
 
+  setInterval(() => { liveSniper.pullStarted().catch((e) => log(`[SNIPER] pullStarted error: ${e.message}`)); }, 5000);
+
+  // ── Nightly Telegram recap (~11:59 PM ET), sent even on days with no fills ──
+  const recap = createNightlyRecap({
+    store, send: (m) => { log(m); if (tg) tg(m); }, dayStartIso: etDayStartIso,
+    live: gate.live, openRisk: () => ledger.totals().total, log,
+  });
+  setInterval(() => { recap.tick().catch((e) => log(`[SNIPER] recap error: ${e.message}`)); }, 30000);
+
   // ── Summary + watchdog ──
   let lastBeat = Date.now();
   setInterval(() => {
     const t = ledger.totals();
     const s = Object.entries(counts.skips).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, v]) => `${k}=${v}`).join(' ');
     const ls = Object.values(lim).map((l) => { const x = l.stats(); return `${x.name}:${x.requests}req/${x.r429}x429`; }).join(' ');
-    log(`[SNIPER] summary mode=${gate.live ? 'LIVE' : 'dry'}${liveSniper.halted() ? ' HALTED' : ''} live=${JSON.stringify(liveSniper.stats())} trade=${JSON.stringify(trader.stats())} locks=${JSON.stringify(coord.stats())} rfqs=${counts.rfqs} would_quote=${counts.quotes} open=$${t.total.toFixed(2)} positions=${ledger.positions.size} dayRisk=$${ledger.day.risk.toFixed(2)} breaker429=${breaker.count()} relayErr=${JSON.stringify(relayErr)} tdOff=${[...tdOff.keys()].join(',') || 'none'} ${disabled ? 'DISABLED' : ''} load: ${ls} skips: ${s || 'none'}`);
+    log(`[SNIPER] summary mode=${gate.live ? 'LIVE' : 'dry'}${liveSniper.halted() ? ' HALTED' : ''} live=${JSON.stringify(liveSniper.stats())} trade=${JSON.stringify(trader.stats())} locks=${JSON.stringify(coord.stats())} kickoffs=${JSON.stringify(kickoffs.stats())} rfqs=${counts.rfqs} would_quote=${counts.quotes} open=$${t.total.toFixed(2)} positions=${ledger.positions.size} dayRisk=$${ledger.day.risk.toFixed(2)} breaker429=${breaker.count()} relayErr=${JSON.stringify(relayErr)} tdOff=${[...tdOff.keys()].join(',') || 'none'} ${disabled ? 'DISABLED' : ''} load: ${ls} skips: ${s || 'none'}`);
     store.decision({ rfq_id: null, action: 'summary', reason: null, details: { counts, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
     counts.rfqs = 0; counts.quotes = 0; counts.skips = {};
   }, 60000);

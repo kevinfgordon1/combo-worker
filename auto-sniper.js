@@ -43,6 +43,7 @@ function sniperConfig(env = process.env) {
     dryRun: flag(env.SNIPER_DRY_RUN, true),            // default dry run
     minRoi: num(env.SNIPER_MIN_ROI, 0.03),             // 3% after maker fee
     maxPayout: num(env.SNIPER_MAX_PAYOUT, 100),        // $ per quote (contracts × $1)
+    maxRisk: num(env.SNIPER_MAX_RISK, 100),            // $ worst-case loss per quote (NO cost + maker fee)
     totalExposureCap: num(env.SNIPER_TOTAL_EXPOSURE_CAP, 10000), // $ open worst-case risk
     perGameCap: num(env.SNIPER_PER_GAME_CAP, 1000),    // $ open risk touching one game
     perLegCap: num(env.SNIPER_PER_LEG_CAP, 750),       // $ open risk on one leg (ticker+side)
@@ -191,6 +192,7 @@ function evaluateSnipe(row, { config, ledger, nowMs = Date.now(), lockOverlap = 
   const px = minQuotePrice({ fair, contracts, cash, makerRate, minRoi: c.minRoi, tick: c.tick });
   if (!px) return skip('roi_below_min');
   if (px.n > c.maxPayout + 1e-9) return skip('payout_over_cap', { payout: px.n });
+  if (c.maxRisk != null && px.risk > c.maxRisk + 1e-9) return skip('risk_over_cap', { risk: px.risk });
   if (px.roi > c.maxRoi) return skip('roi_suspicious');
 
   const combo = comboKey(legs);
