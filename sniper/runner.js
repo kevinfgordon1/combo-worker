@@ -303,7 +303,7 @@ async function main(env = process.env) {
     const s = Object.entries(counts.skips).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, v]) => `${k}=${v}`).join(' ');
     const ls = Object.values(lim).map((l) => { const x = l.stats(); return `${x.name}:${x.requests}req/${x.r429}x429`; }).join(' ');
     log(`[SNIPER] summary mode=${gate.live ? 'LIVE' : 'dry'}${liveSniper.halted() ? ' HALTED' : ''} live=${JSON.stringify(liveSniper.stats())} trade=${JSON.stringify(trader.stats())} locks=${JSON.stringify(coord.stats())} kickoffs=${JSON.stringify(kickoffs.stats())} rfqs=${counts.rfqs} would_quote=${counts.quotes} open=$${t.total.toFixed(2)} positions=${ledger.positions.size} dayRisk=$${ledger.day.risk.toFixed(2)} breaker429=${breaker.count()} relayErr=${JSON.stringify(relayErr)} tdOff=${[...tdOff.keys()].join(',') || 'none'} ${disabled ? 'DISABLED' : ''} load: ${ls} skips: ${s || 'none'}`);
-    store.decision({ rfq_id: null, action: 'summary', reason: null, details: { counts, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
+    store.decision({ rfq_id: null, action: 'summary', reason: null, details: { mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
     counts.rfqs = 0; counts.quotes = 0; counts.skips = {};
   }, 60000);
   setInterval(() => {
