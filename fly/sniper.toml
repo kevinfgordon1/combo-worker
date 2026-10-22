@@ -23,4 +23,12 @@ kill_timeout = "30s"
 [env]
   SNIPER_DRY_RUN = "1"
   SNIPER_KALSHI_SUBACCOUNT = "1"
+  # Kevin's go-live risk rules (Oct 22)
+  SNIPER_MAX_RISK = "100"
+  SNIPER_MAX_PAYOUT = "100000"
+  SNIPER_DAILY_LOSS_CAP = "5000"
+  SNIPER_TOTAL_EXPOSURE_CAP = "5000"
+  SNIPER_PER_GAME_CAP = "1500"
+  SNIPER_MIN_ROI = "0.03"
+  SNIPER_FAIR_DEPTH_USD = "1000"
   SNIPER_ODDS_RELAY_URL = "http://kaygo-odds-relay.internal:8787"

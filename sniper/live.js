@@ -20,6 +20,8 @@ function createLiveSniper({
   const confirming = new Set();
   const stats = { posted: 0, postFail: 0, accepted: 0, confirmed: 0, declined: {}, fills: 0, cancelled: 0, settled: 0, aborted: {} };
   let halted = false;
+  let haltReason = null; let haltDay = null;
+  const etDayKey = (ms) => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
   const bump = (o, k) => { o[k] = (o[k] || 0) + 1; };
   const live = () => !!trader.live && !halted;
 
@@ -146,14 +148,23 @@ function createLiveSniper({
     }
     const day = await store.dayRealized(dayStartIso);
     if (!halted && -day >= config.dailyLossCap) {
-      halted = true; onHalt('daily_loss');
-      alert(`🎯 SNIPER (not Combo Locks) 🛑 AUTO-DISABLED: realized loss today $${(-day).toFixed(2)} ≥ $${config.dailyLossCap} daily stop. No new quotes until next ET day + restart.`);
+      halted = true; haltReason = 'daily_loss'; haltDay = etDayKey(now()); onHalt('daily_loss');
+      alert(`🎯 SNIPER (not Combo Locks) 🛑 AUTO-DISABLED: realized loss today $${(-day).toFixed(2)} ≥ $${config.dailyLossCap} daily stop. No new quotes until the next ET day (auto-resumes after midnight ET).`);
     }
     return day;
   }
 
-  function halt(reason) { if (!halted) { halted = true; onHalt(reason); } }
-  return { send, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, halted: () => halted, pending, stats: () => ({ ...stats, pending: pending.size }), _minQuotePrice: minQuotePrice };
+  function halt(reason) { if (!halted) { halted = true; haltReason = reason; haltDay = etDayKey(now()); onHalt(reason); } }
+  // Daily-loss stop lifts at the next ET day. Other halts (rate limit) still need a restart.
+  function resumeIfNewDay() {
+    if (halted && haltReason === 'daily_loss' && etDayKey(now()) !== haltDay) {
+      halted = false; haltReason = null; haltDay = null;
+      alert('🎯 SNIPER (not Combo Locks) — new ET day: daily loss stop lifted, quoting resumes.');
+      return true;
+    }
+    return false;
+  }
+  return { send, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, haltReason: () => haltReason, halted: () => halted, pending, stats: () => ({ ...stats, pending: pending.size }), _minQuotePrice: minQuotePrice };
 }
 
 module.exports = { createLiveSniper };

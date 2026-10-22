@@ -25,15 +25,22 @@ const { createSniperTrader } = require('./trader');
 const { createLockCoord } = require('./coord');
 const { createLiveSniper } = require('./live');
 const { capsFrom } = require('./ledger-store');
+const { createNightlyRecap } = require('./recap');
 
 const ORIGIN = 'https://api.elections.kalshi.com';
 const P = '/trade-api/v2';
 const num = (v, d) => (v == null || v === '' || !Number.isFinite(Number(v)) ? d : Number(v));
 const log = (m) => console.log(m);
 
+// Midnight ET for the ET day containing ms (DST-correct: EDT -04:00 / EST -05:00).
 function etDayStartIso(ms) {
   const d = new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
-  return new Date(`${d}T00:00:00-04:00`).toISOString();
+  for (const off of ['-04:00', '-05:00']) {
+    const t = new Date(`${d}T00:00:00${off}`);
+    const h = new Date(t).toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', hourCycle: 'h23' });
+    if (Number(h) === 0 && new Date(t).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }) === d) return t.toISOString();
+  }
+  return new Date(`${d}T00:00:00-05:00`).toISOString();
 }
 
 async function main(env = process.env) {
@@ -206,6 +213,7 @@ async function main(env = process.env) {
   const counts = { rfqs: 0, quotes: 0, skips: {}, ledgerFail: 0 };
   const pricesHealthy = () => Date.now() - health.ml < 30000;
   async function onRfq(rfq) {
+    if (liveSniper.halted()) liveSniper.resumeIfNewDay();
     if (disabled || liveSniper.halted() || !rfq || !rfq.isCombo) return;
     // Combo Locks priority before anything else (read-only check of active locks).
     const blocked = coord.blockReason(rfq);
@@ -256,6 +264,13 @@ async function main(env = process.env) {
     onStatus: (s, info) => log(`[SNIPER] ws ${typeof s === 'string' ? s : JSON.stringify(s)}${info ? ` ${JSON.stringify(info)}` : ''}`),
   });
   if (ws && typeof ws.start === 'function') ws.start(); else if (ws && typeof ws.connect === 'function') ws.connect();
+
+  // ── Nightly Telegram recap (~11:59 PM ET), sent even on days with no fills ──
+  const recap = createNightlyRecap({
+    store, send: (m) => { log(m); if (tg) tg(m); }, dayStartIso: etDayStartIso,
+    live: gate.live, openRisk: () => ledger.totals().total, log,
+  });
+  setInterval(() => { recap.tick().catch((e) => log(`[SNIPER] recap error: ${e.message}`)); }, 30000);
 
   // ── Summary + watchdog ──
   let lastBeat = Date.now();
