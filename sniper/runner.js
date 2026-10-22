@@ -19,7 +19,7 @@ const { sniperConfig, createSniperLedger, formatDecision, createTelegramNotifier
 const { createLimiter, createRateBreaker } = require('./limiter');
 const { createLedgerStore } = require('./ledger-store');
 const { venuesFromEnv } = require('./fair');
-const { decide, repriceFair } = require('./engine');
+const { decide, repriceFair, pregameCheck } = require('./engine');
 const { liveGate, sniperSubaccount } = require('./gates');
 const { createSniperTrader } = require('./trader');
 const { createLockCoord } = require('./coord');
@@ -197,6 +197,8 @@ async function main(env = process.env) {
     config, trader, store: liveStore, coord, caps, log,
     reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues }),
     alert,
+    // Rule 9 at commence time (no buffer here; decide() already stops new quotes 30 min early).
+    startedReason: (rfq) => pregameCheck(rfq.legKeys || [], kickoffFor, Date.now(), 0),
     onHalt: () => { /* halted flag inside liveSniper blocks new sends/confirms */ },
   });
   liveSniperRef = () => liveSniper.halt('rate_limit');
@@ -264,6 +266,8 @@ async function main(env = process.env) {
     onStatus: (s, info) => log(`[SNIPER] ws ${typeof s === 'string' ? s : JSON.stringify(s)}${info ? ` ${JSON.stringify(info)}` : ''}`),
   });
   if (ws && typeof ws.start === 'function') ws.start(); else if (ws && typeof ws.connect === 'function') ws.connect();
+
+  setInterval(() => { liveSniper.pullStarted().catch((e) => log(`[SNIPER] pullStarted error: ${e.message}`)); }, 5000);
 
   // ── Nightly Telegram recap (~11:59 PM ET), sent even on days with no fills ──
   const recap = createNightlyRecap({

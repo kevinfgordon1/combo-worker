@@ -103,5 +103,24 @@ const ev = (r, ledger, opts = {}) => S.evaluateSnipe(r, { config, ledger, nowMs:
   assert.deepStrictEqual([s.fills, s.wins, s.losses, s.pnl], [1, 1, 1, -3]);
   assert.strictEqual(etDayStartIso(Date.parse('2026-11-05T12:00:00Z')), '2026-11-05T05:00:00.000Z', 'EST midnight after DST ends');
   assert.strictEqual(etDayStartIso(NOW), '2026-10-22T04:00:00.000Z');
+  // (9) started games: no new quote at/after commence; open quotes touching a started game are pulled
+  const KO = NOW + 3600e3;
+  const legs9 = ['KXNFLGAME-26OCT25INDMIN-MIN:yes', 'KXNFLGAME-26OCT25BUFNYJ-BUF:yes'];
+  for (const at of [KO, KO + 60e3]) {
+    const r9 = decide({ rfqId: `s${at}`, legKeys: legs9, contracts: 10 }, { ...base, kickoffFor: (tk) => (tk.includes('BUFNYJ') ? KO : KO + 864e5), nowMs: at });
+    assert.strictEqual(r9.decision.reason, 'game_started');
+  }
+  let clk = NOW; const cancels = []; const rel = [];
+  const { pregameCheck } = require('./engine');
+  const L9 = createLiveSniper({ config, log: () => {}, now: () => clk, ttlMs: 1e9,
+    trader: { live: true, postQuote: async () => ({ quoteId: 'Q1', noBid: '0.5' }), cancel: async (q) => cancels.push(q) },
+    store: { release: async (r, ph) => rel.push(ph), update: async () => true },
+    coord: { blockReason: () => null, comboWorkerQuoting: async () => null }, caps: () => ({}), reprice: () => 0.25,
+    startedReason: (rfq) => pregameCheck(rfq.legKeys, () => KO, clk, 0) });
+  assert.ok((await L9.send({ rfqId: 'p1', legKeys: legs9 }, { rfqId: 'p1', quoteYes: 0.3, contracts: 10, makerRate: 0 })).sent);
+  assert.strictEqual(await L9.pullStarted(), 0);
+  clk = KO; assert.strictEqual(await L9.pullStarted(), 1);
+  assert.deepStrictEqual(cancels, ['Q1']); assert.strictEqual(L9.pending.size, 0);
+  assert.strictEqual((await L9.send({ rfqId: 'p2', legKeys: legs9 }, { rfqId: 'p2', quoteYes: 0.3, contracts: 10, makerRate: 0 })).reason, 'game_started');
   console.log('sniper/risk-rules.test.js ok');
 })().catch((e) => { console.error(e); process.exit(1); });
