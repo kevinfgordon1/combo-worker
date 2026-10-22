@@ -50,7 +50,7 @@ function walk(levels, venue, usd = DEPTH_USD) {
     const c = p + fee(p);
     const take = Math.min(q, (usd - spent) / c);
     spent += take * c; got += take;
-    if (spent >= usd - 1e-9) return { vwap: spent / got, top, depthUsd: usd };
+    if (spent >= usd - 1e-9) return { vwap: spent / got, top, depthUsd: usd, availUsd: lv.reduce((s, [pp, qq]) => (pp <= p + 1e-9 ? s + qq * (pp + fee(pp)) : s), 0) }; // $ at or better than the marginal price used
   }
   return { fail: 'depth', top, depthUsd: spent };
 }
@@ -152,7 +152,7 @@ function createPmLiveBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 
     const out = { venue: v, key: src.key, ageMs: Math.round(age), changeAgeMs: src.changedAt ? Math.round(now() - src.changedAt) : null, topAmerican: w.top != null ? american(w.top) : null, depthKnown: src.depthKnown };
     if (age > staleMs) return { ...out, used: false, reason: 'stale' };
     if (w.fail) return { ...out, used: false, reason: w.fail };
-    return { ...out, used: true, cost: w.vwap, costAmerican: american(w.vwap), reason: src.depthKnown ? 'ok' : 'top_only' };
+    return { ...out, used: true, cost: w.vwap, availUsd: w.availUsd, costAmerican: american(w.vwap), reason: src.depthKnown ? 'ok' : 'top_only' };
   }
 
   // Per-leg fair: { p, american, best, sources:[...] } or null (no fresh venue).

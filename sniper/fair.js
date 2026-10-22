@@ -25,13 +25,13 @@ function legFairDepth(leg, { pmLive, tdBook, venues }) {
     const m = tdBook.legMulti({ id: leg.id, side: leg.side });
     const b = bestCost(m && m.sources, venues);
     if (!b) return { p: null, reason: 'td_no_venue_depth' };
-    return { p: 1 - b.cost, best: b.venue };
+    return { p: 1 - b.cost, best: b.venue, venue: b.venue, depthUsd: b.availUsd != null ? b.availUsd : null };
   }
   if (!pmLive) return { p: null, reason: 'no_ml_book' };
   const f = pmLive.legFair(leg.gameId, leg.team);
   if (!f) return { p: null, reason: 'no_game' };
   const b = bestCost(f.sources, venues);
   if (!b) return { p: null, reason: 'no_venue_depth' };
-  return { p: 1 - b.cost, best: `${b.venue}${b.via ? ':' + b.via : ''}` };
+  return { p: 1 - b.cost, best: `${b.venue}${b.via ? ':' + b.via : ''}`, venue: b.venue, depthUsd: b.availUsd != null ? b.availUsd : null };
 }
 module.exports = { ALL_VENUES, venuesFromEnv, bestCost, legFairDepth };

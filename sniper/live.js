@@ -9,6 +9,7 @@
 const { snipeEconomics, minQuotePrice } = require('../auto-sniper');
 const { shouldConfirmAccept } = require('../engine');
 const { RESERVE_TTL_MS } = require('../reserve');
+const { formatFillAlert } = require('./fill-alert');
 
 function createLiveSniper({
   config, trader, store, coord, caps, reprice, alert = () => {}, log = console.log,
@@ -143,7 +144,7 @@ function createLiveSniper({
       fill_ids: book.book.map((r) => r.fill_id), market_ticker: p.rfq.marketTicker || (book.book[0] && book.book[0].ticker) || null,
     });
     stats.fills += 1; pending.delete(quoteId); byRfq.delete(p.rfq.rfqId);
-    alert(`🎯 SNIPER (not Combo Locks) — FILL rfq=${p.rfq.rfqId} ${book.contracts} NO @ avg ${(cost / book.contracts).toFixed(3)} cost $${cost.toFixed(2)} fee $${fee.toFixed(2)} ticker=${p.rfq.marketTicker || '?'}`);
+    alert(formatFillAlert({ d: p.d, rfq: p.rfq, contracts: book.contracts, cost, fee }));
     return { booked: true, contracts: book.contracts };
   }
 
