@@ -177,7 +177,7 @@ function createLiveSniper({
     }
     return false;
   }
-  return { send, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => ({ ...stats, pending: pending.size }), _minQuotePrice: minQuotePrice };
+  return { send, forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); }, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => ({ ...stats, pending: pending.size }), _minQuotePrice: minQuotePrice };
 }
 
 module.exports = { createLiveSniper };
