@@ -16,7 +16,7 @@ function createLiveSniper({
   config, trader, store, coord, caps, reprice, alert = () => {}, log = console.log,
   now = () => Date.now(), ttlMs = RESERVE_TTL_MS, fillRetries = 4, fillRetryMs = 1500,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)), onHalt = () => {},
-  startedReason = () => null, kickoffOf = () => null, // kickoffOf: ticker -> kickoff ms (fill alert); startedReason: (rfq) -> 'game_started' | 'no_kickoff' | null (rule 9)
+  startedReason = () => null, kickoffOf = () => null, onFilled = () => {}, // onFilled: book-arb check (alert-only) // kickoffOf: ticker -> kickoff ms (fill alert); startedReason: (rfq) -> 'game_started' | 'no_kickoff' | null (rule 9)
 } = {}) {
   const pending = new Map(); // quoteId -> { d, rfq, accepted, timer }
   const byRfq = new Map(); // rfqId -> quoteId
@@ -148,6 +148,7 @@ function createLiveSniper({
     });
     stats.fills += 1; pending.delete(quoteId); byRfq.delete(p.rfq.rfqId);
     alert(formatFillAlert({ d: p.d, contracts: book.contracts, cost, fee, kickoffOf }));
+    try { Promise.resolve(onFilled({ rfqId: p.d.rfqId, legs: p.d.legs, contracts: book.contracts, cost, fee })).catch(() => {}); } catch (_) { /* never blocks booking */ }
     return { booked: true, contracts: book.contracts };
   }
 
