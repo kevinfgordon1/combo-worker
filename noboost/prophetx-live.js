@@ -1,13 +1,49 @@
 // ProphetX partner API moneyline depth for the PM live inverse fair (port of aibetbuilder
 // lib/book-depth.js fetchProphetXDepth). READ-ONLY GETs. Off (returns []) without credentials:
 // PROPHETX_API_KEY, or PROPHETX_ACCESS_KEY + PROPHETX_SECRET_KEY.
+//
+// PROPHETX_AUTH_MODE:
+//   (unset)/affiliate  legacy /affiliate endpoints (needs an affiliate data key).
+//   relay              read ProphetX from our odds relay (/board?venue=prophetx), which holds the
+//                      single ProphetX login + push feed. URL: PROPHETX_RELAY_URL, else
+//                      SNIPER_ODDS_RELAY_URL / NOBOOST_ODDS_RELAY_URL. No ProphetX key needed here.
 'use strict';
 const BASE = () => process.env.PROPHETX_API_BASE || 'https://cash.api.prophetx.co/partner';
 
-function hasProphetXCreds(env = process.env) { return !!(env.PROPHETX_API_KEY || (env.PROPHETX_ACCESS_KEY && env.PROPHETX_SECRET_KEY)); }
+function authMode(env = process.env) { return String(env.PROPHETX_AUTH_MODE || 'affiliate').trim().toLowerCase(); }
+function relayUrl(env = process.env) { return String(env.PROPHETX_RELAY_URL || env.SNIPER_ODDS_RELAY_URL || env.NOBOOST_ODDS_RELAY_URL || '').replace(/\/+$/, ''); }
+function hasProphetXCreds(env = process.env) {
+  if (authMode(env) === 'relay') return !!relayUrl(env);
+  return !!(env.PROPHETX_API_KEY || (env.PROPHETX_ACCESS_KEY && env.PROPHETX_SECRET_KEY));
+}
+
+// Relay board quotes -> the same rows nflMoneylines() returns.
+function rowsFromRelayQuotes(quotes) {
+  const out = [];
+  for (const q of quotes || []) {
+    if (!q || q.bet_type !== 'moneyline' || !q.side) continue;
+    const levels = (q.depth && q.depth.length ? q.depth : [{ american: q.american, size: q.size }])
+      .map((l) => ({ american: Number(l.american), size: Number(l.size) }))
+      .filter((l) => Number.isFinite(l.american) && l.size > 0);
+    if (levels.length) out.push({ away: q.away, home: q.home, start: q.start, side: q.side, key: q.token_id || `${q.event_id}:${q.side}`, levels });
+  }
+  return out;
+}
 function decToAmerican(d) { if (!(d > 1)) return null; return d >= 2 ? Math.round((d - 1) * 100) : -Math.round(100 / (d - 1)); }
 
 function createProphetXClient({ env = process.env, fetchImpl = fetch } = {}) {
+  if (authMode(env) === 'relay') {
+    return {
+      async nflMoneylines() {
+        const base = relayUrl(env);
+        if (!base) return [];
+        const r = await fetchImpl(`${base}/board?venue=prophetx&league=NFL`, {});
+        if (!r.ok) throw new Error(`prophetx relay board -> ${r.status}`);
+        const j = await r.json();
+        return rowsFromRelayQuotes(j.quotes);
+      },
+    };
+  }
   let token = null; let tokenAt = 0;
   async function auth() {
     if (env.PROPHETX_API_KEY) return env.PROPHETX_API_KEY;
@@ -44,4 +80,4 @@ function createProphetXClient({ env = process.env, fetchImpl = fetch } = {}) {
   return { nflMoneylines };
 }
 
-module.exports = { createProphetXClient, hasProphetXCreds };
+module.exports = { createProphetXClient, hasProphetXCreds, rowsFromRelayQuotes, authMode };

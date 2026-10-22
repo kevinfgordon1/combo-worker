@@ -13,6 +13,7 @@
 const http = require('http');
 const { authHeaders: polymarketAuthHeaders } = require('./polymarket-auth');
 const { authHeaders: kalshiAuthHeaders, normalizePem } = require('./kalshi-auth');
+const prophetxFeed = require('./prophetx-feed');
 
 const US_WS_URL = 'wss://api.polymarket.us/v1/ws/markets';
 const US_WS_PATH = '/v1/ws/markets';
@@ -25,7 +26,7 @@ const KALSHI_WS_URL = 'wss://external-api-ws.kalshi.com/trade-api/ws/v2';
 const KALSHI_WS_SIGN_PATH = '/trade-api/ws/v2';
 
 const BOOK_IDS = Object.freeze({ polymarket: 193, kalshi: 194, novig: 195 });
-const VENUES = ['polymarket', 'kalshi', 'novig'];
+const VENUES = ['polymarket', 'kalshi', 'novig', 'prophetx'];
 const LEAGUES = ['NFL', 'NCAAF', 'MLB'];
 const US_LEAGUE_PATH = Object.freeze({ NFL: 'nfl', MLB: 'mlb', NCAAF: 'cfb' });
 const WINNER_TYPES = new Set([
@@ -566,8 +567,8 @@ function createChannel() {
 }
 
 function createState() {
-  const books = { polymarket: {}, kalshi: {}, novig: {} };
-  const channels = { polymarket: {}, kalshi: {}, novig: {} };
+  const books = { polymarket: {}, kalshi: {}, novig: {}, prophetx: {} };
+  const channels = { polymarket: {}, kalshi: {}, novig: {}, prophetx: {} };
   const emitters = { polymarket: {}, kalshi: {} };
   for (const league of LEAGUES) {
     books.polymarket[league] = new Map();
@@ -576,6 +577,8 @@ function createState() {
     channels.polymarket[league] = createChannel();
     channels.kalshi[league] = createChannel();
     channels.novig[league] = createChannel();
+    books.prophetx[league] = new Map();
+    channels.prophetx[league] = createChannel();
     emitters.polymarket[league] = createQuoteEmitter(
       books.polymarket[league],
       (q) => q.token_id,
@@ -598,8 +601,9 @@ function createState() {
     usSubscribed: new Set(),
     usSeedAt: new Map(),
     kalshiWsUp: false,
-    status: { us: 'starting', clob: 'starting', kalshi: 'starting', novig: 'off' },
+    status: { us: 'starting', clob: 'starting', kalshi: 'starting', novig: 'off', prophetx: 'off' },
     novigFeed: null,
+    prophetxFeed: null,
   };
 }
 
@@ -693,8 +697,17 @@ function novigSig(quote) {
 }
 
 function publishNovig(state, league, quotes, mode) {
-  const book = state.books.novig && state.books.novig[league];
-  const channel = state.channels.novig && state.channels.novig[league];
+  publishFullBook(state, 'novig', league, quotes, mode);
+}
+
+// ProphetX hands over its full league board the same way Novig does.
+function publishProphetX(state, league, quotes, mode) {
+  publishFullBook(state, 'prophetx', league, quotes, mode);
+}
+
+function publishFullBook(state, venue, league, quotes, mode) {
+  const book = state.books[venue] && state.books[venue][league];
+  const channel = state.channels[venue] && state.channels[venue][league];
   if (!book || !channel) return;
   const next = new Map();
   for (const quote of quotes || []) {
@@ -712,9 +725,10 @@ function publishNovig(state, league, quotes, mode) {
   book.clear();
   for (const [key, quote] of next) book.set(key, quote);
   if (!removed && !changed.length) return;
-  if (removed || !state.novigSnapshotted || !state.novigSnapshotted[league]) {
+  const snapKey = venue === 'novig' ? league : `${venue}:${league}`;
+  if (removed || !state.novigSnapshotted || !state.novigSnapshotted[snapKey]) {
     state.novigSnapshotted = state.novigSnapshotted || {};
-    state.novigSnapshotted[league] = true;
+    state.novigSnapshotted[snapKey] = true;
     channel.push({ quotes: [...next.values()], complete: true, mode: 'snapshot' });
     return;
   }
@@ -3377,6 +3391,33 @@ function startNovig(state, opts, env) {
   return () => feed.stop();
 }
 
+// ProphetX main markets (moneyline / spread / total) for NFL, NCAAF, MLB. Off unless
+// PROPHETX_RELAY=1 and PROPHETX_ACCESS_KEY + PROPHETX_SECRET_KEY are set. Read-only.
+function startProphetX(state, opts, env) {
+  if (opts.prophetx === false || String(env.PROPHETX_RELAY || '') !== '1') {
+    state.status.prophetx = 'off';
+    return () => {};
+  }
+  if (!opts.createProphetXFeed && !prophetxFeed.prophetxRelayCreds(env)) {
+    state.status.prophetx = 'off (no PROPHETX_ACCESS_KEY/PROPHETX_SECRET_KEY)';
+    console.log('[odds-relay] prophetx off: PROPHETX_RELAY=1 but no PROPHETX_ACCESS_KEY + PROPHETX_SECRET_KEY');
+    return () => {};
+  }
+  const feed = (opts.createProphetXFeed || prophetxFeed.createProphetXFeed)({
+    env,
+    fetchFn: opts.prophetxFetch || opts.fetchFn,
+    WebSocket: opts.prophetxWebSocket,
+    onQuotes: (league, quotes, mode) => {
+      state.status.prophetx = feed && feed.status ? `rest:${feed.status.rest} ws:${feed.status.ws}` : 'up';
+      publishProphetX(state, league, quotes, mode);
+    },
+  });
+  state.prophetxFeed = feed;
+  state.status.prophetx = 'starting';
+  console.log('[odds-relay] prophetx relay on (push + REST reconcile)');
+  return () => feed.stop();
+}
+
 // ------------------------------------------------------------------ Betstamp
 // One shared Betstamp live poller per (league, book set), fanned out over SSE
 // to every browser on the Pro odds board (GET /betstamp). Before this, each
@@ -5111,11 +5152,12 @@ function handleRequest(req, res, state) {
       for (const league of LEAGUES) counts[venue][league] = state.books[venue][league].size;
     }
     const novig = state.novigFeed ? state.novigFeed.health() : null;
+    const prophetx = state.prophetxFeed ? state.prophetxFeed.health() : null;
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     const dkfd = state.dkfd && state.dkfd.poller ? state.dkfd.poller.health() : null;
     const t = state.usTd;
     const usTd = t && t.on ? { markets: t.catalog.size, books: t.books.size, subscriptions: t.subs.size, subscribed: t.subscribed.size, events: t.eventSlugs.length, lastDiscoverAgeMs: t.lastDiscoverAt ? Date.now() - t.lastDiscoverAt : null, discoverErrors: t.discoverErrors, subErrors: t.subErrors, lastSubError: t.lastSubError } : { on: false };
-    res.end(JSON.stringify({ ok: true, status: state.status, counts, polymarketUs: { lastFrameAgeMs: state.usLastFrameAt ? Date.now() - state.usLastFrameAt : null, lastAliveAgeMs: state.usLastAliveAt ? Date.now() - state.usLastAliveAt : null, discoverError: state.usDiscoverError || null, td: usTd }, novig, betstamp: state.betstamp ? state.betstamp.health() : null, underdog: state.underdog ? state.underdog.health() : null, dkfd }));
+    res.end(JSON.stringify({ ok: true, status: state.status, counts, polymarketUs: { lastFrameAgeMs: state.usLastFrameAt ? Date.now() - state.usLastFrameAt : null, lastAliveAgeMs: state.usLastAliveAt ? Date.now() - state.usLastAliveAt : null, discoverError: state.usDiscoverError || null, td: usTd }, novig, prophetx, betstamp: state.betstamp ? state.betstamp.health() : null, underdog: state.underdog ? state.underdog.health() : null, dkfd }));
     return;
   }
   if (url.pathname !== '/stream' && url.pathname !== '/board') {
@@ -5177,8 +5219,9 @@ function startOddsRelay(opts = {}) {
     stops.push(startClob(state, opts));
     stops.push(startKalshi(state, opts));
     stops.push(startNovig(state, opts, env));
+    stops.push(startProphetX(state, opts, env));
   } else {
-    state.status = { us: 'off', clob: 'off', kalshi: 'off', novig: 'off' };
+    state.status = { us: 'off', clob: 'off', kalshi: 'off', novig: 'off', prophetx: 'off' };
   }
   {
     const env = opts.env || process.env;
@@ -5260,6 +5303,9 @@ module.exports = {
   createState,
   publish,
   publishNovig,
+  publishProphetX,
+  startProphetX,
+  prophetxFeed,
   applyPolymarketStreamMessage,
   bestAskFromLevels,
   kalshiYesAskFromNoBids,
