@@ -46,7 +46,7 @@ function vwapFor(levels, usd = DEPTH_USD, feeFn = fee) {
     const c = p + feeFn(p);
     const take = Math.min(q, (usd - spent) / c);
     spent += take * c; got += take;
-    if (spent >= usd - 1e-9) return { vwap: spent / got, top: levels[0][0] + feeFn(levels[0][0]), topUsd: levels[0][1] * (levels[0][0] + feeFn(levels[0][0])) };
+    if (spent >= usd - 1e-9) return { vwap: spent / got, top: levels[0][0] + feeFn(levels[0][0]), topUsd: levels[0][1] * (levels[0][0] + feeFn(levels[0][0])), availUsd: levels.reduce((s, [pp, qq]) => (pp > 0 && pp <= p + 1e-9 && qq > 0 ? s + qq * (pp + feeFn(pp)) : s), 0) }; // $ at or better than the marginal price used
   }
   return null; // not enough depth
 }
@@ -243,7 +243,7 @@ function createTdBook({ now = () => Date.now(), staleMs = 15000, depthUsd = DEPT
       if (opp) { out.topAmerican = american(opp.top); out.topUsd = Math.round(opp.topUsd * 100) / 100; }
       if (age > staleMs) return { ...out, used: false, reason: 'stale' };
       if (e.fail) return { ...out, used: false, reason: e.fail };
-      return { ...out, used: true, reason: 'ok', cost: opp.vwap, costAmerican: american(opp.vwap) };
+      return { ...out, used: true, reason: 'ok', cost: opp.vwap, availUsd: opp.availUsd, costAmerican: american(opp.vwap) };
     };
     const k = books.get(t);
     const ks = evalEntry('kalshi', k);

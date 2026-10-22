@@ -33,7 +33,7 @@ function decide(rfq, { config, ledger, pmLive, tdBook, venues, kickoffFor, maker
   const legs = keys.map((k, i) => {
     const [ticker, side] = String(k).split(':');
     const f = legFairDepth(cls.legs[i], { pmLive, tdBook, venues });
-    return { ticker, side: side || 'yes', fair_yes: f.p, fair_best: f.best || null, date: legDate(ticker) };
+    return { ticker, side: side || 'yes', fair_yes: f.p, fair_best: f.best || null, venue: f.venue || null, depth_usd: f.depthUsd != null ? Math.round(f.depthUsd) : null, name: (tdBook && tdBook.names && tdBook.names.get && tdBook.names.get(String(ticker).toUpperCase())) || null, date: legDate(ticker) };
   });
   const row = {
     rfq_id: rfq.rfqId, venue: 'kalshi', status: 'seen', legs,
@@ -41,7 +41,11 @@ function decide(rfq, { config, ledger, pmLive, tdBook, venues, kickoffFor, maker
     cash_size: Number(rfq.targetCostDollars) > 0 ? Number(rfq.targetCostDollars) : null,
   };
   const d = evaluateSnipe(row, { config, ledger, nowMs, makerRate });
-  if (d.action === 'quote') d.releaseAt = releaseAtMs(legs, nowMs);
+  if (d.action === 'quote') {
+    d.releaseAt = releaseAtMs(legs, nowMs);
+    // Per-leg detail for the fill alert + audit (sniper_decisions.details.legDetail).
+    d.legDetail = legs.map((l) => ({ ticker: l.ticker, side: l.side, fair: l.fair_yes, venue: l.venue, depthUsd: l.depth_usd, name: l.name }));
+  }
   return { decision: d, row };
 }
 
