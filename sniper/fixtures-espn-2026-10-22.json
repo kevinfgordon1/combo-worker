@@ -1,0 +1,108 @@
+{
+ "events": [
+  {
+   "date": "2026-10-23T00:15Z",
+   "shortName": "NE @ CHI",
+   "status": {
+    "type": {
+     "state": "pre"
+    }
+   },
+   "competitions": [
+    {
+     "date": "2026-10-23T00:15Z",
+     "competitors": [
+      {
+       "team": {
+        "displayName": "Chicago Bears"
+       }
+      },
+      {
+       "team": {
+        "displayName": "New England Patriots"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "date": "2026-10-25T13:30Z",
+   "shortName": "PIT VS NO",
+   "status": {
+    "type": {
+     "state": "pre"
+    }
+   },
+   "competitions": [
+    {
+     "date": "2026-10-25T13:30Z",
+     "competitors": [
+      {
+       "team": {
+        "displayName": "New Orleans Saints"
+       }
+      },
+      {
+       "team": {
+        "displayName": "Pittsburgh Steelers"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "date": "2026-10-25T17:00Z",
+   "shortName": "CIN @ BAL",
+   "status": {
+    "type": {
+     "state": "pre"
+    }
+   },
+   "competitions": [
+    {
+     "date": "2026-10-25T17:00Z",
+     "competitors": [
+      {
+       "team": {
+        "displayName": "Baltimore Ravens"
+       }
+      },
+      {
+       "team": {
+        "displayName": "Cincinnati Bengals"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "date": "2026-10-26T00:20Z",
+   "shortName": "KC @ SEA",
+   "status": {
+    "type": {
+     "state": "pre"
+    }
+   },
+   "competitions": [
+    {
+     "date": "2026-10-26T00:20Z",
+     "competitors": [
+      {
+       "team": {
+        "displayName": "Seattle Seahawks"
+       }
+      },
+      {
+       "team": {
+        "displayName": "Kansas City Chiefs"
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}
