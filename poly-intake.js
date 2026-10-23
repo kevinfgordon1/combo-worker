@@ -7,7 +7,7 @@
 //
 //  • createPolyIntakeStats()  per-interval counters (seen / ws / rest /
 //    rest_only / per-skip-reason / candidates / matched / quoted …).
-//  • crawlOpenRfqs()          best-effort cursor pagination with a polite
+//  • crawlOpenRfqs()          best-effort cursor pagination with a 1.2s
 //    inter-page delay + page cap. Polymarket's edge (Cloudflare) sometimes
 //    answers 403 for a deep cursor; that is treated as a TRUNCATED crawl
 //    (rows already collected are kept), never retried in a loop.
@@ -21,7 +21,7 @@
 const DEFAULT_CRAWL_MS = 30000;
 const DEFAULT_PAGE_LIMIT = 100;
 const DEFAULT_MAX_PAGES = 100;
-const DEFAULT_PAGE_DELAY_MS = 250; // ≈4 req/s, well under the documented 10 req/s
+const DEFAULT_PAGE_DELAY_MS = 1200; // GET /v1/rfqs is 1 req/s per IP (docs.polymarket.us rate limits) → ≤0.83 req/s
 const DEFAULT_HEARTBEAT_MS = 60000;
 const WS_SEEN_MAX = 30000;
 const MAX_REASON_KEYS = 64;

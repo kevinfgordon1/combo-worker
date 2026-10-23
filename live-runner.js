@@ -151,6 +151,7 @@ const {
 const { startHeartbeat } = require('./heartbeat');
 const { createLatencyStats, createLoopLagSampler } = require('./latency-stats');
 const { startPolymarketRfqLoop } = require('./polymarket-rfq');
+const { createPolySniper } = require('./poly-sniper');
 const { shortId } = require('./short-id');
 const {
   classifySkip,
@@ -2968,7 +2969,17 @@ async function main() {
   const polyAppAlerts = createAppAlerts({ client: SCOPE.isTester ? null : supabase });
   const polyStallAlerts = createPolyStallAlerts({ appAlerts: polyAppAlerts, log: console.log });
   { const t = setInterval(() => { polyStallAlerts.tick().catch(() => {}); }, 30000); if (t.unref) t.unref(); }
+  // Polymarket combo sniper — Phase 1 DRY RUN (poly-sniper/). Off unless POLY_SNIPER_ENABLED=1, and refuses
+  // to start unless POLY_SNIPER_DRY_RUN=1. Gets RFQ payloads only — never the Polymarket client or keys.
+  let polySniper = null;
+  if (SPLIT.runPoly && process.env.COMBO_ROLE === 'poly') {
+    try {
+      polySniper = createPolySniper({ env: process.env, supabase: SCOPE.isTester ? null : supabase, log: console.log });
+      if (polySniper) polySniper.start();
+    } catch (e) { console.error(`[${MODE}] poly-sniper not started: ${e.message}`); polySniper = null; }
+  }
   const poly = !SPLIT.runPoly ? null : startPolymarketRfqLoop({
+    onRfqObserved: polySniper ? (raw, src) => { setImmediate(() => { try { polySniper.observe(raw, src); } catch (_) { /* dry run only */ } }); } : null,
     pendingQuotes: polyPendingQuotes,
     kalshiPendingQuotes: pendingQuotes,
     capBook,
