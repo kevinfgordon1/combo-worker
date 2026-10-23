@@ -2,8 +2,8 @@
 // Same books, depths and staleness as the Kalshi sniper (sniper/runner.js):
 //   Kalshi PUBLIC orderbooks (unauthenticated) + our odds-relay (/board, /td) + ESPN/odds_cache kickoffs.
 // No Kalshi key, no ProphetX key, no Polymarket key. ProphetX comes from the relay only.
-// Polymarket's own book is EXCLUDED by default (POLY_SNIPER_FAIR_INCLUDE_POLY=1 to include):
-// we are quoting into Polymarket, so its book should not set our fair for that RFQ.
+// Full 4-venue inverse method by default (Kevin Oct 23): best opposing price across Kalshi,
+// Polymarket US, Novig and ProphetX, each with its own fee. POLY_SNIPER_FAIR_INCLUDE_POLY=0 excludes Polymarket.
 'use strict';
 const { createPmLiveBook } = require('../noboost/pm-live');
 const { createTdBook, isTdTicker } = require('../noboost/td-book');
@@ -13,14 +13,14 @@ const { createNcaafBook, espnNcaafKickoffs, oddsNcaafKickoffs, ESPN_NCAAF, isFbs
 const { createLimiter } = require('../sniper/limiter');
 const { ALL_VENUES } = require('../sniper/fair');
 const { createKalshiIndex } = require('./map');
-const { fetchLiveTdCrosswalk } = require('./prop-xwalk');
+const { startTdCrosswalkRefresher } = require('./prop-xwalk');
 
 const ORIGIN = 'https://api.elections.kalshi.com';
 const P = '/trade-api/v2';
 const num = (v, d) => (v == null || v === '' || !Number.isFinite(Number(v)) ? d : Number(v));
 
 function fairVenues(env = process.env) {
-  const includePoly = String(env.POLY_SNIPER_FAIR_INCLUDE_POLY || '') === '1';
+  const includePoly = String(env.POLY_SNIPER_FAIR_INCLUDE_POLY == null ? '1' : env.POLY_SNIPER_FAIR_INCLUDE_POLY).trim() !== '0';
   return ALL_VENUES.filter((v) => includePoly || v !== 'polymarket');
 }
 
@@ -121,13 +121,11 @@ function createPolySniperFeed({ env = process.env, log = console.log, fetchImpl 
   // Live NFL TD player crosswalk (public GETs, own slow limiter so it never starves the books).
   const xwLim = createLimiter({ name: 'poly_sniper_xwalk', ratePerSec: num(env.POLY_SNIPER_XWALK_RPS, 1), burst: 1 });
   const xwalk = { players: 0, at: 0 };
-  async function pollCrosswalk() {
-    const r = await fetchLiveTdCrosswalk((u) => getJson(xwLim, u));
-    if (!r.players.length && xwalk.players) { log('[POLY-SNIPER] td crosswalk refresh returned 0 players; keeping previous'); return; }
+  function onCrosswalk(r) {
     index.setPropIdx(r.idx);
     xwalk.players = r.players.length; xwalk.at = Date.now();
     const s = index.tdStats();
-    log(`[POLY-SNIPER] td crosswalk players=${r.players.length} kalshi_events=${r.kalshiEvents} poly_events=${r.polyEvents} td_indexed=${s.indexed}/${s.seen}`);
+    log(`[POLY-SNIPER] td crosswalk players=${r.players.length} td_indexed=${s.indexed}/${s.seen}`);
   }
   async function pollKickoffs() {
     const r = await fetchImpl(ESPN_NFL, { headers: { accept: 'application/json' } });
@@ -159,7 +157,7 @@ function createPolySniperFeed({ env = process.env, log = console.log, fetchImpl 
     loop(pollRelay, 'relay', num(env.POLY_SNIPER_RELAY_POLL_MS, 3000));
     loop(pollKickoffs, 'espn_kickoffs', 60000);
     loop(pollOddsKickoffs, 'odds_kickoffs', 300000);
-    loop(pollCrosswalk, 'td_crosswalk', num(env.POLY_SNIPER_XWALK_MS, 15 * 60 * 1000));
+    startTdCrosswalkRefresher({ getJson: (u) => getJson(xwLim, u), everyMs: num(env.POLY_SNIPER_XWALK_MS, 15 * 60 * 1000), log }).onUpdate(onCrosswalk);
   }
   // Same rule as the sniper: Kalshi books (if used) and relay must be < 30s old.
   function pricesHealthy(nowMs = Date.now()) {

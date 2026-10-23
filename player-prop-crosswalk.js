@@ -22,11 +22,21 @@ function index(players) {
   }
   return { byKalshi, byPoly };
 }
-const base = index(data.players);
+let base = index(data.players);
+
+// Live override (poly-sniper/prop-xwalk.js refresher): this week's verified NFL TD players replace
+// the snapshot's NFL TD entries; everything else (MLB HR) stays from the checked-in file.
+function setLiveNflTd(players) {
+  const live = (players || []).filter((p) => p.league === 'nfl' && p.kind === 'td');
+  base = index([...live, ...(data.players || []).filter((p) => !(p.league === 'nfl' && p.kind === 'td'))]);
+  return base.byKalshi.size;
+}
 
 module.exports = {
   nname,
   index,
+  setLiveNflTd,
+  current: () => base,
   byKalshi: (k, idx) => (idx || base).byKalshi.get(String(k).toUpperCase()) || null,
   byPoly: (stem, abbr, idx) => (idx || base).byPoly.get(`${stem}|${abbr}`) || null,
   size: () => base.byKalshi.size,

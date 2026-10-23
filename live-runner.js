@@ -2972,6 +2972,16 @@ async function main() {
   // Polymarket combo sniper — Phase 1 DRY RUN (poly-sniper/). Off unless POLY_SNIPER_ENABLED=1, and refuses
   // to start unless POLY_SNIPER_DRY_RUN=1. Gets RFQ payloads only — never the Polymarket client or keys.
   let polySniper = null;
+  // Combo Locks NFL TD legs: refresh the verified player crosswalk from public Kalshi/Poly US data
+  // (the checked-in file is a Week 5 snapshot). Same matching rules; pricing/caps untouched.
+  if (SPLIT.runPoly && process.env.COMBO_ROLE === 'poly' && String(process.env.POLY_TD_LIVE_XWALK || '1') !== '0') {
+    try {
+      const { startTdCrosswalkRefresher } = require('./poly-sniper/prop-xwalk');
+      const { createLimiter: mkLim } = require('./sniper/limiter');
+      const xl = mkLim({ name: 'td_xwalk', ratePerSec: 1, burst: 1 });
+      startTdCrosswalkRefresher({ getJson: async (u) => { const r = await xl.run(() => fetch(u, { headers: { accept: 'application/json' } })); if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }, log: console.log });
+    } catch (e) { console.error(`[${MODE}] td crosswalk refresher not started: ${e.message}`); }
+  }
   if (SPLIT.runPoly && process.env.COMBO_ROLE === 'poly') {
     try {
       polySniper = createPolySniper({ env: process.env, supabase: SCOPE.isTester ? null : supabase, log: console.log });

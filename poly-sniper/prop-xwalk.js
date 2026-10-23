@@ -44,4 +44,28 @@ async function fetchLiveTdCrosswalk(getJson) {
   return { idx: PROPX.index(players), players, unmatchedKalshi: xw.unmatchedKalshi.length, kalshiEvents: events.length, polyEvents: Object.keys(poly).length };
 }
 
-module.exports = { fetchLiveTdCrosswalk, polyEventShape };
+// One refresher per process, shared by Combo Locks (via PROPX.setLiveNflTd) and the sniper feed
+// (onUpdate). Public GETs at <= 1 req/s; an empty refresh keeps the previous list.
+let shared = null;
+function startTdCrosswalkRefresher({ getJson, everyMs = 15 * 60 * 1000, log = console.log } = {}) {
+  if (shared) return shared;
+  const subs = new Set(); const state = { players: 0, at: 0, last: null };
+  async function tick() {
+    try {
+      const r = await fetchLiveTdCrosswalk(getJson);
+      if (!r.players.length && state.players) { log('[TD-XWALK] refresh returned 0 players; keeping previous'); }
+      else {
+        PROPX.setLiveNflTd(r.players);
+        state.players = r.players.length; state.at = Date.now(); state.last = r;
+        log(`[TD-XWALK] live NFL TD crosswalk players=${r.players.length} kalshi_events=${r.kalshiEvents} poly_events=${r.polyEvents}`);
+        for (const f of subs) { try { f(r); } catch (_) { /* subscriber bug must not stop refresh */ } }
+      }
+    } catch (e) { log(`[TD-XWALK] refresh error: ${e.message}`); }
+    const t = setTimeout(tick, everyMs); if (t.unref) t.unref();
+  }
+  shared = { state, onUpdate(f) { subs.add(f); if (state.last) f(state.last); }, ready: tick() };
+  return shared;
+}
+function _resetShared() { shared = null; }
+
+module.exports = { fetchLiveTdCrosswalk, polyEventShape, startTdCrosswalkRefresher, _resetShared };
