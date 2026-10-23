@@ -21,6 +21,23 @@ function gameIdOfTicker(ticker) {
   return p && !p.skip && p.gameId ? p.gameId : null;
 }
 
+// Kalshi KXNCAAFGAME (moneyline) tickers often carry the date one day BEFORE the game
+// (e.g. 26OCT23 for a Sat Oct 24 kickoff); NCAAF spread/total tickers are dated correctly.
+// For ncaaf gameIds, match the team pair on the ticker date OR the next day, accepting
+// only when exactly one of those games is known (ambiguous => no match).
+function nextDay(date) {
+  const d = new Date(`${date}T12:00:00Z`); if (!Number.isFinite(d.getTime())) return null;
+  d.setUTCDate(d.getUTCDate() + 1); return d.toISOString().slice(0, 10);
+}
+function ncaafCandidates(gid) {
+  const m = /^ncaaf\|(\d{4}-\d\d-\d\d)\|(.+)$/.exec(gid || ''); if (!m) return [gid];
+  const n = nextDay(m[1]); return n ? [gid, `ncaaf|${n}|${m[2]}`] : [gid];
+}
+function lookup(map, gid) {
+  const hits = ncaafCandidates(gid).filter((g) => map.has(g));
+  return hits.length === 1 ? { gid: hits[0], k: map.get(hits[0]) } : null;
+}
+
 function createKickoffResolver({ log = () => {} } = {}) {
   const real = { espn: new Map(), odds_cache: new Map() }; // gameId -> { kickoffMs, state }
   const kalshi = new Map(); // ticker -> occurrence_datetime ms
@@ -40,8 +57,8 @@ function createKickoffResolver({ log = () => {} } = {}) {
     const gid = gameIdOfTicker(t);
     if (gid) {
       for (const src of ['espn', 'odds_cache']) {
-        const k = real[src].get(gid);
-        if (k) return { kickoffMs: k.kickoffMs, source: src, state: k.state, gameId: gid };
+        const hit = lookup(real[src], gid);
+        if (hit) return { kickoffMs: hit.k.kickoffMs, source: src, state: hit.k.state, gameId: hit.gid };
       }
     }
     if (kalshi.has(t)) {
@@ -59,4 +76,4 @@ function createKickoffResolver({ log = () => {} } = {}) {
   return { setKickoffs, setKalshiOccurrence, resolve, kickoffFor, stats: () => ({ espn: real.espn.size, odds: real.odds_cache.size, kalshi: kalshi.size, fallbacks: warned.size }) };
 }
 
-module.exports = { createKickoffResolver, gameIdOfTicker, ESPN_NFL };
+module.exports = { createKickoffResolver, gameIdOfTicker, ESPN_NFL, ncaafCandidates };

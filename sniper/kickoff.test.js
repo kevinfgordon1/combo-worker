@@ -36,4 +36,26 @@ assert.strictEqual(pregameCheck(legs, K.kickoffFor, Date.parse('2026-10-23T00:15
 const live = JSON.parse(JSON.stringify(espn)); live.events[0].status.type.state = 'in';
 K.setKickoffs(espnKickoffs(live));
 assert.strictEqual(pregameCheck(legs, K.kickoffFor, Date.parse('2026-10-22T20:00:00Z'), 0), 'game_started');
+
+// NCAAF ML tickers dated a day early: match team pair on ticker date OR next day, only if unique
+{
+  const L2 = []; const N2 = createKickoffResolver({ log: (m) => L2.push(m) });
+  N2.setKickoffs([{ source: 'espn', gameId: 'ncaaf|2026-10-24|ALA+TENN', kickoffMs: Date.parse('2026-10-24T19:30:00Z'), state: 'pre' }]);
+  const ml = 'KXNCAAFGAME-26OCT23ALATENN-ALA';
+  const gid = require('./kickoff').gameIdOfTicker(ml);
+  if (gid) { // only when crosswalk maps these codes
+    assert.strictEqual(gid, 'ncaaf|2026-10-23|ALA+TENN');
+    N2.setKalshiOccurrence(ml, Date.parse('2026-10-24T08:00:00Z'));
+    const r = N2.resolve(ml);
+    assert.strictEqual(r.source, 'espn'); assert.strictEqual(r.gameId, 'ncaaf|2026-10-24|ALA+TENN');
+    assert.strictEqual(N2.kickoffFor(ml), Date.parse('2026-10-24T19:30:00Z'));
+    assert.strictEqual(L2.length, 0, 'no fallback');
+    // ambiguous: same pair on ticker date and next day => no ESPN match (falls back)
+    N2.setKickoffs([{ source: 'espn', gameId: 'ncaaf|2026-10-23|ALA+TENN', kickoffMs: Date.parse('2026-10-23T23:00:00Z'), state: 'pre' }]);
+    assert.strictEqual(N2.resolve(ml).source, 'kalshi_occ_minus_3h');
+  }
+  const { ncaafCandidates } = require('./kickoff');
+  assert.deepStrictEqual(ncaafCandidates('ncaaf|2026-10-31|A+B'), ['ncaaf|2026-10-31|A+B', 'ncaaf|2026-11-01|A+B']);
+  assert.deepStrictEqual(ncaafCandidates('KXNFL|x'), ['KXNFL|x']);
+}
 console.log('sniper/kickoff.test.js ok');
