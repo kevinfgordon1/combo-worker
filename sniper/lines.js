@@ -126,7 +126,8 @@ function createLinesBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 2
       const startMs = Date.parse(q.start || '') || 0;
       if (startMs && !q.is_live && now() - startMs > SETTLED_AFTER_MS) continue;
       const changedAt = Date.parse(q.updated_at || '') || 0;
-      const at = poly ? changedAt : (feedLive ? polledAt : changedAt); // Polymarket: book fetch time
+      // Polymarket: relay confirmed_at = now while its market-data socket is alive + subscribed (quiet book is current).
+      const at = poly ? Math.max(Date.parse(q.confirmed_at || '') || 0, changedAt) : (feedLive ? polledAt : changedAt);
       let levels;
       const raw = (Array.isArray(q.depth) && q.depth.length ? q.depth : [{ odds: q.odds, size: q.size }]).map((d) => [Number(d.odds), Number(d.size)]).filter(([o, z]) => o > 0 && o < 1 && z > 0);
       if (!raw.length) continue;

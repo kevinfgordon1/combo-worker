@@ -88,5 +88,10 @@ console.log('lines.test ok', decision.action, decision.reason || '');
   assert.strictEqual(b3.legFair(L.classifyLineLeg(`${SP}:yes`)).best, 'novig', 'Poly on 6.5 not used for 7.5');
   // non-lines Polymarket feed ignored
   assert.strictEqual(b3.ingestRelay('polymarket', 'nfl', [{ ...base, feed: 'polymarket-us', side: 'Carolina Panthers', line: 7.5, odds: 0.3, depth: [{ odds: 0.3, size: 1e5 }] }]), 0);
+  // quiet Polymarket book (old updated_at) is fresh when the relay confirms it
+  const b4 = L.createLinesBook({ now: () => t2, depthUsd: 2000 }); b4.addGamesFromTickers([SP]);
+  b4.ingestRelay('novig', 'nfl', [{ ...base, feed: undefined, side: 'Carolina Panthers', line: 7.5, odds: 0.52, depth: [{ odds: 0.52, size: 10000 }], is_alt: false }]);
+  b4.ingestRelay('polymarket', 'nfl', [{ ...base, updated_at: new Date(t2 - 600000).toISOString(), confirmed_at: new Date(t2).toISOString(), side: 'Carolina Panthers', line: 7.5, odds: 0.45, depth: [{ odds: 0.45, size: 100000 }] }]);
+  assert.strictEqual(b4.legFair(L.classifyLineLeg(`${SP}:yes`)).best, 'polymarket', 'confirmed_at keeps a quiet book fresh');
   console.log('lines.test polymarket ok');
 }
