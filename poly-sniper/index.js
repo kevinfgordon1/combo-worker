@@ -23,18 +23,53 @@ function normalizePolymarketRfq(raw) {
   };
 }
 
-function createDecisionLogger({ supabase, log = console.log, batchMs = 2000, maxBatch = 200, logSkips = true }) {
-  let buf = []; let warned = false;
-  async function flush() {
-    if (!buf.length || !supabase) { buf = []; return; }
-    const rows = buf.splice(0, maxBatch);
+// Batched inserts: drains the whole buffer in chunks of maxBatch every batchMs, and flushes early
+// once a chunk is full, so ~100+ rows/sec bursts are written instead of silently dropped.
+// One flush at a time; rows are only dropped past maxBuffer (counted, logged once a minute).
+function createDecisionLogger({ supabase, log = console.log, batchMs = 1000, maxBatch = 500, maxBuffer = 20000, logSkips = true }) {
+  let buf = []; let warned = false; let busy = false; let inflight = null;
+  const stats = { pushed: 0, written: 0, dropped: 0, failed: 0 };
+  // Concurrent callers share the in-flight drain and then drain anything that arrived meanwhile.
+  function flush() {
+    if (inflight) return inflight.then(() => (buf.length && supabase ? flush() : undefined));
+    inflight = drain().finally(() => { inflight = null; });
+    return inflight;
+  }
+  async function drain() {
+    busy = true;
     try {
-      const { error } = await supabase.from('poly_sniper_decisions').insert(rows);
-      if (error && !warned) { warned = true; log(`[POLY-SNIPER] poly_sniper_decisions insert failed (table missing?): ${error.message}`); }
-    } catch (e) { if (!warned) { warned = true; log(`[POLY-SNIPER] insert threw: ${e.message}`); } }
+      while (buf.length) {
+        if (!supabase) { buf = []; break; }
+        const rows = buf.splice(0, maxBatch);
+        try {
+          const { error } = await supabase.from('poly_sniper_decisions').insert(rows);
+          if (error) { stats.failed += rows.length; if (!warned) { warned = true; log(`[POLY-SNIPER] poly_sniper_decisions insert failed (table missing?): ${error.message}`); } break; }
+          stats.written += rows.length;
+        } catch (e) { stats.failed += rows.length; if (!warned) { warned = true; log(`[POLY-SNIPER] insert threw: ${e.message}`); } break; }
+      }
+    } finally { busy = false; }
   }
   const t = setInterval(flush, batchMs); if (t.unref) t.unref();
-  return { push(row) { if (!logSkips && row.action !== 'quote') return; buf.push(row); if (buf.length > 5000) buf.splice(0, buf.length - 5000); }, flush };
+  return {
+    stats, flush,
+    push(row) {
+      if (!logSkips && row.action !== 'quote') return;
+      stats.pushed += 1; buf.push(row);
+      if (buf.length > maxBuffer) { const n = buf.length - maxBuffer; buf.splice(0, n); stats.dropped += n; }
+      if (buf.length >= maxBatch && !busy) setImmediate(flush);
+    },
+    size: () => buf.length,
+  };
+}
+
+// Per-leg record for the tape: every Poly leg with whether it matched a Kalshi-equivalent leg.
+function legRows(rfq, d) {
+  if (Array.isArray(d.legs) && d.legs.length) return d.legs.map((l) => ({ ...l, matched: true }));
+  const hit = new Map(((d.matched) || []).map((m) => [`${m.polySymbol}|${m.polySide}`, m]));
+  return (rfq.comboLegs || []).map((l) => {
+    const m = hit.get(`${l.symbol}|${l.side}`);
+    return m ? { polySymbol: l.symbol, polySide: l.side, ticker: m.ticker, side: m.side, matched: true } : { polySymbol: l.symbol, polySide: l.side, matched: false };
+  });
 }
 
 function createPolySniper({ env = process.env, supabase = null, log = console.log, feed = null, now = () => Date.now() } = {}) {
@@ -64,7 +99,7 @@ function createPolySniper({ env = process.env, supabase = null, log = console.lo
       rfq_id: rfq.rfqId, venue: 'polymarket', dry_run: true, source: src || null, symbol: rfq.symbol || null,
       action: d.action, reason: d.reason || null,
       leg_count: Array.isArray(rfq.comboLegs) ? rfq.comboLegs.length : null,
-      legs: d.legs || (rfq.comboLegs || []).map((l) => ({ polySymbol: l.symbol, polySide: l.side })),
+      legs: legRows(rfq, d),
       fair: d.fair != null ? d.fair : null, buy_price: d.buyPrice != null ? d.buyPrice : null,
       edge: d.roi != null && Number.isFinite(d.roi) ? d.roi : null, min_edge: d.minRoi != null ? d.minRoi : null,
       ev: d.ev != null ? d.ev : null, risk: d.risk != null ? d.risk : null, contracts: d.contracts != null ? d.contracts : null,
@@ -76,9 +111,9 @@ function createPolySniper({ env = process.env, supabase = null, log = console.lo
   }
   const hb = setInterval(() => {
     const top = Object.entries(counts.skip).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => `${k}=${v}`).join(' ');
-    log(`[POLY-SNIPER] DRY RUN seen=${counts.seen} would_quote=${counts.quote} index=${f.index.size()} healthy=${f.pricesHealthy()} venues=${f.venues.join('+')} ${top}`);
+    log(`[POLY-SNIPER] DRY RUN seen=${counts.seen} would_quote=${counts.quote} index=${f.index.size()} td_index=${f.index.tdStats ? `${f.index.tdStats().indexed}/${f.index.tdStats().seen}` : '?'} tape=${logger.stats.written}w/${logger.stats.dropped}d healthy=${f.pricesHealthy()} venues=${f.venues.join('+')} ${top}`);
   }, 60000);
   if (hb.unref) hb.unref();
   return { start: () => { if (!feed) f.start(); log(`[POLY-SNIPER] DRY RUN started (posts nothing). fair venues=${f.venues.join('+')} depth game=$${f.depths ? f.depths.game : '?'} td=$${f.depths ? f.depths.td : '?'}`); }, observe, counts, ledger, flush: logger.flush };
 }
-module.exports = { createPolySniper, normalizePolymarketRfq };
+module.exports = { createPolySniper, normalizePolymarketRfq, createDecisionLogger, legRows };

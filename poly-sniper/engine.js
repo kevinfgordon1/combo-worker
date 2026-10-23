@@ -72,7 +72,7 @@ function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now() }) {
   if (comboLegs.length > config.maxLegs) return skip('too_many_legs');
   if (!feed.pricesHealthy(nowMs)) return skip('prices_stale');
   const m = mapPolyLegs(comboLegs, feed.index);
-  if (!m.ok) return skip(m.reason, { unmapped: m.unmapped || null });
+  if (!m.ok) return skip(m.reason, { unmapped: m.unmapped || null, matched: m.matched || null });
   const kRfq = { rfqId: rfq.rfqId, legKeys: m.legKeys };
   const cls = classifyLegs(kRfq, { td: !!feed.tdBook, ncaaf: config.ncaaf && !!feed.ncaafBook });
   if (!cls.ok) return skip(`scope_${cls.reason}`);

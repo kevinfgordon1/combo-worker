@@ -13,6 +13,7 @@ const { createNcaafBook, espnNcaafKickoffs, oddsNcaafKickoffs, ESPN_NCAAF, isFbs
 const { createLimiter } = require('../sniper/limiter');
 const { ALL_VENUES } = require('../sniper/fair');
 const { createKalshiIndex } = require('./map');
+const { fetchLiveTdCrosswalk } = require('./prop-xwalk');
 
 const ORIGIN = 'https://api.elections.kalshi.com';
 const P = '/trade-api/v2';
@@ -117,6 +118,17 @@ function createPolySniperFeed({ env = process.env, log = console.log, fetchImpl 
     }
     health.relay = Date.now();
   }
+  // Live NFL TD player crosswalk (public GETs, own slow limiter so it never starves the books).
+  const xwLim = createLimiter({ name: 'poly_sniper_xwalk', ratePerSec: num(env.POLY_SNIPER_XWALK_RPS, 1), burst: 1 });
+  const xwalk = { players: 0, at: 0 };
+  async function pollCrosswalk() {
+    const r = await fetchLiveTdCrosswalk((u) => getJson(xwLim, u));
+    if (!r.players.length && xwalk.players) { log('[POLY-SNIPER] td crosswalk refresh returned 0 players; keeping previous'); return; }
+    index.setPropIdx(r.idx);
+    xwalk.players = r.players.length; xwalk.at = Date.now();
+    const s = index.tdStats();
+    log(`[POLY-SNIPER] td crosswalk players=${r.players.length} kalshi_events=${r.kalshiEvents} poly_events=${r.polyEvents} td_indexed=${s.indexed}/${s.seen}`);
+  }
   async function pollKickoffs() {
     const r = await fetchImpl(ESPN_NFL, { headers: { accept: 'application/json' } });
     if (!r.ok) throw new Error(`espn ${r.status}`);
@@ -147,12 +159,13 @@ function createPolySniperFeed({ env = process.env, log = console.log, fetchImpl 
     loop(pollRelay, 'relay', num(env.POLY_SNIPER_RELAY_POLL_MS, 3000));
     loop(pollKickoffs, 'espn_kickoffs', 60000);
     loop(pollOddsKickoffs, 'odds_kickoffs', 300000);
+    loop(pollCrosswalk, 'td_crosswalk', num(env.POLY_SNIPER_XWALK_MS, 15 * 60 * 1000));
   }
   // Same rule as the sniper: Kalshi books (if used) and relay must be < 30s old.
   function pricesHealthy(nowMs = Date.now()) {
     const fresh = (t) => t > 0 && nowMs - t < 30000;
     return (!venues.includes('kalshi') || fresh(health.ml)) && (!relayBase || fresh(health.relay));
   }
-  return { start, stop: () => { stopped = true; timers.forEach(clearTimeout); }, pmLive, tdBook, ncaafBook, kickoffs, index, venues, pricesHealthy, health, depths: { game: gameDepth, td: tdDepth } };
+  return { start, stop: () => { stopped = true; timers.forEach(clearTimeout); }, pmLive, tdBook, ncaafBook, kickoffs, index, venues, pricesHealthy, health, xwalk, depths: { game: gameDepth, td: tdDepth } };
 }
 module.exports = { createPolySniperFeed, fairVenues };
