@@ -1,0 +1,6 @@
+\set n random(1, 1000000000)
+\set g random(0, 39)
+\set l random(0, 299)
+select sniper_reserve(jsonb_build_object('rfq_id','b-'||:n||'-'||:client_id,'combo_key','bc-'||:n||'-'||:client_id,'games',jsonb_build_array('G'||:g,'G'||((:g+3)%40)),'legs',jsonb_build_array('L'||:l,'L'||((:l+9)%300),'L'||((:l+77)%300),'L'||((:l+150)%300)),'dry_run',false,'risk',1,'release_at',(now()+interval '80 s')::text),
+ jsonb_build_object('total',1e9,'game',1e9,'leg',1e9,'daily_risk',1e9,'daily_loss',1e9,'per_hour',1e9,'day_start',(now()-interval '12 hours')::text,'live',true));
+update sniper_ledger set status='released', phase='cancelled' where rfq_id='b-'||:n||'-'||:client_id;
