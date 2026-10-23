@@ -11,14 +11,15 @@
 //   cost_v = fee-included VWAP to buy $depth of "T loses" on venue v
 //            (Kalshi: cheaper of Yes-on-O and No-on-T; Polymarket US / Novig: O's ask ladder)
 //   fair(T) = 1 − min_v cost_v, same FEES table, same 15s staleness, real depth only.
-// ProphetX: the sniper has no ProphetX key (prophetx=off), so it is not wired for NCAAF.
+// ProphetX: read from our odds relay (PROPHETX_AUTH_MODE=relay; no key here). Relay level odds are
+// raw ProphetX prices with size = stake $; the 2% commission is folded in via pxEffective (same as NFL).
 'use strict';
 const X = require('../ncaaf-crosswalk');
 const XDATA = require('../ncaaf-crosswalk.json');
 // FBS only: explicit list from ESPN's FBS group (groups=80). Any FCS/unknown team => skip.
 const FBS = new Set(Object.keys(require('./ncaaf-fbs.json').teams));
 const isFbs = (code) => FBS.has(String(code || '').toUpperCase());
-const { walk, american, FEES } = require('../noboost/pm-live');
+const { walk, american, FEES, pxEffective } = require('../noboost/pm-live');
 const { etDate } = require('../mm-paper-odds');
 
 const SERIES = 'KXNCAAFGAME';
@@ -129,7 +130,7 @@ function createNcaafBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 1
       const confirmedAt = Date.parse(q.confirmed_at || '') || 0;
       const at = venue === 'polymarket' ? Math.max(confirmedAt, changedAt) : (feedLive ? polledAt : changedAt);
       let levels; let depthKnown;
-      if (Array.isArray(q.depth) && q.depth.length) { levels = q.depth.map((d) => [Number(d.odds), Number(d.size)]); depthKnown = true; } else if (q.size > 0) { levels = [[Number(q.odds), Number(q.size)]]; depthKnown = true; } else { levels = [[Number(q.odds), Infinity]]; depthKnown = false; }
+      if (venue === 'prophetx') { const lv = (Array.isArray(q.depth) && q.depth.length ? q.depth : [{ odds: q.odds, size: q.size }]).map((d) => [Number(d.odds), Number(d.size)]).filter(([o, z]) => o > 0 && o < 1 && z > 0); if (!lv.length) continue; levels = lv.map(([o, z]) => [pxEffective(o), z / o]); depthKnown = true; } else if (Array.isArray(q.depth) && q.depth.length) { levels = q.depth.map((d) => [Number(d.odds), Number(d.size)]); depthKnown = true; } else if (q.size > 0) { levels = [[Number(q.odds), Number(q.size)]]; depthKnown = true; } else { levels = [[Number(q.odds), Infinity]]; depthKnown = false; }
       set(asks, gid, side, venue, { levels, at, changedAt, depthKnown, key: q.token_id || null });
       n += 1;
     }
@@ -148,7 +149,7 @@ function createNcaafBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 1
     const opp = g.teams.find((t) => t !== team); if (!opp || !g.teams.includes(team)) return null;
     const o = asks.get(`${gameId}:${opp}`) || {};
     const sources = [];
-    for (const v of ['kalshi', 'polymarket', 'novig']) { const r = evalVenue(v, o[v]); if (r) sources.push(v === 'kalshi' ? { ...r, via: 'yes_opp' } : r); }
+    for (const v of ['kalshi', 'polymarket', 'novig', 'prophetx']) { const r = evalVenue(v, o[v]); if (r) sources.push(v === 'kalshi' ? { ...r, via: 'yes_opp' } : r); }
     const rn = evalVenue('kalshi', (kalshiNo.get(`${gameId}:${team}`) || {}).kalshi);
     if (rn) sources.push({ ...rn, via: 'no_own' });
     const used = sources.filter((s) => s.used);

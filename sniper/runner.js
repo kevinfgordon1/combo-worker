@@ -13,7 +13,7 @@ const { createKalshiFirehose, readShardFactor, DEFAULT_LIVE_SHARD_FACTOR, summar
 const { normalizePem } = require('../kalshi-auth');
 const { createPmLiveBook } = require('../noboost/pm-live');
 const { createTdBook, isTdTicker } = require('../noboost/td-book');
-const { createProphetXClient, hasProphetXCreds } = require('../noboost/prophetx-live');
+const { createProphetXClient, hasProphetXCreds, authMode } = require('../noboost/prophetx-live');
 const { createSeriesFeeCache, seriesOfTicker } = require('../series-fee');
 const { sniperConfig, createSniperLedger, formatDecision, createTelegramNotifier } = require('../auto-sniper');
 const { createLimiter, createRateBreaker } = require('./limiter');
@@ -180,7 +180,17 @@ async function main(env = process.env) {
     health.relay = Date.now();
   }
   const px = hasProphetXCreds(env) && venues.includes('prophetx') ? createProphetXClient({ env, fetchImpl: (u, o) => lim.prophetx.run(() => fetch(u, o)).catch((e) => { if (e.is429) breaker.hit('prophetx'); throw e; }) }) : null;
-  async function pollPx() { if (px) pmLive.ingestProphetX(await px.nflMoneylines()); }
+  const pxRelayNcaaf = px && ncaafBook && relayBase && authMode(env) === 'relay';
+  async function pollPx() {
+    if (!px) return;
+    pmLive.ingestProphetX(await px.nflMoneylines());
+    if (pxRelayNcaaf) { // NCAAF ProphetX from the relay board (same crosswalk; unmatched teams skipped)
+      const polledAt = Date.now(); const h = await getJson(lim.relay, `${relayBase}/health`);
+      const feedLive = /ws:up/.test(String((h && h.status && h.status.prophetx) || ''));
+      const c = await getJson(lim.relay, `${relayBase}/board?venue=prophetx&league=NCAAF`);
+      ncaafBook.ingestRelay('prophetx', c.quotes || [], { feedLive, polledAt });
+    }
+  }
 
   const loop = (fn, name, ms) => {
     const tick = async () => {

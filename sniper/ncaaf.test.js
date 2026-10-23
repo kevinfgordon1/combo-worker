@@ -127,3 +127,16 @@ assert.ok(N.FBS_COUNT >= 134 && N.FBS_COUNT <= 140, `FBS list size ${N.FBS_COUNT
 // a hypothetical FBS-vs-FCS game is also skipped (one team off the list)
 assert.strictEqual(['LIB', 'GRAM'].every(N.isFbs), false);
 console.log('sniper/ncaaf.test.js ok');
+
+// ProphetX via relay (NCAAF): commission folded via pxEffective, size = stake $, unmatched teams skipped.
+{
+  const { pxEffective } = require('../noboost/pm-live');
+  const before = book.legFair ? null : null;
+  const unmatched = book.ingestRelay('prophetx', [{ bet_type: 'moneyline', away: 'Nowhere Tech', home: 'Kennesaw State', side: 'Kennesaw State', odds: 0.1, size: 1e5, start: '2026-10-22T23:00:00Z', updated_at: new Date().toISOString() }], { feedLive: true, polledAt: Date.now() });
+  assert.strictEqual(unmatched, 0, 'unmatched ProphetX NCAAF team must be skipped');
+  const n = book.ingestRelay('prophetx', [{ bet_type: 'moneyline', away: 'Liberty', home: 'Kennesaw State', side: 'Kennesaw State', odds: 0.05, size: 5000, start: '2026-10-22T23:00:00Z', updated_at: new Date().toISOString(), depth: [{ odds: 0.05, size: 5000 }] }], { feedLive: true, polledAt: Date.now() });
+  assert.strictEqual(n, 1);
+  const lv = [...book._asks.values()].map((o) => o.prophetx).filter(Boolean)[0];
+  assert.ok(lv && Math.abs(lv.levels[0][0] - pxEffective(0.05)) < 1e-12 && Math.abs(lv.levels[0][1] - 100000) < 1e-6, 'px level = pxEffective(odds), contracts = stake/odds');
+  console.log('ncaaf prophetx relay ok');
+}
