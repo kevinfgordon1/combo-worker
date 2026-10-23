@@ -207,6 +207,11 @@ async function main(env = process.env) {
         relayErr.prophetx_td = (relayErr.prophetx_td || 0) + 1;
       }
     }
+    if (linesBook && venues.includes('polymarket')) { // Polymarket US spreads/totals (relay /lines, RELAY_POLY_LINES=1)
+      for (const [lg, L] of [['NFL', 'nfl'], ...(ncaafBook ? [['NCAAF', 'ncaaf']] : [])]) {
+        try { const j = await getJson(lim.relay, `${relayBase}/lines?venue=polymarket&league=${lg}`); linesBook.ingestRelay('polymarket', L, j.quotes || []); } catch (e) { if (/disabled/.test(e.message)) throw e; relayErr[`polymarket_lines_${L}`] = (relayErr[`polymarket_lines_${L}`] || 0) + 1; }
+      }
+    }
     health.relay = Date.now();
   }
   const px = hasProphetXCreds(env) && venues.includes('prophetx') ? createProphetXClient({ env, fetchImpl: (u, o) => lim.prophetx.run(() => fetch(u, o)).catch((e) => { if (e.is429) breaker.hit('prophetx'); throw e; }) }) : null;

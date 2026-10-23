@@ -67,3 +67,26 @@ assert.strictEqual(hi.reason, 'roi_below_min_lines');
 assert.notStrictEqual(decision.reason, 'scope_lines_off');
 if (decision.action === 'quote') { assert.strictEqual(decision.minRoi, 0.04); assert.strictEqual(decision.hasLine, true); }
 console.log('lines.test ok', decision.action, decision.reason || '');
+
+// ── Polymarket US lines (relay /lines): exact number only, Polymarket fee, never decides main ──
+{
+  let t2 = 1e12; const b2 = L.createLinesBook({ now: () => t2, depthUsd: 2000 });
+  b2.addGamesFromTickers([SP]);
+  const at = new Date(t2).toISOString();
+  const base = { league: 'NFL', away: 'Carolina Panthers', home: 'Green Bay Packers', start: '2026-10-29T17:00:00Z', updated_at: at, bet_type: 'spread', feed: 'polymarket-us-lines' };
+  // Poly alone (alt 10.5 marked main by Poly) must NOT make a line main
+  b2.ingestRelay('polymarket', 'nfl', [{ ...base, side: 'Carolina Panthers', line: 7.5, odds: 0.45, depth: [{ odds: 0.45, size: 100000 }], is_alt: false }]);
+  assert.strictEqual(b2.legFair(L.classifyLineLeg(`${SP}:yes`)).reason, 'not_main_line', 'Polymarket never sets the main line');
+  b2.ingestRelay('novig', 'nfl', [{ ...base, feed: undefined, side: 'Carolina Panthers', line: 7.5, odds: 0.52, depth: [{ odds: 0.52, size: 10000 }], is_alt: false }]);
+  const f2 = b2.legFair(L.classifyLineLeg(`${SP}:yes`)); // opposite CAR +7.5: Poly 0.45 + fee vs Novig 0.52
+  const polyFee = 0.0695 * 0.45 * 0.55;
+  assert.strictEqual(f2.best, 'polymarket'); assert.ok(Math.abs(f2.p - (1 - (0.45 + polyFee))) < 1e-9, 'Polymarket fee applied');
+  // wrong number from Polymarket is ignored
+  const b3 = L.createLinesBook({ now: () => t2, depthUsd: 2000 }); b3.addGamesFromTickers([SP]);
+  b3.ingestRelay('novig', 'nfl', [{ ...base, feed: undefined, side: 'Carolina Panthers', line: 7.5, odds: 0.52, depth: [{ odds: 0.52, size: 10000 }], is_alt: false }]);
+  b3.ingestRelay('polymarket', 'nfl', [{ ...base, side: 'Carolina Panthers', line: 6.5, odds: 0.4, depth: [{ odds: 0.4, size: 100000 }], is_alt: false }]);
+  assert.strictEqual(b3.legFair(L.classifyLineLeg(`${SP}:yes`)).best, 'novig', 'Poly on 6.5 not used for 7.5');
+  // non-lines Polymarket feed ignored
+  assert.strictEqual(b3.ingestRelay('polymarket', 'nfl', [{ ...base, feed: 'polymarket-us', side: 'Carolina Panthers', line: 7.5, odds: 0.3, depth: [{ odds: 0.3, size: 1e5 }] }]), 0);
+  console.log('lines.test polymarket ok');
+}

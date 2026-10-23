@@ -14,7 +14,8 @@
 //   cost_v = fee-included VWAP to buy $depth of the OPPOSITE outcome at the same line on venue v
 //   (Kalshi: the other side of the same market; Novig / ProphetX: the other side's ask ladder).
 // Same FEES table (noboost/pm-live), ProphetX commission via pxEffective, 15s staleness, real depth
-// only. Polymarket US: the relay carries no spreads/totals today, so it is never a source here.
+// only. Polymarket US: from the relay's /lines feed (public gateway books, read-only); exact number
+// only, Polymarket fee from the same FEES table; never used to decide which line is main.
 'use strict';
 const { parseKalshiUnhedgedTicker } = require('../unhedged-rfq');
 const { normTeam } = require('../leg-identity');
@@ -105,27 +106,33 @@ function createLinesBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 2
   }
   // odds-relay /board?league=NFL|NCAAF quotes (Novig / ProphetX). Polymarket US has no lines => ignored.
   function ingestRelay(venue, league, quotes, { feedLive = false, polledAt = now() } = {}) {
-    if (venue !== 'novig' && venue !== 'prophetx') return 0;
-    const code = league === 'nfl' ? nflCode : N.codeForName;
+    if (venue !== 'novig' && venue !== 'prophetx' && venue !== 'polymarket') return 0;
+    const poly = venue === 'polymarket';
+    // Polymarket identity: NFL full team names; college via the crosswalk's Polymarket abbreviations.
+    const code = poly ? (league === 'nfl' ? nflCode : ((n, ab) => (ab ? N.codeForPoly(ab) : null))) : (league === 'nfl' ? nflCode : N.codeForName);
     let n = 0;
     for (const q of quotes || []) {
       if (!q || (q.bet_type !== 'spread' && q.bet_type !== 'total')) continue;
+      if (poly && q.feed !== 'polymarket-us-lines') continue;
       const line = Number(q.line); if (!Number.isFinite(line) || Math.abs(line * 2 % 2) !== 1) continue; // x.5 only (Kalshi strikes)
-      const a = code(q.away); const h = code(q.home); const date = etDate(q.start);
+      const a = code(q.away, q.away_abbr); const h = code(q.home, q.home_abbr); const date = etDate(q.start);
       if (!a || !h || a === h || !date) continue;
       const gid = findGame(league, date, a, h); if (!gid) continue;
       let oc;
-      if (q.bet_type === 'total') { const s = String(q.side_type || q.side || '').toLowerCase(); if (s !== 'over' && s !== 'under') continue; oc = `total:${s}:${line}`; } else { const s = code(q.side); if (s !== a && s !== h) continue; oc = `spread:${s}:${fmt(line)}`; }
+      if (q.bet_type === 'total') { const s = String(q.side_type || q.side || '').toLowerCase(); if (s !== 'over' && s !== 'under') continue; oc = `total:${s}:${line}`; } else { const s = code(q.side, q.side_abbr); if (s !== a && s !== h) continue;
+        if (poly && league === 'ncaaf' && N.codeForName(q.side) && N.codeForName(q.side) !== s) continue; // name disagrees: distrust
+        oc = `spread:${s}:${fmt(line)}`;
+      }
       const startMs = Date.parse(q.start || '') || 0;
       if (startMs && !q.is_live && now() - startMs > SETTLED_AFTER_MS) continue;
       const changedAt = Date.parse(q.updated_at || '') || 0;
-      const at = feedLive ? polledAt : changedAt;
+      const at = poly ? changedAt : (feedLive ? polledAt : changedAt); // Polymarket: book fetch time
       let levels;
       const raw = (Array.isArray(q.depth) && q.depth.length ? q.depth : [{ odds: q.odds, size: q.size }]).map((d) => [Number(d.odds), Number(d.size)]).filter(([o, z]) => o > 0 && o < 1 && z > 0);
       if (!raw.length) continue;
       levels = venue === 'prophetx' ? raw.map(([o, z]) => [pxEffective(o), z / o]) : raw;
       set(gid, oc, venue, { levels, at, depthKnown: true, key: q.token_id || null });
-      if (!q.is_alt) { const k = `${gid}|${oc}`; const s = main.get(k) || new Set(); s.add(venue); main.set(k, s); }
+      if (!q.is_alt && !poly) { const k = `${gid}|${oc}`; const s = main.get(k) || new Set(); s.add(venue); main.set(k, s); }
       n += 1;
     }
     return n;
@@ -145,7 +152,7 @@ function createLinesBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 2
     if (!isMain(leg.gameId, leg.outcome) && !isMain(leg.gameId, leg.opposite)) return { p: null, reason: 'not_main_line', sources: [] };
     const o = asks.get(`${leg.gameId}|${leg.opposite}`) || {};
     const sources = [];
-    for (const v of ['kalshi', 'novig', 'prophetx']) { const r = evalVenue(v, o[v]); if (r) sources.push(r); }
+    for (const v of ['kalshi', 'polymarket', 'novig', 'prophetx']) { const r = evalVenue(v, o[v]); if (r) sources.push(r); }
     const used = sources.filter((s) => s.used);
     if (!used.length) return { p: null, reason: 'no_venue_depth', sources };
     const best = used.reduce((x, y) => (y.cost < x.cost ? y : x));
