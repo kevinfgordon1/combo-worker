@@ -9,6 +9,7 @@
 // KALSHI_KEY_ID is ignored here so a second communications subscriber cannot
 // unsubscribe the quoter.
 'use strict';
+const { createPolyUsLines } = require('./poly-us-lines');
 
 const http = require('http');
 const { authHeaders: polymarketAuthHeaders } = require('./polymarket-auth');
@@ -5123,6 +5124,19 @@ function handleRequest(req, res, state) {
     state.underdog.handle(req, res, url);
     return;
   }
+  if (url.pathname === '/lines') {
+    // Polymarket US full-game spreads + totals (RELAY_POLY_LINES=1; public gateway, read-only).
+    const venue = String(url.searchParams.get('venue') || 'polymarket');
+    const league = String(url.searchParams.get('league') || 'NFL').trim().toUpperCase();
+    if (venue !== 'polymarket' || !state.polyLines) {
+      res.writeHead(venue === 'polymarket' ? 503 : 400, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ ok: false, error: venue === 'polymarket' ? 'lines_off' : 'venue polymarket required' }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    res.end(JSON.stringify({ ok: true, venue, league, feed: state.polyLines.status(), quotes: state.polyLines.rows(league) }));
+    return;
+  }
   if (url.pathname === '/td') {
     // Player anytime-TD Yes / No ask ladders (RELAY_TD=1). Prices are pre-fee; size = $1 contracts.
     const venue = String(url.searchParams.get('venue') || '');
@@ -5231,6 +5245,13 @@ function startOddsRelay(opts = {}) {
   {
     const env = opts.env || process.env;
     stops.push(startDkfd(state, opts, env));
+  }
+  {
+    const env = opts.env || process.env;
+    if (opts.upstream !== false && String(env.RELAY_POLY_LINES || '') === '1') {
+      state.polyLines = createPolyUsLines({ env, fetchFn: opts.polyLinesFetch });
+      stops.push(state.polyLines.start());
+    }
   }
   if (opts.betstamp !== false) {
     const env = opts.env || process.env;
