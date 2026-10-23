@@ -7,6 +7,7 @@
 const { parseKalshiUnhedgedTicker } = require('../unhedged-rfq');
 const { parseTdTicker } = require('../noboost/td-book');
 const { isNcaafTicker, parseNcaafMl } = require('./ncaaf');
+const { isLineTicker, parseLineTicker } = require('./lines');
 
 const ESPN_NFL = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard';
 const KALSHI_OFFSET_MS = 3 * 3600 * 1000;
@@ -14,6 +15,7 @@ const KALSHI_OFFSET_MS = 3 * 3600 * 1000;
 function gameIdOfTicker(ticker) {
   const t = String(ticker || '').split(':')[0].toUpperCase();
   if (/^KXNFLTD-/.test(t)) { const p = parseTdTicker(t); return p ? p.gameId : null; }
+  if (isLineTicker(t)) { const g = parseLineTicker(t); return g ? g.gameId : null; } // spreads / totals: same gameId as the ML
   if (isNcaafTicker(t)) { const g = parseNcaafMl(t); return g ? g.gameId : null; } // ncaaf|date|KALSHI+CODES
   const p = parseKalshiUnhedgedTicker(t, 'yes');
   return p && !p.skip && p.gameId ? p.gameId : null;

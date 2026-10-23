@@ -19,7 +19,15 @@ function bestCost(sources, venues) {
   }
   return best;
 }
-function legFairDepth(leg, { pmLive, tdBook, venues, ncaafBook }) {
+function legFairDepth(leg, { pmLive, tdBook, venues, ncaafBook, linesBook = null }) {
+  if (leg.kind === 'line') { // main spread / total (sniper/lines.js)
+    if (!linesBook) return { p: null, reason: 'lines_off' };
+    const f = linesBook.legFair(leg);
+    if (f.p == null && f.reason) return { p: null, reason: f.reason };
+    const b = bestCost(f.sources, venues);
+    if (!b) return { p: null, reason: 'no_venue_depth' };
+    return { p: 1 - b.cost, best: b.venue, venue: b.venue, depthUsd: b.availUsd != null ? b.availUsd : null };
+  }
   if (leg.kind === 'ncaaf') {
     if (!ncaafBook) return { p: null, reason: 'no_ncaaf_book' };
     const f = ncaafBook.legFair(leg.gameId, leg.team);
