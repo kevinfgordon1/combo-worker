@@ -54,7 +54,9 @@ function etDayStartIso(ms) {
 async function main(env = process.env) {
   const config = sniperConfig(env);
   const venues = venuesFromEnv(env);
-  const depth = num(env.SNIPER_FAIR_DEPTH_USD, 1000);
+  const depth = num(env.SNIPER_FAIR_DEPTH_USD, 1000); // NFL player-TD legs (Kevin: stays $1,000)
+  // Game lines (NFL moneyline + college ML, later spreads/totals): Kevin Oct 23 → $2,000 per leg.
+  const gameDepth = num(env.SNIPER_GAME_DEPTH_USD, 2000);
   const tg = createTelegramNotifier(env);
   // Every sniper Telegram message is labelled so it can never be read as a Combo Locks alert.
   const tgLabel = (m) => (/^🎯 SNIPER/.test(m) ? m : `🎯 SNIPER (not Combo Locks) — ${String(m).replace(/^\[SNIPER\]\s*/, '')}`);
@@ -63,7 +65,7 @@ async function main(env = process.env) {
   const gate = liveGate(env);
   config.dryRun = !gate.live;
   if (String(env.SNIPER_DRY_RUN) === '0' && !gate.live) alert(`[SNIPER] SNIPER_DRY_RUN=0 but live gate closed (${gate.why.join(', ')}) — staying DRY RUN.`);
-  log(`[SNIPER] boot enabled=${config.enabled} mode=${gate.live ? 'LIVE' : 'DRY_RUN'} depth=$${depth} venues=${venues.join('+')} prophetx=${hasProphetXCreds(env) ? 'on' : 'off'} ncaaf=${config.ncaaf ? `on(min ${(config.minRoiNcaaf * 100).toFixed(1)}%)` : 'off'}`);
+  log(`[SNIPER] boot enabled=${config.enabled} mode=${gate.live ? 'LIVE' : 'DRY_RUN'} depth=game:$${gameDepth},td:$${depth} venues=${venues.join('+')} prophetx=${hasProphetXCreds(env) ? 'on' : 'off'} ncaaf=${config.ncaaf ? `on(min ${(config.minRoiNcaaf * 100).toFixed(1)}%)` : 'off'}`);
   if (gate.live) alert('[SNIPER] ⚠️ LIVE MODE: all gates set — this service will send and confirm real Kalshi RFQ quotes.');
 
   // ── Request budgets (well under venue limits) ──
@@ -93,10 +95,10 @@ async function main(env = process.env) {
   // ── Books (own copies, $depth) ──
   const tdVenues = venues.filter((v) => v === 'polymarket' || v === 'novig');
   const tdBook = createTdBook({ staleMs: 15000, depthUsd: depth, maxOverround: 0.15, venues: tdVenues });
-  const pmLive = createPmLiveBook({ staleMs: 15000, depthUsd: depth });
+  const pmLive = createPmLiveBook({ staleMs: 15000, depthUsd: gameDepth });
   pmLive.setTdBook(tdBook);
   // College football ML book (same inverse-bet fair, own crosswalk identity). SNIPER_NCAAF=0 = off.
-  const ncaafBook = config.ncaaf ? createNcaafBook({ staleMs: 15000, depthUsd: depth }) : null;
+  const ncaafBook = config.ncaaf ? createNcaafBook({ staleMs: 15000, depthUsd: gameDepth }) : null;
   // Real kickoffs (ESPN > odds_cache > Kalshi occurrence−3h fallback, logged). `kick` keeps the
   // Kalshi estimate per ticker for the td-book's own staleness use.
   const kick = new Map();
