@@ -10,6 +10,13 @@ const MON = { JAN: '01', FEB: '02', MAR: '03', APR: '04', MAY: '05', JUN: '06', 
 const legDate = (t) => { const m = /-(\d\d)([A-Z]{3})(\d\d)/.exec(t || ''); return m ? `20${m[1]}-${MON[m[2]]}-${m[3]}` : null; };
 
 // kickoffFor(ticker) -> ms | null. Unknown kickoff => cannot prove pregame => skip.
+// Full settle = latest leg kickoff + game length (default 4h). null if any kickoff unknown (DB treats as long).
+function settleAtMs(keys, kickoffFor, gameHours = 4) {
+  let last = -Infinity;
+  for (const k of keys) { const ko = kickoffFor(String(k).split(':')[0]); if (!Number.isFinite(ko) || ko <= 0) return null; if (ko > last) last = ko; }
+  return Number.isFinite(last) ? last + (Number.isFinite(gameHours) ? gameHours : 4) * 3600e3 : null;
+}
+
 function pregameCheck(keys, kickoffFor, nowMs, bufferMs) {
   for (const k of keys) {
     const t = String(k).split(':')[0];
@@ -98,6 +105,7 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
   if (rogue.length) d.rogue = rogue;
   if (d.action === 'quote') {
     d.releaseAt = releaseAtMs(legs, nowMs);
+    d.settleAt = settleAtMs(keys, kickoffFor, config.gameHours);
     d.minRoi = minRoi; d.hasTd = hasTd; d.hasLine = hasLine; d.hasNcaaf = hasNcaaf;
     // Per-leg detail for the fill alert + audit (sniper_decisions.details.legDetail).
     d.legDetail = legs.map((l) => ({ ticker: l.ticker, side: l.side, fair: l.fair_yes, venue: l.venue, depthUsd: l.depth_usd, name: l.name }));
@@ -118,4 +126,4 @@ function repriceFair(rfq, { pmLive, tdBook, venues, ncaafBook = null, linesBook 
   return fair;
 }
 
-module.exports = { decide, pregameCheck, legDate, repriceFair, classifyLegs };
+module.exports = { decide, settleAtMs, pregameCheck, legDate, repriceFair, classifyLegs };
