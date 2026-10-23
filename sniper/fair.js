@@ -5,6 +5,9 @@
 //   moneyline: opponent's Yes ask ladder (Kalshi also No on own team)
 //   TD Yes: walk the player's No side; TD No: walk Yes.
 'use strict';
+const { rogueGuard, rogueConfig } = require('./rogue');
+let ENV_ROGUE = null;
+const envRogue = () => (ENV_ROGUE || (ENV_ROGUE = rogueConfig(process.env)));
 const ALL_VENUES = ['kalshi', 'polymarket', 'novig', 'prophetx'];
 function venuesFromEnv(env) {
   const v = String(env.SNIPER_FAIR_VENUES || ALL_VENUES.join(',')).toLowerCase().split(',').map((x) => x.trim()).filter((x) => ALL_VENUES.includes(x));
@@ -19,35 +22,36 @@ function bestCost(sources, venues) {
   }
   return best;
 }
-function legFairDepth(leg, { pmLive, tdBook, venues, ncaafBook, linesBook = null }) {
+// Best depth venue after the rogue-line guard (sniper/rogue.js). skip → leg has no fair.
+function guarded(sources, venues, rogue, noVenueReason) {
+  const g = rogueGuard(sources || [], venues, rogue || envRogue(), bestCost);
+  const rogueEv = g.events.filter((e) => e.kind !== 'no_ref');
+  if (g.skip) return { p: null, reason: g.skip, rogue: rogueEv };
+  if (!g.best) return { p: null, reason: noVenueReason };
+  const b = g.best;
+  return { p: 1 - b.cost, best: `${b.venue}${b.via && b.via !== 'td_opposite' ? ':' + b.via : ''}`, venue: b.venue, depthUsd: b.availUsd != null ? b.availUsd : null, rogue: rogueEv.length ? rogueEv : undefined };
+}
+function legFairDepth(leg, { pmLive, tdBook, venues, ncaafBook, linesBook = null, rogue }) {
   if (leg.kind === 'line') { // main spread / total (sniper/lines.js)
     if (!linesBook) return { p: null, reason: 'lines_off' };
     const f = linesBook.legFair(leg);
     if (f.p == null && f.reason) return { p: null, reason: f.reason };
-    const b = bestCost(f.sources, venues);
-    if (!b) return { p: null, reason: 'no_venue_depth' };
-    return { p: 1 - b.cost, best: b.venue, venue: b.venue, depthUsd: b.availUsd != null ? b.availUsd : null };
+    return guarded(f.sources, venues, rogue, 'no_venue_depth');
   }
   if (leg.kind === 'ncaaf') {
     if (!ncaafBook) return { p: null, reason: 'no_ncaaf_book' };
     const f = ncaafBook.legFair(leg.gameId, leg.team);
     if (!f) return { p: null, reason: 'no_game' };
-    const b = bestCost(f.sources, venues);
-    if (!b) return { p: null, reason: 'no_venue_depth' };
-    return { p: 1 - b.cost, best: `${b.venue}${b.via ? ':' + b.via : ''}`, venue: b.venue, depthUsd: b.availUsd != null ? b.availUsd : null };
+    return guarded(f.sources, venues, rogue, 'no_venue_depth');
   }
   if (leg.kind === 'td') {
     if (!tdBook) return { p: null, reason: 'td_no_book' };
     const m = tdBook.legMulti({ id: leg.id, side: leg.side });
-    const b = bestCost(m && m.sources, venues);
-    if (!b) return { p: null, reason: 'td_no_venue_depth' };
-    return { p: 1 - b.cost, best: b.venue, venue: b.venue, depthUsd: b.availUsd != null ? b.availUsd : null };
+    return guarded(m && m.sources, venues, rogue, 'td_no_venue_depth');
   }
   if (!pmLive) return { p: null, reason: 'no_ml_book' };
   const f = pmLive.legFair(leg.gameId, leg.team);
   if (!f) return { p: null, reason: 'no_game' };
-  const b = bestCost(f.sources, venues);
-  if (!b) return { p: null, reason: 'no_venue_depth' };
-  return { p: 1 - b.cost, best: `${b.venue}${b.via ? ':' + b.via : ''}`, venue: b.venue, depthUsd: b.availUsd != null ? b.availUsd : null };
+  return guarded(f.sources, venues, rogue, 'no_venue_depth');
 }
 module.exports = { ALL_VENUES, venuesFromEnv, bestCost, legFairDepth };
