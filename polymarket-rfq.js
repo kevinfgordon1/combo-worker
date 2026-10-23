@@ -1876,6 +1876,8 @@ function startPolymarketRfqLoop(ctx = {}) {
 
   // Every RFQ the Poly path handles is tallied (seen / source / reason).
   async function handleRfq(raw, src) {
+    // Polymarket combo sniper DRY RUN (poly-sniper/): observe-only, never awaited, never throws into the quote path.
+    if (typeof ctx.onRfqObserved === 'function') { try { ctx.onRfqObserved(raw, src); } catch (_) { /* observe only */ } }
     const out = await handleRfqCore(raw, src);
     try { intake.recordOutcome(out, src); } catch (_) { /* observability only */ }
     return out;
@@ -2924,8 +2926,10 @@ function startPolymarketRfqLoop(ctx = {}) {
   const crawlMs = ctx.crawlMs != null ? ctx.crawlMs : envIntLocal('POLY_CRAWL_MS', DEFAULT_CRAWL_MS);
   const crawlMaxPages = ctx.crawlMaxPages != null ? ctx.crawlMaxPages : envIntLocal('POLY_CRAWL_MAX_PAGES', DEFAULT_MAX_PAGES);
   const crawlPageDelayRaw = ctx.crawlPageDelayMs != null ? ctx.crawlPageDelayMs : envIntLocal('POLY_CRAWL_PAGE_DELAY_MS', DEFAULT_PAGE_DELAY_MS);
-  // GET /v1/rfqs is 1 req/s per IP: never page faster than 1.2s on poly-worker.
-  const crawlPageDelayMs = polyRole ? Math.max(POLY_MIN_PAGE_DELAY_MS, crawlPageDelayRaw) : crawlPageDelayRaw;
+  // GET /v1/rfqs is 1 req/s per IP (docs.polymarket.us/api-reference/rate-limits): never page faster than 1.2s.
+  // Applies to every role (combo-worker too): Polymarket's limit is per IP, not per service.
+  // An explicit ctx value (tests) is honoured as-is.
+  const crawlPageDelayMs = ctx.crawlPageDelayMs != null ? crawlPageDelayRaw : Math.max(POLY_MIN_PAGE_DELAY_MS, crawlPageDelayRaw);
   const heartbeatMs = ctx.polyHeartbeatMs != null ? ctx.polyHeartbeatMs : envIntLocal('POLY_HEARTBEAT_MS', DEFAULT_HEARTBEAT_MS);
 
   function emitPolyHeartbeat() {
