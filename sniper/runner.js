@@ -369,7 +369,11 @@ async function main(env = process.env) {
   const lat = createLatencyStats();
   // Recent DB-reserve time (EWMA, ms) for the expiry gate; deadline = quote-sender's rfq_age drop.
   const postDeadlineMs = num(env.SNIPER_POST_DEADLINE_MS, 3000);
-  const reserveEst = (() => { let v = 250; return { add: (ms) => { if (Number.isFinite(ms)) v = 0.8 * v + 0.2 * ms; }, get: () => v }; })();
+  // Decays back toward the 250ms baseline (half-life 5s) when no reserves are happening, so a slow
+  // burst can never block every RFQ forever (the estimate only updates on reserves that ran).
+  const reserveEst = (() => { const base = 250; let v = base; let at = Date.now();
+    const cur = () => base + (v - base) * Math.pow(0.5, (Date.now() - at) / 5000);
+    return { add: (ms) => { if (Number.isFinite(ms)) { v = 0.8 * cur() + 0.2 * ms; at = Date.now(); } }, get: cur }; })();
   // Rogue-line guard log (sniper/rogue.js): one sniper_decisions row per leg+venue+kind per minute.
   const rogueSeen = new Map();
   const rogueCfg = rogueConfig(env);
@@ -412,7 +416,7 @@ async function main(env = process.env) {
     if (gate.live && !config.dryRun) {
       const age = rfqAgeMs(rfq.createdTs, signedNow());
       const ls = liveSniper.stats();
-      const projected = age == null ? null : age + reserveEst.get() + (ls.postP50 || 150);
+      const projected = age == null ? null : age + reserveEst.get() + Math.min(ls.postP50 || 150, 1000); // POST window is recent-only; cap so it cannot latch
       if (projected != null && projected > postDeadlineMs) {
         ledger.positions.delete(d.rfqId); ledger.hour.pop();
         counts.skips.cant_make_expiry = (counts.skips.cant_make_expiry || 0) + 1; return;
