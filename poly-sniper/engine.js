@@ -15,7 +15,8 @@ const POLY_COMBO_MAKER_RATE = 0;
 function polySniperConfig(env = process.env) {
   return {
     minRoiNflMl: num(env.POLY_SNIPER_MIN_ROI_NFL_ML, 0.03), // all legs NFL moneyline
-    minRoiNfl: num(env.POLY_SNIPER_MIN_ROI_NFL, 0.04),      // any other NFL (TD; spreads/totals later)
+    minRoiNfl: num(env.POLY_SNIPER_MIN_ROI_NFL, 0.04),      // any other NFL (spreads/totals)
+    minRoiTd: num(env.POLY_SNIPER_MIN_ROI_TD, 0.06),        // any NFL player-TD leg (Kevin Oct 23: 6%)
     minRoiNcaaf: num(env.POLY_SNIPER_MIN_ROI_NCAAF, 0.05),  // any college (FBS only) leg
     maxRoi: num(env.POLY_SNIPER_MAX_ROI, 0.5),
     minLegFair: num(env.POLY_SNIPER_MIN_LEG_FAIR, 0.05),
@@ -32,6 +33,19 @@ function polySniperConfig(env = process.env) {
     latencyTargetMs: num(env.POLY_SNIPER_LATENCY_TARGET_MS, 200),
     ncaaf: String(env.POLY_SNIPER_NCAAF == null ? '1' : env.POLY_SNIPER_NCAAF) !== '0',
   };
+}
+
+// Minimum edge: the highest applicable rule wins — all-NFL-ML 3%, other NFL (spreads/totals) 4%,
+// college 5%, NFL player TD 6%.
+function polyMinRoi(legs, config) {
+  let m = config.minRoiNflMl;
+  for (const l of legs || []) {
+    const college = l.kind === 'ncaaf' || (l.kind === 'line' && l.league === 'ncaaf');
+    if (college) m = Math.max(m, config.minRoiNcaaf);
+    else if (l.kind === 'td') m = Math.max(m, config.minRoiTd != null ? config.minRoiTd : config.minRoiNfl);
+    else if (l.kind !== 'ml') m = Math.max(m, config.minRoiNfl);
+  }
+  return m;
 }
 
 // Hypothetical per-venue ledger (dry run: positions are what we WOULD have quoted).
@@ -82,7 +96,7 @@ function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now() }) {
   for (let i = 0; i < m.legKeys.length; i += 1) {
     const [ticker, side] = m.legKeys[i].split(':');
     const f = legFairDepth(cls.legs[i], { pmLive: feed.pmLive, tdBook: feed.tdBook, ncaafBook: feed.ncaafBook, venues: feed.venues });
-    const leg = { polySymbol: comboLegs[i].symbol, polySide: comboLegs[i].side, ticker, side, kind: cls.legs[i].kind || 'ml', fair: f.p, venue: f.venue || null, best: f.best || null, depthUsd: f.depthUsd != null ? Math.round(f.depthUsd) : null, reason: f.reason || null, date: legDate(ticker) };
+    const leg = { polySymbol: comboLegs[i].symbol, polySide: comboLegs[i].side, ticker, side, kind: cls.legs[i].kind || 'ml', league: cls.legs[i].league || null, fair: f.p, venue: f.venue || null, best: f.best || null, depthUsd: f.depthUsd != null ? Math.round(f.depthUsd) : null, reason: f.reason || null, date: legDate(ticker) };
     legs.push(leg);
     if (!(f.p > 0 && f.p < 1)) return skip(f.reason || 'leg_no_fair', { legs });
     if (f.p < config.minLegFair || f.p > config.maxLegFair) return skip('leg_fair_out_of_range', { legs });
@@ -91,7 +105,7 @@ function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now() }) {
   if (fair < config.minComboFair) return skip('combo_fair_too_low', { legs, fair });
   const hasTd = legs.some((l) => l.kind === 'td');
   const hasNcaaf = legs.some((l) => l.kind === 'ncaaf');
-  const minRoi = hasNcaaf ? config.minRoiNcaaf : (hasTd ? config.minRoiNfl : config.minRoiNflMl);
+  const minRoi = polyMinRoi(legs, config);
   const { contracts, cash } = sizeOf(rfq);
   if (contracts == null && cash == null) return skip('no_size', { legs, fair });
   const tick = tickOf(rfq);
@@ -114,4 +128,4 @@ function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now() }) {
   return { ...base, action: 'quote', legs, combo, games, ...econ };
 }
 
-module.exports = { decidePoly, polySniperConfig, createVenueLedger, POLY_COMBO_MAKER_RATE };
+module.exports = { decidePoly, polySniperConfig, polyMinRoi, createVenueLedger, POLY_COMBO_MAKER_RATE };
