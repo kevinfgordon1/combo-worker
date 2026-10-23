@@ -16,7 +16,7 @@ function createLiveSniper({
   config, trader, store, coord, caps, reprice, alert = () => {}, log = console.log,
   now = () => Date.now(), ttlMs = RESERVE_TTL_MS, fillRetries = 4, fillRetryMs = 1500,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)), onHalt = () => {},
-  startedReason = () => null, kickoffOf = () => null, onFilled = () => {}, // onFilled: book-arb check (alert-only) // kickoffOf: ticker -> kickoff ms (fill alert); startedReason: (rfq) -> 'game_started' | 'no_kickoff' | null (rule 9)
+  onHold = () => {}, startedReason = () => null, kickoffOf = () => null, onFilled = () => {}, // onFilled: book-arb check (alert-only) // kickoffOf: ticker -> kickoff ms (fill alert); startedReason: (rfq) -> 'game_started' | 'no_kickoff' | null (rule 9)
 } = {}) {
   const pending = new Map(); // quoteId -> { d, rfq, accepted, timer }
   const byRfq = new Map(); // rfqId -> quoteId
@@ -110,6 +110,8 @@ function createLiveSniper({
       if (!e || e.roi < (d.minRoi != null ? d.minRoi : config.minRoi) - 1e-12) return decline('reprice_below_min');
       const cap = await store.confirmCheck(d.rfqId, Math.round(e.risk * 100) / 100, caps());
       if (!cap.ok) return decline(`cap_${cap.reason}`);
+      // Accepted: hold the exposure until the games settle (was only the short quote hold).
+      try { await onHold(d); } catch (err) { log(`[SNIPER] hold extend failed rfq=${d.rfqId}: ${err.message}`); }
       try { await trader.confirm(evt.rfqId || rfq.rfqId, quoteId); } catch (err) {
         await store.release(d.rfqId, 'failed', {}); pending.delete(quoteId); byRfq.delete(rfq.rfqId);
         log(`[SNIPER] confirm failed quote_id=${quoteId}: ${err.message}`);
@@ -182,7 +184,19 @@ function createLiveSniper({
     }
     return false;
   }
-  return { send, forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); }, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => ({ ...stats, pending: pending.size }), _minQuotePrice: minQuotePrice };
+  // Graceful stop (SIGTERM): stop sending, cancel every open unaccepted quote on Kalshi and
+  // release its row. Accepted / confirming quotes are left to the DB (phase accepted).
+  let stopping = false;
+  async function shutdown() {
+    stopping = true; halted = true; haltReason = haltReason || 'shutdown';
+    let n = 0;
+    for (const [qid, p] of [...pending]) {
+      if (p.accepted || confirming.has(qid)) continue;
+      await dropQuote(qid, 'cancelled', 'shutdown'); n += 1;
+    }
+    return n;
+  }
+  return { shutdown, stopping: () => stopping, send, forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); }, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => ({ ...stats, pending: pending.size }), _minQuotePrice: minQuotePrice };
 }
 
 module.exports = { createLiveSniper };

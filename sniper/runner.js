@@ -21,6 +21,7 @@ const { createLedgerStore } = require('./ledger-store');
 const { createBookArbWatch } = require('./book-arb-watch');
 const { loadBookData } = require('./book-arb');
 const { venuesFromEnv } = require('./fair');
+const { RESERVE_TTL_MS } = require('../reserve');
 const { rogueConfig, americanOf } = require('./rogue');
 const { decide, repriceFair, pregameCheck } = require('./engine');
 const { liveGate, sniperSubaccount } = require('./gates');
@@ -278,11 +279,33 @@ async function main(env = process.env) {
   const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
   const store = createLedgerStore({ supabase, log });
   const ledger = createSniperLedger({ dayRiskOnAdd: false });
+  // Startup sweep (live): rows a previous process left 'reserved' / 'quoted' (its 20s quote
+  // timers died with it). Cancel the Kalshi quote (404 = already gone), then release the row,
+  // BEFORE hydrating so stale reservations never count as open exposure.
+  if (gate.live) {
+    try {
+      const stale = await store.staleOpen();
+      const sweepTrader = createSniperTrader({ gate, keyId: env.SNIPER_KALSHI_KEY_ID, pem: normalizePem(env.SNIPER_KALSHI_PRIVATE_KEY || ''), subaccount: sniperSubaccount(env), limiter: lim.kalshiTrade, log });
+      let cancelled = 0; let failed = 0; let usd = 0;
+      for (const r of stale) {
+        if (r.quote_id) {
+          try { await sweepTrader.cancel(r.quote_id); cancelled += 1; } catch (e) { failed += 1; log(`[SNIPER] sweep cancel ${r.quote_id} failed: ${e.message}`); continue; }
+        }
+        await store.release(r.rfq_id, 'cancelled', {}); usd += Number(r.risk) || 0;
+      }
+      log(`[SNIPER] startup sweep: ${stale.length} stale reserved/quoted row(s), released $${usd.toFixed(2)}, kalshi cancels=${cancelled} failed=${failed}`);
+    } catch (e) { log(`[SNIPER] startup sweep error: ${e.message}`); }
+  }
   const hydrated = await store.hydrate(ledger, etDayStartIso(Date.now()), { live: gate.live });
   log(`[SNIPER] ledger hydrated (${gate.live ? 'live' : 'dry'} book): ${hydrated.length} open position(s), filled_today=$${ledger.day.risk.toFixed(2)} (${ledger.day.fills} fills) pending=$${ledger.day.pending.toFixed(2)}`);
   // Daily cap = filled cost today, from the same DB function the cap check uses.
   loop(async () => { ledger.setDayExposure(await store.dayExposure(etDayStartIso(Date.now()), { live: gate.live })); }, 'day_exposure', num(env.SNIPER_DAY_EXPOSURE_POLL_MS, 15000));
   const caps = () => capsFrom(config, etDayStartIso(Date.now()), gate.live);
+  const pendingHoldMs = num(env.SNIPER_PENDING_HOLD_MS, RESERVE_TTL_MS + 60000);
+  async function onHold(d) {
+    const pos = ledger.positions.get(d.rfqId); if (pos) pos.releaseAt = d.releaseAt;
+    await store.update(d.rfqId, { release_at: new Date(d.releaseAt).toISOString() });
+  }
   const coord = createLockCoord({ supabase, log });
   coord.start();
   const trader = createSniperTrader({
@@ -307,7 +330,7 @@ async function main(env = process.env) {
   });
   if (bookArb && gate.live) loop(() => bookArb.recheckOpen(), 'book_arb', num(env.SNIPER_BOOK_ARB_POLL_MS, 300000));
   const liveSniper = createLiveSniper({
-    config, trader, store: liveStore, coord, caps, log,
+    config, trader, store: liveStore, coord, caps, log, onHold,
     reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues, ncaafBook, linesBook, ncaaf: !!ncaafBook }),
     alert,
     onFilled: (f) => (bookArb ? bookArb.check(f, 'fill') : null),
@@ -316,6 +339,17 @@ async function main(env = process.env) {
     startedReason: (rfq) => pregameCheck(rfq.legKeys || [], kickoffFor, Date.now(), 0),
     onHalt: () => { /* halted flag inside liveSniper blocks new sends/confirms */ },
   });
+  // Graceful stop (Fly sends SIGTERM on deploy/restart, kill_timeout 30s): cancel our open
+  // quotes on Kalshi and release their rows so nothing is left holding exposure.
+  let stoppingSig = false;
+  const onStop = async (sig) => {
+    if (stoppingSig) return; stoppingSig = true; disabled = true;
+    const t = setTimeout(() => process.exit(0), 20000); if (t.unref) t.unref();
+    try { const n = await liveSniper.shutdown(); log(`[SNIPER] ${sig}: cancelled ${n} open quote(s), exiting`); } catch (e) { log(`[SNIPER] ${sig} shutdown error: ${e.message}`); }
+    process.exit(0);
+  };
+  process.once('SIGTERM', () => { onStop('SIGTERM'); });
+  process.once('SIGINT', () => { onStop('SIGINT'); });
   liveSniperRef = () => liveSniper.halt('rate_limit');
   async function marketResult(ticker) {
     const j = await getJson(lim.kalshiSettle, `${ORIGIN}${P}/markets/${encodeURIComponent(ticker)}`);
@@ -371,7 +405,11 @@ async function main(env = process.env) {
       lat.staleIntake(); counts.skips.stale_before_reserve = (counts.skips.stale_before_reserve || 0) + 1; return;
     }
     const t0 = Date.now();
-    const res = await store.reserve(d, { releaseAt: d.releaseAt, dryRun: config.dryRun, caps: caps(), marketTicker: rfq.marketTicker || null });
+    // Live: reserved / quoted rows only hold exposure for the quote's life (20s TTL + buffer);
+    // onHold extends to d.releaseAt (games settle) once a taker accepts.
+    const holdAt = gate.live && !config.dryRun ? Date.now() + pendingHoldMs : d.releaseAt;
+    const pos0 = ledger.positions.get(d.rfqId); if (pos0) pos0.releaseAt = holdAt;
+    const res = await store.reserve(d, { releaseAt: holdAt, dryRun: config.dryRun, caps: caps(), marketTicker: rfq.marketTicker || null });
     lat.reserve(Date.now() - t0);
     if (!res.ok) {
       // roll back the in-memory reservation; a DB problem fails closed (no quote)
