@@ -102,10 +102,19 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
     if (error) throw new Error(error.message);
     return data || [];
   }
+  // Open live rows left in 'reserved' / 'quoted' by an earlier process (restart / crash): the
+  // startup sweep cancels their Kalshi quotes and releases them.
+  async function staleOpen() {
+    const { data, error } = await supabase.from('sniper_ledger')
+      .select('rfq_id,quote_id,phase,risk').eq('status', 'open').eq('dry_run', false)
+      .in('phase', ['reserved', 'quoted']).limit(5000);
+    if (error) throw new Error(`stale open: ${error.message}`);
+    return data || [];
+  }
   async function decision(rec) {
     try { await supabase.from('sniper_decisions').insert(rec); } catch (_) { /* audit only */ }
   }
-  return { hydrate, dayExposure, reserve, confirmCheck, update, release, openFilled, openFilledWithLegs, dayRealized, dayRecap, decision };
+  return { hydrate, staleOpen, dayExposure, reserve, confirmCheck, update, release, openFilled, openFilledWithLegs, dayRealized, dayRecap, decision };
 }
 
 module.exports = { createLedgerStore, capsFrom };

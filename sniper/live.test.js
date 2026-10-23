@@ -70,7 +70,7 @@ const ALL = { SNIPER_ENABLED: '1', SNIPER_DRY_RUN: '0', SNIPER_LIVE_CONFIRM: LIV
 
   // ── live lifecycle with fakes ──
   const config = S.sniperConfig({ SNIPER_ENABLED: '1', SNIPER_DRY_RUN: '0' });
-  function rig({ fair = 0.5, capReason = null, block = null, live = true } = {}) {
+  function rig({ fair = 0.5, capReason = null, block = null, live = true, holds = null } = {}) {
     const calls = []; const alerts = []; const ledgerOps = [];
     const trader = { live, postQuote: async () => { calls.push('post'); return { quoteId: 'Q1', noBid: '0.419', yesBid: '0.00' }; },
       confirm: async () => { calls.push('confirm'); }, cancel: async () => { calls.push('cancel'); },
@@ -81,10 +81,24 @@ const ALL = { SNIPER_ENABLED: '1', SNIPER_DRY_RUN: '0', SNIPER_LIVE_CONFIRM: LIV
       dayRealized: async () => -1600 };
     const c = { blockReason: () => block, comboWorkerQuoting: async () => null };
     const ref = { fair };
-    const L = createLiveSniper({ config, trader, store, coord: c, caps: () => ({}), reprice: () => ref.fair, alert: (m) => alerts.push(m), log: () => {}, ttlMs: 50, fillRetryMs: 1, sleep: async () => {} });
+    const L = createLiveSniper({ config, trader, store, coord: c, caps: () => ({}), reprice: () => ref.fair, alert: (m) => alerts.push(m), log: () => {}, ttlMs: 50, fillRetryMs: 1, sleep: async () => {}, onHold: async (dd) => { if (holds) holds.push(dd.rfqId); } });
     return { L, calls, alerts, ledgerOps, ref };
   }
   const d = { rfqId: 'R1', quoteYes: 0.581, contracts: 20, makerRate: 0, risk: 8.38 };
+  // accept extends the short quote hold (onHold) only after the DB cap check passes
+  { const holds = []; const h = rig({ fair: 0.5, holds });
+    await h.L.send(rfq, d); assert.deepStrictEqual(holds, []);
+    await h.L.onAccepted({ quoteId: 'Q1', rfqId: 'R1', acceptedSide: 'no', contractsAccepted: 20 });
+    assert.deepStrictEqual(holds, ['R1']);
+    const h2 = rig({ fair: 0.5, holds: [], capReason: 'total_cap' }); await h2.L.send(rfq, d);
+    await h2.L.onAccepted({ quoteId: 'Q1', rfqId: 'R1', acceptedSide: 'no' }); }
+  // graceful shutdown cancels open unaccepted quotes on Kalshi and releases their rows, then refuses sends
+  { const g = rig({ fair: 0.5 }); await g.L.send(rfq, d);
+    assert.strictEqual(await g.L.shutdown(), 1);
+    assert.deepStrictEqual(g.calls, ['post', 'cancel']);
+    assert.ok(g.ledgerOps.some((o) => o[0] === 'release' && o[1] === 'R1' && o[2] === 'cancelled'));
+    assert.strictEqual(g.L.pending.size, 0);
+    assert.strictEqual((await g.L.send(rfq, d)).sent, false); }
   // happy path: send → accept → confirm → fill → settle (loss) → daily stop
   let r = rig({ fair: 0.5 });
   assert.deepStrictEqual(await r.L.send(rfq, d), { sent: true, quoteId: 'Q1' });
