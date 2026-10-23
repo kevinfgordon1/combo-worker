@@ -114,6 +114,6 @@ function createPolySniper({ env = process.env, supabase = null, log = console.lo
     log(`[POLY-SNIPER] DRY RUN seen=${counts.seen} would_quote=${counts.quote} index=${f.index.size()} td_index=${f.index.tdStats ? `${f.index.tdStats().indexed}/${f.index.tdStats().seen}` : '?'} tape=${logger.stats.written}w/${logger.stats.dropped}d healthy=${f.pricesHealthy()} venues=${f.venues.join('+')} ${top}`);
   }, 60000);
   if (hb.unref) hb.unref();
-  return { start: () => { if (!feed) f.start(); log(`[POLY-SNIPER] DRY RUN started (posts nothing). fair venues=${f.venues.join('+')} depth game=$${f.depths ? f.depths.game : '?'} td=$${f.depths ? f.depths.td : '?'}`); }, observe, counts, ledger, flush: logger.flush };
+  return { start: () => { if (!feed) f.start(); log(`[POLY-SNIPER] DRY RUN started (posts nothing). fair venues=${f.venues.join('+')} depth game=$${f.depths ? f.depths.game : '?'} td=$${f.depths ? f.depths.td : '?'} minEdge=ml:${(config.minRoiNflMl * 100).toFixed(1)}%,nfl:${(config.minRoiNfl * 100).toFixed(1)}%,ncaaf:${(config.minRoiNcaaf * 100).toFixed(1)}%,td:${(config.minRoiTd * 100).toFixed(1)}%`); }, observe, counts, ledger, flush: logger.flush };
 }
 module.exports = { createPolySniper, normalizePolymarketRfq, createDecisionLogger, legRows };

@@ -97,3 +97,20 @@ t('poly-sniper source never references quote/confirm/delete endpoints or the Pol
 t('RFQ crawl pages at <= 1 req/s by default', () => { assert.ok(DEFAULT_PAGE_DELAY_MS >= 1000); });
 
 console.log(`poly-sniper: ${n} tests passed`);
+
+{ // min edge: highest applicable rule wins (ML 3%, other NFL 4%, college 5%, TD 6%)
+  const { polyMinRoi } = require('./engine');
+  const c = polySniperConfig({});
+  assert.strictEqual(c.minRoiTd, 0.06);
+  assert.strictEqual(polySniperConfig({ POLY_SNIPER_MIN_ROI_TD: '0.07' }).minRoiTd, 0.07);
+  const ml = { kind: 'ml' }; const td = { kind: 'td' }; const nfl = { kind: 'line', league: 'nfl' };
+  const cfb = { kind: 'ncaaf' }; const cfbLine = { kind: 'line', league: 'ncaaf' };
+  assert.strictEqual(polyMinRoi([ml, ml], c), 0.03);
+  assert.strictEqual(polyMinRoi([ml, nfl], c), 0.04);
+  assert.strictEqual(polyMinRoi([ml, cfb], c), 0.05);
+  assert.strictEqual(polyMinRoi([ml, cfbLine], c), 0.05);
+  assert.strictEqual(polyMinRoi([ml, td], c), 0.06);
+  assert.strictEqual(polyMinRoi([td, cfb], c), 0.06);
+  assert.strictEqual(polyMinRoi([nfl, cfb], c), 0.05);
+  assert.strictEqual(polyMinRoi([td, nfl, cfb], c), 0.06);
+}
