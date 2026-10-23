@@ -3,6 +3,7 @@
 // sniper_confirm_check (one advisory lock, so concurrent RFQs cannot both pass). Any DB error
 // fails closed (no quote / no confirm).
 'use strict';
+const { netRiskOf, hedgePnl } = require('./hedge');
 
 function capsFrom(config, dayStartIso, live = false) {
   return {
@@ -25,12 +26,46 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
     for (const r of data || []) {
       const rel = Date.parse(r.release_at);
       if (!(rel > t) && r.phase !== 'accepted' && r.phase !== 'filled') continue;
-      ledger.positions.set(r.rfq_id, { combo: r.combo_key, games: r.games || [], legs: r.legs || [], risk: Number(r.risk) || 0, releaseAt: Math.max(rel, r.phase === 'filled' || r.phase === 'accepted' ? t + 7 * 864e5 : rel) });
+      ledger.positions.set(r.rfq_id, { combo: r.combo_key, games: r.games || [], legs: r.legs || [], risk: Number(r.risk) || 0, grossRisk: Number(r.risk) || 0, releaseAt: Math.max(rel, r.phase === 'filled' || r.phase === 'accepted' ? t + 7 * 864e5 : rel) });
       ledger.seenRfqs.add(r.rfq_id);
       rows.push(r);
     }
+    await applyHedges(ledger, rows);
     if (ledger.setDayExposure) ledger.setDayExposure(await dayExposure(etDayStartIso, { live }), t);
     return rows;
+  }
+  // Active sportsbook hedges (sniper_hedges, logged from My Fills) by rfq_id. Throws on error.
+  async function activeHedges(rfqIds = null) {
+    let q = supabase.from('sniper_hedges').select('rfq_id,american,stake,status').eq('status', 'active').limit(5000);
+    if (rfqIds) { if (!rfqIds.length) return new Map(); q = q.in('rfq_id', rfqIds); }
+    const { data, error } = await q;
+    if (error) throw new Error(`hedges: ${error.message}`);
+    const m = new Map(); for (const h of data || []) { if (!m.has(h.rfq_id)) m.set(h.rfq_id, []); m.get(h.rfq_id).push(h); }
+    return m;
+  }
+  // In-memory pre-check mirrors the DB cap: hedged open fills count at net worst-case loss (sniper/hedge.js).
+  // rows: open ledger rows with phase/filled_*; on any error positions keep GROSS risk (conservative).
+  async function applyHedges(ledger, rows) {
+    let hs; try { hs = await activeHedges(); } catch (e) {
+      log(`[SNIPER] hedge refresh failed (back to gross risk): ${e.message}`);
+      for (const pos of ledger.positions.values()) if (pos.grossRisk != null) pos.risk = pos.grossRisk;
+      return 0;
+    }
+    const byId = new Map((rows || []).map((r) => [r.rfq_id, r]));
+    let freed = 0;
+    for (const [id, pos] of ledger.positions) {
+      const gross = pos.grossRisk != null ? pos.grossRisk : pos.risk;
+      const r = byId.get(id);
+      const net = r && hs.has(id) ? netRiskOf(r, hs.get(id)) : gross;
+      pos.grossRisk = gross; pos.risk = net; freed += gross - net;
+    }
+    return freed;
+  }
+  async function refreshHedges(ledger, { live = false } = {}) {
+    const ids = [...ledger.positions.keys()]; if (!ids.length) return 0;
+    const { data, error } = await supabase.from('sniper_ledger').select('rfq_id,risk,phase,filled_contracts,filled_cost,filled_fee').in('rfq_id', ids.slice(0, 2000)).eq('dry_run', !live);
+    if (error) { log(`[SNIPER] hedge refresh ledger read failed (back to gross risk): ${error.message}`); for (const pos of ledger.positions.values()) if (pos.grossRisk != null) pos.risk = pos.grossRisk; return 0; }
+    return applyHedges(ledger, data || []);
   }
   // Same function the DB daily cap uses: { filled, fills, pending }. Throws on error.
   async function dayExposure(dayStartIso, { live = false } = {}) {
@@ -78,11 +113,15 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
     if (error) throw new Error(error.message);
     return data || [];
   }
+  // Realized P&L today = Kalshi realized + P&L of active book hedges on those settled fills
+  // (same as the DB daily-loss check). Throws on error (hedge read included) so the stop never under-counts.
   async function dayRealized(dayStartIso) {
-    const { data, error } = await supabase.from('sniper_ledger').select('realized_pnl')
+    const { data, error } = await supabase.from('sniper_ledger').select('rfq_id,realized_pnl,market_result')
       .gte('settled_at', dayStartIso).eq('dry_run', false).limit(20000);
     if (error) throw new Error(error.message);
-    return (data || []).reduce((s, r) => s + (Number(r.realized_pnl) || 0), 0);
+    const rows = data || [];
+    const hs = await activeHedges(rows.map((r) => r.rfq_id));
+    return rows.reduce((s, r) => s + (Number(r.realized_pnl) || 0) + (hs.has(r.rfq_id) ? hedgePnl(r.market_result, hs.get(r.rfq_id)) : 0), 0);
   }
   // Day recap inputs: quotes (decisions) + ledger rows touched since dayStartIso, for one book.
   async function dayRecap(dayStartIso, { live = false } = {}) {
@@ -96,12 +135,14 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
     return { quotes: dq.count || 0, rows: fl.data || [] };
   }
   // Book-arb re-check: open live fills with their legs.
+  // Each row carries hedges: [] (active sportsbook hedges already logged) so the watch can skip alerts.
   async function openFilledWithLegs() {
     const { data, error } = await supabase.from('sniper_ledger')
       .select('rfq_id,legs,filled_contracts,filled_cost,filled_fee')
       .eq('status', 'open').eq('phase', 'filled').eq('dry_run', false).gt('filled_contracts', 0).limit(500);
     if (error) throw new Error(error.message);
-    return data || [];
+    let hs = new Map(); try { hs = await activeHedges((data || []).map((r) => r.rfq_id)); } catch (e) { log(`[SNIPER] book_arb hedge read failed: ${e.message}`); }
+    return (data || []).map((r) => ({ ...r, hedges: hs.get(r.rfq_id) || [] }));
   }
   // Open live rows left in 'reserved' / 'quoted' by an earlier process (restart / crash): the
   // startup sweep cancels their Kalshi quotes and releases them.
@@ -115,7 +156,7 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
   async function decision(rec) {
     try { await supabase.from('sniper_decisions').insert(rec); } catch (_) { /* audit only */ }
   }
-  return { hydrate, staleOpen, dayExposure, reserve, confirmCheck, update, release, openFilled, openFilledWithLegs, dayRealized, dayRecap, decision };
+  return { hydrate, refreshHedges, activeHedges, staleOpen, dayExposure, reserve, confirmCheck, update, release, openFilled, openFilledWithLegs, dayRealized, dayRecap, decision };
 }
 
 module.exports = { createLedgerStore, capsFrom };

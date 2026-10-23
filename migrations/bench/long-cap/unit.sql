@@ -1,5 +1,5 @@
 -- Unit checks for 20261023d. Run on a fresh DB with all sniper migrations applied. Raises on failure.
-truncate sniper_ledger;
+truncate sniper_ledger cascade;
 create or replace function pg_temp.rv(id text, risk numeric, settle_h numeric) returns text language sql as $$
   select sniper_reserve(jsonb_build_object('rfq_id',id,'combo_key','c-'||id,'games',jsonb_build_array('G-'||id),'legs',jsonb_build_array('L-'||id),
     'dry_run',false,'risk',risk,'release_at',(now()+interval '1 hour')::text,
