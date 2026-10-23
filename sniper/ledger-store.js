@@ -7,7 +7,7 @@
 function capsFrom(config, dayStartIso, live = false) {
   return {
     live: !!live,
-    total: config.totalExposureCap, game: config.perGameCap, leg: config.perLegCap,
+    total: config.totalExposureCap, long_total: config.longExposureCap, short_settle_hours: config.shortSettleHours, game: config.perGameCap, leg: config.perLegCap,
     daily_risk: config.dailyRiskCap, daily_loss: config.dailyLossCap,
     per_hour: config.maxQuotesPerHour, day_start: dayStartIso,
   };
@@ -47,6 +47,7 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
       risk: d.risk, ev: d.ev, roi: d.roi, quote_yes: d.quoteYes, quote_american: d.quoteAmerican,
       fair_yes: d.fairYes, fair_american: d.fairAmerican, contracts: d.contracts, fee: d.fee, maker_rate: d.makerRate,
       market_ticker: marketTicker, release_at: new Date(releaseAt).toISOString(),
+      settle_at: Number.isFinite(d.settleAt) ? new Date(d.settleAt).toISOString() : null,
     };
     try {
       const { data, error } = await supabase.rpc('sniper_reserve', { p_row: row, p_caps: caps });

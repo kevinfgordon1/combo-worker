@@ -49,6 +49,9 @@ function sniperConfig(env = process.env) {
     maxPayout: num(env.SNIPER_MAX_PAYOUT, 100),        // $ per quote (contracts × $1)
     maxRisk: num(env.SNIPER_MAX_RISK, 100),            // $ worst-case loss per quote (NO cost + maker fee)
     totalExposureCap: num(env.SNIPER_TOTAL_EXPOSURE_CAP, 10000), // $ open worst-case risk
+    longExposureCap: num(env.SNIPER_LONG_EXPOSURE_CAP, 5000),    // $ open risk on parlays settling > shortSettleHours after quote
+    shortSettleHours: num(env.SNIPER_SHORT_SETTLE_HOURS, 32),
+    gameHours: num(env.SNIPER_GAME_HOURS, 4),                    // settle = last kickoff + this
     perGameCap: num(env.SNIPER_PER_GAME_CAP, 1000),    // $ open risk touching one game
     perLegCap: num(env.SNIPER_PER_LEG_CAP, 750),       // $ open risk on one leg (ticker+side)
     dailyRiskCap: num(env.SNIPER_DAILY_RISK_CAP, 5000),// $ new risk opened per ET day
