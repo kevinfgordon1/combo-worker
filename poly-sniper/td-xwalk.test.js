@@ -93,6 +93,24 @@ t('decision tape: a 1,000-row burst is fully written in batches, nothing dropped
   assert.ok(inserts.every((x) => x <= 200) && inserts.length >= 5);
 });
 
+t('shared refresher feeds Combo Locks (PROPX) and the sniper index; MLB snapshot kept', async () => {
+  const PX = require('../player-prop-crosswalk');
+  const { startTdCrosswalkRefresher, _resetShared } = require('./prop-xwalk');
+  const L = require('../leg-identity');
+  _resetShared();
+  const mlbBefore = [...PX.current().byKalshi.values()].filter((p) => p && p.league === 'mlb').length;
+  const r = startTdCrosswalkRefresher({ getJson: fakeGet, everyMs: 1e9, log: () => {} });
+  await r.ready;
+  assert.ok(PX.byKalshi(`${EV}-NONFANT87`));
+  assert.strictEqual([...PX.current().byKalshi.values()].filter((p) => p && p.league === 'mlb').length, mlbBefore);
+  // Combo Locks path (no opts.idx) now resolves this week's TD leg
+  const id = L.parseKalshiPropTicker(`${EV}-NONFANT87-1`, 'yes', 'Noah Fant: 1+', {});
+  assert.ok(id && id.selection === 'p.noafan');
+  const got = []; r.onUpdate((x) => got.push(x.players.length));
+  assert.deepStrictEqual(got, [2]);
+  PX.setLiveNflTd([]); _resetShared();
+});
+
 t('crosswalk module is read-only: no trading verbs, no keys', async () => {
   const src = require('fs').readFileSync(require.resolve('./prop-xwalk'), 'utf8');
   assert.ok(!/createQuote|confirmQuote|deleteQuote|POLYMARKET_|API_KEY|SECRET|method:\s*['"](POST|PUT|DELETE)/i.test(src));

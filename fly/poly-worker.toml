@@ -16,6 +16,8 @@ kill_timeout = "30s"
   POLY_DRY_RUN = "0"
   POLYMARKET_RFQ_LIVE = "1"
   COMBO_VENUE_COORD = "1"
+  # Poly sniper fair = full 4-venue inverse method incl. Polymarket (Kevin Oct 23). Sniper stays DRY (secrets).
+  POLY_SNIPER_FAIR_INCLUDE_POLY = "1"
 
 [processes]
   app = "npm run start:poly"

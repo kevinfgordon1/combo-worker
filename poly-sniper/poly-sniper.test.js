@@ -13,11 +13,11 @@ let n = 0;
 const t = (name, fn) => { fn(); n += 1; console.log(`ok ${name}`); };
 const NOW = Date.parse('2026-10-24T16:00:00Z');
 
-function fakeFeed({ cost = 0.45, kickoffMs = Date.parse('2026-10-25T17:00:00Z'), healthy = true } = {}) {
+function fakeFeed({ cost = 0.45, kickoffMs = Date.parse('2026-10-25T17:00:00Z'), healthy = true, venues = fairVenues({ POLY_SNIPER_FAIR_INCLUDE_POLY: '0' }) } = {}) {
   const index = createKalshiIndex();
   index.ingestMarkets(['PHIWAS-PHI', 'PHIWAS-WAS', 'NYGDEN-NYG', 'NYGDEN-DEN', 'BUFNYJ-BUF', 'BUFNYJ-NYJ'].map((x) => ({ ticker: `KXNFLGAME-26OCT25${x}` })));
   return {
-    index, venues: fairVenues({}), pricesHealthy: () => healthy, tdBook: null, ncaafBook: null,
+    index, venues, pricesHealthy: () => healthy, tdBook: null, ncaafBook: null,
     kickoffs: { kickoffFor: () => kickoffMs },
     pmLive: { legFair: () => ({ sources: [{ venue: 'novig', used: true, reason: 'ok', cost, availUsd: 2500 }, { venue: 'polymarket', used: true, reason: 'ok', cost: 0.30 }] }) },
   };
@@ -35,9 +35,11 @@ t('NFL ML combo: quotes at >= 3% edge, sell side off, Polymarket book excluded f
   assert.deepStrictEqual(d.legs.map((l) => l.venue), ['novig', 'novig']);
 });
 
-t('fair venues exclude polymarket by default; opt-in includes it', () => {
-  assert.deepStrictEqual(fairVenues({}), ['kalshi', 'novig', 'prophetx']);
-  assert.ok(fairVenues({ POLY_SNIPER_FAIR_INCLUDE_POLY: '1' }).includes('polymarket'));
+t('fair venues include polymarket by default (4-venue inverse); =0 excludes it', () => {
+  assert.deepStrictEqual(fairVenues({}), ['kalshi', 'polymarket', 'novig', 'prophetx']); // default: all 4 venues
+  assert.deepStrictEqual(fairVenues({ POLY_SNIPER_FAIR_INCLUDE_POLY: '0' }), ['kalshi', 'novig', 'prophetx']);
+  const d = decidePoly(rfq(ML2), { feed: fakeFeed({ venues: fairVenues({}) }), config: polySniperConfig({}), ledger: createVenueLedger(), nowMs: NOW });
+  assert.deepStrictEqual(d.legs.map((l) => l.venue), ['polymarket', 'polymarket']); // best opposing price wins
 });
 
 t('no quoting inside 30 min of kickoff / after kickoff', () => {
