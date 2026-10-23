@@ -427,6 +427,9 @@ function usTdBooksFromMessage(message, catalog, nowMs = Date.now()) {
 // /lines rows: relay /board-shaped quotes; confirmed_at = now while the socket is alive and the slug
 // is subscribed (a quiet book is current), else the last frame time.
 const US_LINES_EVENT_GAP_MS = 1000;
+const US_EVENT_PAGE_GAP_MS = 2500; // shared by the lines + TD lanes (gateway: ~5 calls / 10s per IP)
+const US_EVENT_PAGE_429_MS = 15000;
+const US_EVENT_PAGE_TTL_MS = 4 * 60 * 1000;
 function usLinesRows(lines, state, league, nowMs = Date.now()) {
   if (!lines) return [];
   const alive = !!(state.usSocketUp && state.usLastAliveAt && nowMs - state.usLastAliveAt < US_CONFIRM_MS);
@@ -1302,6 +1305,30 @@ function startPolymarketUs(state, deps) {
   const linesOn = ['1', 'true', 'on', 'yes'].includes(String(env.RELAY_POLY_LINES || '').toLowerCase());
   const lines = { on: linesOn, perEvent: Number(env.POLY_LINES_PER_EVENT) || 2, days: Number(env.POLY_LINES_DAYS) || 8, catalog: new Map(), books: new Map(), subs: new Map(), subscribed: new Set(), eventSlugs: { NFL: [], NCAAF: [] }, lastDiscoverAt: 0, discoverErrors: 0, subErrors: 0, lastSubError: null };
   state.usLines = lines;
+  // One queue for every US event-page read (lines + TD): the gateway allows about 5 calls / 10s per IP
+  // and both lanes used to hit it at once, so the TD lane 429'd on its first call, gave up, and served
+  // nothing. Calls are spaced US_EVENT_PAGE_GAP_MS apart, a 429 waits and retries, and a body is reused
+  // for US_EVENT_PAGE_TTL_MS so the TD lane reads the NFL pages the lines lane just fetched.
+  const eventPages = new Map(); let pageChain = Promise.resolve(); let lastPageAt = 0;
+  const usEventPage = (slug) => {
+    const hit = eventPages.get(slug);
+    if (hit && Date.now() - hit.at < US_EVENT_PAGE_TTL_MS) return Promise.resolve(hit.body);
+    const run = pageChain.then(async () => {
+      for (let attempt = 0; attempt < 3 && !stopped; attempt += 1) {
+        const wait = lastPageAt + US_EVENT_PAGE_GAP_MS - Date.now();
+        if (wait > 0) await sleep(wait, () => stopped);
+        lastPageAt = Date.now();
+        const res = await fetchJson(fetchFn, `${US_GATEWAY}/v1/events/slug/${encodeURIComponent(slug)}`, { timeoutMs: 20000 });
+        if (res.status === 429) { await sleep(US_EVENT_PAGE_429_MS, () => stopped); continue; }
+        if (!res.ok || !res.body) return null;
+        eventPages.set(slug, { at: Date.now(), body: res.body });
+        return res.body;
+      }
+      return null;
+    });
+    pageChain = run.catch(() => null);
+    return run;
+  };
   const sendLineSubs = () => {
     if (!linesOn || !ws || ws.readyState !== 1) return;
     const chunks = usTdChunks([...lines.catalog.keys()]);
@@ -1329,14 +1356,11 @@ function startPolymarketUs(state, deps) {
       for (const evSlug of lines.eventSlugs[league] || []) {
         if (stopped) return;
         try {
-          const res = await fetchJson(fetchFn, `${US_GATEWAY}/v1/events/slug/${encodeURIComponent(evSlug)}`, { timeoutMs: 20000 });
-          if (res.status === 429) { lines.discoverErrors += 1; await sleep(30000, () => stopped); continue; }
-          if (res.ok && res.body) {
-            ok += 1;
-            for (const m of lineMarketsFromEvent(res.body.event || res.body, league, lines.perEvent)) next.set(m.slug, m);
-          }
+          const body = await usEventPage(evSlug);
+          if (!body) { lines.discoverErrors += 1; continue; }
+          ok += 1;
+          for (const m of lineMarketsFromEvent(body.event || body, league, lines.perEvent)) next.set(m.slug, m);
         } catch (_) { lines.discoverErrors += 1; }
-        await sleep(US_LINES_EVENT_GAP_MS, () => stopped);
       }
     }
     if (!ok) return; // keep the last good catalog
@@ -1371,22 +1395,21 @@ function startPolymarketUs(state, deps) {
   const tdDiscover = async () => {
     if (!tdOn) return;
     const next = new Map();
-    let ok = 0;
+    let ok = 0; const failed = new Set();
     for (const evSlug of td.eventSlugs) {
       if (stopped) return;
       try {
-        const res = await fetchJson(fetchFn, `${US_GATEWAY}/v1/events/slug/${encodeURIComponent(evSlug)}`, { timeoutMs: 20000 });
-        if (res.status === 429) { td.discoverErrors += 1; break; }
-        if (res.ok && res.body) {
-          ok += 1;
-          for (const m of usTdMarketsFromEvent(res.body, Date.now())) next.set(m.slug, m);
-        }
-      } catch (_) { td.discoverErrors += 1; }
-      await sleep(US_TD_EVENT_GAP_MS, () => stopped);
+        const body = await usEventPage(evSlug);
+        if (!body) { td.discoverErrors += 1; failed.add(evSlug); continue; }
+        ok += 1;
+        for (const m of usTdMarketsFromEvent(body, Date.now())) next.set(m.slug, m);
+      } catch (_) { td.discoverErrors += 1; failed.add(evSlug); }
     }
     if (!ok) return; // keep the last good catalog
-    for (const slug of [...td.catalog.keys()]) {
-      if (!next.has(slug)) { td.catalog.delete(slug); td.books.delete(slug); }
+    for (const [slug, m] of td.catalog) {
+      if (next.has(slug)) continue;
+      if (failed.has(m.eventSlug) && (Date.parse(m.start || '') || 0) > Date.now()) { next.set(slug, m); continue; } // page failed: keep its markets
+      td.catalog.delete(slug); td.books.delete(slug);
     }
     for (const [slug, m] of next) td.catalog.set(slug, m);
     td.lastDiscoverAt = Date.now();

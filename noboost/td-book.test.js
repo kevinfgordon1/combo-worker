@@ -29,3 +29,11 @@ assert(c.ok && c.legs[0].kind === 'td' && c.legs.length === 2);
 const same = classifyNfl({ legKeys: ['KXNFLTD-26OCT18NYJNE-NYJGWILSON5-1:yes', 'KXNFLGAME-26OCT18NYJNE-NE:yes'] }, 'kalshi', { td: true });
 assert.strictEqual(same.reason, 'correlated_same_game');
 console.log('noboost/td-book.test.js ok');
+
+// Venue first-name aliases (Oct 23 2026 coverage audit)
+{
+  const { samePlayer: sp } = require('./td-book');
+  const a = require('assert');
+  a.ok(sp('Bam Knight', 'Zonovan Knight')); a.ok(sp('Mitchell Tinsley', 'Mitch Tinsley')); a.ok(!sp('Bam Knight', 'Bo Knight'));
+  console.log('td-book alias ok');
+}
