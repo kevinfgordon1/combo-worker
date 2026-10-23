@@ -10,6 +10,14 @@ const { snipeEconomics, minQuotePrice } = require('../auto-sniper');
 const { shouldConfirmAccept } = require('../engine');
 const { RESERVE_TTL_MS } = require('../reserve');
 const { formatFillAlert } = require('./fill-alert');
+// 'http_409:rfq_closed' | 'stale_drop:queue_wait' | 'error' — Kalshi error body code when present.
+function postFailKey(err) {
+  const m = String((err && err.message) || err || '');
+  const sd = m.match(/STALE_DROP (\w+)/); if (sd) return `stale_drop:${sd[1]}`;
+  const h = m.match(/Kalshi quote failed (\d+): ?(.*)$/s);
+  if (h) { let code = ''; try { const j = JSON.parse(h[2]); code = (j.error && (j.error.code || j.error.message)) || j.code || ''; } catch (_) { code = ''; } return `http_${h[1]}${code ? `:${String(code).slice(0, 40)}` : ''}`; }
+  return 'error';
+}
 const usdS = (x) => `$${(Number(x) || 0).toFixed(2)}`;
 
 function createLiveSniper({
@@ -21,7 +29,7 @@ function createLiveSniper({
   const pending = new Map(); // quoteId -> { d, rfq, accepted, timer }
   const byRfq = new Map(); // rfqId -> quoteId
   const confirming = new Set();
-  const stats = { posted: 0, postFail: 0, accepted: 0, confirmed: 0, declined: {}, fills: 0, cancelled: 0, settled: 0, aborted: {} };
+  const stats = { posted: 0, postFail: 0, staleDrop: 0, postFailBy: {}, postMs: [], accepted: 0, confirmed: 0, declined: {}, fills: 0, cancelled: 0, settled: 0, aborted: {} };
   let halted = false;
   let haltReason = null; let haltDay = null;
   const etDayKey = (ms) => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
@@ -46,10 +54,17 @@ function createLiveSniper({
     const e = roiAt(d, fresh);
     if (!e || e.roi < (d.minRoi != null ? d.minRoi : config.minRoi) - 1e-12) return abort('reprice_below_min');
     let res;
+    const tPost = now();
     try { res = await trader.postQuote(rfq, d.quoteYes, config.tick); } catch (err) {
-      stats.postFail += 1; log(`[SNIPER] quote POST failed rfq=${rfq.rfqId}: ${err.message}`);
-      await store.release(d.rfqId, 'failed', {}); return { sent: false, reason: 'post_failed' };
+      // Free the reservation first so a failed POST never sits in pending risk.
+      stats.postMs.push(now() - tPost); if (stats.postMs.length > 200) stats.postMs.shift();
+      await store.release(d.rfqId, 'failed', {});
+      const k = postFailKey(err); bump(stats.postFailBy, k);
+      if (k.startsWith('stale_drop')) stats.staleDrop += 1; else stats.postFail += 1;
+      log(`[SNIPER] quote POST failed rfq=${rfq.rfqId} kind=${k} ms=${now() - tPost}: ${String(err.message || err).slice(0, 400)}`);
+      return { sent: false, reason: k.startsWith('stale_drop') ? 'post_stale_drop' : 'post_failed' };
     }
+    stats.postMs.push(now() - tPost); if (stats.postMs.length > 200) stats.postMs.shift();
     if (!res.quoteId) { await store.release(d.rfqId, 'failed', {}); return { sent: false, reason: 'no_quote_id' }; }
     stats.posted += 1;
     await store.update(d.rfqId, { phase: 'quoted', quote_id: res.quoteId, no_bid: res.noBid });
@@ -196,7 +211,7 @@ function createLiveSniper({
     }
     return n;
   }
-  return { shutdown, stopping: () => stopping, send, forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); }, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => ({ ...stats, pending: pending.size }), _minQuotePrice: minQuotePrice };
+  return { shutdown, stopping: () => stopping, send, forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); }, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, postMs: undefined, postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
 }
 
-module.exports = { createLiveSniper };
+module.exports = { createLiveSniper, postFailKey };
