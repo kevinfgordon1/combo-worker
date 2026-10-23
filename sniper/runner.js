@@ -300,6 +300,8 @@ async function main(env = process.env) {
   log(`[SNIPER] ledger hydrated (${gate.live ? 'live' : 'dry'} book): ${hydrated.length} open position(s), filled_today=$${ledger.day.risk.toFixed(2)} (${ledger.day.fills} fills) pending=$${ledger.day.pending.toFixed(2)}`);
   // Daily cap = filled cost today, from the same DB function the cap check uses.
   loop(async () => { ledger.setDayExposure(await store.dayExposure(etDayStartIso(Date.now()), { live: gate.live })); }, 'day_exposure', num(env.SNIPER_DAY_EXPOSURE_POLL_MS, 15000));
+  // Logged sportsbook hedges free in-memory room too (DB cap is authoritative; errors keep gross risk).
+  loop(() => store.refreshHedges(ledger, { live: gate.live }), 'hedges', num(env.SNIPER_HEDGE_POLL_MS, 60000));
   const caps = () => capsFrom(config, etDayStartIso(Date.now()), gate.live);
   const pendingHoldMs = num(env.SNIPER_PENDING_HOLD_MS, RESERVE_TTL_MS + 60000);
   async function onHold(d) {
