@@ -65,11 +65,16 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
   if (keys.length !== cls.legs.length) return skip('leg_mismatch');
   const pg = pregameCheck(keys, kickoffFor, nowMs, bufferMs);
   if (pg) return skip(pg);
+  const rogue = []; // rogue-line guard events (sniper/rogue.js), logged by the runner
   const legs = keys.map((k, i) => {
     const [ticker, side] = String(k).split(':');
     const f = legFairDepth(cls.legs[i], { pmLive, tdBook, venues, ncaafBook, linesBook });
+    if (f.rogue && f.rogue.length) rogue.push(...f.rogue.map((e) => ({ ...e, ticker, side: side || 'yes' })));
     return { ticker, side: side || 'yes', fair_yes: f.p, fair_best: f.best || null, venue: f.venue || null, depth_usd: f.depthUsd != null ? Math.round(f.depthUsd) : null, name: (tdBook && tdBook.names && tdBook.names.get && tdBook.names.get(String(ticker).toUpperCase())) || null, date: legDate(ticker) };
   });
+  if (rogue.some((e) => e.kind === 'rogue_low') && legs.some((l) => l.fair_yes == null)) {
+    return { decision: { action: 'skip', reason: 'rogue_fair_low', rfqId: rfq.rfqId, rogue } };
+  }
   const row = {
     rfq_id: rfq.rfqId, venue: 'kalshi', status: 'seen', legs,
     contracts: Number(rfq.contracts) > 0 ? Number(rfq.contracts) : null,
@@ -90,6 +95,7 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
   if (d.action === 'skip' && d.reason === 'roi_below_min' && hasNcaaf) d.reason = 'roi_below_min_ncaaf';
   else if (d.action === 'skip' && d.reason === 'roi_below_min' && hasTd) d.reason = 'roi_below_min_td';
   else if (d.action === 'skip' && d.reason === 'roi_below_min' && hasLine) d.reason = 'roi_below_min_lines';
+  if (rogue.length) d.rogue = rogue;
   if (d.action === 'quote') {
     d.releaseAt = releaseAtMs(legs, nowMs);
     d.minRoi = minRoi; d.hasTd = hasTd; d.hasLine = hasLine; d.hasNcaaf = hasNcaaf;

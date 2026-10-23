@@ -21,6 +21,7 @@ const { createLedgerStore } = require('./ledger-store');
 const { createBookArbWatch } = require('./book-arb-watch');
 const { loadBookData } = require('./book-arb');
 const { venuesFromEnv } = require('./fair');
+const { rogueConfig, americanOf } = require('./rogue');
 const { decide, repriceFair, pregameCheck } = require('./engine');
 const { liveGate, sniperSubaccount } = require('./gates');
 const { createSniperTrader } = require('./trader');
@@ -332,6 +333,22 @@ async function main(env = process.env) {
   // pricing / reservation work. Quote-sender still hard-drops at 3s right before the POST.
   const maxAgeMs = num(env.SNIPER_MAX_RFQ_AGE_MS, 2000);
   const lat = createLatencyStats();
+  // Rogue-line guard log (sniper/rogue.js): one sniper_decisions row per leg+venue+kind per minute.
+  const rogueSeen = new Map();
+  const rogueCfg = rogueConfig(env);
+  log(`[SNIPER] rogue-line guard mode=${rogueCfg.mode} maxDev=${(rogueCfg.maxDev * 100).toFixed(1)}pp maxLogit=${rogueCfg.maxLogit} minDev=${(rogueCfg.minDev * 100).toFixed(1)}pp dropHigh=${rogueCfg.dropHigh}`);
+  function logRogue(d) {
+    const t = Date.now();
+    for (const e of d.rogue) {
+      counts.rogue = counts.rogue || {}; counts.rogue[e.kind] = (counts.rogue[e.kind] || 0) + 1;
+      const k = `${e.kind}|${e.ticker}|${e.side}|${e.venue}`;
+      if (t - (rogueSeen.get(k) || 0) < 60000) continue;
+      rogueSeen.set(k, t); if (rogueSeen.size > 5000) rogueSeen.delete(rogueSeen.keys().next().value);
+      const am = (p) => americanOf(p);
+      log(`[SNIPER] ${e.kind} ${e.ticker}:${e.side} venue=${e.venue} ${am(e.p)} vs others ${am(e.ref)} (${(e.devPp * 100).toFixed(1)}pp)${d.action === 'skip' ? ` -> ${d.reason}` : ''}`);
+      store.decision({ rfq_id: d.rfqId || null, action: 'rogue_line', reason: e.kind, details: { ...e, americanVenue: am(e.p), americanOthers: am(e.ref), outcome: d.action === 'skip' ? d.reason : 'quoted_anyway', mode: rogueCfg.mode } });
+    }
+  }
   async function onRfq(rfq) {
     if (liveSniper.halted()) liveSniper.resumeIfNewDay();
     if (disabled || liveSniper.halted() || !rfq || !rfq.isCombo) return;
@@ -346,6 +363,7 @@ async function main(env = process.env) {
     try { const e = await fees.prefetch(seriesOfTicker(rfq.marketTicker)); makerRate = e ? e.rate : null; } catch (_) { makerRate = null; }
     const nowMs = Date.now();
     const { decision: d } = decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook, linesBook, venues, kickoffFor, makerRate, nowMs, pricesHealthy: pricesHealthy() });
+    if (d.rogue && d.rogue.length) logRogue(d);
     if (d.action !== 'quote') { counts.skips[d.reason] = (counts.skips[d.reason] || 0) + 1; return; }
     // Re-check age right before the DB reserve (fees prefetch can await on a cold series).
     if (tooOld(rfq, signedNow(), maxAgeMs) != null) {
