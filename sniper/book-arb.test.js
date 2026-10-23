@@ -32,11 +32,21 @@ assert.strictEqual(sg.sgp, true); assert.strictEqual(sg.books.length, 1); assert
 // Watcher: logs a decision, alerts once, re-alerts only on ≥$1 improvement, skips started games.
 (async () => {
   const sent = []; const decisions = [];
-  const w = createBookArbWatch({ loadData: async () => ({ props, odds }), store: { decision: async (d) => decisions.push(d), openFilledWithLegs: async () => [{ rfq_id: 'a', legs, filled_contracts: 100, filled_cost: 70, filled_fee: 0 }] }, alert: (m) => sent.push(m) });
+  const w = createBookArbWatch({ loadData: async () => ({ props, odds }), store: { decision: async (d) => decisions.push(d), openFilledWithLegs: async () => [{ rfq_id: 'a', legs, filled_contracts: 100, filled_cost: 70, filled_fee: 0 }] }, alert: (m) => sent.push(m), summaryMs: 0 });
   await w.check({ rfqId: 'a', legs, contracts: 100, cost: 70, fee: 0 }, 'fill');
   await w.recheckOpen();
   assert.strictEqual(sent.length, 1); assert.strictEqual(decisions.length, 2); assert.strictEqual(decisions[0].action, 'book_arb');
   const w2 = createBookArbWatch({ loadData: async () => ({ props, odds }), store: { decision: async () => {} }, alert: (m) => sent.push(m), kickoffOf: () => 1, now: () => 2 });
   assert.strictEqual(await w2.check({ rfqId: 'b', legs, contracts: 100, cost: 70 }, 'fill'), null);
+  // Coverage summary: one Telegram per summaryMs, coverage line logged every recheck.
+  const sent3 = []; const logs = [];
+  const w3 = createBookArbWatch({ loadData: async () => ({ props, odds }), store: { decision: async () => {}, openFilledWithLegs: async () => [
+    { rfq_id: 'a', legs, filled_contracts: 100, filled_cost: 70, filled_fee: 0 },
+    { rfq_id: 'n', legs: ['KXNFLTD-26OCT25CINBAL-BALDHENRY22-1:no'], filled_contracts: 10, filled_cost: 5, filled_fee: 0 }] }, alert: (m) => sent3.push(m), log: (m) => logs.push(m), now: () => 0, summaryMs: 1000 });
+  const cv = await w3.recheckOpen(); await w3.recheckOpen();
+  assert.strictEqual(cv.fills, 2); assert.strictEqual(cv.priceable, 1); assert.strictEqual(cv.tdNoFills, 1);
+  assert.strictEqual(sent3.filter((m) => m.includes('COVERAGE')).length, 1);
+  assert.ok(sent3.some((m) => m.includes('Coverage: 1 of 2 open fills priceable')), sent3.join('\n'));
+  assert.ok(logs.some((m) => /Coverage: 1 of 2 .*TD No \(unhedgeable\) 0\/1 legs/.test(m)), logs.join('\n'));
   console.log('sniper/book-arb.test.js ok');
 })().catch((e) => { console.error(e); process.exit(1); });

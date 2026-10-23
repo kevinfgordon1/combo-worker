@@ -327,6 +327,7 @@ async function main(env = process.env) {
     loadData: () => loadBookData({ url: env.SUPABASE_URL, key: env.SUPABASE_SERVICE_KEY }), store, alert, log,
     kickoffOf: (t) => { const r = kickoffs.resolve(t); return r ? r.kickoffMs : null; },
     minImprove: num(env.SNIPER_BOOK_ARB_REALERT_USD, 1),
+    summaryMs: num(env.SNIPER_BOOK_ARB_SUMMARY_MS, 6 * 3600e3),
   });
   if (bookArb && gate.live) loop(() => bookArb.recheckOpen(), 'book_arb', num(env.SNIPER_BOOK_ARB_POLL_MS, 300000));
   const liveSniper = createLiveSniper({
