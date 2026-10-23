@@ -12,6 +12,9 @@
 const { rfqAgeMs } = require('../quote-sender');
 
 const NFL_NEEDLES = [Buffer.from('KXNFLGAME'), Buffer.from('KXNFLTD'), Buffer.from('KXNCAAFGAME'), Buffer.from('KXNFLSPREAD'), Buffer.from('KXNFLTOTAL'), Buffer.from('KXNCAAFSPREAD'), Buffer.from('KXNCAAFTOTAL')]; // + main spreads/totals (unscoped legs still skip in classify) // + college football ML
+// NBA game legs (SNIPER_NBA=1 only; NBA props never match these needles). Kept separate so the
+// ~40% of the firehose that is NBA is only parsed when NBA quoting is on.
+const NBA_NEEDLES = [Buffer.from('KXNBAGAME'), Buffer.from('KXNBASPREAD'), Buffer.from('KXNBATOTAL')];
 
 function frameHas(raw, needles) {
   if (Buffer.isBuffer(raw)) return needles.some((n) => raw.indexOf(n) !== -1);
@@ -65,4 +68,4 @@ function createLatencyStats() {
   };
 }
 
-module.exports = { createNflFrameFilter, createDeletedFilter, tooOld, createLatencyStats, NFL_NEEDLES };
+module.exports = { createNflFrameFilter, createDeletedFilter, tooOld, createLatencyStats, NFL_NEEDLES, NBA_NEEDLES };

@@ -23,8 +23,9 @@ const { teamCode, etDate } = require('../mm-paper-odds');
 const { walk, american, FEES, pxEffective } = require('../noboost/pm-live');
 const X = require('../ncaaf-crosswalk');
 const N = require('./ncaaf');
+const B = require('./nba'); // NBA: same team table + gameId as KXNBAGAME legs
 
-const SERIES = { KXNFLSPREAD: ['nfl', 'spread'], KXNFLTOTAL: ['nfl', 'total'], KXNCAAFSPREAD: ['ncaaf', 'spread'], KXNCAAFTOTAL: ['ncaaf', 'total'] };
+const SERIES = { KXNFLSPREAD: ['nfl', 'spread'], KXNFLTOTAL: ['nfl', 'total'], KXNCAAFSPREAD: ['ncaaf', 'spread'], KXNCAAFTOTAL: ['ncaaf', 'total'], KXNBASPREAD: ['nba', 'spread'], KXNBATOTAL: ['nba', 'total'] };
 const MON = { JAN: '01', FEB: '02', MAR: '03', APR: '04', MAY: '05', JUN: '06', JUL: '07', AUG: '08', SEP: '09', OCT: '10', NOV: '11', DEC: '12' };
 const SETTLED_AFTER_MS = 4.5 * 3600 * 1000;
 const isLineTicker = (t) => { const s = String(t || '').split(':')[0].toUpperCase().split('-')[0]; return !!SERIES[s]; };
@@ -36,6 +37,7 @@ function gameOfBlob(league, blob) {
   const m = /^(\d\d)([A-Z]{3})(\d\d)(?:\d{4})?([A-Z]+)$/.exec(blob);
   if (!m || !MON[m[2]]) return null;
   const date = `20${m[1]}-${MON[m[2]]}-${m[3]}`;
+  if (league === 'nba') { const g = B.gameOfBlob(blob); return g ? { ...g, fbs: true } : null; }
   if (league === 'ncaaf') {
     const sp = X.splitBlob(m[4]); if (!sp) return null;
     const codes = sp.codes.slice();
@@ -109,7 +111,8 @@ function createLinesBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 2
     if (venue !== 'novig' && venue !== 'prophetx' && venue !== 'polymarket') return 0;
     const poly = venue === 'polymarket';
     // Polymarket identity: NFL full team names; college via the crosswalk's Polymarket abbreviations.
-    const code = poly ? (league === 'nfl' ? nflCode : ((n, ab) => (ab ? N.codeForPoly(ab) : null))) : (league === 'nfl' ? nflCode : N.codeForName);
+    const code = league === 'nba' ? (poly ? ((n, ab) => (ab ? B.codeForPoly(ab) : B.codeForName(n))) : B.codeForName)
+      : poly ? (league === 'nfl' ? nflCode : ((n, ab) => (ab ? N.codeForPoly(ab) : null))) : (league === 'nfl' ? nflCode : N.codeForName);
     let n = 0;
     for (const q of quotes || []) {
       if (!q || (q.bet_type !== 'spread' && q.bet_type !== 'total')) continue;
@@ -121,6 +124,7 @@ function createLinesBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 2
       let oc;
       if (q.bet_type === 'total') { const s = String(q.side_type || q.side || '').toLowerCase(); if (s !== 'over' && s !== 'under') continue; oc = `total:${s}:${line}`; } else { const s = code(q.side, q.side_abbr); if (s !== a && s !== h) continue;
         if (poly && league === 'ncaaf' && N.codeForName(q.side) && N.codeForName(q.side) !== s) continue; // name disagrees: distrust
+        if (poly && league === 'nba' && B.codeForName(q.side) && B.codeForName(q.side) !== s) continue;
         oc = `spread:${s}:${fmt(line)}`;
       }
       const startMs = Date.parse(q.start || '') || 0;

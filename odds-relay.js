@@ -28,11 +28,12 @@ const KALSHI_WS_SIGN_PATH = '/trade-api/ws/v2';
 
 const BOOK_IDS = Object.freeze({ polymarket: 193, kalshi: 194, novig: 195 });
 const VENUES = ['polymarket', 'kalshi', 'novig', 'prophetx'];
-const LEAGUES = ['NFL', 'NCAAF', 'MLB'];
-const US_LEAGUE_PATH = Object.freeze({ NFL: 'nfl', MLB: 'mlb', NCAAF: 'cfb' });
+const LEAGUES = ['NFL', 'NCAAF', 'MLB', 'NBA'];
+const US_LEAGUE_PATH = Object.freeze({ NFL: 'nfl', MLB: 'mlb', NCAAF: 'cfb', NBA: 'nba' });
 const WINNER_TYPES = new Set([
   'football_team_full_game_winner',
   'baseball_team_full_game_winner',
+  'basketball_team_full_game_winner',
   'moneyline',
 ]);
 const POLY_SERIES = Object.freeze({ NFL: '12185', NCAAF: '12756', MLB: '3' });
@@ -40,6 +41,7 @@ const KALSHI_GAME_SERIES = Object.freeze({
   NFL: 'KXNFLGAME',
   NCAAF: 'KXNCAAFGAME',
   MLB: 'KXMLBGAME',
+  NBA: 'KXNBAGAME',
 });
 const ESPN_SCOREBOARD = Object.freeze({
   NFL: 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard',
@@ -50,6 +52,7 @@ const ESPN_SCOREBOARD = Object.freeze({
     'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?groups=81&limit=400',
   ],
   MLB: 'https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard',
+  NBA: 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard',
 });
 const US_SLUG_CAP = 100;
 const US_FRESH_MS = 15_000;
@@ -111,7 +114,7 @@ function moneyValue(raw) {
 }
 
 function pairKeyFromSlug(slug) {
-  const m = String(slug || '').toLowerCase().match(/(?:nfl|mlb|cfb|ncaaf)-([a-z0-9]+)-([a-z0-9]+)-\d{4}/);
+  const m = String(slug || '').toLowerCase().match(/(?:nfl|mlb|cfb|ncaaf|nba)-([a-z0-9]+)-([a-z0-9]+)-\d{4}/);
   if (!m) return '';
   return [m[1], m[2]].sort().join('|');
 }
@@ -445,9 +448,9 @@ function usLinesRows(lines, state, league, nowMs = Date.now()) {
   return out;
 }
 function usLinesStatus(lines, state, nowMs = Date.now()) {
-  const c = { NFL: 0, NCAAF: 0 }; let books = 0;
+  const c = { NFL: 0, NCAAF: 0, NBA: 0 }; let books = 0;
   for (const m of lines.catalog.values()) { c[m.league] = (c[m.league] || 0) + 1; if (lines.books.has(m.slug)) books += 1; }
-  return { ws: state.usSocketUp ? 'up' : 'down', catalog: c, books, subscribed: lines.subscribed.size, events: { NFL: lines.eventSlugs.NFL.length, NCAAF: lines.eventSlugs.NCAAF.length }, lastDiscoverAgeMs: lines.lastDiscoverAt ? nowMs - lines.lastDiscoverAt : null, discoverErrors: lines.discoverErrors, subErrors: lines.subErrors, lastSubError: lines.lastSubError };
+  return { ws: state.usSocketUp ? 'up' : 'down', catalog: c, books, subscribed: lines.subscribed.size, events: { NFL: lines.eventSlugs.NFL.length, NCAAF: lines.eventSlugs.NCAAF.length, NBA: (lines.eventSlugs.NBA || []).length }, lastDiscoverAgeMs: lines.lastDiscoverAt ? nowMs - lines.lastDiscoverAt : null, discoverErrors: lines.discoverErrors, subErrors: lines.subErrors, lastSubError: lines.lastSubError };
 }
 
 function usTdRows(td, state, nowMs = Date.now()) {
@@ -1303,7 +1306,7 @@ function startPolymarketUs(state, deps) {
   // Full-game spreads / totals (RELAY_POLY_LINES=1): strikes found on event pages (low rate), books
   // from this same read-only market-data socket (requestId prefix ln-).
   const linesOn = ['1', 'true', 'on', 'yes'].includes(String(env.RELAY_POLY_LINES || '').toLowerCase());
-  const lines = { on: linesOn, perEvent: Number(env.POLY_LINES_PER_EVENT) || 2, days: Number(env.POLY_LINES_DAYS) || 8, catalog: new Map(), books: new Map(), subs: new Map(), subscribed: new Set(), eventSlugs: { NFL: [], NCAAF: [] }, lastDiscoverAt: 0, discoverErrors: 0, subErrors: 0, lastSubError: null };
+  const lines = { on: linesOn, perEvent: Number(env.POLY_LINES_PER_EVENT) || 2, days: Number(env.POLY_LINES_DAYS) || 8, catalog: new Map(), books: new Map(), subs: new Map(), subscribed: new Set(), eventSlugs: { NFL: [], NCAAF: [], NBA: [] }, lastDiscoverAt: 0, discoverErrors: 0, subErrors: 0, lastSubError: null };
   state.usLines = lines;
   // One queue for every US event-page read (lines + TD): the gateway allows about 5 calls / 10s per IP
   // and both lanes used to hit it at once, so the TD lane 429'd on its first call, gave up, and served
@@ -1352,7 +1355,7 @@ function startPolymarketUs(state, deps) {
     if (!linesOn) return;
     const next = new Map();
     let ok = 0;
-    for (const league of ['NFL', 'NCAAF']) {
+    for (const league of ['NFL', 'NCAAF', 'NBA']) {
       for (const evSlug of lines.eventSlugs[league] || []) {
         if (stopped) return;
         try {
@@ -1469,7 +1472,7 @@ function startPolymarketUs(state, deps) {
           throw new Error(`HTTP ${res.status}${res.body ? '' : ' (non-JSON body)'}`);
         }
         lastGood.set(league, usMarketsFromEvents(res.body.events, league, Date.now()));
-        if (linesOn && (league === 'NFL' || league === 'NCAAF')) {
+        if (linesOn && (league === 'NFL' || league === 'NCAAF' || league === 'NBA')) {
           const nowMs = Date.now();
           lines.eventSlugs[league] = res.body.events.filter((ev) => ev && ev.slug && usLineInWindow(ev, nowMs, lines.days)).map((ev) => String(ev.slug));
         }
@@ -1669,6 +1672,7 @@ function startClob(state, deps) {
     const next = [];
     const now = Date.now();
     for (const league of LEAGUES) {
+      if (!POLY_SERIES[league]) continue; // NBA: Polymarket US only (no international series)
       const url = `${POLY_GAMMA}/events?series_id=${POLY_SERIES[league]}&active=true&closed=false&limit=50&order=startTime&ascending=true`;
       const listed = await fetchJson(fetchFn, url, { timeoutMs: 8000 });
       const events = Array.isArray(listed.body) ? listed.body : [];
@@ -1994,7 +1998,7 @@ const novigFeed = (() => {
 
   const NOVIG_BOOK_ID = 195;
   const DEFAULT_BASE = 'https://api.novig.com';
-  const LEAGUES = ['NFL', 'MLB', 'NCAAF'];
+  const LEAGUES = ['NFL', 'MLB', 'NCAAF', 'NBA'];
   const BOARD_TYPES = ['MONEY', 'SPREAD', 'TOTAL'];
   const WINDOW_BACK_MS = 8 * 3600 * 1000;
   const WINDOW_AHEAD_MS = 8 * 24 * 3600 * 1000;

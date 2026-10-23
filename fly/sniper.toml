@@ -40,4 +40,8 @@ kill_timeout = "30s"
   SNIPER_LINES = "1"              # main spreads/totals (preview)
   SNIPER_ROGUE_MODE = "shadow"     # weekend: log rogue_line rows only, never change the fair
   SNIPER_MIN_ROI_LINES = "0.04"
+  SNIPER_NBA = "1"                # Kevin Oct 23: NBA moneylines + main spreads/totals (no player props)
+  SNIPER_MIN_ROI_NBA = "0.05"     # any NBA leg needs 5% (highest rule wins)
+  SNIPER_NBA_HOURS = "36"         # NBA legs must tip within 36h of the quote
+  SNIPER_NBA_GAME_HOURS = "3"     # NBA settle_at = last tip + 3h
   SNIPER_ODDS_RELAY_URL = "http://kaygo-odds-relay.internal:8787"

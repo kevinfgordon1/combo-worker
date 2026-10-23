@@ -46,6 +46,10 @@ function sniperConfig(env = process.env) {
     minRoiNcaaf: num(env.SNIPER_MIN_ROI_NCAAF, 0.05),
     minRoiLines: num(env.SNIPER_MIN_ROI_LINES, 0.04), // main spreads / totals (NFL); college lines still 5%  // 5% after maker fee when any leg is college football
     ncaaf: String(env.SNIPER_NCAAF == null ? '1' : env.SNIPER_NCAAF) !== '0', // SNIPER_NCAAF=0 turns college football off
+    nba: String(env.SNIPER_NBA || '0') === '1',                  // NBA ML / spreads / totals (Kevin Oct 23); off unless 1
+    minRoiNba: num(env.SNIPER_MIN_ROI_NBA, 0.05),               // any NBA leg: 5% (highest rule wins)
+    nbaHours: num(env.SNIPER_NBA_HOURS, 36),                    // NBA legs must tip within this many hours
+    nbaGameHours: num(env.SNIPER_NBA_GAME_HOURS, 3),            // NBA settle = last tip + this
     maxPayout: num(env.SNIPER_MAX_PAYOUT, 100),        // $ per quote (contracts × $1)
     maxRisk: num(env.SNIPER_MAX_RISK, 100),            // $ worst-case loss per quote (NO cost + maker fee)
     totalExposureCap: num(env.SNIPER_TOTAL_EXPOSURE_CAP, 10000), // $ open worst-case risk

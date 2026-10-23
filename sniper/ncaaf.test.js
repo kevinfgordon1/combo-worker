@@ -52,7 +52,7 @@ assert.ok(mixed.ok); assert.deepStrictEqual(mixed.legs.map((l) => l.kind || 'ml'
 assert.strictEqual(mixed.legs[1].gameId, 'nfl|2026-10-25|ind+min'); assert.strictEqual(mixed.legs[2].team, 'USU');
 assert.strictEqual(classifyLegs({ legKeys: [`${LIB}:yes`, `${KENN}:no`] }, { ncaaf: true }).reason, 'correlated_same_game');
 assert.strictEqual(classifyLegs({ legKeys: [`${LIB}:yes`, 'KXNCAAFGAME-26OCT31UNACARK-UNA:yes'] }, { ncaaf: true }).reason, 'ncaaf_unmapped');
-assert.strictEqual(classifyLegs({ legKeys: [`${LIB}:yes`, 'KXNBAGAME-26OCT25LALBOS-LAL:yes'] }, { ncaaf: true }).reason, 'not_nfl_ml');
+assert.strictEqual(classifyLegs({ legKeys: [`${LIB}:yes`, 'KXNBAGAME-26OCT25LALBOS-LAL:yes'] }, { ncaaf: true }).reason, 'nba_off'); // NBA needs SNIPER_NBA=1 (sniper/nba.test.js)
 assert.strictEqual(classifyLegs({ legKeys: [`${LIB}:yes`, `${NFL}:yes`] }, { ncaaf: false }).reason, 'ncaaf_off');
 assert.strictEqual(classifyLegs({ legKeys: [`${LIB}:yes`, 'KXNCAAFSPREAD-26OCT22LIBKENN-LIB7:yes'] }, { ncaaf: true }).reason, 'lines_off');
 
