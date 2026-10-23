@@ -68,7 +68,7 @@ async function main(env = process.env) {
   const gate = liveGate(env);
   config.dryRun = !gate.live;
   if (String(env.SNIPER_DRY_RUN) === '0' && !gate.live) alert(`[SNIPER] SNIPER_DRY_RUN=0 but live gate closed (${gate.why.join(', ')}) — staying DRY RUN.`);
-  log(`[SNIPER] boot enabled=${config.enabled} mode=${gate.live ? 'LIVE' : 'DRY_RUN'} depth=game:$${gameDepth},td:$${depth} venues=${venues.join('+')} prophetx=${hasProphetXCreds(env) ? 'on' : 'off'} ncaaf=${config.ncaaf ? `on(min ${(config.minRoiNcaaf * 100).toFixed(1)}%)` : 'off'} lines=${String(env.SNIPER_LINES || '0') === '1' ? 'on' : 'off'}`);
+  log(`[SNIPER] boot enabled=${config.enabled} mode=${gate.live ? 'LIVE' : 'DRY_RUN'} depth=game:$${gameDepth},td:$${depth} venues=${venues.join('+')} prophetx=${hasProphetXCreds(env) ? 'on' : 'off'} minEdge=ml:${(config.minRoi * 100).toFixed(1)}%,lines:${(config.minRoiLines * 100).toFixed(1)}%,td:${(config.minRoiTd * 100).toFixed(1)}% ncaaf=${config.ncaaf ? `on(min ${(config.minRoiNcaaf * 100).toFixed(1)}%)` : 'off'} lines=${String(env.SNIPER_LINES || '0') === '1' ? 'on' : 'off'}`);
   if (gate.live) alert('[SNIPER] ⚠️ LIVE MODE: all gates set — this service will send and confirm real Kalshi RFQ quotes.');
 
   // ── Request budgets (well under venue limits) ──
