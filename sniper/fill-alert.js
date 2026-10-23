@@ -2,6 +2,7 @@
 // We SELL the taker's parlay: they buy YES at q, we hold NO at (1 − q). We win when any leg loses.
 'use strict';
 const { parseNcaafMl, teamName } = require('./ncaaf');
+const { parseLineTicker } = require('./lines');
 const VENUE = { kalshi: 'Kalshi', polymarket: 'Polymarket', novig: 'Novig', prophetx: 'ProphetX' };
 function american(p) {
   const x = Number(p);
@@ -25,6 +26,33 @@ function kickText(ms) {
   if (!Number.isFinite(ms) || ms <= 0) return null;
   return new Date(ms).toLocaleString('en-US', { timeZone: 'America/New_York', weekday: 'short', hour: 'numeric', minute: '2-digit' }).replace(',', '') + ' ET';
 }
+const NICK = { ARI: 'Cardinals', ATL: 'Falcons', BAL: 'Ravens', BUF: 'Bills', CAR: 'Panthers', CHI: 'Bears', CIN: 'Bengals', CLE: 'Browns', DAL: 'Cowboys', DEN: 'Broncos', DET: 'Lions', GB: 'Packers', HOU: 'Texans', IND: 'Colts', JAC: 'Jaguars', JAX: 'Jaguars', KC: 'Chiefs', LV: 'Raiders', LAC: 'Chargers', LAR: 'Rams', LA: 'Rams', MIA: 'Dolphins', MIN: 'Vikings', NE: 'Patriots', NO: 'Saints', NYG: 'Giants', NYJ: 'Jets', PHI: 'Eagles', PIT: 'Steelers', SF: '49ers', SEA: 'Seahawks', TB: 'Buccaneers', TEN: 'Titans', WAS: 'Commanders', WSH: 'Commanders' };
+const ptsTxt = (x) => { const v = Math.round(Number(x) * 10) / 10; return `${v}`; };
+// Spread / total legs (strike from the ticker = Kalshi floor_strike: GB8 => "wins by over 7.5").
+//   KXNFLSPREAD-26OCT25NYGHOU-HOU11:no => "Texans -10.5 — No (Giants +10.5)", opp "HOU -10.5"
+//   KXNFLTOTAL-26OCT26DALPHI-45:no     => "DAL @ PHI Over/Under 44.5 — Under", opp "Over 44.5"
+function lineParts(t, no) {
+  const g = parseLineTicker(t); if (!g) return null;
+  const nfl = g.league === 'nfl';
+  const blob = String(t.split('-')[1] || '').replace(/^\d{2}[A-Z]{3}\d{2}(\d{4})?/, '');
+  const up = (c) => String(c).toUpperCase();
+  // Kalshi lists away then home; codes normalised (e.g. jax/jac) may not appear verbatim => keep order.
+  const ix = (c) => { const i = blob.indexOf(up(c)); return i < 0 ? 99 : i; };
+  const [away, home] = [...g.teams].map(up).sort((a, b) => ix(a) - ix(b));
+  g.sel = up(g.sel);
+  const nm = (c) => (nfl ? (NICK[c] || c) : teamName(c));
+  const game = nfl ? `${away} @ ${home}` : `${teamName(away)} @ ${teamName(home)}`;
+  const L = ptsTxt(g.line);
+  if (g.market === 'total') {
+    return { bet: `${game} Over/Under ${L} — ${no ? 'Under' : 'Over'}`, game, opp: `${no ? 'Over' : 'Under'} ${L}` };
+  }
+  const opp = [away, home].find((x) => x !== g.sel);
+  const short = (c) => (nfl ? c : teamName(c));
+  return {
+    bet: no ? `${nm(g.sel)} -${L} — No (${nm(opp)} +${L})` : `${nm(g.sel)} -${L}`,
+    game, opp: no ? `${short(g.sel)} -${L}` : `${short(opp)} +${L}`,
+  };
+}
 // KXNFLGAME-26OCT25CINBAL-CIN:yes → { bet: "CIN to win", game: "CIN @ BAL" }
 // KXNFLTD-26OCT25CINBAL-BALDHENRY22-1:no → { bet: "Derrick Henry anytime TD (No)", game: "CIN @ BAL" }
 function legParts(ticker, side, name) {
@@ -34,15 +62,17 @@ function legParts(ticker, side, name) {
     let who = name ? String(name).split(':')[0].replace(/\s*(anytime|to score).*$/i, '').trim() : null;
     if (!who) { const m = /^[A-Z]{2,3}([A-Z])([A-Z]+?)\d*$/.exec(code); who = m ? `${m[1]}. ${title(m[2])}` : code; }
     const tm = gameOf(parts[1], code.slice(0, 3)).includes('@') ? code.slice(0, 3) : code.slice(0, 2);
-    return { bet: `${who} anytime TD${no ? ' (No)' : ''}`, game: gameOf(parts[1], tm) };
+    return { bet: `${who} anytime TD${no ? ' (No)' : ''}`, game: gameOf(parts[1], tm), opp: no ? 'TD Yes' : 'No TD' };
   }
   if (t.startsWith('KXNCAAFGAME-')) {
     const g = parseNcaafMl(t);
-    if (g) return { bet: `${teamName(g.selection)} to win${no ? ' (No)' : ''}`, game: `${teamName(g.codes[0])} @ ${teamName(g.codes[1])}` };
+    if (g) { const other = g.codes.find((c) => c !== g.selection); return { bet: `${teamName(g.selection)} to win${no ? ' (No)' : ''}`, game: `${teamName(g.codes[0])} @ ${teamName(g.codes[1])}`, opp: no ? teamName(g.selection) : (other ? teamName(other) : null) }; }
   }
+  if (/^KX(NFL|NCAAF)(SPREAD|TOTAL)-/.test(t)) { const lp = lineParts(t, no); if (lp) return lp; }
   if (t.startsWith('KXNFLGAME')) {
     const pick = parts[2] || '';
-    return { bet: `${pick} to win${no ? ' (No)' : ''}`, game: gameOf(parts[1], pick) };
+    const game = gameOf(parts[1], pick); const other = game.includes(' @ ') ? game.split(' @ ').find((x) => x !== pick) : null;
+    return { bet: `${pick} to win${no ? ' (No)' : ''}`, game, opp: no ? pick : other };
   }
   return { bet: `${t}${no ? ' (No)' : ''}`, game: '' };
 }
@@ -61,6 +91,8 @@ function formatFillAlert({ d, contracts, cost, fee = 0, kickoffOf = () => null }
     lines.push(`${i + 1}. ${p.bet}`);
     lines.push(`    ${[p.game, ko].filter(Boolean).join(' · ')}`);
     const bits = [`fair ${american(l.fair)}`];
+    // fair = 1 − (best opposing cost incl. that venue's fee), so the opposing price is exactly 1 − fair.
+    if (Number(l.fair) > 0 && Number(l.fair) < 1) bits.push(`from opp ${p.opp ? `${p.opp} ` : ''}${american(1 - Number(l.fair))}`);
     if (l.depthUsd != null) bits.push(`${usd0(l.depthUsd)} deep`);
     if (l.venue) bits.push(VENUE[String(l.venue).split(':')[0]] || l.venue);
     lines.push(`    ${bits.join(' · ')}`);
