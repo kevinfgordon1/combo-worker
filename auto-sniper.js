@@ -43,7 +43,8 @@ function sniperConfig(env = process.env) {
     dryRun: flag(env.SNIPER_DRY_RUN, true),            // default dry run
     minRoi: num(env.SNIPER_MIN_ROI, 0.03),             // 3% after maker fee
     minRoiTd: num(env.SNIPER_MIN_ROI_TD, 0.04),        // 4% after maker fee when any leg is a player TD
-    minRoiNcaaf: num(env.SNIPER_MIN_ROI_NCAAF, 0.05),  // 5% after maker fee when any leg is college football
+    minRoiNcaaf: num(env.SNIPER_MIN_ROI_NCAAF, 0.05),
+    minRoiLines: num(env.SNIPER_MIN_ROI_LINES, 0.04), // main spreads / totals (NFL); college lines still 5%  // 5% after maker fee when any leg is college football
     ncaaf: String(env.SNIPER_NCAAF == null ? '1' : env.SNIPER_NCAAF) !== '0', // SNIPER_NCAAF=0 turns college football off
     maxPayout: num(env.SNIPER_MAX_PAYOUT, 100),        // $ per quote (contracts × $1)
     maxRisk: num(env.SNIPER_MAX_RISK, 100),            // $ worst-case loss per quote (NO cost + maker fee)

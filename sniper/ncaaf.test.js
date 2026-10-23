@@ -54,7 +54,7 @@ assert.strictEqual(classifyLegs({ legKeys: [`${LIB}:yes`, `${KENN}:no`] }, { nca
 assert.strictEqual(classifyLegs({ legKeys: [`${LIB}:yes`, 'KXNCAAFGAME-26OCT31UNACARK-UNA:yes'] }, { ncaaf: true }).reason, 'ncaaf_unmapped');
 assert.strictEqual(classifyLegs({ legKeys: [`${LIB}:yes`, 'KXNBAGAME-26OCT25LALBOS-LAL:yes'] }, { ncaaf: true }).reason, 'not_nfl_ml');
 assert.strictEqual(classifyLegs({ legKeys: [`${LIB}:yes`, `${NFL}:yes`] }, { ncaaf: false }).reason, 'ncaaf_off');
-assert.strictEqual(classifyLegs({ legKeys: [`${LIB}:yes`, 'KXNCAAFSPREAD-26OCT22LIBKENN-LIB7:yes'] }, { ncaaf: true }).reason, 'not_moneyline');
+assert.strictEqual(classifyLegs({ legKeys: [`${LIB}:yes`, 'KXNCAAFSPREAD-26OCT22LIBKENN-LIB7:yes'] }, { ncaaf: true }).reason, 'lines_off');
 
 // ── decide: 5% NCAAF minimum (SNIPER_MIN_ROI_NCAAF), NFL stays 3%, same caps ──
 const src = (venue, cost) => ({ venue, cost, reason: 'ok', used: true, availUsd: 5000 });

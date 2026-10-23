@@ -34,4 +34,6 @@ kill_timeout = "30s"
   SNIPER_MIN_ROI_NCAAF = "0.05"   # Kevin Oct 23: college stays 5% (3% all-NFL-ML, 4% other NFL)
   SNIPER_FAIR_DEPTH_USD = "1000"   # NFL player-TD legs
   SNIPER_GAME_DEPTH_USD = "2000"   # NFL + college moneylines (and spreads/totals)
+  SNIPER_LINES = "1"              # main spreads/totals (preview)
+  SNIPER_MIN_ROI_LINES = "0.04"
   SNIPER_ODDS_RELAY_URL = "http://kaygo-odds-relay.internal:8787"
