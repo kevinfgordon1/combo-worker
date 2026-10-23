@@ -3,6 +3,7 @@
 'use strict';
 const { parseNcaafMl, teamName } = require('./ncaaf');
 const { parseLineTicker } = require('./lines');
+const NBA = require('./nba');
 const VENUE = { kalshi: 'Kalshi', polymarket: 'Polymarket', novig: 'Novig', prophetx: 'ProphetX' };
 function american(p) {
   const x = Number(p);
@@ -33,21 +34,21 @@ const ptsTxt = (x) => { const v = Math.round(Number(x) * 10) / 10; return `${v}`
 //   KXNFLTOTAL-26OCT26DALPHI-45:no     => "DAL @ PHI Over/Under 44.5 — Under", opp "Over 44.5"
 function lineParts(t, no) {
   const g = parseLineTicker(t); if (!g) return null;
-  const nfl = g.league === 'nfl';
+  const nfl = g.league === 'nfl'; const nba = g.league === 'nba';
   const blob = String(t.split('-')[1] || '').replace(/^\d{2}[A-Z]{3}\d{2}(\d{4})?/, '');
   const up = (c) => String(c).toUpperCase();
   // Kalshi lists away then home; codes normalised (e.g. jax/jac) may not appear verbatim => keep order.
   const ix = (c) => { const i = blob.indexOf(up(c)); return i < 0 ? 99 : i; };
   const [away, home] = [...g.teams].map(up).sort((a, b) => ix(a) - ix(b));
   g.sel = up(g.sel);
-  const nm = (c) => (nfl ? (NICK[c] || c) : teamName(c));
-  const game = nfl ? `${away} @ ${home}` : `${teamName(away)} @ ${teamName(home)}`;
+  const nm = (c) => (nfl ? (NICK[c] || c) : nba ? NBA.nickName(c) : teamName(c));
+  const game = nfl || nba ? `${away} @ ${home}` : `${teamName(away)} @ ${teamName(home)}`;
   const L = ptsTxt(g.line);
   if (g.market === 'total') {
     return { bet: `${game} Over/Under ${L} — ${no ? 'Under' : 'Over'}`, game, opp: `${no ? 'Over' : 'Under'} ${L}` };
   }
   const opp = [away, home].find((x) => x !== g.sel);
-  const short = (c) => (nfl ? c : teamName(c));
+  const short = (c) => (nfl || nba ? c : teamName(c));
   return {
     bet: no ? `${nm(g.sel)} -${L} — No (${nm(opp)} +${L})` : `${nm(g.sel)} -${L}`,
     game, opp: no ? `${short(g.sel)} -${L}` : `${short(opp)} +${L}`,
@@ -68,7 +69,11 @@ function legParts(ticker, side, name) {
     const g = parseNcaafMl(t);
     if (g) { const other = g.codes.find((c) => c !== g.selection); return { bet: `${teamName(g.selection)} to win${no ? ' (No)' : ''}`, game: `${teamName(g.codes[0])} @ ${teamName(g.codes[1])}`, opp: no ? teamName(g.selection) : (other ? teamName(other) : null) }; }
   }
-  if (/^KX(NFL|NCAAF)(SPREAD|TOTAL)-/.test(t)) { const lp = lineParts(t, no); if (lp) return lp; }
+  if (t.startsWith('KXNBAGAME-')) { // KXNBAGAME-26OCT23DALIND-IND:yes → "Pacers to win" · "DAL @ IND", opp "DAL"
+    const g = NBA.parseNbaMl(t);
+    if (g) { const other = g.codes.find((c) => c !== g.selection); return { bet: `${NBA.nickName(g.selection)} to win${no ? ' (No)' : ''}`, game: `${g.codes[0]} @ ${g.codes[1]}`, opp: no ? g.selection : other }; }
+  }
+  if (/^KX(NFL|NCAAF|NBA)(SPREAD|TOTAL)-/.test(t)) { const lp = lineParts(t, no); if (lp) return lp; }
   if (t.startsWith('KXNFLGAME')) {
     const pick = parts[2] || '';
     const game = gameOf(parts[1], pick); const other = game.includes(' @ ') ? game.split(' @ ').find((x) => x !== pick) : null;

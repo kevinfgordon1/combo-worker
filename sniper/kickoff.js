@@ -8,6 +8,7 @@ const { parseKalshiUnhedgedTicker } = require('../unhedged-rfq');
 const { parseTdTicker } = require('../noboost/td-book');
 const { isNcaafTicker, parseNcaafMl } = require('./ncaaf');
 const { isLineTicker, parseLineTicker } = require('./lines');
+const { isNbaTicker, parseNbaMl } = require('./nba');
 
 const ESPN_NFL = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard';
 const KALSHI_OFFSET_MS = 3 * 3600 * 1000;
@@ -17,6 +18,7 @@ function gameIdOfTicker(ticker) {
   if (/^KXNFLTD-/.test(t)) { const p = parseTdTicker(t); return p ? p.gameId : null; }
   if (isLineTicker(t)) { const g = parseLineTicker(t); return g ? g.gameId : null; } // spreads / totals: same gameId as the ML
   if (isNcaafTicker(t)) { const g = parseNcaafMl(t); return g ? g.gameId : null; } // ncaaf|date|KALSHI+CODES
+  if (isNbaTicker(t)) { const g = parseNbaMl(t); return g ? g.gameId : null; } // nba|date|KALSHI+CODES
   const p = parseKalshiUnhedgedTicker(t, 'yes');
   return p && !p.skip && p.gameId ? p.gameId : null;
 }
@@ -30,8 +32,9 @@ function nextDay(date) {
   d.setUTCDate(d.getUTCDate() + 1); return d.toISOString().slice(0, 10);
 }
 function ncaafCandidates(gid) {
-  const m = /^ncaaf\|(\d{4}-\d\d-\d\d)\|(.+)$/.exec(gid || ''); if (!m) return [gid];
-  const n = nextDay(m[1]); return n ? [gid, `ncaaf|${n}|${m[2]}`] : [gid];
+  // NBA tickers are dated on the ET tip date (checked Oct 23 2026); same safety net as college.
+  const m = /^(ncaaf|nba)\|(\d{4}-\d\d-\d\d)\|(.+)$/.exec(gid || ''); if (!m) return [gid];
+  const n = nextDay(m[2]); return n ? [gid, `${m[1]}|${n}|${m[3]}`] : [gid];
 }
 function lookup(map, gid) {
   const hits = ncaafCandidates(gid).filter((g) => map.has(g));

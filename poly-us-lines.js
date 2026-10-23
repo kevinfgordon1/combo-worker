@@ -11,7 +11,7 @@
 // consumers (Combo Sniper) take the main line from Novig/ProphetX and use Polymarket only on the
 // exact same number.
 'use strict';
-const TYPES = { football_team_full_game_spread: 'spread', football_team_full_game_total: 'total' };
+const TYPES = { football_team_full_game_spread: 'spread', football_team_full_game_total: 'total', basketball_team_full_game_spread: 'spread', basketball_team_full_game_total: 'total' };
 const DEPTH_LEVELS = 25;
 const num = (v, d) => (v == null || v === '' || !Number.isFinite(Number(v)) ? d : Number(v));
 const money = (q) => { const v = Number(q && (q.value != null ? q.value : q)); return Number.isFinite(v) ? v : null; };

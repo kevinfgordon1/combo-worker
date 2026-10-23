@@ -20,7 +20,7 @@
 'use strict';
 
 const DEFAULT_BASE = 'https://cash.api.prophetx.co/partner';
-const TOURNAMENTS = Object.freeze({ NFL: 31, NCAAF: 27653, MLB: 109 });
+const TOURNAMENTS = Object.freeze({ NFL: 31, NCAAF: 27653, MLB: 109, NBA: 132 });
 const MAIN_SUBTYPES = new Set(['moneyline', 'spread', 'total']);
 // NFL player anytime TD (YES / NO). Kept on the same event snapshot + push channel (no extra
 // REST calls); served on /td, never on /board.
@@ -197,7 +197,7 @@ function createProphetXFeed(opts = {}) {
   const log = opts.log || ((m) => console.log(m));
   const onQuotes = opts.onQuotes || (() => {});
   const base = env.PROPHETX_API_BASE_MM || env.PROPHETX_API_BASE || DEFAULT_BASE;
-  const leagues = String(env.PROPHETX_LEAGUES || 'NFL,NCAAF,MLB').split(',').map((s) => s.trim().toUpperCase()).filter((l) => TOURNAMENTS[l]);
+  const leagues = String(env.PROPHETX_LEAGUES || 'NFL,NCAAF,MLB,NBA').split(',').map((s) => s.trim().toUpperCase()).filter((l) => TOURNAMENTS[l]);
   const restGapMs = Math.max(1000 / Math.max(0.05, Math.min(1, Number(env.PROPHETX_REST_RPS) || 0.8)), 1000);
   const discoverMs = Number(env.PROPHETX_DISCOVER_MS) || 10 * 60 * 1000;
   const pushOn = String(env.PROPHETX_PUSH || '1') !== '0';

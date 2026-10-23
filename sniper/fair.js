@@ -31,7 +31,13 @@ function guarded(sources, venues, rogue, noVenueReason) {
   const b = g.best;
   return { p: 1 - b.cost, best: `${b.venue}${b.via && b.via !== 'td_opposite' ? ':' + b.via : ''}`, venue: b.venue, depthUsd: b.availUsd != null ? b.availUsd : null, rogue: rogueEv.length ? rogueEv : undefined };
 }
-function legFairDepth(leg, { pmLive, tdBook, venues, ncaafBook, linesBook = null, rogue }) {
+function legFairDepth(leg, { pmLive, tdBook, venues, ncaafBook, linesBook = null, nbaBook = null, rogue }) {
+  if (leg.kind === 'nba') { // NBA moneyline (sniper/nba.js); NBA spreads/totals are kind 'line'
+    if (!nbaBook) return { p: null, reason: 'no_nba_book' };
+    const f = nbaBook.legFair(leg.gameId, leg.team);
+    if (!f) return { p: null, reason: 'no_game' };
+    return guarded(f.sources, venues, rogue, 'no_venue_depth');
+  }
   if (leg.kind === 'line') { // main spread / total (sniper/lines.js)
     if (!linesBook) return { p: null, reason: 'lines_off' };
     const f = linesBook.legFair(leg);
