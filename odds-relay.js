@@ -5132,13 +5132,18 @@ function handleRequest(req, res, state) {
       rows = state.novigFeed.tdRows();
       const st = state.novigFeed.status || {};
       feed = { ws: st.ws, lastWsAliveAgeMs: st.lastWsAliveAt ? Date.now() - st.lastWsAliveAt : null };
+    } else if (venue === 'prophetx' && state.prophetxFeed && state.prophetxFeed.tdRows) {
+      rows = state.prophetxFeed.tdRows();
+      const st = state.prophetxFeed.status || {};
+      feed = { ws: st.ws, lastWsAliveAgeMs: st.lastWsMsgAt ? Date.now() - st.lastWsMsgAt : null };
     } else if (venue === 'polymarket' && state.usTd) {
       rows = usTdRows(state.usTd, state);
       feed = { ws: state.usSocketUp ? 'up' : 'down', lastWsAliveAgeMs: state.usLastAliveAt ? Date.now() - state.usLastAliveAt : null };
     }
     if (!rows) {
-      res.writeHead(venue === 'novig' || venue === 'polymarket' ? 503 : 400, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-      res.end(JSON.stringify({ ok: false, error: venue === 'novig' || venue === 'polymarket' ? 'td_off' : 'venue novig|polymarket required' }));
+      const known = venue === 'novig' || venue === 'polymarket' || venue === 'prophetx';
+      res.writeHead(known ? 503 : 400, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ ok: false, error: known ? 'td_off' : 'venue novig|polymarket|prophetx required' }));
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
