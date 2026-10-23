@@ -9,7 +9,7 @@
 // KALSHI_KEY_ID is ignored here so a second communications subscriber cannot
 // unsubscribe the quoter.
 'use strict';
-const { createPolyUsLines } = require('./poly-us-lines');
+const { lineMarketsFromEvent, quotesFor: usLineQuotes, inWindow: usLineInWindow } = require('./poly-us-lines');
 
 const http = require('http');
 const { authHeaders: polymarketAuthHeaders } = require('./polymarket-auth');
@@ -422,6 +422,29 @@ function usTdBooksFromMessage(message, catalog, nowMs = Date.now()) {
     out.push({ slug, ladders: usLadders(book.offers || book.asks, book.bids), ts });
   }
   return out;
+}
+
+// /lines rows: relay /board-shaped quotes; confirmed_at = now while the socket is alive and the slug
+// is subscribed (a quiet book is current), else the last frame time.
+const US_LINES_EVENT_GAP_MS = 1000;
+function usLinesRows(lines, state, league, nowMs = Date.now()) {
+  if (!lines) return [];
+  const alive = !!(state.usSocketUp && state.usLastAliveAt && nowMs - state.usLastAliveAt < US_CONFIRM_MS);
+  const L = String(league || '').toUpperCase();
+  const out = [];
+  for (const meta of lines.catalog.values()) {
+    if (meta.league !== L) continue;
+    const b = lines.books.get(meta.slug);
+    if (!b) continue;
+    const confirmed = alive && lines.subscribed.has(meta.slug) ? nowMs : b.at;
+    for (const q of usLineQuotes(meta, b.ladders, b.ts)) out.push({ ...q, confirmed_at: new Date(confirmed).toISOString() });
+  }
+  return out;
+}
+function usLinesStatus(lines, state, nowMs = Date.now()) {
+  const c = { NFL: 0, NCAAF: 0 }; let books = 0;
+  for (const m of lines.catalog.values()) { c[m.league] = (c[m.league] || 0) + 1; if (lines.books.has(m.slug)) books += 1; }
+  return { ws: state.usSocketUp ? 'up' : 'down', catalog: c, books, subscribed: lines.subscribed.size, events: { NFL: lines.eventSlugs.NFL.length, NCAAF: lines.eventSlugs.NCAAF.length }, lastDiscoverAgeMs: lines.lastDiscoverAt ? nowMs - lines.lastDiscoverAt : null, discoverErrors: lines.discoverErrors, subErrors: lines.subErrors, lastSubError: lines.lastSubError };
 }
 
 function usTdRows(td, state, nowMs = Date.now()) {
@@ -1274,6 +1297,56 @@ function startPolymarketUs(state, deps) {
   const tdOn = ['1', 'true', 'on', 'yes'].includes(String(env.RELAY_TD || '').toLowerCase());
   const td = { on: tdOn, catalog: new Map(), books: new Map(), subs: new Map(), subscribed: new Set(), eventSlugs: [], lastDiscoverAt: 0, discoverErrors: 0, subErrors: 0, lastSubError: null };
   state.usTd = td;
+  // Full-game spreads / totals (RELAY_POLY_LINES=1): strikes found on event pages (low rate), books
+  // from this same read-only market-data socket (requestId prefix ln-).
+  const linesOn = ['1', 'true', 'on', 'yes'].includes(String(env.RELAY_POLY_LINES || '').toLowerCase());
+  const lines = { on: linesOn, perEvent: Number(env.POLY_LINES_PER_EVENT) || 2, days: Number(env.POLY_LINES_DAYS) || 8, catalog: new Map(), books: new Map(), subs: new Map(), subscribed: new Set(), eventSlugs: { NFL: [], NCAAF: [] }, lastDiscoverAt: 0, discoverErrors: 0, subErrors: 0, lastSubError: null };
+  state.usLines = lines;
+  const sendLineSubs = () => {
+    if (!linesOn || !ws || ws.readyState !== 1) return;
+    const chunks = usTdChunks([...lines.catalog.keys()]);
+    chunks.forEach((chunk, i) => {
+      const key = chunk.join(',');
+      const prev = lines.subs.get(i);
+      if (prev && prev.key === key) return;
+      if (prev) { try { ws.send(JSON.stringify({ unsubscribe: { requestId: prev.requestId } })); } catch (_) { /* closing */ } }
+      const requestId = `ln-${i}-${Date.now()}`;
+      try { ws.send(JSON.stringify(usSubscribeMessage(chunk, requestId))); } catch (_) { return; }
+      lines.subs.set(i, { key, requestId, slugs: chunk });
+    });
+    for (const i of [...lines.subs.keys()]) {
+      if (i < chunks.length) continue;
+      try { ws.send(JSON.stringify({ unsubscribe: { requestId: lines.subs.get(i).requestId } })); } catch (_) { /* closing */ }
+      lines.subs.delete(i);
+    }
+    lines.subscribed = new Set([...lines.subs.values()].flatMap((x) => x.slugs));
+  };
+  const linesDiscover = async () => {
+    if (!linesOn) return;
+    const next = new Map();
+    let ok = 0;
+    for (const league of ['NFL', 'NCAAF']) {
+      for (const evSlug of lines.eventSlugs[league] || []) {
+        if (stopped) return;
+        try {
+          const res = await fetchJson(fetchFn, `${US_GATEWAY}/v1/events/slug/${encodeURIComponent(evSlug)}`, { timeoutMs: 20000 });
+          if (res.status === 429) { lines.discoverErrors += 1; await sleep(30000, () => stopped); continue; }
+          if (res.ok && res.body) {
+            ok += 1;
+            for (const m of lineMarketsFromEvent(res.body.event || res.body, league, lines.perEvent)) next.set(m.slug, m);
+          }
+        } catch (_) { lines.discoverErrors += 1; }
+        await sleep(US_LINES_EVENT_GAP_MS, () => stopped);
+      }
+    }
+    if (!ok) return; // keep the last good catalog
+    for (const slug of [...lines.catalog.keys()]) {
+      if (!next.has(slug)) { lines.catalog.delete(slug); lines.books.delete(slug); }
+    }
+    for (const [slug, m] of next) lines.catalog.set(slug, m);
+    lines.lastDiscoverAt = Date.now();
+    sendLineSubs();
+  };
 
   const sendTdSubs = () => {
     if (!tdOn || !ws || ws.readyState !== 1) return;
@@ -1373,6 +1446,10 @@ function startPolymarketUs(state, deps) {
           throw new Error(`HTTP ${res.status}${res.body ? '' : ' (non-JSON body)'}`);
         }
         lastGood.set(league, usMarketsFromEvents(res.body.events, league, Date.now()));
+        if (linesOn && (league === 'NFL' || league === 'NCAAF')) {
+          const nowMs = Date.now();
+          lines.eventSlugs[league] = res.body.events.filter((ev) => ev && ev.slug && usLineInWindow(ev, nowMs, lines.days)).map((ev) => String(ev.slug));
+        }
         if (league === 'NFL' && tdOn) {
           const nowMs = Date.now();
           td.eventSlugs = res.body.events
@@ -1421,6 +1498,8 @@ function startPolymarketUs(state, deps) {
       sendSub();
       td.subs.clear();
       sendTdSubs();
+      lines.subs.clear();
+      sendLineSubs();
       const seeded = [];
       for (const meta of catalog.values()) {
         seeded.push(...usQuotesFromPrices(meta, meta.bestBid, meta.bestAsk, meta.updatedAt || Date.now()));
@@ -1459,6 +1538,18 @@ function startPolymarketUs(state, deps) {
           }
         }
       }
+      if (linesOn) {
+        const nowMs = Date.now();
+        for (const b of usTdBooksFromMessage(parsed, lines.catalog, nowMs)) lines.books.set(b.slug, { ladders: b.ladders, ts: b.ts, at: nowMs });
+        for (const msg of Array.isArray(parsed) ? parsed : [parsed]) {
+          const rid = String((msg && (msg.requestId || msg.request_id)) || '');
+          if (msg && msg.error && rid.startsWith('ln-')) {
+            lines.subErrors += 1;
+            lines.lastSubError = String(msg.error).slice(0, 200);
+            console.error(`[odds-relay] polymarket us lines subscription ${rid} error: ${lines.lastSubError}`);
+          }
+        }
+      }
       const quotes = usQuotesFromMessage(parsed, catalog, Date.now());
       if (!quotes.length) return;
       state.usLastFrameAt = Date.now();
@@ -1475,6 +1566,8 @@ function startPolymarketUs(state, deps) {
       state.usSubscribed = new Set();
       td.subs.clear();
       td.subscribed = new Set();
+      lines.subs.clear();
+      lines.subscribed = new Set();
       schedule();
     };
     ws.on('close', reopen);
@@ -1506,6 +1599,16 @@ function startPolymarketUs(state, deps) {
       await sleep(5000, () => stopped);
       while (!stopped) {
         try { await tdDiscover(); } catch (_) { td.discoverErrors += 1; }
+        await sleep(US_TD_DISCOVER_MS, () => stopped);
+      }
+    })();
+  }
+  if (linesOn) {
+    console.log(`[odds-relay] polymarket us lines ON (event pages every ${US_TD_DISCOVER_MS / 60000} min, books via market-data socket)`);
+    (async () => {
+      await sleep(8000, () => stopped);
+      while (!stopped) {
+        try { await linesDiscover(); } catch (_) { lines.discoverErrors += 1; }
         await sleep(US_TD_DISCOVER_MS, () => stopped);
       }
     })();
@@ -5128,13 +5231,13 @@ function handleRequest(req, res, state) {
     // Polymarket US full-game spreads + totals (RELAY_POLY_LINES=1; public gateway, read-only).
     const venue = String(url.searchParams.get('venue') || 'polymarket');
     const league = String(url.searchParams.get('league') || 'NFL').trim().toUpperCase();
-    if (venue !== 'polymarket' || !state.polyLines) {
+    if (venue !== 'polymarket' || !state.usLines || !state.usLines.on) {
       res.writeHead(venue === 'polymarket' ? 503 : 400, { 'content-type': 'application/json', 'cache-control': 'no-store' });
       res.end(JSON.stringify({ ok: false, error: venue === 'polymarket' ? 'lines_off' : 'venue polymarket required' }));
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-    res.end(JSON.stringify({ ok: true, venue, league, feed: state.polyLines.status(), quotes: state.polyLines.rows(league) }));
+    res.end(JSON.stringify({ ok: true, venue, league, feed: usLinesStatus(state.usLines, state), quotes: usLinesRows(state.usLines, state, league) }));
     return;
   }
   if (url.pathname === '/td') {
@@ -5246,13 +5349,6 @@ function startOddsRelay(opts = {}) {
     const env = opts.env || process.env;
     stops.push(startDkfd(state, opts, env));
   }
-  {
-    const env = opts.env || process.env;
-    if (opts.upstream !== false && String(env.RELAY_POLY_LINES || '') === '1') {
-      state.polyLines = createPolyUsLines({ env, fetchFn: opts.polyLinesFetch });
-      stops.push(state.polyLines.start());
-    }
-  }
   if (opts.betstamp !== false) {
     const env = opts.env || process.env;
     state.betstamp = betstampRelay.createRegistry({ env, fetchFn: opts.betstampFetch, upstream: opts.betstampUpstream, pollMs: opts.betstampPollMs, idleStopMs: opts.betstampIdleStopMs, quietPollMs: opts.betstampQuietPollMs });
@@ -5316,6 +5412,7 @@ module.exports = {
   usTdChunks,
   usTdBooksFromMessage,
   usTdRows,
+  usLinesRows,
   rankUsMarkets,
   relayPolyCreds,
   relayKalshiCreds,

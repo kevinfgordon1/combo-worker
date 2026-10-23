@@ -1,8 +1,7 @@
-// Polymarket US full-game spreads + totals (NFL, college) for the odds relay. PUBLIC read-only
-// gateway endpoints only (no keys, no orders):
-//   GET /v2/leagues/{nfl|cfb}/events   -> event slugs (in window, not live)
-//   GET /v1/events/slug/{slug}        -> every market of the event (spread / total ladders)
-//   GET /v1/markets/{slug}/book       -> full book (bids / offers with qty)
+// Polymarket US full-game spreads + totals (NFL, college) for the odds relay: pure helpers.
+// The relay (odds-relay.js startPolymarketUs, RELAY_POLY_LINES=1) finds strikes on the public event
+// page (GET /v1/events/slug/{slug}, low rate) and streams their books over the SAME read-only
+// market-data socket used for moneylines / TD. No orders, no new keys.
 // Slug semantics (verified against the market descriptions, same as leg-identity.js):
 //   asc-…-pos-6pt5 (line +6.5): long (Yes) = FIRST slug team +6.5, short = second team −6.5
 //   asc-…-neg-6pt5 (line −6.5): long = FIRST team −6.5,           short = second team +6.5
@@ -10,10 +9,8 @@
 // Per event we keep the POLY_LINES_PER_EVENT (default 3) most balanced spread strikes and the same
 // number of total strikes (closest mid to 0.5). is_alt=false only on the most balanced one;
 // consumers (Combo Sniper) take the main line from Novig/ProphetX and use Polymarket only on the
-// exact same number. Books are refreshed round-robin, soonest kickoff first, at POLY_LINES_RPS.
+// exact same number.
 'use strict';
-const GATEWAY = 'https://gateway.polymarket.us';
-const LEAGUE_PATH = { NFL: 'nfl', NCAAF: 'cfb' };
 const TYPES = { football_team_full_game_spread: 'spread', football_team_full_game_total: 'total' };
 const DEPTH_LEVELS = 25;
 const num = (v, d) => (v == null || v === '' || !Number.isFinite(Number(v)) ? d : Number(v));
@@ -87,75 +84,4 @@ function quotesFor(meta, ld, atMs) {
   return [q(meta.yes, ld.yes, 'yes'), q(meta.no, ld.no, 'no')].filter(Boolean);
 }
 
-function createPolyUsLines({ env = process.env, fetchFn = fetch, now = () => Date.now(), log = console.log } = {}) {
-  // Public gateway rate-limits ~5+ req/s (429 seen at 10/s), so a full cycle of ~120 books takes ~30s+; books older than a consumer's staleness limit simply drop out there. A 429 pauses 30s.
-  const perEvent = num(env.POLY_LINES_PER_EVENT, 1);
-  const rps = num(env.POLY_LINES_RPS, 4);
-  const days = num(env.POLY_LINES_DAYS, 3);
-  const maxInflight = num(env.POLY_LINES_INFLIGHT, 2);
-  let inflight = 0; let pausedUntil = 0;
-  const discoverMs = num(env.POLY_LINES_DISCOVER_MS, 5 * 60 * 1000);
-  const catalog = new Map(); // slug -> meta
-  const quotes = new Map(); // slug -> { at, rows }
-  const st = { discoveredAt: 0, events: { NFL: 0, NCAAF: 0 }, markets: { NFL: 0, NCAAF: 0 }, books: 0, errors: 0, lastError: null };
-  let stopped = false; let timer = null; let order = []; let cursor = 0;
-  const getJson = async (path) => {
-    const r = await fetchFn(`${GATEWAY}${path}`, { headers: { accept: 'application/json' } });
-    if (r.status === 429) { pausedUntil = now() + 30000; st.rateLimited = (st.rateLimited || 0) + 1; }
-    if (!r.ok) throw new Error(`HTTP ${r.status} ${path.split('?')[0]}`);
-    return r.json();
-  };
-  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
-  async function discover() {
-    const next = new Map();
-    for (const league of Object.keys(LEAGUE_PATH)) {
-      let evs = [];
-      try { const j = await getJson(`/v2/leagues/${LEAGUE_PATH[league]}/events?limit=200&active=true&closed=false`); evs = (j && j.events) || []; } catch (e) { st.errors += 1; st.lastError = e.message; continue; }
-      const slugs = evs.filter((ev) => ev && ev.slug && inWindow(ev, now(), days)).map((ev) => String(ev.slug));
-      st.events[league] = slugs.length; let n = 0;
-      for (const s of slugs) {
-        if (stopped) return;
-        try {
-          const j = await getJson(`/v1/events/slug/${encodeURIComponent(s)}`);
-          for (const m of lineMarketsFromEvent((j && j.event) || j, league, perEvent)) { next.set(m.slug, m); n += 1; }
-        } catch (e) { st.errors += 1; st.lastError = e.message; }
-        await sleep(250); // discovery is gentle (every 5 min)
-      }
-      st.markets[league] = n;
-    }
-    if (next.size) {
-      catalog.clear(); for (const [k, v] of next) catalog.set(k, v);
-      for (const k of [...quotes.keys()]) if (!catalog.has(k)) quotes.delete(k);
-      order = [...catalog.values()].sort((a, b) => (Date.parse(a.start || '') || 0) - (Date.parse(b.start || '') || 0)).map((m) => m.slug);
-      cursor = 0;
-    }
-    st.discoveredAt = now();
-  }
-  async function pollOne() {
-    if (!order.length) return;
-    const slug = order[cursor % order.length]; cursor += 1;
-    const meta = catalog.get(slug); if (!meta) return;
-    try {
-      const j = await getJson(`/v1/markets/${encodeURIComponent(slug)}/book`);
-      quotes.set(slug, { at: now(), rows: quotesFor(meta, laddersFromBook(j && j.marketData), now()) }); st.books += 1;
-    } catch (e) { st.errors += 1; st.lastError = e.message; }
-  }
-  async function loop() {
-    while (!stopped) {
-      try {
-        if (now() < pausedUntil) { await sleep(1000); continue; }
-        if (!st.discoveredAt || now() - st.discoveredAt > discoverMs) await discover();
-        if (inflight < maxInflight) { inflight += 1; pollOne().finally(() => { inflight -= 1; }); }
-      } catch (e) { st.errors += 1; st.lastError = e.message; }
-      await sleep(1000 / rps);
-    }
-  }
-  return {
-    start() { log(`[odds-relay] polymarket us lines ON (public gateway, ${rps} req/s, ${perEvent} strikes/event/type)`); loop(); return () => { stopped = true; if (timer) clearTimeout(timer); }; },
-    rows(league) { const L = String(league || '').toUpperCase(); const out = []; for (const [slug, v] of quotes) { const m = catalog.get(slug); if (m && m.league === L) out.push(...v.rows); } return out; },
-    status() { const c = { NFL: 0, NCAAF: 0 }; for (const m of catalog.values()) c[m.league] += 1; return { ...st, catalog: c, cycleMs: order.length ? Math.round(order.length * 1000 / rps) : null }; },
-    _discover: discover, _pollOne: pollOne,
-  };
-}
-
-module.exports = { createPolyUsLines, lineMarketsFromEvent, laddersFromBook, quotesFor, inWindow };
+module.exports = { lineMarketsFromEvent, laddersFromBook, quotesFor, inWindow };

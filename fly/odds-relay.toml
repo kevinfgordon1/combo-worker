@@ -20,6 +20,7 @@ kill_timeout = "30s"
   memory = "2gb"
 
 [env]
+  RELAY_POLY_LINES = "1"
   PORT = "8787"
   RELAY_TD = "1"   # NFL anytime-TD books: Polymarket US, Novig, ProphetX (read-only) on /td
 

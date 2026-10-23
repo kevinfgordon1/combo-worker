@@ -48,16 +48,13 @@ const now = Date.parse('2026-10-23T05:00:00Z');
 assert.strictEqual(P.inWindow({ startTime: '2026-10-25T13:30:00Z' }, now, 3), true);
 assert.strictEqual(P.inWindow({ startTime: '2026-10-30T13:30:00Z' }, now, 3), false);
 assert.strictEqual(P.inWindow({ startTime: '2026-10-25T13:30:00Z', live: true }, now, 3), false);
-// read-only: only GET gateway paths are ever requested
-(async () => {
-  const seen = [];
-  const fetchFn = async (u, o) => { seen.push([u, (o && o.method) || 'GET']); const p = new URL(u).pathname;
-    const body = p.startsWith('/v2/leagues/nfl') ? { events: [ev] } : p.startsWith('/v2/leagues') ? { events: [] } : p.startsWith('/v1/events/slug') ? { event: ev } : { marketData: { offers: [{ px: q(0.47), qty: '9000' }], bids: [{ px: q(0.465), qty: '9000' }] } };
-    return { ok: true, status: 200, json: async () => body }; };
-  const L = P.createPolyUsLines({ env: { POLY_LINES_PER_EVENT: '1' }, fetchFn, now: () => now, log: () => {} });
-  await L._discover(); await L._pollOne(); await L._pollOne();
-  assert.strictEqual(L.status().catalog.NFL, 2);
-  assert.strictEqual(L.rows('NFL').length, 4);
-  assert.ok(seen.every(([u, m]) => m === 'GET' && u.startsWith('https://gateway.polymarket.us/')));
-  console.log('poly-us-lines.test ok');
-})().catch((e) => { console.error(e); process.exit(1); });
+// relay rows: books from the socket, confirmed_at = now while alive + subscribed
+const { usLinesRows } = require('./odds-relay');
+const lines = { catalog: new Map([[sp.slug, sp]]), books: new Map([[sp.slug, { ladders: ld, ts: now - 60000, at: now - 60000 }]]), subscribed: new Set([sp.slug]) };
+const alive = { usSocketUp: true, usLastAliveAt: now - 1000 };
+const rows = usLinesRows(lines, alive, 'NFL', now);
+assert.strictEqual(rows.length, 2);
+assert.strictEqual(rows[0].confirmed_at, new Date(now).toISOString(), 'quiet book on a live socket is current');
+assert.strictEqual(usLinesRows(lines, { usSocketUp: false }, 'NFL', now)[0].confirmed_at, new Date(now - 60000).toISOString(), 'socket down => last frame time');
+assert.strictEqual(usLinesRows(lines, alive, 'NCAAF', now).length, 0);
+console.log('poly-us-lines.test ok');
