@@ -8,6 +8,15 @@ kill_timeout = "30s"
 [build]
   dockerfile = "../Dockerfile"
 
+# Non-secret settings MUST live here: `fly deploy` replaces the machine config with this file,
+# so any env set only with `fly machine update --env` is wiped on the next deploy (Oct 23 outage).
+# Live Combo Locks Polymarket quoting (Kevin approved Oct 20). Hedges stay dry: POLY_SINGLE_LEG_LIVE unset.
+[env]
+  COMBO_CAP_AT_CONFIRM = "1"
+  POLY_DRY_RUN = "0"
+  POLYMARKET_RFQ_LIVE = "1"
+  COMBO_VENUE_COORD = "1"
+
 [processes]
   app = "npm run start:poly"
 
