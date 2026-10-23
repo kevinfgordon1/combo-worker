@@ -367,6 +367,9 @@ async function main(env = process.env) {
   // pricing / reservation work. Quote-sender still hard-drops at 3s right before the POST.
   const maxAgeMs = num(env.SNIPER_MAX_RFQ_AGE_MS, 2000);
   const lat = createLatencyStats();
+  // Recent DB-reserve time (EWMA, ms) for the expiry gate; deadline = quote-sender's rfq_age drop.
+  const postDeadlineMs = num(env.SNIPER_POST_DEADLINE_MS, 3000);
+  const reserveEst = (() => { let v = 250; return { add: (ms) => { if (Number.isFinite(ms)) v = 0.8 * v + 0.2 * ms; }, get: () => v }; })();
   // Rogue-line guard log (sniper/rogue.js): one sniper_decisions row per leg+venue+kind per minute.
   const rogueSeen = new Map();
   const rogueCfg = rogueConfig(env);
@@ -404,13 +407,24 @@ async function main(env = process.env) {
       ledger.positions.delete(d.rfqId); ledger.hour.pop();
       lat.staleIntake(); counts.skips.stale_before_reserve = (counts.skips.stale_before_reserve || 0) + 1; return;
     }
+    // Expiry gate (before the DB lock): if this RFQ can't reach Kalshi inside the quote-sender's
+    // 3s rfq_age budget given recent reserve + POST times, don't take the advisory lock for it.
+    if (gate.live && !config.dryRun) {
+      const age = rfqAgeMs(rfq.createdTs, signedNow());
+      const ls = liveSniper.stats();
+      const projected = age == null ? null : age + reserveEst.get() + (ls.postP50 || 150);
+      if (projected != null && projected > postDeadlineMs) {
+        ledger.positions.delete(d.rfqId); ledger.hour.pop();
+        counts.skips.cant_make_expiry = (counts.skips.cant_make_expiry || 0) + 1; return;
+      }
+    }
     const t0 = Date.now();
     // Live: reserved / quoted rows only hold exposure for the quote's life (20s TTL + buffer);
     // onHold extends to d.releaseAt (games settle) once a taker accepts.
     const holdAt = gate.live && !config.dryRun ? Date.now() + pendingHoldMs : d.releaseAt;
     const pos0 = ledger.positions.get(d.rfqId); if (pos0) pos0.releaseAt = holdAt;
     const res = await store.reserve(d, { releaseAt: holdAt, dryRun: config.dryRun, caps: caps(), marketTicker: rfq.marketTicker || null });
-    lat.reserve(Date.now() - t0);
+    lat.reserve(Date.now() - t0); reserveEst.add(Date.now() - t0);
     if (!res.ok) {
       // roll back the in-memory reservation; a DB problem fails closed (no quote)
       ledger.positions.delete(d.rfqId); ledger.hour.pop();
@@ -481,7 +495,7 @@ async function main(env = process.env) {
     const latency = lat.snapshot();
     const wsThroughput = () => { try { if (!ws || typeof ws.takeThroughput !== 'function') return null; const t = summarizeThroughput(ws.takeThroughput()); delete t.perShard; return t; } catch (_) { return null; } };
     log(`[SNIPER] latency ${JSON.stringify(latency)} ws=${JSON.stringify(wsThroughput())}`);
-    store.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
+    store.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts: JSON.parse(JSON.stringify(counts)), live: liveSniper.stats(), reserveEstMs: Math.round(reserveEst.get()), open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
     counts.rfqs = 0; counts.quotes = 0; counts.skips = {};
   }, 60000);
   setInterval(() => {

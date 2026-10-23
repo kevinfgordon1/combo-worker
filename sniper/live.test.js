@@ -142,3 +142,10 @@ const ALL = { SNIPER_ENABLED: '1', SNIPER_DRY_RUN: '0', SNIPER_LIVE_CONFIRM: LIV
   r = rig({ live: false }); assert.strictEqual((await r.L.send(rfq, d)).reason, 'not_live'); assert.deepStrictEqual(r.calls, []);
   console.log('sniper/live.test.js ok');
 })().catch((e) => { console.error(e); process.exit(1); });
+
+test('postFailKey classifies Kalshi errors and stale drops', () => {
+  const { postFailKey } = require('./live');
+  assert.strictEqual(postFailKey(new Error('Kalshi quote failed 409: {"error":{"code":"rfq_closed","message":"rfq closed"}}')), 'http_409:rfq_closed');
+  assert.strictEqual(postFailKey(new Error('STALE_DROP rfq_age age=3100ms')), 'stale_drop:rfq_age');
+  assert.strictEqual(postFailKey(new Error('boom')), 'error');
+});
