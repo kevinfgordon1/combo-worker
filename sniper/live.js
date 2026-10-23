@@ -57,6 +57,7 @@ function createLiveSniper({
     const tPost = now();
     try { res = await trader.postQuote(rfq, d.quoteYes, config.tick); } catch (err) {
       // Free the reservation first so a failed POST never sits in pending risk.
+      stats.postMs.push(now() - tPost); if (stats.postMs.length > 200) stats.postMs.shift();
       await store.release(d.rfqId, 'failed', {});
       const k = postFailKey(err); bump(stats.postFailBy, k);
       if (k.startsWith('stale_drop')) stats.staleDrop += 1; else stats.postFail += 1;
