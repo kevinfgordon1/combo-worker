@@ -1,0 +1,6 @@
+\set n random(1, 1000000000)
+\set g random(0, 5)
+\set l random(0, 19)
+\set r random(5, 60)
+select sniper_reserve(jsonb_build_object('rfq_id','t-'||:n||'-'||:client_id,'combo_key','tc-'||:n||'-'||:client_id,'games',jsonb_build_array('TG'||:g,'TG'||((:g+1)%6)),'legs',jsonb_build_array('TL'||:l,'TL'||((:l+3)%20)),'dry_run',false,'risk',:r,'release_at',(now()+interval '1 hour')::text),
+ jsonb_build_object('total',5000,'game',1500,'leg',750,'daily_risk',1e9,'daily_loss',1e9,'per_hour',1e9,'day_start',(now()-interval '12 hours')::text,'live',true));
