@@ -103,3 +103,15 @@ const restMarkets = [
   assert.strictEqual((await client.nflMoneylines()).length, 2);
   console.log('prophetx feed e2e ok');
 })().catch((e) => { console.error(e); process.exit(1); });
+
+// ProphetX anytime-TD markets kept only when asked (relay RELAY_TD), with the player name.
+{
+  const assert = require('assert');
+  const px = require('./prophetx-feed');
+  const raw = [{ id: 9, sub_type: 'to_score_a_touchdown', type: 'moneyline', line: 0, name: 'Devaughn Vele To Score a Touchdown', selections: [[{ name: 'YES', odds: 117, value: 400 }], [{ name: 'NO', odds: -150, value: 300 }]] }, { id: 1, sub_type: 'moneyline', type: 'moneyline', selections: [[], []] }];
+  assert.strictEqual(px.mainMarketsFromRest(raw).length, 1);
+  const withTd = px.mainMarketsFromRest(raw, { td: true });
+  assert.strictEqual(withTd.length, 2);
+  assert.strictEqual(withTd.find((m) => m.marketId === 9).player, 'Devaughn Vele');
+  console.log('prophetx td markets ok');
+}

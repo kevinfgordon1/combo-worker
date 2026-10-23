@@ -94,7 +94,7 @@ async function main(env = process.env) {
   };
 
   // ── Books (own copies, $depth) ──
-  const tdVenues = venues.filter((v) => v === 'polymarket' || v === 'novig');
+  const tdVenues = venues.filter((v) => v === 'polymarket' || v === 'novig' || v === 'prophetx');
   const tdBook = createTdBook({ staleMs: 15000, depthUsd: depth, maxOverround: 0.15, venues: tdVenues });
   const pmLive = createPmLiveBook({ staleMs: 15000, depthUsd: gameDepth });
   pmLive.setTdBook(tdBook);
@@ -192,6 +192,19 @@ async function main(env = process.env) {
         if (/disabled/.test(e.message)) throw e;
         if (/HTTP 503/.test(e.message)) tdOff.set(venue, Date.now());
         relayErr[`${venue}_td`] = (relayErr[`${venue}_td`] || 0) + 1;
+      }
+    }
+    // ProphetX player TDs come from the relay's read-only ProphetX feed (/td), not the sniper's key.
+    if (venues.includes('prophetx') && !(tdOff.has('prophetx') && Date.now() - tdOff.get('prophetx') < 10 * 60 * 1000)) {
+      try {
+        const polledAt = Date.now();
+        const t = await getJson(lim.relay, `${relayBase}/td?venue=prophetx&league=NFL`);
+        tdOff.delete('prophetx');
+        tdBook.ingestVenue('prophetx', t.markets || [], { polledAt });
+      } catch (e) {
+        if (/disabled/.test(e.message)) throw e;
+        if (/HTTP 503/.test(e.message)) tdOff.set('prophetx', Date.now());
+        relayErr.prophetx_td = (relayErr.prophetx_td || 0) + 1;
       }
     }
     health.relay = Date.now();

@@ -22,6 +22,11 @@
 const DEFAULT_BASE = 'https://cash.api.prophetx.co/partner';
 const TOURNAMENTS = Object.freeze({ NFL: 31, NCAAF: 27653, MLB: 109 });
 const MAIN_SUBTYPES = new Set(['moneyline', 'spread', 'total']);
+// NFL player anytime TD (YES / NO). Kept on the same event snapshot + push channel (no extra
+// REST calls); served on /td, never on /board.
+const TD_SUBTYPE = 'to_score_a_touchdown';
+const PX_COMMISSION = 0.02; // on net winnings
+function tdPlayerName(m) { return String(m.name || '').replace(/\s+to\s+score\s+a(n)?\s+(anytime\s+)?touchdown.*$/i, '').trim(); }
 const DONE_STATUS = /ended|closed|cancel|settled|complete|finished|abandon/i;
 
 function probFromAmerican(am) {
@@ -29,6 +34,7 @@ function probFromAmerican(am) {
   if (!Number.isFinite(n) || n === 0) return null;
   return n > 0 ? 100 / (n + 100) : -n / (-n + 100);
 }
+const pxEffective = (p) => 1 / (1 + (1 / p - 1) * (1 - PX_COMMISSION));
 function round4(n) { return Math.round(n * 10000) / 10000; }
 
 // One side's ladder -> [{american, odds, size, to_win}], best (highest American) first.
@@ -66,18 +72,20 @@ function nsToMs(n) {
 }
 
 // REST v2 get_markets -> [{marketId, subType, type, lines:[{strike, selections}]}] for main markets.
-function mainMarketsFromRest(markets) {
+function mainMarketsFromRest(markets, { td = false } = {}) {
   const out = [];
   for (const m of markets || []) {
     const sub = String(m.sub_type || '').toLowerCase();
-    if (!MAIN_SUBTYPES.has(sub)) continue;
+    if (!MAIN_SUBTYPES.has(sub) && !(td && sub === TD_SUBTYPE)) continue;
     const lines = [];
     if (Array.isArray(m.market_lines)) {
       for (const ln of m.market_lines) lines.push({ strike: Number(ln.line), selections: ln.selections || [] });
     } else {
       lines.push({ strike: Number(m.line) || 0, selections: m.selections || [] });
     }
-    out.push({ marketId: Number(m.id), subType: sub, type: String(m.type || sub), lines });
+    const row = { marketId: Number(m.id), subType: sub, type: String(m.type || sub), lines };
+    if (sub === TD_SUBTYPE) row.player = tdPlayerName(m);
+    out.push(row);
   }
   return out;
 }
@@ -125,6 +133,7 @@ function pickMainLine(lines) {
 function quotesForEvent(ev, markets, now = Date.now()) {
   const out = [];
   for (const m of markets.values()) {
+    if (m.subType === TD_SUBTYPE) continue;
     const ln = pickMainLine([...m.lines.values()]);
     if (!ln) continue;
     for (let i = 0; i < 2; i += 1) {
@@ -192,6 +201,7 @@ function createProphetXFeed(opts = {}) {
   const restGapMs = Math.max(1000 / Math.max(0.05, Math.min(1, Number(env.PROPHETX_REST_RPS) || 0.8)), 1000);
   const discoverMs = Number(env.PROPHETX_DISCOVER_MS) || 10 * 60 * 1000;
   const pushOn = String(env.PROPHETX_PUSH || '1') !== '0';
+  const tdOn = ['1', 'true', 'on', 'yes'].includes(String(env.RELAY_TD || '').toLowerCase());
 
   const status = {
     rest: 'starting', ws: pushOn ? 'starting' : 'off', auth: 'starting',
@@ -287,7 +297,7 @@ function createProphetXFeed(opts = {}) {
   async function snapshot(ev) {
     const j = await api(`/v2/mm/get_markets?event_id=${ev.id}`, {}, { rest: true });
     const at = Date.now();
-    const mains = mainMarketsFromRest((j.data && j.data.markets) || []);
+    const mains = mainMarketsFromRest((j.data && j.data.markets) || [], { td: tdOn && ev.league === 'NFL' });
     const keep = new Set(mains.map((m) => m.marketId));
     for (const id of ev.markets.keys()) if (!keep.has(id)) ev.markets.delete(id);
     for (const m of mains) {
@@ -297,6 +307,7 @@ function createProphetXFeed(opts = {}) {
       if (cur) cur.lines = fresh;
       applyLines(ev, m.marketId, m.subType, m.type, m.lines.filter((l) => !fresh.has(String(l.strike))), 'rest', at, null);
       const mm = ev.markets.get(m.marketId);
+      if (m.player) mm.player = m.player;
       for (const [k] of mm.lines) if (!m.lines.some((l) => String(l.strike) === k) && !fresh.has(k)) mm.lines.delete(k);
     }
     ev.snapshotAt = at;
@@ -442,6 +453,33 @@ function createProphetXFeed(opts = {}) {
     connect();
   })();
 
+  // /td rows (same shape as the Novig / Polymarket US lanes): YES / NO ask ladders as
+  // [{odds, size}] with size in $1 contracts and the 2% commission folded into the price.
+  function tdRows(nowMs = Date.now()) {
+    const out = [];
+    const pushLive = status.ws === 'up' && nowMs - status.lastWsMsgAt < 60000;
+    for (const ev of events.values()) {
+      if (ev.league !== 'NFL') continue;
+      for (const m of ev.markets.values()) {
+        if (m.subType !== TD_SUBTYPE || !m.player) continue;
+        const ln = [...m.lines.values()][0];
+        if (!ln) continue;
+        const side = (i) => ladder(ln.selections[i]).map((l) => { const eff = pxEffective(l.odds); return { odds: round4(eff), size: Math.round((l.size / eff) * 100) / 100 }; }).sort((a, b) => a.odds - b.odds);
+        const names = [0, 1].map((i) => String((sideMeta(ln.selections[i]) || {}).name || '').toUpperCase());
+        const yi = names[0] === 'NO' ? 1 : 0;
+        const confirmed = pushLive && subscribed.has(ev.id) ? nowMs : (ln.changedAt || 0);
+        out.push({
+          venue: 'prophetx', market: `${ev.id}:${m.marketId}`, player: m.player, team: '',
+          away: ev.away, home: ev.home, start: ev.start, live: !!ev.isLive,
+          yes: side(yi), no: side(1 - yi), fee_coefficient: 0, fee_when: 'in_price',
+          updated_at: ln.changedAt ? new Date(ln.changedAt).toISOString() : null,
+          confirmed_at: confirmed ? new Date(confirmed).toISOString() : null,
+        });
+      }
+    }
+    return out;
+  }
+
   function health() {
     const counts = {}; const quotes = {};
     for (const l of leagues) { counts[l] = 0; quotes[l] = 0; }
@@ -456,12 +494,14 @@ function createProphetXFeed(opts = {}) {
       lastWsUpdateAgeMs: status.lastWsUpdateAt ? now - status.lastWsUpdateAt : null,
       lastRestAgeMs: status.lastRestAt ? now - status.lastRestAt : null,
       pushLatencyMs: latency.stats(),
+      td: tdOn ? { on: true, markets: tdRows(now).length } : { on: false },
     };
   }
 
   return {
     status,
     health,
+    tdRows,
     stop() {
       stopped = true; clearInterval(watch); clearInterval(cfgWatch);
       for (const t of timers) clearTimeout(t);
@@ -472,4 +512,4 @@ function createProphetXFeed(opts = {}) {
 
 function prophetxRelayCreds(env = process.env) { return !!(env.PROPHETX_ACCESS_KEY && env.PROPHETX_SECRET_KEY); }
 
-module.exports = { createProphetXFeed, prophetxRelayCreds, decodePushFrame, mainMarketsFromRest, quotesForEvent, ladder, pickMainLine, probFromAmerican, nsToMs, TOURNAMENTS };
+module.exports = { TD_SUBTYPE, tdPlayerName, createProphetXFeed, prophetxRelayCreds, decodePushFrame, mainMarketsFromRest, quotesForEvent, ladder, pickMainLine, probFromAmerican, nsToMs, TOURNAMENTS };

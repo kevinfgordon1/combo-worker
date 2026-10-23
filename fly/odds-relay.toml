@@ -21,6 +21,7 @@ kill_timeout = "30s"
 
 [env]
   PORT = "8787"
+  RELAY_TD = "1"   # NFL anytime-TD books: Polymarket US, Novig, ProphetX (read-only) on /td
 
 [http_service]
   internal_port = 8787
