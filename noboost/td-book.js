@@ -94,6 +94,7 @@ function venueGameKeys(away, home, start) {
 const VENUE_FEE = {
   polymarket: (coef) => { const c = Number.isFinite(Number(coef)) && Number(coef) > 0 ? Number(coef) : POLY_THETA; return (p) => c * p * (1 - p); },
   novig: (coef, live) => (live && Number(coef) > 0 ? (p) => Number(coef) * p * (1 - p) : () => 0),
+  prophetx: () => () => 0, // relay folds ProphetX's 2% commission into the level price
 };
 const american = (p) => (p > 0 && p < 1 ? (p >= 0.5 ? -Math.round((100 * p) / (1 - p)) : Math.round((100 * (1 - p)) / p)) : null);
 // Kalshi orderbook_fp: yes_dollars / no_dollars are BIDS [[price, contracts]].
