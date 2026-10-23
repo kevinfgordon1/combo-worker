@@ -6,6 +6,7 @@
 'use strict';
 const { parseKalshiUnhedgedTicker } = require('../unhedged-rfq');
 const { parseTdTicker } = require('../noboost/td-book');
+const { isNcaafTicker, parseNcaafMl } = require('./ncaaf');
 
 const ESPN_NFL = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard';
 const KALSHI_OFFSET_MS = 3 * 3600 * 1000;
@@ -13,6 +14,7 @@ const KALSHI_OFFSET_MS = 3 * 3600 * 1000;
 function gameIdOfTicker(ticker) {
   const t = String(ticker || '').split(':')[0].toUpperCase();
   if (/^KXNFLTD-/.test(t)) { const p = parseTdTicker(t); return p ? p.gameId : null; }
+  if (isNcaafTicker(t)) { const g = parseNcaafMl(t); return g ? g.gameId : null; } // ncaaf|date|KALSHI+CODES
   const p = parseKalshiUnhedgedTicker(t, 'yes');
   return p && !p.skip && p.gameId ? p.gameId : null;
 }

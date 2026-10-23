@@ -1,0 +1,560 @@
+{
+ "note": "FBS teams as Kalshi KXNCAAF codes. Source: ESPN core API seasons/2026/types/2/groups/80/teams (FBS), each team mapped to its Kalshi code through ncaaf-crosswalk names. Anything not listed is treated as non-FBS (FCS or lower) and never quoted by the sniper.",
+ "source": "https://sports.core.api.espn.com/v2/sports/football/leagues/college-football/seasons/2026/types/2/groups/80/teams",
+ "generatedAt": "2026-10-22T23:27:37.621Z",
+ "count": 138,
+ "teams": {
+  "AFA": {
+   "espnId": "2005",
+   "name": "Air Force"
+  },
+  "AKR": {
+   "espnId": "2006",
+   "name": "Akron"
+  },
+  "ALA": {
+   "espnId": "333",
+   "name": "Alabama"
+  },
+  "APP": {
+   "espnId": "2026",
+   "name": "App State"
+  },
+  "ARIZ": {
+   "espnId": "12",
+   "name": "Arizona"
+  },
+  "ARK": {
+   "espnId": "8",
+   "name": "Arkansas"
+  },
+  "ARMY": {
+   "espnId": "349",
+   "name": "Army"
+  },
+  "ARST": {
+   "espnId": "2032",
+   "name": "Arkansas State"
+  },
+  "ASU": {
+   "espnId": "9",
+   "name": "Arizona State"
+  },
+  "AUB": {
+   "espnId": "2",
+   "name": "Auburn"
+  },
+  "BALL": {
+   "espnId": "2050",
+   "name": "Ball State"
+  },
+  "BAY": {
+   "espnId": "239",
+   "name": "Baylor"
+  },
+  "BC": {
+   "espnId": "103",
+   "name": "Boston College"
+  },
+  "BGSU": {
+   "espnId": "189",
+   "name": "Bowling Green"
+  },
+  "BSU": {
+   "espnId": "68",
+   "name": "Boise State"
+  },
+  "BUFF": {
+   "espnId": "2084",
+   "name": "Buffalo"
+  },
+  "BYU": {
+   "espnId": "252",
+   "name": "BYU"
+  },
+  "CAL": {
+   "espnId": "25",
+   "name": "California"
+  },
+  "CCAR": {
+   "espnId": "324",
+   "name": "Coastal Carolina"
+  },
+  "CHAR": {
+   "espnId": "2429",
+   "name": "Charlotte"
+  },
+  "CIN": {
+   "espnId": "2132",
+   "name": "Cincinnati"
+  },
+  "CLEM": {
+   "espnId": "228",
+   "name": "Clemson"
+  },
+  "CMU": {
+   "espnId": "2117",
+   "name": "Central Michigan"
+  },
+  "COLO": {
+   "espnId": "38",
+   "name": "Colorado"
+  },
+  "CONN": {
+   "espnId": "41",
+   "name": "UConn"
+  },
+  "CSU": {
+   "espnId": "36",
+   "name": "Colorado State"
+  },
+  "DEL": {
+   "espnId": "48",
+   "name": "Delaware"
+  },
+  "DUKE": {
+   "espnId": "150",
+   "name": "Duke"
+  },
+  "ECU": {
+   "espnId": "151",
+   "name": "East Carolina"
+  },
+  "EMU": {
+   "espnId": "2199",
+   "name": "Eastern Michigan"
+  },
+  "FAU": {
+   "espnId": "2226",
+   "name": "Florida Atlantic"
+  },
+  "FIU": {
+   "espnId": "2229",
+   "name": "Florida International"
+  },
+  "FLA": {
+   "espnId": "57",
+   "name": "Florida"
+  },
+  "FRES": {
+   "espnId": "278",
+   "name": "Fresno State"
+  },
+  "FSU": {
+   "espnId": "52",
+   "name": "Florida State"
+  },
+  "GASO": {
+   "espnId": "290",
+   "name": "Georgia Southern"
+  },
+  "GAST": {
+   "espnId": "2247",
+   "name": "Georgia State"
+  },
+  "GT": {
+   "espnId": "59",
+   "name": "Georgia Tech"
+  },
+  "HAW": {
+   "espnId": "62",
+   "name": "Hawai'i"
+  },
+  "HOU": {
+   "espnId": "248",
+   "name": "Houston"
+  },
+  "ILL": {
+   "espnId": "356",
+   "name": "Illinois"
+  },
+  "IND": {
+   "espnId": "84",
+   "name": "Indiana"
+  },
+  "IOWA": {
+   "espnId": "2294",
+   "name": "Iowa"
+  },
+  "ISU": {
+   "espnId": "66",
+   "name": "Iowa State"
+  },
+  "JMU": {
+   "espnId": "256",
+   "name": "James Madison"
+  },
+  "JVST": {
+   "espnId": "55",
+   "name": "Jacksonville State"
+  },
+  "KENN": {
+   "espnId": "338",
+   "name": "Kennesaw State"
+  },
+  "KENT": {
+   "espnId": "2309",
+   "name": "Kent State"
+  },
+  "KSU": {
+   "espnId": "2306",
+   "name": "Kansas State"
+  },
+  "KU": {
+   "espnId": "2305",
+   "name": "Kansas"
+  },
+  "LIB": {
+   "espnId": "2335",
+   "name": "Liberty"
+  },
+  "LOU": {
+   "espnId": "97",
+   "name": "Louisville"
+  },
+  "LSU": {
+   "espnId": "99",
+   "name": "LSU"
+  },
+  "LT": {
+   "espnId": "2348",
+   "name": "Louisiana Tech"
+  },
+  "MASS": {
+   "espnId": "113",
+   "name": "Massachusetts"
+  },
+  "MD": {
+   "espnId": "120",
+   "name": "Maryland"
+  },
+  "MEM": {
+   "espnId": "235",
+   "name": "Memphis"
+  },
+  "MIA": {
+   "espnId": "2390",
+   "name": "Miami (FL)"
+  },
+  "MICH": {
+   "espnId": "130",
+   "name": "Michigan"
+  },
+  "MINN": {
+   "espnId": "135",
+   "name": "Minnesota"
+  },
+  "MISS": {
+   "espnId": "145",
+   "name": "Ole Miss"
+  },
+  "MIZZ": {
+   "espnId": "142",
+   "name": "Missouri"
+  },
+  "MOH": {
+   "espnId": "193",
+   "name": "Miami (OH)"
+  },
+  "MOSU": {
+   "espnId": "2623",
+   "name": "Missouri State"
+  },
+  "MRSH": {
+   "espnId": "276",
+   "name": "Marshall"
+  },
+  "MSST": {
+   "espnId": "344",
+   "name": "Mississippi State"
+  },
+  "MSU": {
+   "espnId": "127",
+   "name": "Michigan State"
+  },
+  "MTU": {
+   "espnId": "2393",
+   "name": "Middle Tennessee"
+  },
+  "NAVY": {
+   "espnId": "2426",
+   "name": "Navy"
+  },
+  "NCST": {
+   "espnId": "152",
+   "name": "NC State"
+  },
+  "ND": {
+   "espnId": "87",
+   "name": "Notre Dame"
+  },
+  "NDSU": {
+   "espnId": "2449",
+   "name": "North Dakota State"
+  },
+  "NEB": {
+   "espnId": "158",
+   "name": "Nebraska"
+  },
+  "NEV": {
+   "espnId": "2440",
+   "name": "Nevada"
+  },
+  "NIU": {
+   "espnId": "2459",
+   "name": "Northern Illinois"
+  },
+  "NMSU": {
+   "espnId": "166",
+   "name": "New Mexico State"
+  },
+  "NW": {
+   "espnId": "77",
+   "name": "Northwestern"
+  },
+  "ODU": {
+   "espnId": "295",
+   "name": "Old Dominion"
+  },
+  "OHIO": {
+   "espnId": "195",
+   "name": "Ohio"
+  },
+  "OKLA": {
+   "espnId": "201",
+   "name": "Oklahoma"
+  },
+  "OKST": {
+   "espnId": "197",
+   "name": "Oklahoma State"
+  },
+  "ORE": {
+   "espnId": "2483",
+   "name": "Oregon"
+  },
+  "ORST": {
+   "espnId": "204",
+   "name": "Oregon State"
+  },
+  "OSU": {
+   "espnId": "194",
+   "name": "Ohio State"
+  },
+  "PITT": {
+   "espnId": "221",
+   "name": "Pittsburgh"
+  },
+  "PSU": {
+   "espnId": "213",
+   "name": "Penn State"
+  },
+  "PUR": {
+   "espnId": "2509",
+   "name": "Purdue"
+  },
+  "RICE": {
+   "espnId": "242",
+   "name": "Rice"
+  },
+  "RUTG": {
+   "espnId": "164",
+   "name": "Rutgers"
+  },
+  "SAC": {
+   "espnId": "16",
+   "name": "Sacramento State"
+  },
+  "SCAR": {
+   "espnId": "2579",
+   "name": "South Carolina"
+  },
+  "SDSU": {
+   "espnId": "21",
+   "name": "San Diego State"
+  },
+  "SHSU": {
+   "espnId": "2534",
+   "name": "Sam Houston"
+  },
+  "SJSU": {
+   "espnId": "23",
+   "name": "San José State"
+  },
+  "SMU": {
+   "espnId": "2567",
+   "name": "SMU"
+  },
+  "STAN": {
+   "espnId": "24",
+   "name": "Stanford"
+  },
+  "SYR": {
+   "espnId": "183",
+   "name": "Syracuse"
+  },
+  "TCU": {
+   "espnId": "2628",
+   "name": "TCU"
+  },
+  "TEM": {
+   "espnId": "218",
+   "name": "Temple"
+  },
+  "TENN": {
+   "espnId": "2633",
+   "name": "Tennessee"
+  },
+  "TEX": {
+   "espnId": "251",
+   "name": "Texas"
+  },
+  "TLSA": {
+   "espnId": "202",
+   "name": "Tulsa"
+  },
+  "TOL": {
+   "espnId": "2649",
+   "name": "Toledo"
+  },
+  "TROY": {
+   "espnId": "2653",
+   "name": "Troy"
+  },
+  "TTU": {
+   "espnId": "2641",
+   "name": "Texas Tech"
+  },
+  "TULN": {
+   "espnId": "2655",
+   "name": "Tulane"
+  },
+  "TXAM": {
+   "espnId": "245",
+   "name": "Texas A&M"
+  },
+  "TXST": {
+   "espnId": "326",
+   "name": "Texas State"
+  },
+  "UAB": {
+   "espnId": "5",
+   "name": "UAB"
+  },
+  "UCF": {
+   "espnId": "2116",
+   "name": "UCF"
+  },
+  "UCLA": {
+   "espnId": "26",
+   "name": "UCLA"
+  },
+  "UGA": {
+   "espnId": "61",
+   "name": "Georgia"
+  },
+  "UK": {
+   "espnId": "96",
+   "name": "Kentucky"
+  },
+  "ULL": {
+   "espnId": "309",
+   "name": "Louisiana"
+  },
+  "ULM": {
+   "espnId": "2433",
+   "name": "UL Monroe"
+  },
+  "UNC": {
+   "espnId": "153",
+   "name": "North Carolina"
+  },
+  "UNLV": {
+   "espnId": "2439",
+   "name": "UNLV"
+  },
+  "UNM": {
+   "espnId": "167",
+   "name": "New Mexico"
+  },
+  "UNT": {
+   "espnId": "249",
+   "name": "North Texas"
+  },
+  "USA": {
+   "espnId": "6",
+   "name": "South Alabama"
+  },
+  "USC": {
+   "espnId": "30",
+   "name": "USC"
+  },
+  "USF": {
+   "espnId": "3198",
+   "name": "SOUTH FLORIDA"
+  },
+  "USM": {
+   "espnId": "2572",
+   "name": "Southern Miss"
+  },
+  "USU": {
+   "espnId": "328",
+   "name": "Utah State"
+  },
+  "UTAH": {
+   "espnId": "254",
+   "name": "Utah"
+  },
+  "UTEP": {
+   "espnId": "2638",
+   "name": "UTEP"
+  },
+  "UTSA": {
+   "espnId": "2636",
+   "name": "UTSA"
+  },
+  "UVA": {
+   "espnId": "258",
+   "name": "Virginia"
+  },
+  "VAN": {
+   "espnId": "238",
+   "name": "Vanderbilt"
+  },
+  "VT": {
+   "espnId": "259",
+   "name": "Virginia Tech"
+  },
+  "WAKE": {
+   "espnId": "154",
+   "name": "Wake Forest"
+  },
+  "WASH": {
+   "espnId": "264",
+   "name": "Washington"
+  },
+  "WIS": {
+   "espnId": "275",
+   "name": "Wisconsin"
+  },
+  "WKU": {
+   "espnId": "98",
+   "name": "Western Kentucky"
+  },
+  "WMU": {
+   "espnId": "2711",
+   "name": "Western Michigan"
+  },
+  "WSU": {
+   "espnId": "265",
+   "name": "Washington State"
+  },
+  "WVU": {
+   "espnId": "277",
+   "name": "West Virginia"
+  },
+  "WYO": {
+   "espnId": "2751",
+   "name": "Wyoming"
+  }
+ }
+}
