@@ -21,6 +21,7 @@ const { createLedgerStore } = require('./ledger-store');
 const { createBookArbWatch } = require('./book-arb-watch');
 const { loadBookData } = require('./book-arb');
 const { venuesFromEnv } = require('./fair');
+const { createCloseSnapshot } = require('./close-snapshot');
 const { RESERVE_TTL_MS } = require('../reserve');
 const { rogueConfig, americanOf } = require('./rogue');
 const { decide, repriceFair, pregameCheck } = require('./engine');
@@ -337,6 +338,11 @@ async function main(env = process.env) {
   loop(async () => { ledger.setDayExposure(await store.dayExposure(etDayStartIso(Date.now()), { live: gate.live })); }, 'day_exposure', num(env.SNIPER_DAY_EXPOSURE_POLL_MS, 15000));
   // Logged sportsbook hedges free in-memory room too (DB cap is authoritative; errors keep gross risk).
   loop(() => store.refreshHedges(ledger, { live: gate.live }), 'hedges', num(env.SNIPER_HEDGE_POLL_MS, 60000));
+  // Closing-line snapshot per open live fill leg (EV drift tracker). SNIPER_CLOSE_SNAPSHOT=0 turns it off.
+  if (String(env.SNIPER_CLOSE_SNAPSHOT || '1') !== '0') {
+    const closeSnap = createCloseSnapshot({ supabase, kickoffFor, books: { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook }, live: gate.live, log });
+    loop(() => closeSnap.tick(), 'close_snapshot', num(env.SNIPER_CLOSE_POLL_MS, 60000));
+  }
   const caps = () => capsFrom(config, etDayStartIso(Date.now()), gate.live);
   const pendingHoldMs = num(env.SNIPER_PENDING_HOLD_MS, RESERVE_TTL_MS + 60000);
   async function onHold(d) {

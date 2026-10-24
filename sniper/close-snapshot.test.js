@@ -1,0 +1,21 @@
+'use strict';
+const assert = require('assert');
+const { dueLegs, createCloseSnapshot } = require('./close-snapshot');
+const ko = { 'KXNFLGAME-26NOV01CINCHI-CIN': 1000 * 60e3, 'KXNBAGAME-26OCT24MILPHI-PHI': 5000 * 60e3 };
+const kf = (t) => ko[t] ?? null;
+const fills = [{ legs: ['KXNFLGAME-26NOV01CINCHI-CIN:yes', 'KXNBAGAME-26OCT24MILPHI-PHI:yes'] }, { legs: ['kxnflgame-26nov01cinchi-CIN'] }];
+const due = dueLegs(fills, kf, 995 * 60e3, new Set());
+assert.strictEqual(due.length, 1); assert.strictEqual(due[0].key, 'KXNFLGAME-26NOV01CINCHI-CIN:yes');
+assert.strictEqual(dueLegs(fills, kf, 980 * 60e3, new Set()).length, 0);
+assert.strictEqual(dueLegs(fills, kf, 995 * 60e3, new Set(['KXNFLGAME-26NOV01CINCHI-CIN:yes'])).length, 0);
+(async () => {
+  const writes = []; let t = 995 * 60e3;
+  const q = { select() { return q; }, gt() { return q; }, neq() { return q; }, eq() { return q; }, limit: async () => ({ data: fills, error: null }) };
+  const supabase = { from: (n) => (n === 'sniper_ledger' ? q : { upsert: async (rows) => { writes.push(...rows); return { error: null }; } }) };
+  const s = createCloseSnapshot({ supabase, kickoffFor: kf, books: { venues: [] }, log: () => {}, now: () => t });
+  assert.strictEqual(await s.tick(), 1); assert.strictEqual(await s.tick(), 0);
+  assert.strictEqual(writes[0].leg_key, 'KXNFLGAME-26NOV01CINCHI-CIN:yes');
+  const miss = createCloseSnapshot({ supabase: { from: (n) => (n === 'sniper_ledger' ? q : { upsert: async () => ({ error: { message: 'relation "sniper_leg_close" does not exist' } }) }) }, kickoffFor: kf, books: { venues: [] }, log: () => {}, now: () => t });
+  assert.strictEqual(await miss.tick(), 0); assert.strictEqual(await miss.tick(), 0);
+  console.log('close-snapshot ok');
+})().catch((e) => { console.error(e); process.exit(1); });
