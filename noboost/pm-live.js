@@ -39,20 +39,24 @@ function american(p) {
   return p >= 0.5 ? -Math.round((100 * p) / (1 - p)) : Math.round((100 * (1 - p)) / p);
 }
 
-// levels [[price, contracts]] cheapest first. Fee-included VWAP to spend $usd, or a failure.
+// levels [[price, contracts]] cheapest first. Fee-included VWAP until the bet can WIN $usd, or a failure.
+// Depth = potential PROFIT, not stake (Kevin): a contract at fee-included cost c wins 1 − c,
+// so $3,000 staked at −200 is $1,500 of depth. depthUsd / availUsd are profit $; stakeUsd is the $ spent.
 function walk(levels, venue, usd = DEPTH_USD) {
   const fee = FEES[venue];
-  let spent = 0; let got = 0;
+  let spent = 0; let got = 0; let won = 0;
   const lv = (levels || []).filter(([p, q]) => p > 0 && p < 1 && q > 0).sort((a, b) => a[0] - b[0]);
   if (!lv.length) return { fail: 'no_ask' };
   const top = lv[0][0] + fee(lv[0][0]);
   for (const [p, q] of lv) {
     const c = p + fee(p);
-    const take = Math.min(q, (usd - spent) / c);
-    spent += take * c; got += take;
-    if (spent >= usd - 1e-9) return { vwap: spent / got, top, depthUsd: usd, availUsd: lv.reduce((s, [pp, qq]) => (pp <= p + 1e-9 ? s + qq * (pp + fee(pp)) : s), 0) }; // $ at or better than the marginal price used
+    const per = 1 - c;
+    if (!(per > 0)) continue;
+    const take = Math.min(q, (usd - won) / per);
+    spent += take * c; got += take; won += take * per;
+    if (won >= usd - 1e-9) return { vwap: spent / got, top, depthUsd: usd, stakeUsd: spent, availUsd: lv.reduce((s, [pp, qq]) => (pp <= p + 1e-9 ? s + qq * Math.max(0, 1 - (pp + fee(pp))) : s), 0) }; // profit $ at or better than the marginal price used
   }
-  return { fail: 'depth', top, depthUsd: spent };
+  return { fail: 'depth', top, depthUsd: won };
 }
 
 function createPmLiveBook({ now = () => Date.now(), staleMs = 15000, depthUsd = DEPTH_USD } = {}) {

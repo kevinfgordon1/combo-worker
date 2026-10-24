@@ -15,7 +15,7 @@ const msg = formatFillAlert({
 });
 assert.ok(msg.includes('1. MIN to win\n    IND @ MIN · Sun 1:00 PM ET'), msg);
 assert.ok(msg.includes('NE @ CHI · Thu 8:15 PM ET'));
-assert.ok(msg.includes('fair -150 · from opp IND +150 · $2,450 deep · Novig'), msg);
+assert.ok(msg.includes('fair -150 · from opp IND +150 · $2,450 deep (to win) · Novig'), msg);
 assert.ok(msg.includes('Parlay fair: +141'));
 assert.ok(msg.includes('We sold at: +131'));
 assert.ok(msg.includes('Risk: $23.29  →  To win: $17.71'));
