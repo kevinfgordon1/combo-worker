@@ -57,9 +57,9 @@ const { capsFrom } = require('./ledger-store');
   assert.strictEqual(out.decision.action, 'quote', JSON.stringify(out.decision));
   assert.ok(Math.abs(out.decision.fairYes - 0.42 * 0.30) < 1e-9);
   assert.ok(out.decision.releaseAt > Date.parse('2026-10-25T00:00:00Z'));
-  // player-TD combo: 4% min edge (SNIPER_MIN_ROI_TD), stored on decision for send/confirm reprice
-  assert.strictEqual(out.decision.minRoi, 0.04); assert.strictEqual(out.decision.hasTd, true);
-  assert.ok(out.decision.roi >= 0.04 - 1e-9, String(out.decision.roi));
+  // player-TD combo: 7% min edge (SNIPER_MIN_ROI_TD), stored on decision for send/confirm reprice
+  assert.strictEqual(out.decision.minRoi, 0.07); assert.strictEqual(out.decision.hasTd, true);
+  assert.ok(out.decision.roi >= 0.07 - 1e-9, String(out.decision.roi));
   const hi = decide(rfq, { config: S.sniperConfig({ SNIPER_ENABLED: '1', SNIPER_MIN_ROI_TD: '1000' }), ledger: S.createSniperLedger(), pmLive, tdBook, venues: ALL_VENUES, kickoffFor: () => Date.parse('2026-10-25T17:00:00Z'), makerRate: 0, nowMs: Date.parse('2026-10-21T05:00:00Z') });
   assert.strictEqual(hi.decision.reason, 'roi_below_min_td', JSON.stringify(hi.decision));
   const off = decide(rfq, { config: S.sniperConfig({}), ledger: S.createSniperLedger(), pmLive, tdBook, venues: ALL_VENUES, kickoffFor: () => 1e15, nowMs: 0 });

@@ -12,15 +12,15 @@ const ev = (r, cfg, ledger, o = {}) => S.evaluateSnipe(r, { config: cfg, ledger,
 t('defaults: dry run on, kill switch off', () => {
   const c = S.sniperConfig({});
   assert.strictEqual(c.dryRun, true); assert.strictEqual(c.enabled, false);
-  assert.strictEqual(c.minRoi, 0.03); assert.strictEqual(c.maxPayout, 100); assert.strictEqual(c.totalExposureCap, 10000);
+  assert.strictEqual(c.minRoi, 0.04); assert.strictEqual(c.maxPayout, 100); assert.strictEqual(c.totalExposureCap, 10000);
   assert.strictEqual(ev(row('a', L1), c, S.createSniperLedger()).reason, 'kill_switch');
 });
-t('quotes lowest price clearing 3% ROI after fee', () => {
+t('quotes lowest price clearing 4% ROI (default) after fee', () => {
   const c = S.sniperConfig(env()); const d = ev(row('a', L1), c, S.createSniperLedger());
   assert.strictEqual(d.action, 'quote');
-  assert.ok(d.roi >= 0.03); assert.strictEqual(d.quoteYes, 0.279); assert.strictEqual(d.makerRate, 0.035);
-  const lower = S.snipeEconomics({ fair: 0.25, q: 0.278, n: 50, makerRate: 0.035 });
-  assert.ok(lower.roi < 0.03);
+  assert.ok(d.roi >= 0.04); assert.strictEqual(d.quoteYes, 0.286); assert.strictEqual(d.makerRate, 0.035);
+  const lower = S.snipeEconomics({ fair: 0.25, q: 0.285, n: 50, makerRate: 0.035 });
+  assert.ok(lower.roi < 0.04);
 });
 t('maker fee counted for non-NFL legs', () => {
   const c = S.sniperConfig(env());

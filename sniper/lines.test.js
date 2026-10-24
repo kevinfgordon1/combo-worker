@@ -60,12 +60,12 @@ assert.ok(ok.ok && ok.legs[0].kind === 'line' && ok.legs[1].gameId === 'nfl|2026
 const pmLive = { legFair: () => ({ sources: [{ venue: 'novig', used: true, reason: 'ok', cost: 0.4, availUsd: 5000 }] }) };
 const S = require('../auto-sniper');
 const config = S.sniperConfig({ SNIPER_ENABLED: '1' });
-assert.strictEqual(config.minRoiLines, 0.04);
+assert.strictEqual(config.minRoiLines, 0.05);
 const { decision } = decide({ rfqId: 'r1', legKeys: [`${SP}:yes`, `${ML}:yes`], contracts: 100 }, { config, ledger: S.createSniperLedger(), pmLive, tdBook: null, linesBook: book, venues: ALL_VENUES, kickoffFor: () => 2e12, makerRate: 0.035, nowMs: t });
 const hi = decide({ rfqId: 'r2', legKeys: [`${SP}:yes`, `${ML}:yes`], contracts: 100 }, { config: S.sniperConfig({ SNIPER_ENABLED: '1', SNIPER_MIN_ROI_LINES: '1000' }), ledger: S.createSniperLedger(), pmLive, tdBook: null, linesBook: book, venues: ALL_VENUES, kickoffFor: () => 2e12, makerRate: 0.035, nowMs: t }).decision;
 assert.strictEqual(hi.reason, 'roi_below_min_lines');
 assert.notStrictEqual(decision.reason, 'scope_lines_off');
-if (decision.action === 'quote') { assert.strictEqual(decision.minRoi, 0.04); assert.strictEqual(decision.hasLine, true); }
+if (decision.action === 'quote') { assert.strictEqual(decision.minRoi, 0.05); assert.strictEqual(decision.hasLine, true); }
 console.log('lines.test ok', decision.action, decision.reason || '');
 
 // ── Polymarket US lines (relay /lines): exact number only, Polymarket fee, never decides main ──

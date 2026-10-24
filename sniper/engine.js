@@ -108,20 +108,20 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
     contracts: Number(rfq.contracts) > 0 ? Number(rfq.contracts) : null,
     cash_size: Number(rfq.targetCostDollars) > 0 ? Number(rfq.targetCostDollars) : null,
   };
-  // Player-TD combos need a higher edge (SNIPER_MIN_ROI_TD, default 4%); any college-football
-  // leg needs SNIPER_MIN_ROI_NCAAF (default 5%). The highest applicable minimum wins.
+  // Player-TD combos need a higher edge (SNIPER_MIN_ROI_TD, default 7%); any college-football
+  // leg needs SNIPER_MIN_ROI_NCAAF (default 6%). The highest applicable minimum wins.
   const hasTd = cls.legs.some((l) => l && l.kind === 'td');
   const hasNcaaf = cls.legs.some((l) => l && (l.kind === 'ncaaf' || (l.kind === 'line' && l.league === 'ncaaf')));
   // Main spread / total legs (NFL) need the 4% "other NFL" minimum (SNIPER_MIN_ROI_LINES); college
   // lines are also hasNcaaf, so they get 5%. 3% only when every leg is an NFL moneyline.
   const hasLine = cls.legs.some((l) => l && l.kind === 'line');
   let minRoi = config.minRoi;
-  if (hasLine) minRoi = Math.max(minRoi, config.minRoiLines != null ? config.minRoiLines : 0.04);
-  if (hasTd) minRoi = Math.max(minRoi, config.minRoiTd != null ? config.minRoiTd : 0.04);
-  if (hasNcaaf) minRoi = Math.max(minRoi, config.minRoiNcaaf != null ? config.minRoiNcaaf : 0.05);
-  // Any NBA leg (moneyline, spread or total): SNIPER_MIN_ROI_NBA (Kevin Oct 23: 5%).
+  if (hasLine) minRoi = Math.max(minRoi, config.minRoiLines != null ? config.minRoiLines : 0.05);
+  if (hasTd) minRoi = Math.max(minRoi, config.minRoiTd != null ? config.minRoiTd : 0.07);
+  if (hasNcaaf) minRoi = Math.max(minRoi, config.minRoiNcaaf != null ? config.minRoiNcaaf : 0.06);
+  // Any NBA leg (moneyline, spread or total): SNIPER_MIN_ROI_NBA (Kevin Oct 24: 6%).
   const hasNba = cls.legs.some((l) => l && (l.kind === 'nba' || (l.kind === 'line' && l.league === 'nba')));
-  if (hasNba) minRoi = Math.max(minRoi, config.minRoiNba != null ? config.minRoiNba : 0.05);
+  if (hasNba) minRoi = Math.max(minRoi, config.minRoiNba != null ? config.minRoiNba : 0.06);
   const d = evaluateSnipe(row, { config: { ...config, minRoi }, ledger, nowMs, makerRate });
   if (d.action === 'skip' && d.reason === 'roi_below_min' && hasNba) d.reason = 'roi_below_min_nba';
   else if (d.action === 'skip' && d.reason === 'roi_below_min' && hasNcaaf) d.reason = 'roi_below_min_ncaaf';

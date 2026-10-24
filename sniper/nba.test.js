@@ -86,21 +86,21 @@ const linesBook = { legFair: () => ({ sources: [src('novig', 0.5)] }) };
 const tip = Date.parse('2026-10-23T23:00:00Z'); const nflKo = Date.parse('2026-10-25T17:00:00Z');
 const kickoffFor = (tk) => (/^KXNBA/.test(tk) ? tip : nflKo);
 const ctx = (env = {}, extra = {}) => ({ config: S.sniperConfig({ SNIPER_ENABLED: '1', SNIPER_NBA: '1', ...env }), ledger: S.createSniperLedger(), pmLive, tdBook: null, nbaBook, linesBook, venues: ALL_VENUES, kickoffFor, makerRate: 0.035, nowMs: Date.parse('2026-10-23T15:00:00Z'), ...extra });
-assert.strictEqual(S.sniperConfig({}).nba, false); assert.strictEqual(S.sniperConfig({}).minRoiNba, 0.05);
+assert.strictEqual(S.sniperConfig({}).nba, false); assert.strictEqual(S.sniperConfig({}).minRoiNba, 0.06);
 assert.strictEqual(S.sniperConfig({}).nbaHours, 36); assert.strictEqual(S.sniperConfig({}).nbaGameHours, 3);
 const rq = { rfqId: 'b1', marketTicker: 'KXMVECROSSCATEGORY-X', legKeys: [`${IND}:yes`, `${NFL}:yes`], contracts: 20 };
 const d = decide(rq, ctx()).decision;
-assert.strictEqual(d.action, 'quote', JSON.stringify(d)); assert.strictEqual(d.minRoi, 0.05); assert.strictEqual(d.hasNba, true);
+assert.strictEqual(d.action, 'quote', JSON.stringify(d)); assert.strictEqual(d.minRoi, 0.06); assert.strictEqual(d.hasNba, true);
 assert.ok(Math.abs(d.fairYes - 0.7 * 0.55) < 1e-9); assert.strictEqual(d.legDetail[0].venue, 'novig');
 assert.strictEqual(d.settleAt, nflKo + 4 * 3600e3, 'NFL leg ends last');
 assert.strictEqual(decide({ ...rq, rfqId: 'b2' }, ctx({ SNIPER_MIN_ROI_NBA: '1000' })).decision.reason, 'roi_below_min_nba');
 assert.strictEqual(decide({ ...rq, rfqId: 'b3' }, ctx({ SNIPER_NBA: '0' })).decision.reason, 'scope_nba_off');
 assert.strictEqual(decide({ ...rq, rfqId: 'b4' }, { ...ctx(), nbaBook: null }).decision.reason, 'scope_nba_off');
-// NBA TD-style higher rules still win: a 6% rule beats NBA's 5%
-const hi = decide({ ...rq, rfqId: 'b5', legKeys: [`${IND}:yes`, `${SPR.replace('DALIND', 'GSWDEN').replace('IND9', 'DEN9')}:no`] }, ctx({ SNIPER_MIN_ROI_LINES: '0.06' })).decision;
-assert.strictEqual(hi.action, 'quote', JSON.stringify(hi)); assert.strictEqual(hi.minRoi, 0.06);
+// NBA TD-style higher rules still win: a 7% rule beats NBA 6%
+const hi = decide({ ...rq, rfqId: 'b5', legKeys: [`${IND}:yes`, `${SPR.replace('DALIND', 'GSWDEN').replace('IND9', 'DEN9')}:no`] }, ctx({ SNIPER_MIN_ROI_LINES: '0.07' })).decision;
+assert.strictEqual(hi.action, 'quote', JSON.stringify(hi)); assert.strictEqual(hi.minRoi, 0.07);
 // lines-only NBA parlay still gets 5% (not the 4% NFL lines rule)
-const lo = decide({ ...rq, rfqId: 'b6', legKeys: [`${TOT}:no`, `${NFL}:yes`] }, ctx()).decision; assert.strictEqual(lo.minRoi, 0.05);
+const lo = decide({ ...rq, rfqId: 'b6', legKeys: [`${TOT}:no`, `${NFL}:yes`] }, ctx()).decision; assert.strictEqual(lo.minRoi, 0.06);
 // NBA-only parlay: settle = last tip + 3h
 const nbaOnly = decide({ ...rq, rfqId: 'b7', legKeys: [`${IND}:yes`, `${GSW}:yes`] }, ctx()).decision;
 assert.strictEqual(nbaOnly.action, 'quote'); assert.strictEqual(nbaOnly.settleAt, tip + 3 * 3600e3);

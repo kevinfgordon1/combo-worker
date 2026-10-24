@@ -41,13 +41,13 @@ function sniperConfig(env = process.env) {
   return {
     enabled: flag(env.SNIPER_ENABLED, false),          // kill switch: off = evaluate nothing
     dryRun: flag(env.SNIPER_DRY_RUN, true),            // default dry run
-    minRoi: num(env.SNIPER_MIN_ROI, 0.03),             // 3% after maker fee
-    minRoiTd: num(env.SNIPER_MIN_ROI_TD, 0.04),        // 4% after maker fee when any leg is a player TD
-    minRoiNcaaf: num(env.SNIPER_MIN_ROI_NCAAF, 0.05),
-    minRoiLines: num(env.SNIPER_MIN_ROI_LINES, 0.04), // main spreads / totals (NFL); college lines still 5%  // 5% after maker fee when any leg is college football
+    minRoi: num(env.SNIPER_MIN_ROI, 0.04),             // 4% after maker fee
+    minRoiTd: num(env.SNIPER_MIN_ROI_TD, 0.07),        // 7% after maker fee when any leg is a player TD
+    minRoiNcaaf: num(env.SNIPER_MIN_ROI_NCAAF, 0.06),
+    minRoiLines: num(env.SNIPER_MIN_ROI_LINES, 0.05), // 5%: main spreads / totals (NFL); college 6%
     ncaaf: String(env.SNIPER_NCAAF == null ? '1' : env.SNIPER_NCAAF) !== '0', // SNIPER_NCAAF=0 turns college football off
     nba: String(env.SNIPER_NBA || '0') === '1',                  // NBA ML / spreads / totals (Kevin Oct 23); off unless 1
-    minRoiNba: num(env.SNIPER_MIN_ROI_NBA, 0.05),               // any NBA leg: 5% (highest rule wins)
+    minRoiNba: num(env.SNIPER_MIN_ROI_NBA, 0.06),               // any NBA leg: 6% (highest rule wins)
     nbaHours: num(env.SNIPER_NBA_HOURS, 36),                    // NBA legs must tip within this many hours
     nbaGameHours: num(env.SNIPER_NBA_GAME_HOURS, 3),            // NBA settle = last tip + this
     maxPayout: num(env.SNIPER_MAX_PAYOUT, 100),        // $ per quote (contracts × $1)
