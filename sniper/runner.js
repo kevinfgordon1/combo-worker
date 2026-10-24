@@ -71,6 +71,9 @@ async function main(env = process.env) {
   config.dryRun = !gate.live;
   if (String(env.SNIPER_DRY_RUN) === '0' && !gate.live) alert(`[SNIPER] SNIPER_DRY_RUN=0 but live gate closed (${gate.why.join(', ')}) — staying DRY RUN.`);
   log(`[SNIPER] boot enabled=${config.enabled} mode=${gate.live ? 'LIVE' : 'DRY_RUN'} depth=game:$${gameDepth},td:$${depth} venues=${venues.join('+')} prophetx=${hasProphetXCreds(env) ? 'on' : 'off'} minEdge=ml:${(config.minRoi * 100).toFixed(1)}%,lines:${(config.minRoiLines * 100).toFixed(1)}%,td:${(config.minRoiTd * 100).toFixed(1)}% ncaaf=${config.ncaaf ? `on(min ${(config.minRoiNcaaf * 100).toFixed(1)}%)` : 'off'} lines=${String(env.SNIPER_LINES || '0') === '1' ? 'on' : 'off'} nba=${config.nba ? `on(min ${(config.minRoiNba * 100).toFixed(1)}%, ${config.nbaHours}h)` : 'off'} caps=total:$${config.totalExposureCap},long:$${config.longExposureCap}(>${config.shortSettleHours}h),game:$${config.perGameCap},leg:$${config.perLegCap},quote:$${config.maxRisk},dailyRisk:$${config.dailyRiskCap},dailyLoss:$${config.dailyLossCap}`);
+  // Effective caps after env overrides, published on every summary heartbeat so the dashboard
+  // header can't drift from what the sniper actually enforces (audit Oct 24).
+  const effectiveCaps = { totalOpen: config.totalExposureCap, longDatedOpen: config.longExposureCap, perGame: config.perGameCap, perLeg: config.perLegCap, dailyLoss: config.dailyLossCap, dailyNewRisk: config.dailyRiskCap, perQuoteRisk: config.maxRisk, minEdge: config.minRoi, minEdgeLines: config.minRoiLines, minEdgeNcaaf: config.minRoiNcaaf, minEdgeNba: config.minRoiNba, minEdgeTd: config.minRoiTd, depthGame: gameDepth, depthTd: depth };
   if (gate.live) alert('[SNIPER] ⚠️ LIVE MODE: all gates set — this service will send and confirm real Kalshi RFQ quotes.');
 
   // ── Request budgets (well under venue limits) ──
@@ -543,7 +546,7 @@ async function main(env = process.env) {
     const latency = lat.snapshot();
     const wsThroughput = () => { try { if (!ws || typeof ws.takeThroughput !== 'function') return null; const t = summarizeThroughput(ws.takeThroughput()); delete t.perShard; return t; } catch (_) { return null; } };
     log(`[SNIPER] latency ${JSON.stringify(latency)} ws=${JSON.stringify(wsThroughput())}`);
-    store.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts: JSON.parse(JSON.stringify(counts)), live: liveSniper.stats(), reserveEstMs: Math.round(reserveEst.get()), open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
+    store.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts: JSON.parse(JSON.stringify(counts)), live: liveSniper.stats(), reserveEstMs: Math.round(reserveEst.get()), caps: effectiveCaps, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
     counts.rfqs = 0; counts.quotes = 0; counts.skips = {};
   }, 60000);
   setInterval(() => {
