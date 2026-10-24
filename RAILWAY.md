@@ -1,3 +1,5 @@
+> **Legacy:** the workers moved from Railway to Fly (see `fly/README.md`). This file is kept for history only.
+
 # Railway: services from this repo
 
 Combo Locks and Unhedged RFQs are **separate processes**. They share the same GitHub repo, Supabase project, and Kalshi / Polymarket credentials. They must **not** share a Node event loop or the Combo Locks Kalshi quote HTTP pool.
