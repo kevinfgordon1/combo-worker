@@ -33,15 +33,18 @@ function yesAsksFromKalshiBook(json) {
   return noBids.map(([p, q]) => [Math.round((1 - p) * 10000) / 10000, q]).sort((a, b) => a[0] - b[0]);
 }
 
+// Walk until the opposing bet can WIN $depthUsd (depth = potential profit, not stake — Kevin).
 function vwapForDepth(asks, depthUsd) {
-  let cost = 0; let qty = 0;
+  let cost = 0; let qty = 0; let won = 0;
   for (const [p, q] of asks) {
-    const take = Math.min(q, (depthUsd - cost) / p);
+    const per = 1 - p;
+    if (!(per > 0)) continue;
+    const take = Math.min(q, (depthUsd - won) / per);
     if (take <= 0) break;
-    cost += take * p; qty += take;
-    if (cost >= depthUsd - 1e-6) break;
+    cost += take * p; qty += take; won += take * per;
+    if (won >= depthUsd - 1e-6) break;
   }
-  if (cost < depthUsd - 1e-6 || qty <= 0) return null;
+  if (won < depthUsd - 1e-6 || qty <= 0) return null;
   return cost / qty;
 }
 

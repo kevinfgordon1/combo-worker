@@ -37,16 +37,20 @@ const TD_RE = /^KXNFLTD-([0-9]{2}[A-Z]{3}[0-9]{2}[A-Z]+)-([A-Z0-9]+)-1$/;
 
 const fee = (p) => THETA * p * (1 - p);
 const POLY_THETA = 0.0695;
-// levels: [[askPrice, contracts], ...] best (cheapest) first. VWAP of fee-included cost for $usd.
+// levels: [[askPrice, contracts], ...] best (cheapest) first. VWAP of fee-included cost until the
+// bet can WIN $usd (depth = potential PROFIT, not stake — Kevin). availUsd is profit $; topUsd
+// stays the $ stake at the top level (display only).
 // feeFn defaults to Kalshi's taker fee (unchanged behaviour for the Kalshi book).
 function vwapFor(levels, usd = DEPTH_USD, feeFn = fee) {
-  let spent = 0; let got = 0;
+  let spent = 0; let got = 0; let won = 0;
   for (const [p, q] of levels) {
     if (!(p > 0 && p < 1) || !(q > 0)) continue;
     const c = p + feeFn(p);
-    const take = Math.min(q, (usd - spent) / c);
-    spent += take * c; got += take;
-    if (spent >= usd - 1e-9) return { vwap: spent / got, top: levels[0][0] + feeFn(levels[0][0]), topUsd: levels[0][1] * (levels[0][0] + feeFn(levels[0][0])), availUsd: levels.reduce((s, [pp, qq]) => (pp > 0 && pp <= p + 1e-9 && qq > 0 ? s + qq * (pp + feeFn(pp)) : s), 0) }; // $ at or better than the marginal price used
+    const per = 1 - c;
+    if (!(per > 0)) continue;
+    const take = Math.min(q, (usd - won) / per);
+    spent += take * c; got += take; won += take * per;
+    if (won >= usd - 1e-9) return { vwap: spent / got, stakeUsd: spent, top: levels[0][0] + feeFn(levels[0][0]), topUsd: levels[0][1] * (levels[0][0] + feeFn(levels[0][0])), availUsd: levels.reduce((s, [pp, qq]) => (pp > 0 && pp <= p + 1e-9 && qq > 0 ? s + qq * Math.max(0, 1 - (pp + feeFn(pp))) : s), 0) }; // profit $ at or better than the marginal price used
   }
   return null; // not enough depth
 }

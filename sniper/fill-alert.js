@@ -98,7 +98,7 @@ function formatFillAlert({ d, contracts, cost, fee = 0, kickoffOf = () => null }
     const bits = [`fair ${american(l.fair)}`];
     // fair = 1 − (best opposing cost incl. that venue's fee), so the opposing price is exactly 1 − fair.
     if (Number(l.fair) > 0 && Number(l.fair) < 1) bits.push(`from opp ${p.opp ? `${p.opp} ` : ''}${american(1 - Number(l.fair))}`);
-    if (l.depthUsd != null) bits.push(`${usd0(l.depthUsd)} deep`);
+    if (l.depthUsd != null) bits.push(`${usd0(l.depthUsd)} deep (to win)`);
     if (l.venue) bits.push(VENUE[String(l.venue).split(':')[0]] || l.venue);
     lines.push(`    ${bits.join(' · ')}`);
   });

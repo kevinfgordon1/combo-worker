@@ -85,11 +85,12 @@ t('venue gating: polymarket shares ledger but not wired', () => {
   assert.strictEqual(ev(row('p', L1, { venue: 'polymarket' }), S.sniperConfig(env({ SNIPER_VENUES: 'kalshi,polymarket' })), S.createSniperLedger()).reason, 'venue_not_wired');
 });
 const F = require('./sniper-fair');
-t('depth VWAP walks book to $1000; thin book → null', () => {
+t('depth VWAP walks book until the bet can WIN $1000 (depth = profit); thin book → null', () => {
   const asks = F.yesAsksFromKalshiBook({ orderbook: { no: [[60, 1000], [58, 5000]] } }); // yes asks .40, .42
   assert.deepStrictEqual(asks.map((a) => a[0]), [0.4, 0.42]);
-  const v = F.vwapForDepth(asks, 1000); // 400 @.40 + 600 @.42
-  assert.ok(Math.abs(v - 1000 / (1000 + 600 / 0.42)) < 1e-9);
+  const v = F.vwapForDepth(asks, 1000); // 1000 ct @.40 wins $600, then 400/.58 ct @.42 wins $400
+  const q2 = 400 / 0.58;
+  assert.ok(Math.abs(v - (400 + q2 * 0.42) / (1000 + q2)) < 1e-9);
   assert.strictEqual(F.vwapForDepth([[0.4, 10]], 1000), null);
   const v500 = F.vwapForDepth(asks, 500); assert.ok(v500 < v);
 });
