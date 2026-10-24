@@ -62,18 +62,18 @@ const pmLive = { legFair: () => ({ sources: [src('kalshi', 0.45)] }) };
 const ncaafBook = { legFair: () => ({ sources: [src('polymarket', 0.3)] }) };
 const ctx = (env = {}) => ({ config: S.sniperConfig({ SNIPER_ENABLED: '1', ...env }), ledger: S.createSniperLedger(), pmLive, tdBook: null, ncaafBook, venues: ALL_VENUES, kickoffFor: () => Date.parse('2026-10-25T17:00:00Z'), makerRate: 0.035, nowMs: Date.parse('2026-10-21T05:00:00Z') });
 const rq = { rfqId: 'n1', marketTicker: 'KXMVECROSSCATEGORY-X', legKeys: [`${LIB}:yes`, `${NFL}:yes`], contracts: 20 };
-assert.strictEqual(S.sniperConfig({}).minRoiNcaaf, 0.05);
+assert.strictEqual(S.sniperConfig({}).minRoiNcaaf, 0.06);
 assert.strictEqual(S.sniperConfig({ SNIPER_MIN_ROI_NCAAF: '0.07' }).minRoiNcaaf, 0.07);
 const q = decide(rq, ctx()).decision;
 assert.strictEqual(q.action, 'quote', JSON.stringify(q));
-assert.strictEqual(q.minRoi, 0.05); assert.strictEqual(q.hasNcaaf, true); assert.ok(q.roi >= 0.05 - 1e-9);
+assert.strictEqual(q.minRoi, 0.06); assert.strictEqual(q.hasNcaaf, true); assert.ok(q.roi >= 0.06 - 1e-9);
 assert.ok(Math.abs(q.fairYes - 0.7 * 0.55) < 1e-9);
 assert.strictEqual(q.legDetail[0].venue, 'polymarket');
 const hi = decide({ ...rq, rfqId: 'n2' }, ctx({ SNIPER_MIN_ROI_NCAAF: '1000' })).decision;
 assert.strictEqual(hi.reason, 'roi_below_min_ncaaf');
 // NFL-only RFQ ignores the NCAAF minimum
 const nflOnly = decide({ ...rq, rfqId: 'n3', legKeys: [`${NFL}:yes`, 'KXNFLGAME-26OCT25CINBAL-BAL:yes'] }, ctx({ SNIPER_MIN_ROI_NCAAF: '1000' })).decision;
-assert.strictEqual(nflOnly.action, 'quote'); assert.strictEqual(nflOnly.minRoi, 0.03); assert.strictEqual(nflOnly.hasNcaaf, false);
+assert.strictEqual(nflOnly.action, 'quote'); assert.strictEqual(nflOnly.minRoi, 0.04); assert.strictEqual(nflOnly.hasNcaaf, false);
 // kill switch
 assert.strictEqual(decide({ ...rq, rfqId: 'n4' }, ctx({ SNIPER_NCAAF: '0' })).decision.reason, 'scope_ncaaf_off');
 // missing NCAAF price => skip (never guessed)
