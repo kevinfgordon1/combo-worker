@@ -85,7 +85,7 @@ t('decision tape: a 1,000-row burst is fully written in batches, nothing dropped
   const inserts = [];
   const supabase = { from: () => ({ insert: async (rows) => { inserts.push(rows.length); await new Promise((r) => setTimeout(r, 5)); return { error: null }; } }) };
   const lg = createDecisionLogger({ supabase, log: () => {}, batchMs: 10000, maxBatch: 200 });
-  for (let i = 0; i < 1000; i += 1) lg.push({ action: 'skip', i });
+  for (let i = 0; i < 1000; i += 1) lg.push({ action: 'quote', i });
   await new Promise((r) => setTimeout(r, 20));
   await lg.flush();
   assert.strictEqual(lg.stats.written, 1000);
