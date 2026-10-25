@@ -18,6 +18,7 @@ function fakeDb(tables) {
         in(c, v) { f.push((r) => v.includes(r[c])); return q; },
         gt(c, v) { f.push((r) => r[c] > v); return q; },
         not(c, op, v) { f.push((r) => r[c] != null); return q; },
+        is(c, v) { f.push((r) => (r[c] == null ? null : r[c]) === v); return q; },
         order() { return q; },
         limit(n) { lim = n; return q; },
         then(res, rej) { return Promise.resolve({ data: (tables[name] || []).filter((r) => f.every((g) => g(r))).slice(0, lim), error: null }).then(res, rej); },

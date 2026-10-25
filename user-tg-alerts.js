@@ -23,6 +23,7 @@
 const { DEFAULT_LIVE_USER_IDS } = require('./live-users');
 
 const MAX_CHARS = 3800;
+const LOCATION_TEXT = '⚠️ Kalshi is rejecting your Combo Locks quotes because your location verification expired. Open the Kalshi app or website and verify your location to resume quoting.';
 const MAX_LINES = 30;
 
 function fmtAmerican(n) {
@@ -73,6 +74,11 @@ function createUserTgAlerts({ supabase, env = process.env, fetchImpl, now = Date
   const users = new Map(); // userId -> { chatId, subCursor, fillCursor, queue: [], lastSentAt, pausedUntil }
   const parlayCache = new Map();
   const active = enabled && !!token && allow.size > 0;
+  // Location-expired Telegram notice (combo_user_alerts kind location_expired,
+  // raised by user-location-alert.js). On by default when user TG alerts are on;
+  // COMBO_USER_TG_LOCATION_ALERTS=0 turns just this off. Once per alert row id.
+  const locationOn = !/^(0|false|no|off)$/i.test(String(env.COMBO_USER_TG_LOCATION_ALERTS || '1').trim());
+  const sentAlertIds = new Set();
 
   async function loadLinks() {
     const { data, error } = await supabase.from('combo_tg_links')
@@ -90,7 +96,7 @@ function createUserTgAlerts({ supabase, env = process.env, fetchImpl, now = Date
       const u = users.get(id);
       if (u) { u.chatId = chatId; continue; }
       // Start from "now": no backlog of old quotes on link / restart.
-      users.set(id, { chatId, subCursor: startIso, fillCursor: startIso, queue: [], lastSentAt: -Infinity, pausedUntil: 0 });
+      users.set(id, { chatId, subCursor: startIso, fillCursor: startIso, alertCursor: startIso, queue: [], lastSentAt: -Infinity, pausedUntil: 0 });
       log(`[USER-TG] ${id.slice(0, 8)} alerts on`);
     }
     return want.size;
@@ -121,6 +127,19 @@ function createUserTgAlerts({ supabase, env = process.env, fetchImpl, now = Date
         .eq('user_id', userId)
         .gt('recorded_at', u.fillCursor).order('recorded_at', { ascending: true }).limit(200),
     ]);
+    if (locationOn) {
+      const aq = await supabase.from('combo_user_alerts')
+        .select('id,user_id,kind,created_at,resolved_at')
+        .eq('user_id', userId).eq('kind', 'location_expired').is('resolved_at', null)
+        .gt('created_at', u.alertCursor || '1970-01-01').order('created_at', { ascending: true }).limit(20);
+      if (aq.error) log(`[USER-TG] location alerts read failed: ${aq.error.message}`);
+      for (const a of (aq.error ? [] : (aq.data || []))) {
+        if (a.created_at > (u.alertCursor || '')) u.alertCursor = a.created_at;
+        if (String(a.user_id).toLowerCase() !== userId || sentAlertIds.has(a.id)) continue;
+        sentAlertIds.add(a.id);
+        u.queue.push(LOCATION_TEXT);
+      }
+    }
     const subs = subsQ.error ? [] : (subsQ.data || []);
     const fills = fillsQ.error ? [] : (fillsQ.data || []);
     if (subsQ.error) log(`[USER-TG] quotes read failed: ${subsQ.error.message}`);
@@ -140,9 +159,10 @@ function createUserTgAlerts({ supabase, env = process.env, fetchImpl, now = Date
 
   function batchText(lines) {
     // Fills first so they never get cut.
+    const warns = lines.filter((l) => l === LOCATION_TEXT);
     const fills = lines.filter((l) => l.startsWith('FILLED'));
-    const quotes = lines.filter((l) => !l.startsWith('FILLED'));
-    const ordered = fills.concat(quotes);
+    const quotes = lines.filter((l) => !l.startsWith('FILLED') && l !== LOCATION_TEXT);
+    const ordered = warns.concat(fills, quotes);
     const shown = ordered.slice(0, MAX_LINES);
     let text = shown.join('\n');
     if (ordered.length > shown.length) text += `\n(+${ordered.length - shown.length} more quotes)`;
@@ -194,4 +214,4 @@ function createUserTgAlerts({ supabase, env = process.env, fetchImpl, now = Date
   return { tick, active, _users: users, _batchText: batchText };
 }
 
-module.exports = { createUserTgAlerts, formatQuote, formatFill, fmtAmerican };
+module.exports = { LOCATION_TEXT, createUserTgAlerts, formatQuote, formatFill, fmtAmerican };
