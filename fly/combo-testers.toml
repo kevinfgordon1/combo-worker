@@ -24,8 +24,8 @@ kill_timeout = "30s"
   # host throttling), load avg 12-17 while the 6 live-runners only used ~0.2 core.
   # Dedicated cores have no burst quota, so no throttle cliff.
   # Rollback switch: size = "shared-cpu-2x", memory = "1gb".
-  size = "performance-2x"
-  memory = "4gb"
+  size = "performance-1x"
+  memory = "2gb"
   # Still ONE machine.
 
 # EXACTLY ONE machine, ever. No [http_service]. Railway combo-testers must stay stopped.
