@@ -9,6 +9,8 @@
 // SNIPER_LIVE_CONFIRM token, own key). Otherwise every quote/confirm/cancel is refused.
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
+const { createIntakeWorker } = require('./intake-host');
+const { maybeStartCpuProfile } = require('./cpu-prof');
 const { writeBehindEnabled, createWriteBehindStore, memoryCapReason, isLongPos } = require('./write-behind');
 const { createKalshiFirehose, readShardFactor, DEFAULT_LIVE_SHARD_FACTOR, summarizeThroughput } = require('../kalshi-ws');
 const { normalizePem, authHeaders: kalshiAuthHeaders } = require('../kalshi-auth');
@@ -354,6 +356,11 @@ async function main(env = process.env) {
   // ── Ledger (persistent) ──
   const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
   const store = createLedgerStore({ supabase, log });
+  // Decision-log writes (one insert per quote / abort / summary) on their own client so they never
+  // queue ahead of reserves, lock polls and the combo_submissions check. SNIPER_DECISION_CLIENT=0 = shared.
+  const decisionStore = String(env.SNIPER_DECISION_CLIENT || '1') === '0' ? store
+    : createLedgerStore({ supabase: createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } }), log });
+  maybeStartCpuProfile('main', env, log);
   const ledger = createSniperLedger({ dayRiskOnAdd: false });
   ledger.shortSettleHours = config.shortSettleHours;
   // Write-behind (SNIPER_WRITE_BEHIND=0 = old blocking reserve). Own Supabase client so ledger
@@ -488,7 +495,7 @@ async function main(env = process.env) {
       rogueSeen.set(k, t); if (rogueSeen.size > 5000) rogueSeen.delete(rogueSeen.keys().next().value);
       const am = (p) => americanOf(p);
       log(`[SNIPER] ${e.kind} ${e.ticker}:${e.side} venue=${e.venue} ${am(e.p)} vs others ${am(e.ref)} (${(e.devPp * 100).toFixed(1)}pp)${d.action === 'skip' ? ` -> ${d.reason}` : ''}`);
-      store.decision({ rfq_id: d.rfqId || null, action: 'rogue_line', reason: e.kind, details: { ...e, americanVenue: am(e.p), americanOthers: am(e.ref), outcome: d.action === 'skip' ? d.reason : 'quoted_anyway', mode: rogueCfg.mode } });
+      decisionStore.decision({ rfq_id: d.rfqId || null, action: 'rogue_line', reason: e.kind, details: { ...e, americanVenue: am(e.p), americanOthers: am(e.ref), outcome: d.action === 'skip' ? d.reason : 'quoted_anyway', mode: rogueCfg.mode } });
     }
   }
   async function onRfq(rfq) {
@@ -561,7 +568,7 @@ async function main(env = process.env) {
     counts.quotes += 1;
     log(formatDecision(d));
     if (!gate.live) {
-      store.decision({ rfq_id: d.rfqId, action: 'would_quote', reason: null, details: d });
+      decisionStore.decision({ rfq_id: d.rfqId, action: 'would_quote', reason: null, details: d });
       if (config.tgAlerts && tg) tg(tgLabel(formatDecision(d)));
       return;
     }
@@ -569,15 +576,16 @@ async function main(env = process.env) {
     if (tooOld(rfq, signedNow(), maxAgeMs) != null) {
       lat.staleReserve(); counts.skips.stale_after_reserve = (counts.skips.stale_after_reserve || 0) + 1;
       await liveStore.release(d.rfqId, 'cancelled', {});
-      store.decision({ rfq_id: d.rfqId, action: 'aborted', reason: 'stale_after_reserve', details: d });
+      decisionStore.decision({ rfq_id: d.rfqId, action: 'aborted', reason: 'stale_after_reserve', details: d });
       return;
     }
+    if (wsWorker) wsWorker.addOpen(d.rfqId); // keep its rfq_deleted before the 100ms open-id sync
     const sent = await liveSniper.send(rfq, d);
     if (sent.sent) { lat.stage('reservedToPosted', Date.now() - tReserved); if (rfq.recvAt) lat.stage('recvToPosted', Date.now() - rfq.recvAt); }
     if (!sent.sent) {
       counts.skips[`live_${sent.reason}`] = (counts.skips[`live_${sent.reason}`] || 0) + 1;
     }
-    store.decision({ rfq_id: d.rfqId, action: sent.sent ? 'quoted' : 'aborted', reason: sent.reason || null, details: { ...d, quoteId: sent.quoteId || null } });
+    decisionStore.decision({ rfq_id: d.rfqId, action: sent.sent ? 'quoted' : 'aborted', reason: sent.reason || null, details: { ...d, quoteId: sent.quoteId || null } });
   }
   // Its OWN read-only Kalshi key (never the combo-worker key), used only for the RFQ socket.
   if (!env.SNIPER_KALSHI_KEY_ID || !env.SNIPER_KALSHI_PRIVATE_KEY) {
@@ -587,7 +595,32 @@ async function main(env = process.env) {
   // One unsharded communications socket overflows Kalshi's per-subscription
   // buffer (error code 25 "Subscription buffer overflow") roughly every 30s at
   // current RFQ volume. Shard it like combo-worker (KALSHI_WS_SHARD_FACTOR, default 8).
-  const ws = createKalshiFirehose({
+  // SNIPER_INTAKE_WORKER=1 (default off): the RFQ socket, decode, needle/age/scope filters and
+  // JSON.parse run in a worker thread; only candidates reach this thread.
+  const intakeWorker = /^(1|true|yes|on)$/i.test(String(env.SNIPER_INTAKE_WORKER || ''));
+  const fastDrop = String(env.SNIPER_WS_FAST_DROP) !== '0';
+  const wsCallbacks = {
+    onRfqCreated: (rfq) => { if (rfq) { if (!rfq.recvAt) { rfq.recvAt = Date.now(); rfq.recvAge = rfqAgeMs(rfq.createdTs, signedNow()); } } onRfq(rfq).catch((e) => log(`[SNIPER] onRfq error: ${e.message}`)); },
+    onRfqDeleted: (evt) => { liveSniper.onRfqClosed(evt).catch((e) => log(`[SNIPER] rfq closed error: ${e.message}`)); },
+    onQuoteAccepted: (evt) => { liveSniper.onAccepted(evt).catch((e) => log(`[SNIPER] accept error: ${e.message}`)); },
+    onQuoteExecuted: (evt) => { liveSniper.onExecuted(evt).catch((e) => log(`[SNIPER] executed error: ${e.message}`)); },
+    onStatus: (st, info) => log(`[SNIPER] ws ${typeof st === 'string' ? st : JSON.stringify(st)}${info ? ` ${JSON.stringify(info)}` : ''}`),
+  };
+  let wsWorker = null; let wsThroughputLast = null;
+  if (intakeWorker) {
+    wsWorker = createIntakeWorker({
+      workerData: {
+        shardFactor: readShardFactor(env.SNIPER_WS_SHARD_FACTOR, env, DEFAULT_LIVE_SHARD_FACTOR), fastDrop, nba: !!nbaBook, maxAgeMs,
+        scope: { td: !!tdBook, ncaaf: config.ncaaf !== false, lines: !!linesBook, nba: !!nbaBook && !!config.nba },
+      },
+      ...wsCallbacks,
+      onSkips: (sk) => { for (const [k, v] of Object.entries(sk)) { counts.skips[k] = (counts.skips[k] || 0) + v; if (k === 'stale_at_intake') for (let i = 0; i < v; i += 1) lat.staleIntake(); } },
+      openIds: () => { const ids = []; liveSniper.forEachRfqId((id) => ids.push(id)); return ids; },
+      log,
+    });
+    log('[SNIPER] RFQ intake in worker thread (SNIPER_INTAKE_WORKER=1)');
+  }
+  const ws = wsWorker ? { start: () => wsWorker.start(), takeThroughput: () => wsThroughputLast } : createKalshiFirehose({
     env,
     shardFactor: readShardFactor(env.SNIPER_WS_SHARD_FACTOR, env, DEFAULT_LIVE_SHARD_FACTOR),
     keyId: env.SNIPER_KALSHI_KEY_ID,
@@ -597,11 +630,7 @@ async function main(env = process.env) {
     shouldDropCreated: String(env.SNIPER_WS_FAST_DROP) === '0' ? undefined : createNflFrameFilter(nbaBook ? [...NFL_NEEDLES, ...NBA_NEEDLES] : NFL_NEEDLES),
     shouldDropDeleted: String(env.SNIPER_WS_FAST_DROP) === '0' ? undefined : createDeletedIdFilter((id) => liveSniper.hasRfqId(id)),
     // Stamp receive time in the ws message tick (before any await) for stage timing.
-    onRfqCreated: (rfq) => { if (rfq) { rfq.recvAt = Date.now(); rfq.recvAge = rfqAgeMs(rfq.createdTs, signedNow()); } onRfq(rfq).catch((e) => log(`[SNIPER] onRfq error: ${e.message}`)); },
-    onRfqDeleted: (evt) => { liveSniper.onRfqClosed(evt).catch((e) => log(`[SNIPER] rfq closed error: ${e.message}`)); },
-    onQuoteAccepted: (evt) => { liveSniper.onAccepted(evt).catch((e) => log(`[SNIPER] accept error: ${e.message}`)); },
-    onQuoteExecuted: (evt) => { liveSniper.onExecuted(evt).catch((e) => log(`[SNIPER] executed error: ${e.message}`)); },
-    onStatus: (s, info) => log(`[SNIPER] ws ${typeof s === 'string' ? s : JSON.stringify(s)}${info ? ` ${JSON.stringify(info)}` : ''}`),
+    ...wsCallbacks,
   });
   // Background reserve failed (DB cap reason or repeated db_error): free memory + pull the quote.
   onReserveFailedRef = async (rfqId, reason) => { ledger.positions.delete(rfqId); counts.skips[`wb_${reason}`] = (counts.skips[`wb_${reason}`] || 0) + 1; await liveSniper.abortRfq(rfqId, `reserve_${reason}`); };
@@ -624,9 +653,10 @@ async function main(env = process.env) {
     const ls = Object.values(lim).map((l) => { const x = l.stats(); return `${x.name}:${x.requests}req/${x.r429}x429`; }).join(' ');
     log(`[SNIPER] summary mode=${gate.live ? 'LIVE' : 'dry'}${liveSniper.halted() ? ' HALTED' : ''} live=${JSON.stringify(liveSniper.stats())} trade=${JSON.stringify(trader.stats())} locks=${JSON.stringify(coord.stats())} kickoffs=${JSON.stringify(kickoffs.stats())} rfqs=${counts.rfqs} would_quote=${counts.quotes} open=$${t.total.toFixed(2)} positions=${ledger.positions.size} filled_today=$${ledger.day.risk.toFixed(2)} (${ledger.day.fills} fills) pending=$${ledger.day.pending.toFixed(2)} breaker429=${breaker.count()} relayErr=${JSON.stringify(relayErr)} tdOff=${[...tdOff.keys()].join(',') || 'none'} ${disabled ? 'DISABLED' : ''} books=${JSON.stringify({ ...bookRouter.stats(), ws: bookFeed ? bookFeed.stats() : 'off' })} load: ${ls} skips: ${s || 'none'}`);
     const latency = lat.snapshot();
-    const wsThroughput = () => { try { if (!ws || typeof ws.takeThroughput !== 'function') return null; const t = summarizeThroughput(ws.takeThroughput()); delete t.perShard; return t; } catch (_) { return null; } };
+    if (wsWorker) wsWorker.takeThroughputAsync().then((v) => { wsThroughputLast = v ? { ...v, worker: wsWorker.stats() } : null; }).catch(() => {});
+    const wsThroughput = () => { if (wsWorker) return wsThroughputLast; try { if (!ws || typeof ws.takeThroughput !== 'function') return null; const t = summarizeThroughput(ws.takeThroughput()); delete t.perShard; return t; } catch (_) { return null; } };
     log(`[SNIPER] latency ${JSON.stringify(latency)} wb=${wbStore ? JSON.stringify(wbStore.wbStats()) : 'off'} ws=${JSON.stringify(wsThroughput())}`);
-    store.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts: JSON.parse(JSON.stringify(counts)), live: liveSniper.stats(), reserveEstMs: Math.round(reserveEst.get()), caps: effectiveCaps, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
+    decisionStore.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts: JSON.parse(JSON.stringify(counts)), live: liveSniper.stats(), reserveEstMs: Math.round(reserveEst.get()), caps: effectiveCaps, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
     counts.rfqs = 0; counts.quotes = 0; counts.skips = {};
   }, 60000);
   setInterval(() => {
