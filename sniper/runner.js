@@ -11,6 +11,8 @@
 const { createClient } = require('@supabase/supabase-js');
 const { createIntakeWorker } = require('./intake-host');
 const { maybeStartCpuProfile } = require('./cpu-prof');
+const { withBreaker, getDbBreaker } = require('../db-breaker');
+const { createBatchedLedgerStore, ledgerBatchEnabled } = require('./ledger-batch');
 const { createReleaseBatcher, withReserveTimeout, isSkipDecision } = require('./release-batch');
 const { writeBehindEnabled, createWriteBehindStore, memoryCapReason, isLongPos } = require('./write-behind');
 const { createKalshiFirehose, readShardFactor, DEFAULT_LIVE_SHARD_FACTOR, summarizeThroughput } = require('../kalshi-ws');
@@ -362,12 +364,12 @@ async function main(env = process.env) {
   if (px) loop(pollPx, 'prophetx', num(env.SNIPER_PROPHETX_POLL_MS, 10000));
 
   // ── Ledger (persistent) ──
-  const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
+  const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, withBreaker({ auth: { persistSession: false } }, env));
   const store = createLedgerStore({ supabase, log });
   // Decision-log writes (one insert per quote / abort / summary) on their own client so they never
   // queue ahead of reserves, lock polls and the combo_submissions check. SNIPER_DECISION_CLIENT=0 = shared.
   const decisionStoreRaw = String(env.SNIPER_DECISION_CLIENT || '1') === '0' ? store
-    : createLedgerStore({ supabase: createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } }), log });
+    : createLedgerStore({ supabase: createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, withBreaker({ auth: { persistSession: false } }, env)), log });
   // SNIPER_DECISION_LOG_SKIPS=1 restores rows for un-quoted RFQs (aborted / rogue_line); default off
   // (~half of sniper_decisions). Counts still land in the per-minute summary row.
   const logSkips = String(env.SNIPER_DECISION_LOG_SKIPS || '0') === '1';
@@ -382,14 +384,21 @@ async function main(env = process.env) {
   const writeBehind = writeBehindEnabled(env);
   let onReserveFailedRef = async () => {};
   const wbStore = writeBehind ? createWriteBehindStore(
-    createLedgerStore({ supabase: createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } }), log }),
+    createLedgerStore({ supabase: createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, withBreaker({ auth: { persistSession: false } }, env)), log }),
     { concurrency: num(env.SNIPER_WB_CONCURRENCY, 8), log, alert: (m) => alert(m), onReserveFailed: (id, r) => onReserveFailedRef(id, r) },
   ) : null;
   // Reserve path on its OWN client (SNIPER_RESERVE_CLIENT=0 = shared with cancels/updates), so a
   // burst of release UPDATEs can't queue ahead of reserves (Oct 25 2026: reserve p50 15s).
   const reserveStore = String(env.SNIPER_RESERVE_CLIENT || '1') === '0' ? store
-    : createLedgerStore({ supabase: createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } }), log });
-  const hotStore = wbStore || reserveStore;
+    : createLedgerStore({ supabase: createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, withBreaker({ auth: { persistSession: false } }, env)), log });
+  const dbBreaker = getDbBreaker(env, log);
+  // SNIPER_LEDGER_BATCH (default on; 0 = old per-RFQ sniper_reserve RPC): no DB call per RFQ. Caps are
+  // in memory; one writer flushes merged ledger rows every SNIPER_LEDGER_FLUSH_MS (300).
+  const batchStore = !wbStore && ledgerBatchEnabled(env) ? createBatchedLedgerStore(store, {
+    supabase, flushMs: Math.min(500, Math.max(250, num(env.SNIPER_LEDGER_FLUSH_MS, 300))), maxQueue: num(env.SNIPER_LEDGER_MAX_QUEUE, 2000), log, breaker: dbBreaker,
+    onRejected: (id) => { ledger.positions.delete(id); liveSniper.abortRfq(id, 'ledger_rejected').catch(() => {}); },
+  }) : null;
+  const hotStore = wbStore || batchStore || reserveStore;
   const reserveTimeoutMs = num(env.SNIPER_RESERVE_TIMEOUT_MS, 1500); // 0 = no timeout
   // Routine releases batched every SNIPER_RELEASE_BATCH_MS (0 = one UPDATE per release, old path).
   const releaseBatchMs = num(env.SNIPER_RELEASE_BATCH_MS, 250);
@@ -444,7 +453,7 @@ async function main(env = process.env) {
       const p = ledger.positions.get(rfqId);
       if (p) ledger.positions.delete(rfqId);
       if (phase === 'settled' && extra && Number(extra.realized_pnl) < 0) ledger.recordRealizedLoss(-Number(extra.realized_pnl));
-      if (releaseBatcher && !wbStore && releaseBatcher.canBatch(phase, extra)) return releaseBatcher.release(rfqId, phase);
+      if (releaseBatcher && !wbStore && !batchStore && releaseBatcher.canBatch(phase, extra)) return releaseBatcher.release(rfqId, phase);
       return hotStore.release(rfqId, phase, extra);
     },
   };
@@ -472,8 +481,9 @@ async function main(env = process.env) {
   let stoppingSig = false;
   const onStop = async (sig) => {
     if (stoppingSig) return; stoppingSig = true; disabled = true;
-    const t = setTimeout(() => process.exit(0), 20000); if (t.unref) t.unref();
+    const t = setTimeout(() => process.exit(0), num(env.SNIPER_SHUTDOWN_MS, 45000)); if (t.unref) t.unref(); // fly kill_timeout 60s
     try { const n = await liveSniper.shutdown(); log(`[SNIPER] ${sig}: cancelled ${n} open quote(s), exiting`); } catch (e) { log(`[SNIPER] ${sig} shutdown error: ${e.message}`); }
+    if (batchStore) { try { await batchStore.flush(); await batchStore.flush(); } catch (_) { /* best effort */ } }
     process.exit(0);
   };
   process.once('SIGTERM', () => { onStop('SIGTERM'); });
@@ -530,6 +540,8 @@ async function main(env = process.env) {
     if (rfq.recvAt) { lat.stage('recvToHandler', tH - rfq.recvAt); if (rfq.recvAge != null) lat.stage('createdToRecv', rfq.recvAge); }
     const old = tooOld(rfq, signedNow(), maxAgeMs);
     if (old != null) { lat.staleIntake(old); counts.skips.stale_at_intake = (counts.skips.stale_at_intake || 0) + 1; return; }
+    // DB circuit breaker open: fail closed (no new quotes) until Supabase recovers.
+    if (dbBreaker.isOpen()) { counts.skips.db_breaker = (counts.skips.db_breaker || 0) + 1; return; }
     // Combo Locks priority before anything else (read-only check of active locks).
     const blocked = coord.blockReason(rfq);
     if (blocked) { counts.skips[blocked] = (counts.skips[blocked] || 0) + 1; return; }
@@ -713,7 +725,7 @@ async function main(env = process.env) {
     const latency = lat.snapshot();
     if (wsWorker) wsWorker.takeThroughputAsync().then((v) => { wsThroughputLast = v ? { ...v, worker: wsWorker.stats() } : null; }).catch(() => {});
     const wsThroughput = () => { if (wsWorker) return wsThroughputLast; try { if (!ws || typeof ws.takeThroughput !== 'function') return null; const t = summarizeThroughput(ws.takeThroughput()); delete t.perShard; return t; } catch (_) { return null; } };
-    log(`[SNIPER] latency ${JSON.stringify(latency)} wb=${wbStore ? JSON.stringify(wbStore.wbStats()) : 'off'} ws=${JSON.stringify(wsThroughput())}`);
+    log(`[SNIPER] latency ${JSON.stringify(latency)} wb=${wbStore ? JSON.stringify(wbStore.wbStats()) : "off"} batch=${batchStore ? JSON.stringify(batchStore.batchStats()) : "off"} dbb=${JSON.stringify(dbBreaker.stats())} ws=${JSON.stringify(wsThroughput())}`);
     decisionStore.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts: JSON.parse(JSON.stringify(counts)), live: liveSniper.stats(), reserveEstMs: Math.round(reserveEst.get()), caps: effectiveCaps, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
     counts.rfqs = 0; counts.quotes = 0; counts.skips = {};
   }, 60000);

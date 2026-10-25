@@ -265,12 +265,10 @@ function createLiveSniper({
   let stopping = false;
   async function shutdown() {
     stopping = true; halted = true; haltReason = haltReason || 'shutdown';
-    let n = 0;
-    for (const [qid, p] of [...pending]) {
-      if (p.accepted || confirming.has(qid)) continue;
-      await dropQuote(qid, 'cancelled', 'shutdown'); n += 1;
-    }
-    return n;
+    // 8 wide (urgent cancels) so a few hundred resting quotes clear well inside Fly's kill_timeout.
+    const todo = [...pending].filter(([qid, p]) => !p.accepted && !confirming.has(qid));
+    await mapLimit(todo, 8, ([qid]) => dropQuote(qid, 'cancelled', 'shutdown'));
+    return todo.length;
   }
   return { shutdown, stopping: () => stopping, send, abortRfq, hasRfqId: (id) => byRfq.has(id) || inflight.has(id) || ttlCancelling.has(id), forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); for (const id of inflight) cb(id); for (const id of ttlCancelling) cb(id); }, isClosed, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, postMs: undefined, preMs: undefined, cwMs: undefined, cwP50: (() => { const b = [...stats.cwMs].sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : null; })(), preP50: (() => { const b = [...stats.preMs].sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : null; })(), postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
 }

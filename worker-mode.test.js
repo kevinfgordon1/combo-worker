@@ -80,7 +80,7 @@ assert.strictEqual(shouldRunUnhedged({ WORKER_MODE: 'all' }), true);
 
   const liveSrc = fs.readFileSync(path.join(__dirname, 'live-runner.js'), 'utf8');
   assert.ok(
-    /createClient\(process\.env\.SUPABASE_URL, process\.env\.SUPABASE_SERVICE_KEY\)/.test(liveSrc),
+    /createClient\(process\.env\.SUPABASE_URL, process\.env\.SUPABASE_SERVICE_KEY(, withBreaker\(\))?\)/.test(liveSrc) && !/createUnhedgedSupabaseClient|undiciFetch/.test(liveSrc), // withBreaker wraps the stock global fetch only
     'Combo Locks quoting path keeps stock createClient — do not share the Unhedged Agent'
   );
   assert.ok(!/createUnhedgedSupabaseClient/.test(liveSrc));

@@ -28,6 +28,7 @@
 //   FILLS_LOOKBACK_SEC     (optional, default 86400) how far back to read on boot
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
+const { withBreaker, getDbBreaker } = require('./db-breaker');
 const { createClient } = require('@supabase/supabase-js');
 const { normalizePem, authHeaders } = require('./kalshi-auth');
 const {
@@ -52,7 +53,7 @@ const SCOPE = resolveWorkerScope(process.env);
 const liveUsers = createLiveUserGate({ env: process.env, scope: SCOPE, log: (m) => console.log(`[${MODE}] ${m}`) });
 const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, withBreaker());
 const sniperGuard = require('./sniper-guard').createSniperGuard({ supabase });
 const { createTelegramGate } = require('./tg-gate');
 const POLL_MS = parseInt(process.env.FILLS_POLL_MS || '20000', 10);

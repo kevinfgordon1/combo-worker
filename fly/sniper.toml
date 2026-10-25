@@ -3,13 +3,13 @@
 app = "kaygo-sniper"
 primary_region = "iad"
 kill_signal = "SIGTERM"
-kill_timeout = "30s"
+kill_timeout = "60s"   # Oct 25: room to cancel every open quote on SIGTERM
 
 [build]
   dockerfile = "../Dockerfile"
 
 [processes]
-  app = "npm run start:sniper"
+  app = "node start-sniper.js"   # Oct 25: node gets SIGTERM directly (npm/sh killed it before quotes were cancelled)
 
 [deploy]
   # never rolling/bluegreen: no overlap of two copies
