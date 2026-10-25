@@ -9,7 +9,7 @@
 // SNIPER_LIVE_CONFIRM token, own key). Otherwise every quote/confirm/cancel is refused.
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
-const { createWriteBehindStore, memoryCapReason, isLongPos } = require('./write-behind');
+const { writeBehindEnabled, createWriteBehindStore, memoryCapReason, isLongPos } = require('./write-behind');
 const { createKalshiFirehose, readShardFactor, DEFAULT_LIVE_SHARD_FACTOR, summarizeThroughput } = require('../kalshi-ws');
 const { normalizePem, authHeaders: kalshiAuthHeaders } = require('../kalshi-auth');
 const { createKalshiBookFeed, createBookRouter } = require('./book-ws');
@@ -358,7 +358,7 @@ async function main(env = process.env) {
   ledger.shortSettleHours = config.shortSettleHours;
   // Write-behind (SNIPER_WRITE_BEHIND=0 = old blocking reserve). Own Supabase client so ledger
   // writes never queue behind decision logs / lock polls on the shared client.
-  const writeBehind = String(env.SNIPER_WRITE_BEHIND || '1') !== '0';
+  const writeBehind = writeBehindEnabled(env);
   let onReserveFailedRef = async () => {};
   const wbStore = writeBehind ? createWriteBehindStore(
     createLedgerStore({ supabase: createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } }), log }),
