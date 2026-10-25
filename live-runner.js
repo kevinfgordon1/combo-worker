@@ -210,6 +210,7 @@ const { resolveWorkerScope, scopeLabel } = require('./worker-scope');
 const { createUserCaps } = require('./user-caps');
 const { createAppAlerts } = require('./app-alerts');
 const { createUserLowCash } = require('./user-low-cash');
+const { createUserLocationAlert, isLocationAttestationFailure } = require('./user-location-alert');
 const { createUserCredits } = require('./user-credits');
 const { createPolyStallAlerts } = require('./poly-stall-alert');
 const { createPartialQuoteDryRun, isPartialQuoteFlagOn } = require('./partial-quote');
@@ -260,6 +261,12 @@ const userLowCash = createUserLowCash({
   client: createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY),
   log: (m) => console.log(`[LIVE] ${m}`),
 });
+// Per-user "verify your location" alert (Kalshi 403 location attestation). Never throws.
+const userLocation = createUserLocationAlert({
+  client: createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY),
+  log: (m) => console.log(`[LIVE] ${m}`),
+});
+Promise.resolve(userLocation.load()).catch(() => {});
 function noteUserLowCash(info) {
   Promise.resolve(userLowCash.onRejected(info)).catch(() => {});
 }
@@ -1632,6 +1639,10 @@ async function onQuoteAccepted(evt) {
     );
   } catch (e) {
     console.error(`[${MODE}] CONFIRM FAILED quote_id=${quoteId} rfq_id=${rfqId}`, e.message);
+    if (isLocationAttestationFailure(e.message)) {
+      const lp = parlayFromPending(pending);
+      if (lp && lp.user_id) Promise.resolve(userLocation.onRejected(lp.user_id)).catch(() => {});
+    }
     const skipReason = quoteFailureSkipReason(e.message);
     if (skipReason) {
       const yb = pending && Number(pending.yesBid);
@@ -2736,6 +2747,7 @@ async function onRfq(rfq, env) {
         if (learned) repeatGuard.claim(learned);
       }
 
+      if (p && p.user_id) Promise.resolve(userLocation.onQuoted(p.user_id)).catch(() => {});
       // Fire-and-forget after POST (Step 1)
       logAsync(p, rfq, d, 'quoted', {
         quote_id: result.id, is_live: true, contracts: reservedContracts,
@@ -2771,6 +2783,9 @@ async function onRfq(rfq, env) {
         (failNote.ageMs != null ? ` rfq_age=${Math.round(failNote.ageMs)}ms` : ''),
         e.message
       );
+      if (p && p.user_id && isLocationAttestationFailure(e.message)) {
+        Promise.resolve(userLocation.onRejected(p.user_id)).catch(() => {});
+      }
       if (quoteFailureSkipReason(e.message)) {
         logFundingSkip(p, rfq, d, { costDollars: quoteCostDollars(d && d.contracts, noBid) });
       } else if (closed) {
