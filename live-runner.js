@@ -122,6 +122,7 @@
 //        lock's owner; resolved by a 60s tick once combo_balances covers it.
 // ─────────────────────────────────────────────────────────────────────────
 'use strict';
+const { withBreaker, getDbBreaker } = require('./db-breaker');
 const { createClient } = require('@supabase/supabase-js');
 const { createKalshiFirehose, readShardFactor, DEFAULT_LIVE_SHARD_FACTOR, summarizeThroughput } = require('./kalshi-ws');
 const { normalizePem, clockOffset, signedRequest, signedNow } = require('./kalshi-auth');
@@ -258,12 +259,12 @@ function takeCostHint() {
 
 // Per-user low-cash alerts on the site (user-low-cash.js). Never throws.
 const userLowCash = createUserLowCash({
-  client: createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY),
+  client: createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, withBreaker()),
   log: (m) => console.log(`[LIVE] ${m}`),
 });
 // Per-user "verify your location" alert (Kalshi 403 location attestation). Never throws.
 const userLocation = createUserLocationAlert({
-  client: createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY),
+  client: createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, withBreaker()),
   log: (m) => console.log(`[LIVE] ${m}`),
 });
 Promise.resolve(userLocation.load()).catch(() => {});
@@ -282,7 +283,7 @@ function noteInsufficientBalance(venue, info = null) {
 }
 const KEY_ID = process.env.KALSHI_KEY_ID;
 const PEM = normalizePem(process.env.Kalshi_combo_key || process.env.KALSHI_PRIVATE_KEY || '');
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, withBreaker());
 const sniperGuard = require('./sniper-guard').createSniperGuard({ supabase });
 
 // Step 2 — two persistent HTTP clients. Quote mutations must not queue
@@ -2427,6 +2428,8 @@ async function onRfq(rfq, env) {
 
   // Step 4 — cheapest rejects first
   if (!rfq.isCombo) return;
+  // DB circuit breaker open (Supabase failing): fail closed, quote nothing until it recovers.
+  if (getDbBreaker().isOpen()) { counts.dbBreaker = (counts.dbBreaker || 0) + 1; return; }
   if (rfq.contracts == null && (rfq.targetCostDollars == null || !(rfq.targetCostDollars > 0))) {
     return;
   }
