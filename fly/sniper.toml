@@ -31,6 +31,7 @@ kill_timeout = "30s"
   SNIPER_DAILY_RISK_CAP = "15000"
   SNIPER_TOTAL_EXPOSURE_CAP = "15000"
   SNIPER_INTAKE_WORKER = "1"
+  SNIPER_LOCK_COORD = "0"      # Kevin Oct 25: no Combo Locks checks; locks win on price anyway
   SNIPER_LONG_EXPOSURE_CAP = "5000"     # Kevin Oct 23: parlays settling >48h after quote (Kevin Oct 24: 32h->48h)
   SNIPER_SHORT_SETTLE_HOURS = "48"
   SNIPER_FETCH_TIMEOUT_MS = "30000"   # Kevin Oct 24: 8s cut off Kalshi book pulls
