@@ -106,7 +106,7 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
     }
     return bookFromQuoteExecution({ orderId, fills: out });
   }
-  return { live, postQuote, confirm, cancel, fillsForOrder, stats: () => ({ ...stats }) };
+  return { live, postQuote, confirm, cancel, fillsForOrder, stats: () => ({ ...stats, queued: sender.queued, active: sender.active }) };
 }
 
 module.exports = { createSniperTrader, noBidFor, sizeSource, LiveGateClosed, YES_DECLINE };
