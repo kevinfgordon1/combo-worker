@@ -58,6 +58,88 @@ function applyResponseDate(headers) {
   return applyServerDate(headerDate(headers));
 }
 
+// ---- Midpoint clock sampling (KALSHI_CLOCK_MIDPOINT=1, default off) -------
+// Oct 25: a tester child whose event loop lagged 4-12s read Kalshi's Date
+// header seconds after it was produced (WS handshake path had no RTT gate),
+// computed offsets of -2.9..-7.9s, and then signed every request in the past
+// -> 401 header_timestamp_expired on every reconnect. With this switch on:
+//   * offset = (Date + 500ms) - midpoint(sentAt, recvAt)
+//   * samples are discarded when the round trip is > 1s or the event loop is
+//     lagging > 250ms (the Date then describes an old moment)
+//   * a sample that moves the offset by more than 1s only steps it 1s
+//   * a rejected sample keeps the last good value
+const CLOCK_SAMPLE_MAX_RTT_MS = 1000;
+const CLOCK_SAMPLE_MAX_LAG_MS = 250;
+const CLOCK_MAX_STEP_MS = 1000;
+const LAG_TICK_MS = 50;
+
+function clockMidpointEnabled(env = process.env) {
+  return /^(1|true|yes|on)$/i.test(String((env && env.KALSHI_CLOCK_MIDPOINT) || '').trim());
+}
+
+let lagTimer = null;
+let lagLastTick = 0;
+let lagRecentMax = 0;
+let lagRecentAt = 0;
+function ensureLagProbe() {
+  if (lagTimer) return;
+  lagLastTick = Date.now();
+  lagTimer = setInterval(() => {
+    const now = Date.now();
+    const lag = Math.max(0, now - lagLastTick - LAG_TICK_MS);
+    lagLastTick = now;
+    if (lag >= lagRecentMax || now - lagRecentAt > 1000) { lagRecentMax = lag; lagRecentAt = now; }
+  }, LAG_TICK_MS);
+  if (lagTimer.unref) lagTimer.unref();
+}
+// Current lag estimate: worst tick in the last second, or the time the probe
+// has been starved right now (a sample handled mid-freeze).
+function currentLoopLagMs(now = Date.now()) {
+  ensureLagProbe();
+  const starving = Math.max(0, now - lagLastTick - LAG_TICK_MS);
+  const recent = now - lagRecentAt <= 1000 ? lagRecentMax : 0;
+  return Math.max(starving, recent);
+}
+
+const clockStats = { accepted: 0, rejectedRtt: 0, rejectedLag: 0, clamped: 0, invalid: 0 };
+
+// -> { offsetMs, accepted, reason }
+function applyServerDateSample(dateHeader, { sentAt, recvAt, loopLagMs } = {}) {
+  const server = dateHeader == null || dateHeader === '' ? NaN : Date.parse(dateHeader);
+  if (!Number.isFinite(server) || !Number.isFinite(sentAt) || !Number.isFinite(recvAt) || recvAt < sentAt) {
+    clockStats.invalid += 1;
+    return { offsetMs: clockOffsetMs, accepted: false, reason: 'invalid' };
+  }
+  const rtt = recvAt - sentAt;
+  if (rtt > CLOCK_SAMPLE_MAX_RTT_MS) {
+    clockStats.rejectedRtt += 1;
+    return { offsetMs: clockOffsetMs, accepted: false, reason: 'rtt' };
+  }
+  const lag = loopLagMs != null ? loopLagMs : currentLoopLagMs();
+  if (lag > CLOCK_SAMPLE_MAX_LAG_MS) {
+    clockStats.rejectedLag += 1;
+    return { offsetMs: clockOffsetMs, accepted: false, reason: 'lag' };
+  }
+  const mid = sentAt + rtt / 2;
+  let target = Math.round(server + 500 - mid);
+  if (Math.abs(target) < DATE_NOISE_MS) target = 0;
+  const delta = target - clockOffsetMs;
+  if (Math.abs(delta) > CLOCK_MAX_STEP_MS) {
+    clockStats.clamped += 1;
+    clockOffsetMs += Math.sign(delta) * CLOCK_MAX_STEP_MS;
+    return { offsetMs: clockOffsetMs, accepted: true, reason: 'clamped' };
+  }
+  clockStats.accepted += 1;
+  clockOffsetMs = target;
+  return { offsetMs: clockOffsetMs, accepted: true, reason: 'ok' };
+}
+
+function takeClockStats() {
+  const out = { ...clockStats, offsetMs: clockOffsetMs };
+  for (const k of Object.keys(clockStats)) clockStats[k] = 0;
+  return out;
+}
+
 function resetClockOffset() {
   clockOffsetMs = 0;
 }
@@ -141,8 +223,10 @@ async function signedRequest(requestFn, {
       headers,
       body,
     });
-    const netMs = Date.now() - tSend;
-    if (netMs <= MAX_DATE_RTT_MS) applyResponseDate(res && res.headers);
+    const tRecv = Date.now();
+    const netMs = tRecv - tSend;
+    if (clockMidpointEnabled()) applyServerDateSample(headerDate(res && res.headers), { sentAt: tSend, recvAt: tRecv });
+    else if (netMs <= MAX_DATE_RTT_MS) applyResponseDate(res && res.headers);
     if (typeof onSent === 'function') {
       try { onSent({ netMs, statusCode: res && res.statusCode }); } catch (_) { /* log only */ }
     }
@@ -164,4 +248,6 @@ module.exports = {
   normalizePem, sign, authHeaders, privateKeyObject,
   applyServerDate, applyResponseDate, resetClockOffset, clockOffset, signedNow,
   headerDate, isTimestampExpired, signedRequest, DATE_NOISE_MS, MAX_DATE_RTT_MS,
+  applyServerDateSample, clockMidpointEnabled, currentLoopLagMs, takeClockStats,
+  CLOCK_SAMPLE_MAX_RTT_MS, CLOCK_SAMPLE_MAX_LAG_MS, CLOCK_MAX_STEP_MS,
 };

@@ -225,6 +225,9 @@ const MODE = SPLIT.mode;
 const { createTelegramGate } = require('./tg-gate');
 const { createPolyDeskFillWatcher } = require('./poly-desk-fills');
 const { comboLocksOnly } = require('./single-leg');
+const { createComboIntakeHost, comboIntakeWorkerEnabled } = require('./combo-intake-host');
+// NEAR-MISS leg-key log for active locks (COMBO_NEAR_MISS_LOG=1, default off; rate-limited).
+const nearMiss = require('./near-miss').createNearMissLogger({ env: process.env, mode: MODE });
 const { createSingleLegRunner } = require('./single-leg-runner');
 let singleLeg = null;
 let bucketManager = null;
@@ -362,6 +365,19 @@ let killByUser = {};
 let filledByParlay = {};
 let sessionFilledByParlay = {};
 const pendingQuotes = new Map();
+// COMBO_INTAKE_WORKER: mirror newly held RFQ ids to the worker at once (its 100ms sync
+// covers the rest) so their rfq_deleted frames are never dropped.
+let intakeHost = null;
+let lastHotPlan = null;
+{
+  const rawSet = pendingQuotes.set.bind(pendingQuotes);
+  pendingQuotes.set = (k, v) => { const r = rawSet(k, v); if (intakeHost && v && v.rfqId) intakeHost.addOpen(v.rfqId); return r; };
+}
+function setHotPlan(plan) {
+  quoteHot.setPlan(plan);
+  lastHotPlan = plan;
+  if (intakeHost) intakeHost.setPlan(plan);
+}
 const polyPendingQuotes = new Map();
 const seenFillIds = new Set();
 let polyLoop = null;
@@ -585,7 +601,7 @@ async function pollPaused() {
     try {
       const plan = lockNeedlePlan(parlays);
       if (fastDropDisabled(process.env)) plan.enabled = false;
-      quoteHot.setPlan(plan);
+      setHotPlan(plan);
     } catch (e) {
       console.error(`[${MODE}] pause needle plan`, e.message);
     }
@@ -655,7 +671,7 @@ async function refresh() {
     }
     const needlePlan = lockNeedlePlan(parlays);
     if (fastDropDisabled(process.env)) needlePlan.enabled = false;
-    quoteHot.setPlan(needlePlan);
+    setHotPlan(needlePlan);
     const fastDropBit = `fastDrop=${needlePlan.enabled ? 'on' : 'off'} needles=${needlePlan.needles.length} uncovered=${needlePlan.uncovered}`;
 
     if (parlaysFailed) {
@@ -2458,6 +2474,7 @@ async function onRfq(rfq, env) {
       }
     }
     counts.lockMiss++;
+    if (nearMiss.enabled) nearMiss.observe(rfq, comboLocksOnly(parlays));
     const nowMiss = Date.now();
     if (nowMiss - lastLockMissLogAt >= LOCK_MISS_LOG_MS) {
       lastLockMissLogAt = nowMiss;
@@ -3135,7 +3152,22 @@ async function main() {
   const wsAlerter = createWsStatusAlerter();
   const shardFactor = readShardFactor(undefined, process.env, DEFAULT_LIVE_SHARD_FACTOR);
 
-  const client = createKalshiFirehose({
+  // COMBO_INTAKE_WORKER=1: the Kalshi WS + pre-parse drops + 15s stale gate run on a
+  // worker thread (combo-intake-host.js); matching/pricing/sends stay here. Default off.
+  const useIntakeWorker = comboIntakeWorkerEnabled(process.env);
+  const client = useIntakeWorker ? createComboIntakeHost({
+    env: process.env,
+    shardFactor,
+    plan: null,
+    maxAgeMs: STALE_RFQ_MS,
+    dropDeleted: !(runUnhedged || dropDeletedDisabled(process.env)),
+    openIds: () => { const ids = []; pendingQuotes.forEach((q) => { if (q && q.rfqId) ids.push(q.rfqId); }); return ids; },
+    onStatus: (s, info) => noteWsStatus(s, info),
+    onRfqCreated: (rfq, env) => onRfq(rfq, env).catch((e) => console.error('onRfq', e)),
+    onRfqDeleted: (evt, env) => { try { onRfqDeleted(evt, env); } catch (e) { console.error('onRfqDeleted', e); } },
+    onQuoteAccepted: (evt) => onQuoteAccepted(evt).catch((e) => console.error('onQuoteAccepted', e)),
+    onQuoteExecuted: (evt) => onQuoteExecuted(evt).catch((e) => console.error('onQuoteExecuted', e)),
+  }) : createKalshiFirehose({
     keyId: KEY_ID,
     pem: PEM,
     shardFactor,
@@ -3213,6 +3245,12 @@ async function main() {
     process.exit(0);
   });
   latencyClient = client;
+  if (useIntakeWorker) {
+    intakeHost = client;
+    client.setPlan(lastHotPlan);
+    console.log(`[${MODE}] intake worker on (COMBO_INTAKE_WORKER=1) shard_factor=${shardFactor} stale_ms=${STALE_RFQ_MS}`);
+    setInterval(() => { console.log(`[${MODE}] intake-stats`, client.stats()); }, 60_000).unref();
+  }
   client.start();
 }
 main();

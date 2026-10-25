@@ -39,7 +39,7 @@
 // KALSHI_WS_OWNER=combo.
 'use strict';
 const WebSocket = require('ws');
-const { authHeaders, applyServerDate, isTimestampExpired } = require('./kalshi-auth');
+const { authHeaders, applyServerDate, applyServerDateSample, clockMidpointEnabled, isTimestampExpired } = require('./kalshi-auth');
 const { parseEnvelope, peekEnvelopeType, isRfqCreated, isRfqClosed, normalizeRfq, normalizeRfqClosed } = require('./rfq');
 const { captureRfq } = require('./rfq-debug');
 
@@ -329,12 +329,17 @@ function createKalshiWs({
     forceReconnect('stall');
   }
 
+  let connectSentAt = 0;
   function onHandshakeFail(req, res) {
     const chunks = [];
     const finish = (text) => {
       const date = headerDate(res);
       if (date) {
-        const offset = applyServerDate(date);
+        // Midpoint mode: time the handshake (connect -> response) and gate on
+        // RTT + loop lag; legacy mode trusts the Date unconditionally.
+        const offset = clockMidpointEnabled(process.env)
+          ? applyServerDateSample(date, { sentAt: connectSentAt, recvAt: Date.now() }).offsetMs
+          : applyServerDate(date);
         if (Math.abs(offset) > 2000) {
           status('clock-offset', { offsetMs: offset });
         }
@@ -373,6 +378,7 @@ function createKalshiWs({
     dropSocket(old);
 
     const headers = authHeaders({ keyId, pem, method: 'GET', signPath: WS_SIGN_PATH });
+    connectSentAt = Date.now();
     status('connecting', { url: WS_URL });
     ws = new Ws(WS_URL, {
       headers,

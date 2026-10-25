@@ -12,6 +12,19 @@ const crypto = require('crypto');
 // inherited, so a dedicated combo-testers service only needs its own vars.
 const FORBIDDEN = /^(KALSHI_KEY_ID|Kalshi_combo_key|KALSHI_PRIVATE_KEY|KALSHI_.*KEY.*|POLYMARKET_KEY_ID|POLYMARKET_SECRET_KEY|POLYMARKET_.*SECRET.*|TELEGRAM_.*|COMBO_USER_TG_.*|DESK_PROTECT_.*|ADMIN_API_SECRET|COMBO_WORKER_USER_ID|WORKER_MODE|KALSHI_BUCKET_.*|COMBO_CAP_AT_CONFIRM|POLYMARKET_RFQ_LIVE|RAILWAY_.*)$/;
 
+// Oct 25: 6 tester children each ran 8 Kalshi WS shards on the main event loop
+// (loop lag 2-12s, ~1/3 of frames dropped) and Kenny's child signed with a bogus
+// -3..-8s clock offset. These are the per-child settings TESTERS_PERF=1 applies.
+const TESTERS_PERF_DEFAULTS = Object.freeze({
+  COMBO_INTAKE_WORKER: '1',   // WS + pre-parse drops + 15s stale gate on a worker thread
+  KALSHI_WS_SHARD_FACTOR: '2', // 2 sockets per tester instead of 8 (users have 1-9 locks)
+  KALSHI_CLOCK_MIDPOINT: '1',  // RTT-midpoint clock offset, lag/RTT-gated, clamped
+  COMBO_NEAR_MISS_LOG: '1',    // rate-limited NEAR-MISS leg-key lines for active locks
+});
+function testersPerfEnabled(env = process.env) {
+  return /^(1|true|yes|on)$/i.test(String((env && env.TESTERS_PERF) || '').trim());
+}
+
 function buildTesterEnv(base, { userId, kalshi, poly } = {}) {
   const env = {};
   for (const [k, v] of Object.entries(base || {})) {
@@ -22,6 +35,13 @@ function buildTesterEnv(base, { userId, kalshi, poly } = {}) {
   for (const [k, v] of Object.entries(base)) {
     const m = /^TESTER_ENV_(.+)$/.exec(k);
     if (m && !FORBIDDEN.test(m[1])) env[m[1]] = v;
+  }
+  // TESTERS_PERF=1 (one switch, default off): per-child defaults for the Oct 25 overload
+  // fix. Any of them can still be overridden one by one with TESTER_ENV_<NAME>.
+  if (testersPerfEnabled(base)) {
+    for (const [k, v] of Object.entries(TESTERS_PERF_DEFAULTS)) {
+      if (!Object.prototype.hasOwnProperty.call(base, `TESTER_ENV_${k}`)) env[k] = v;
+    }
   }
   env.WORKER_MODE = 'combo';
   env.COMBO_WORKER_USER_ID = userId;
@@ -64,4 +84,4 @@ function makeRedactor(secrets) {
   };
 }
 
-module.exports = { buildTesterEnv, keyFingerprint, makeRedactor, FORBIDDEN };
+module.exports = { buildTesterEnv, keyFingerprint, makeRedactor, FORBIDDEN, TESTERS_PERF_DEFAULTS, testersPerfEnabled };
