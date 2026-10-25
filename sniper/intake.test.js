@@ -23,3 +23,19 @@ const snap = L.snapshot();
 assert.deepStrictEqual(snap.arriveAgeMs, { n: 4, p50: 300, p90: 4000, max: 4000 });
 assert.strictEqual(snap.staleIntake, 1); assert.strictEqual(L.snapshot().arriveAgeMs.n, 0);
 console.log('sniper intake ok');
+
+// stage timing + stale buckets + loop lag summary
+{
+  const { createLatencyStats: mk, staleBucket } = require('./intake');
+  const l = mk();
+  l.staleIntake(2500); l.staleIntake(45000); l.staleIntake(7000);
+  l.stage('decidedToReserved', 100); l.stage('decidedToReserved', 300); l.stage('bogus', 5);
+  l.loopLag(10); l.loopLag(1500);
+  const snap = l.snapshot();
+  assert.deepStrictEqual(snap.staleBuckets, { '2-5s': 1, '5-10s': 1, '10-30s': 0, '>30s': 1 });
+  assert.strictEqual(snap.stages.decidedToReserved.n, 2);
+  assert.strictEqual(snap.stages.decidedToReserved.p90, 300);
+  assert.strictEqual(snap.loopLagMs.max, 1500);
+  assert.strictEqual(l.snapshot().staleIntake, 0);
+  assert.strictEqual(staleBucket(12000), '10-30s');
+}

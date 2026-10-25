@@ -35,7 +35,7 @@ const { createLockCoord } = require('./coord');
 const { createLiveSniper } = require('./live');
 const { capsFrom } = require('./ledger-store');
 const { createNightlyRecap } = require('./recap');
-const { createNflFrameFilter, createDeletedFilter, tooOld, createLatencyStats, NFL_NEEDLES, NBA_NEEDLES } = require('./intake');
+const { createNflFrameFilter, createDeletedFilter, tooOld, createLatencyStats, createLoopLagSampler, NFL_NEEDLES, NBA_NEEDLES } = require('./intake');
 const { signedNow } = require('../kalshi-auth');
 const { rfqAgeMs } = require('../quote-sender');
 const { createKickoffResolver, ESPN_NFL } = require('./kickoff');
@@ -454,6 +454,7 @@ async function main(env = process.env) {
   // pricing / reservation work. Quote-sender still hard-drops at 3s right before the POST.
   const maxAgeMs = num(env.SNIPER_MAX_RFQ_AGE_MS, 2000);
   const lat = createLatencyStats();
+  createLoopLagSampler((ms) => lat.loopLag(ms));
   // Recent DB-reserve time (EWMA, ms) for the expiry gate; deadline = quote-sender's rfq_age drop.
   const postDeadlineMs = num(env.SNIPER_POST_DEADLINE_MS, 3000);
   // Decays back toward the 250ms baseline (half-life 5s) when no reserves are happening, so a slow
@@ -480,9 +481,11 @@ async function main(env = process.env) {
   async function onRfq(rfq) {
     if (liveSniper.halted()) liveSniper.resumeIfNewDay();
     if (disabled || liveSniper.halted() || !rfq || !rfq.isCombo) return;
+    const tH = Date.now();
     lat.arrive(rfqAgeMs(rfq.createdTs, signedNow()));
+    if (rfq.recvAt) { lat.stage('recvToHandler', tH - rfq.recvAt); if (rfq.recvAge != null) lat.stage('createdToRecv', rfq.recvAge); }
     const old = tooOld(rfq, signedNow(), maxAgeMs);
-    if (old != null) { lat.staleIntake(); counts.skips.stale_at_intake = (counts.skips.stale_at_intake || 0) + 1; return; }
+    if (old != null) { lat.staleIntake(old); counts.skips.stale_at_intake = (counts.skips.stale_at_intake || 0) + 1; return; }
     // Combo Locks priority before anything else (read-only check of active locks).
     const blocked = coord.blockReason(rfq);
     if (blocked) { counts.skips[blocked] = (counts.skips[blocked] || 0) + 1; return; }
@@ -491,6 +494,7 @@ async function main(env = process.env) {
     try { const e = await fees.prefetch(seriesOfTicker(rfq.marketTicker)); makerRate = e ? e.rate : null; } catch (_) { makerRate = null; }
     const nowMs = Date.now();
     const { decision: d } = decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook, linesBook, nbaBook, venues, kickoffFor, makerRate, nowMs, pricesHealthy: pricesHealthy() });
+    lat.stage('handlerToDecided', Date.now() - tH);
     staleAlert.record(d.reason === 'prices_stale');
     if (d.rogue && d.rogue.length) logRogue(d);
     if (d.action !== 'quote') { counts.skips[d.reason] = (counts.skips[d.reason] || 0) + 1; return; }
@@ -511,12 +515,14 @@ async function main(env = process.env) {
       }
     }
     const t0 = Date.now();
+    const tDecided = t0;
     // Live: reserved / quoted rows only hold exposure for the quote's life (20s TTL + buffer);
     // onHold extends to d.releaseAt (games settle) once a taker accepts.
     const holdAt = gate.live && !config.dryRun ? Date.now() + pendingHoldMs : d.releaseAt;
     const pos0 = ledger.positions.get(d.rfqId); if (pos0) pos0.releaseAt = holdAt;
     const res = await store.reserve(d, { releaseAt: holdAt, dryRun: config.dryRun, caps: caps(), marketTicker: rfq.marketTicker || null });
-    lat.reserve(Date.now() - t0); reserveEst.add(Date.now() - t0);
+    lat.reserve(Date.now() - t0); reserveEst.add(Date.now() - t0); lat.stage('decidedToReserved', Date.now() - tDecided);
+    const tReserved = Date.now();
     if (!res.ok) {
       // roll back the in-memory reservation; a DB problem fails closed (no quote)
       ledger.positions.delete(d.rfqId); ledger.hour.pop();
@@ -538,6 +544,7 @@ async function main(env = process.env) {
       return;
     }
     const sent = await liveSniper.send(rfq, d);
+    if (sent.sent) { lat.stage('reservedToPosted', Date.now() - tReserved); if (rfq.recvAt) lat.stage('recvToPosted', Date.now() - rfq.recvAt); }
     if (!sent.sent) {
       counts.skips[`live_${sent.reason}`] = (counts.skips[`live_${sent.reason}`] || 0) + 1;
     }
@@ -560,7 +567,8 @@ async function main(env = process.env) {
     // RFQs we hold no quote on are dropped too (we only act on closes of our own quotes).
     shouldDropCreated: String(env.SNIPER_WS_FAST_DROP) === '0' ? undefined : createNflFrameFilter(nbaBook ? [...NFL_NEEDLES, ...NBA_NEEDLES] : NFL_NEEDLES),
     shouldDropDeleted: String(env.SNIPER_WS_FAST_DROP) === '0' ? undefined : createDeletedFilter((cb) => liveSniper.forEachRfqId(cb)),
-    onRfqCreated: (rfq) => { onRfq(rfq).catch((e) => log(`[SNIPER] onRfq error: ${e.message}`)); },
+    // Stamp receive time in the ws message tick (before any await) for stage timing.
+    onRfqCreated: (rfq) => { if (rfq) { rfq.recvAt = Date.now(); rfq.recvAge = rfqAgeMs(rfq.createdTs, signedNow()); } onRfq(rfq).catch((e) => log(`[SNIPER] onRfq error: ${e.message}`)); },
     onRfqDeleted: (evt) => { liveSniper.onRfqClosed(evt).catch((e) => log(`[SNIPER] rfq closed error: ${e.message}`)); },
     onQuoteAccepted: (evt) => { liveSniper.onAccepted(evt).catch((e) => log(`[SNIPER] accept error: ${e.message}`)); },
     onQuoteExecuted: (evt) => { liveSniper.onExecuted(evt).catch((e) => log(`[SNIPER] executed error: ${e.message}`)); },
