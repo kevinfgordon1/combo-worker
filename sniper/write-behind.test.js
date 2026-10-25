@@ -35,3 +35,9 @@ const { createWriteBehindStore, memoryCapReason, isLongPos } = require('./write-
   assert.strictEqual(isLongPos(NaN, now, 48), true);
   console.log('write-behind ok');
 })().catch((e) => { console.error(e); process.exit(1); });
+{
+  const { writeBehindEnabled } = require('./write-behind');
+  assert.strictEqual(writeBehindEnabled({}), false);
+  assert.strictEqual(writeBehindEnabled({ SNIPER_WRITE_BEHIND: '0' }), false);
+  assert.strictEqual(writeBehindEnabled({ SNIPER_WRITE_BEHIND: '1' }), true);
+}

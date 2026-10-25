@@ -76,4 +76,8 @@ function memoryCapReason(ledger, rfqId, { risk, settleAt, nowMs, longCap, shortH
   return long + risk > longCap + 1e-9 ? 'long_cap' : null;
 }
 
-module.exports = { createWriteBehindStore, memoryCapReason, isLongPos };
+// Default OFF (v49/v50 rollout: zero LIVE QUOTEs with write-behind on; ~3s pre-POST stall).
+// SNIPER_WRITE_BEHIND=1 opts in once the stall is understood.
+function writeBehindEnabled(env) { return /^(1|true|yes|on)$/i.test(String((env && env.SNIPER_WRITE_BEHIND) || '')); }
+
+module.exports = { writeBehindEnabled, createWriteBehindStore, memoryCapReason, isLongPos };

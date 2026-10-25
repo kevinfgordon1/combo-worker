@@ -41,7 +41,7 @@ function createLiveSniper({
     if (closed.size > CLOSED_MAX) { for (const [k, v] of closed) { if (closed.size <= CLOSED_MAX && t - v < CLOSED_KEEP_MS) break; closed.delete(k); } }
   };
   const isClosed = (rfqId) => { const t = closed.get(rfqId); if (t == null) return false; if (now() - t > CLOSED_KEEP_MS) { closed.delete(rfqId); return false; } return true; };
-  const stats = { cancelSkipped: 0, posted: 0, postFail: 0, staleDrop: 0, postFailBy: {}, postMs: [], preMs: [], accepted: 0, confirmed: 0, declined: {}, fills: 0, cancelled: 0, settled: 0, aborted: {} };
+  const stats = { cancelSkipped: 0, posted: 0, postFail: 0, staleDrop: 0, postFailBy: {}, postMs: [], preMs: [], cwMs: [], accepted: 0, confirmed: 0, declined: {}, fills: 0, cancelled: 0, settled: 0, aborted: {} };
   let halted = false;
   let haltReason = null; let haltDay = null;
   const etDayKey = (ms) => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
@@ -65,7 +65,9 @@ function createLiveSniper({
     if (!live()) return abort(halted ? 'halted' : 'not_live');
     const st = startedReason(rfq); if (st) return abort(st);
     const b = coord.blockReason(rfq); if (b) return abort(b);
-    const cw = await coord.comboWorkerQuoting(rfq.rfqId); if (cw) return abort(cw);
+    const tCw = now(); const cw = await coord.comboWorkerQuoting(rfq.rfqId);
+    stats.cwMs.push(now() - tCw); if (stats.cwMs.length > 200) stats.cwMs.shift();
+    if (cw) return abort(cw);
     stats.preMs.push(now() - tSend); if (stats.preMs.length > 200) stats.preMs.shift();
     // Re-price at send time with the freshest books.
     const fresh = reprice(rfq);
@@ -260,7 +262,7 @@ function createLiveSniper({
     }
     return n;
   }
-  return { shutdown, stopping: () => stopping, send, abortRfq, hasRfqId: (id) => byRfq.has(id) || inflight.has(id) || ttlCancelling.has(id), forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); for (const id of inflight) cb(id); for (const id of ttlCancelling) cb(id); }, isClosed, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, postMs: undefined, preMs: undefined, preP50: (() => { const b = [...stats.preMs].sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : null; })(), postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
+  return { shutdown, stopping: () => stopping, send, abortRfq, hasRfqId: (id) => byRfq.has(id) || inflight.has(id) || ttlCancelling.has(id), forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); for (const id of inflight) cb(id); for (const id of ttlCancelling) cb(id); }, isClosed, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, postMs: undefined, preMs: undefined, cwMs: undefined, cwP50: (() => { const b = [...stats.cwMs].sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : null; })(), preP50: (() => { const b = [...stats.preMs].sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : null; })(), postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
 }
 
 module.exports = { createLiveSniper, postFailKey };

@@ -13,7 +13,18 @@ const { lockLegOverlap } = require('../unhedged-boot');
 
 function createLockCoord({ supabase, pollMs = 5000, staleMs = 30000, now = Date.now, log = console.log,
   skipOverlap = /^(1|true|yes|on)$/i.test(String(process.env.SNIPER_SKIP_LOCK_OVERLAP || '')),
-  failClosed = /^(1|true|yes|on)$/i.test(String(process.env.SNIPER_LOCKS_FAIL_CLOSED || '')), warnEveryMs = 60000, cwTimeoutMs = Number(process.env.SNIPER_CW_CHECK_TIMEOUT_MS) || 300 } = {}) {
+  failClosed = /^(1|true|yes|on)$/i.test(String(process.env.SNIPER_LOCKS_FAIL_CLOSED || '')), warnEveryMs = 60000, cwTimeoutMs = Number(process.env.SNIPER_CW_CHECK_TIMEOUT_MS) || 300,
+  // 'query' (default): one combo_submissions query per send (on the hot path, shared client).
+  // 'poll': one query every cwPollMs into an in-memory Set; send-time check is a Set lookup.
+  cwMode = String(process.env.SNIPER_CW_CHECK_MODE || 'query'), cwPollMs = Number(process.env.SNIPER_CW_POLL_MS) || 500 } = {}) {
+  let cwLive = new Set(); let cwAt = 0; let cwTimer = null;
+  async function pollSubs() {
+    try {
+      const { data, error } = await supabase.from('combo_submissions').select('rfq_id').eq('is_live', true).limit(5000);
+      if (error) throw new Error(error.message);
+      cwLive = new Set((data || []).map((r) => r.rfq_id)); cwAt = now();
+    } catch (_) { stats.cwPollFail = (stats.cwPollFail || 0) + 1; }
+  }
   let locks = []; let at = 0; let timer = null;
   const stats = { polls: 0, pollFail: 0, blocked: 0, staleChecks: 0, submissionsUnknown: 0 }; let lastWarn = 0;
   const isStale = () => !at || now() - at > staleMs;
@@ -25,8 +36,11 @@ function createLockCoord({ supabase, pollMs = 5000, staleMs = 30000, now = Date.
       locks = data || []; at = now();
     } catch (e) { stats.pollFail += 1; log(`[SNIPER] lock poll failed: ${e.message}`); }
   }
-  function start() { poll(); timer = setInterval(poll, pollMs); if (timer.unref) timer.unref(); }
-  function stop() { if (timer) clearInterval(timer); }
+  function start() {
+    poll(); timer = setInterval(poll, pollMs); if (timer.unref) timer.unref();
+    if (cwMode === 'poll') { pollSubs(); cwTimer = setInterval(pollSubs, cwPollMs); if (cwTimer.unref) cwTimer.unref(); }
+  }
+  function stop() { if (timer) clearInterval(timer); if (cwTimer) clearInterval(cwTimer); }
   // Synchronous check (memory only) — used at decide, before POST and before confirm.
   function blockReason(rfq) {
     if (isStale()) {
@@ -41,6 +55,10 @@ function createLockCoord({ supabase, pollMs = 5000, staleMs = 30000, now = Date.
   function unknownSubs() { if (failClosed) return 'submissions_unknown'; stats.submissionsUnknown += 1; return null; }
   // Async check against combo-worker's live submissions for this RFQ (read-only).
   async function comboWorkerQuoting(rfqId) {
+    if (cwMode === 'poll') {
+      if (!cwAt || now() - cwAt > Math.max(5000, cwPollMs * 10)) return unknownSubs();
+      return cwLive.has(rfqId) ? 'combo_worker_quoting' : null;
+    }
     try {
       // Bounded: this query is on the quote hot path. A slow answer is treated like an unknown one.
       let timer;
@@ -53,8 +71,10 @@ function createLockCoord({ supabase, pollMs = 5000, staleMs = 30000, now = Date.
       return (data && data.length) ? 'combo_worker_quoting' : null;
     } catch (_) { return unknownSubs(); }
   }
-  function setLocks(l, t = now()) { locks = l; at = t; } // tests
-  return { start, stop, poll, blockReason, comboWorkerQuoting, setLocks, stats: () => ({ ...stats, locks: locks.length, ageMs: at ? now() - at : null, locksStale: isStale(), failClosed }) };
+  function setLocks(l, t = now()) { locks = l; at = t; }
+  function _setSubs(ids, t = now()) { cwLive = new Set(ids); cwAt = t; } // tests
+  const pollSubsNow = pollSubs; // tests
+  return { start, stop, poll, pollSubs: pollSubsNow, _setSubs, blockReason, comboWorkerQuoting, setLocks, stats: () => ({ ...stats, locks: locks.length, ageMs: at ? now() - at : null, locksStale: isStale(), failClosed }) };
 }
 
 module.exports = { createLockCoord };
