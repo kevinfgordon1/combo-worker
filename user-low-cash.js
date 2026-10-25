@@ -148,7 +148,7 @@ function createUserLowCash({ client, log = (...a) => console.log(...a), clock = 
     if (!ids.length) return 0;
     try {
       const { data, error } = await client.from(TABLE).select('id,user_id,venue,need_usd,available_usd')
-        .in('user_id', ids).is('resolved_at', null).limit(200);
+        .in('user_id', ids).eq('kind', 'low_cash').is('resolved_at', null).limit(200);
       if (error || !data || !data.length) return 0;
       const done = [];
       const balCache = new Map();
