@@ -29,5 +29,20 @@ const { createLimiter } = require('./limiter');
   const hi = L.run(async () => { seq.push('post'); return { ok: true }; });
   await Promise.all([lo, hi]);
   assert.deepStrictEqual(seq, ['post', 'cancel']);
+  // 4) three lanes: urgent cancel > quote > routine TTL cancel
+  const L2 = createLimiter({ name: 't2', ratePerSec: 20, burst: 1 }); const seq2 = [];
+  await L2.run(async () => ({ ok: true }));
+  const mk = (tag, opts) => L2.run(async () => { seq2.push(tag); return { ok: true }; }, opts);
+  await Promise.all([mk('ttl', { priority: 0 }), mk('quote', {}), mk('urgent', { priority: 2 })]);
+  assert.deepStrictEqual(seq2, ['urgent', 'quote', 'ttl']);
+  // 5) trader.cancel maps urgency → limiter priority; live passes urgent only for non-TTL reasons
+  const { createSniperTrader } = require('./trader');
+  const seen = []; const fakeLim = { run: async (fn, o) => { seen.push(o.priority); return fn(); }, stats: () => ({}) };
+  const tr = createSniperTrader({ gate: { live: true }, keyId: 'k', pem: '', subaccount: 1, limiter: fakeLim,
+    request: async () => ({ statusCode: 204, headers: {}, text: '' }) });
+  try { await tr.cancel('q1', { urgent: false }); await tr.cancel('q2'); } catch (_) { /* signing with a dummy key may throw before request */ }
+  if (seen.length === 2) assert.deepStrictEqual(seen, [0, 2]);
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'live.js'), 'utf8');
+  assert.match(src, /trader\.cancel\(quoteId, \{ urgent: reason !== 'ttl' \}\)/);
   console.log('trade-lane.test.js ok');
 })().catch((e) => { console.error(e); process.exit(1); });

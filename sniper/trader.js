@@ -37,7 +37,7 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
   const sender = createQuoteSender({ maxConcurrent, maxQueued, serverNow: () => signedNow(), log: (m) => log(`[SNIPER] ${m}`) });
   const stats = { posts: 0, confirms: 0, cancels: 0, fillReads: 0, refused: 0 };
 
-  async function raw(method, signPath, { path, body, quote = false, timeoutMs, shouldRetryExpired, low = false, lim = limiter } = {}) {
+  async function raw(method, signPath, { path, body, quote = false, timeoutMs, shouldRetryExpired, low = false, priority, lim = limiter } = {}) {
     const doReq = request || (async ({ method: m, path: p, headers, body: b }) => {
       const http = quote ? pools().quote : pools().rest;
       const req = { method: m, path: p, headers };
@@ -50,7 +50,7 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
       keyId, pem, method, signPath, path, body, shouldRetryExpired,
       headers: body != null ? { 'Content-Type': 'application/json' } : undefined,
     });
-    const res = lim ? await lim.run(async () => { const r = await go(); return { ...r, ok: r.statusCode !== 429, status: r.statusCode }; }, { low }) : await go();
+    const res = lim ? await lim.run(async () => { const r = await go(); return { ...r, ok: r.statusCode !== 429, status: r.statusCode }; }, { low, priority }) : await go();
     return res;
   }
   function mustBeLive(op) { if (!live) { stats.refused += 1; throw new LiveGateClosed(op); } }
@@ -77,9 +77,11 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
     if (statusCode < 200 || statusCode >= 300) throw new Error(`Kalshi confirm failed ${statusCode}: ${text}`);
     return { statusCode };
   }
-  async function cancel(quoteId) {
+  // urgent=true (price move / started game / reprice abort / shutdown): ahead of quotes.
+  // urgent=false (routine 20s TTL): yields to quotes and confirms.
+  async function cancel(quoteId, { urgent = true } = {}) {
     mustBeLive('cancel');
-    const { statusCode, text } = await raw('DELETE', cancelPath(quoteId), { quote: true, low: true }); // cancels yield to posts/confirms
+    const { statusCode, text } = await raw('DELETE', cancelPath(quoteId), { quote: true, priority: urgent ? 2 : 0 });
     stats.cancels += 1;
     if (statusCode === 204 || statusCode === 404 || (statusCode >= 200 && statusCode < 300)) return { statusCode };
     throw new Error(`Kalshi cancel failed ${statusCode}: ${text}`);

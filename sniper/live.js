@@ -79,7 +79,7 @@ function createLiveSniper({
   async function dropQuote(quoteId, phase, reason) {
     const p = pending.get(quoteId); if (!p) return;
     clearTimeout(p.timer); pending.delete(quoteId); byRfq.delete(p.rfq.rfqId);
-    try { await trader.cancel(quoteId); } catch (e) { log(`[SNIPER] cancel ${quoteId} failed: ${e.message}`); }
+    try { await trader.cancel(quoteId, { urgent: reason !== 'ttl' }); } catch (e) { log(`[SNIPER] cancel ${quoteId} failed: ${e.message}`); }
     await store.release(p.d.rfqId, phase, {});
     if (phase === 'declined') { bump(stats.declined, reason); log(`[SNIPER] DECLINE quote_id=${quoteId} rfq=${p.rfq.rfqId} reason=${reason}`); } else stats.cancelled += 1;
   }
