@@ -16,6 +16,7 @@ const cfg = workerData || {};
 const env = process.env;
 const open = new Set(); // RFQ ids main holds a quote / POST / cancel on (mirrored)
 let skips = {};
+const started = new Set(); // leg tickers on games main marked started (synced)
 const bump = (k) => { skips[k] = (skips[k] || 0) + 1; };
 const post = (m) => { try { parentPort.postMessage(m); } catch (_) { /* main gone */ } };
 
@@ -23,10 +24,11 @@ parentPort.on('message', (m) => {
   if (!m) return;
   if (m.t === 'open') { open.clear(); for (const id of m.ids || []) open.add(id); }
   else if (m.t === 'open+') { for (const id of m.ids || []) open.add(id); }
+  else if (m.t === 'started') { for (const t of m.tickers || []) started.add(t); }
   else if (m.t === 'throughput') post({ t: 'throughput', id: m.id, value: safeThroughput() });
 });
 
-const candidate = createCandidateFilter(cfg, { clock: () => signedNow(), bump });
+const candidate = createCandidateFilter(cfg, { clock: () => signedNow(), bump, started });
 
 const ws = createKalshiFirehose({
   env,

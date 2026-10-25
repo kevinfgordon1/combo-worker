@@ -619,21 +619,35 @@ async function main(env = process.env) {
   // SNIPER_INTAKE_WORKER=1 (default off): the RFQ socket, decode, needle/age/scope filters and
   // JSON.parse run in a worker thread; only candidates reach this thread.
   const intakeWorker = /^(1|true|yes|on)$/i.test(String(env.SNIPER_INTAKE_WORKER || ''));
+  // SNIPER_INTAKE_EARLY_FILTER=0 = off. Leg tickers main has seen are checked against kickoffs every
+  // 2s; newly started ones go to the worker, which then drops their RFQs (+ duplicate ids) itself.
+  const earlyFilter = String(env.SNIPER_INTAKE_EARLY_FILTER || '1') !== '0';
+  const legTickersSeen = new Set(); const startedTickers = new Set();
   const fastDrop = String(env.SNIPER_WS_FAST_DROP) !== '0';
   const wsCallbacks = {
-    onRfqCreated: (rfq) => { if (rfq) { if (!rfq.recvAt) { rfq.recvAt = Date.now(); rfq.recvAge = rfqAgeMs(rfq.createdTs, signedNow()); } } onRfq(rfq).catch((e) => log(`[SNIPER] onRfq error: ${e.message}`)); },
+    onRfqCreated: (rfq) => { if (rfq) { if (earlyFilter && legTickersSeen.size < 50000) for (const k of rfq.legKeys || []) legTickersSeen.add(String(k).split(':')[0].toUpperCase()); if (!rfq.recvAt) { rfq.recvAt = Date.now(); rfq.recvAge = rfqAgeMs(rfq.createdTs, signedNow()); } } onRfq(rfq).catch((e) => log(`[SNIPER] onRfq error: ${e.message}`)); },
     onRfqDeleted: (evt) => { liveSniper.onRfqClosed(evt).catch((e) => log(`[SNIPER] rfq closed error: ${e.message}`)); },
     onQuoteAccepted: (evt) => { liveSniper.onAccepted(evt).catch((e) => log(`[SNIPER] accept error: ${e.message}`)); },
     onQuoteExecuted: (evt) => { liveSniper.onExecuted(evt).catch((e) => log(`[SNIPER] executed error: ${e.message}`)); },
     onStatus: (st, info) => log(`[SNIPER] ws ${typeof st === 'string' ? st : JSON.stringify(st)}${info ? ` ${JSON.stringify(info)}` : ''}`),
   };
   let wsWorker = null; let wsThroughputLast = null;
+  if (intakeWorker && earlyFilter) {
+    setInterval(() => {
+      if (!wsWorker) return;
+      const nowMs = Date.now(); const fresh = [];
+      for (const t of legTickersSeen) { const ko = kickoffFor(t); if (Number.isFinite(ko) && ko > 0 && nowMs >= ko - 30 * 60 * 1000) { legTickersSeen.delete(t); startedTickers.add(t); fresh.push(t); } }
+      if (fresh.length) wsWorker.addStarted(fresh);
+    }, 2000).unref?.();
+  }
   if (intakeWorker) {
     wsWorker = createIntakeWorker({
       workerData: {
         shardFactor: readShardFactor(env.SNIPER_WS_SHARD_FACTOR, env, DEFAULT_LIVE_SHARD_FACTOR), fastDrop, nba: !!nbaBook, maxAgeMs,
         scope: { td: !!tdBook, ncaaf: config.ncaaf !== false, lines: !!linesBook, nba: !!nbaBook && !!config.nba },
+        earlyFilter,
       },
+      startedAll: () => [...startedTickers],
       ...wsCallbacks,
       onSkips: (sk) => { for (const [k, v] of Object.entries(sk)) { counts.skips[k] = (counts.skips[k] || 0) + v; if (k === 'stale_at_intake') for (let i = 0; i < v; i += 1) lat.staleIntake(); } },
       openIds: () => { const ids = []; liveSniper.forEachRfqId((id) => ids.push(id)); return ids; },
