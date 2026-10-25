@@ -93,6 +93,7 @@ function createLiveSniper({
     entry.timer = setTimeout(() => { expire(res.quoteId).catch(() => {}); }, ttlMs);
     if (entry.timer.unref) entry.timer.unref();
     pending.set(res.quoteId, entry); byRfq.set(rfq.rfqId, res.quoteId);
+    if (abortAfterPost.has(rfq.rfqId)) { const r = abortAfterPost.get(rfq.rfqId); abortAfterPost.delete(rfq.rfqId); await dropQuote(res.quoteId, 'cancelled', r); return { sent: true, quoteId: res.quoteId, aborted: r }; }
     log(`[SNIPER] LIVE QUOTE rfq=${rfq.rfqId} quote_id=${res.quoteId} no_bid=${res.noBid} yes=${d.quoteYes} fair=${fresh.toFixed(4)} roi=${(e.roi * 100).toFixed(2)}%`);
     return { sent: true, quoteId: res.quoteId };
   }
@@ -130,6 +131,14 @@ function createLiveSniper({
     const p = pending.get(quoteId);
     if (!p || p.accepted || confirming.has(quoteId)) return;
     await dropQuote(quoteId, 'cancelled', 'ttl');
+  }
+  // Ledger reserve failed in the background: cancel our quote now (urgent) or as soon as the POST returns.
+  const abortAfterPost = new Map();
+  async function abortRfq(rfqId, reason) {
+    const qid = byRfq.get(rfqId);
+    if (qid && !confirming.has(qid)) { await dropQuote(qid, 'cancelled', reason); return true; }
+    abortAfterPost.set(rfqId, reason); if (abortAfterPost.size > 2000) abortAfterPost.delete(abortAfterPost.keys().next().value);
+    return false;
   }
   async function onRfqClosed(evt) {
     if (evt && evt.rfqId) noteClosed(evt.rfqId);
@@ -244,7 +253,7 @@ function createLiveSniper({
     }
     return n;
   }
-  return { shutdown, stopping: () => stopping, send, forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); for (const id of inflight) cb(id); for (const id of ttlCancelling) cb(id); }, isClosed, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, postMs: undefined, postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
+  return { shutdown, stopping: () => stopping, send, abortRfq, forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); for (const id of inflight) cb(id); for (const id of ttlCancelling) cb(id); }, isClosed, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, postMs: undefined, postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
 }
 
 module.exports = { createLiveSniper, postFailKey };

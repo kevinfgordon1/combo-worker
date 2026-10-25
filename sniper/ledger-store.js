@@ -3,6 +3,7 @@
 // sniper_confirm_check (one advisory lock, so concurrent RFQs cannot both pass). Any DB error
 // fails closed (no quote / no confirm).
 'use strict';
+const { isLongPos } = require('./write-behind');
 const { netRiskOf, hedgePnl } = require('./hedge');
 
 function capsFrom(config, dayStartIso, live = false) {
@@ -18,7 +19,7 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
   if (!supabase) throw new Error('ledger store needs supabase');
   async function hydrate(ledger, etDayStartIso, { live = false } = {}) {
     const { data, error } = await supabase.from('sniper_ledger')
-      .select('rfq_id,combo_key,games,legs,risk,release_at,created_at,phase,quote_id,market_ticker,contracts,filled_contracts,filled_cost,filled_fee,dry_run')
+      .select('rfq_id,combo_key,games,legs,risk,release_at,created_at,settle_at,phase,quote_id,market_ticker,contracts,filled_contracts,filled_cost,filled_fee,dry_run')
       .eq('status', 'open').eq('dry_run', !live).limit(20000);
     if (error) throw new Error(`hydrate: ${error.message}`);
     const rows = [];
@@ -26,7 +27,9 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
     for (const r of data || []) {
       const rel = Date.parse(r.release_at);
       if (!(rel > t) && r.phase !== 'accepted' && r.phase !== 'filled') continue;
-      ledger.positions.set(r.rfq_id, { combo: r.combo_key, games: r.games || [], legs: r.legs || [], risk: Number(r.risk) || 0, grossRisk: Number(r.risk) || 0, releaseAt: Math.max(rel, r.phase === 'filled' || r.phase === 'accepted' ? t + 7 * 864e5 : rel) });
+      const settleMs = r.settle_at ? Date.parse(r.settle_at) : NaN; const createdMs = Date.parse(r.created_at);
+      ledger.positions.set(r.rfq_id, { combo: r.combo_key, games: r.games || [], legs: r.legs || [], risk: Number(r.risk) || 0, grossRisk: Number(r.risk) || 0, releaseAt: Math.max(rel, r.phase === 'filled' || r.phase === 'accepted' ? t + 7 * 864e5 : rel),
+        long: ledger.shortSettleHours != null ? isLongPos(settleMs, Number.isFinite(createdMs) ? createdMs : t, ledger.shortSettleHours) : false });
       ledger.seenRfqs.add(r.rfq_id);
       rows.push(r);
     }
