@@ -35,7 +35,7 @@ const { createLockCoord } = require('./coord');
 const { createLiveSniper } = require('./live');
 const { capsFrom } = require('./ledger-store');
 const { createNightlyRecap } = require('./recap');
-const { createNflFrameFilter, createDeletedFilter, tooOld, createLatencyStats, createLoopLagSampler, NFL_NEEDLES, NBA_NEEDLES } = require('./intake');
+const { createNflFrameFilter, createDeletedFilter, createDeletedIdFilter, tooOld, createLatencyStats, createLoopLagSampler, NFL_NEEDLES, NBA_NEEDLES } = require('./intake');
 const { signedNow } = require('../kalshi-auth');
 const { rfqAgeMs } = require('../quote-sender');
 const { createKickoffResolver, ESPN_NFL } = require('./kickoff');
@@ -566,7 +566,7 @@ async function main(env = process.env) {
     // ~97% of rfq_created frames have no NFL leg: drop them before JSON.parse. rfq_deleted for
     // RFQs we hold no quote on are dropped too (we only act on closes of our own quotes).
     shouldDropCreated: String(env.SNIPER_WS_FAST_DROP) === '0' ? undefined : createNflFrameFilter(nbaBook ? [...NFL_NEEDLES, ...NBA_NEEDLES] : NFL_NEEDLES),
-    shouldDropDeleted: String(env.SNIPER_WS_FAST_DROP) === '0' ? undefined : createDeletedFilter((cb) => liveSniper.forEachRfqId(cb)),
+    shouldDropDeleted: String(env.SNIPER_WS_FAST_DROP) === '0' ? undefined : createDeletedIdFilter((id) => liveSniper.hasRfqId(id)),
     // Stamp receive time in the ws message tick (before any await) for stage timing.
     onRfqCreated: (rfq) => { if (rfq) { rfq.recvAt = Date.now(); rfq.recvAge = rfqAgeMs(rfq.createdTs, signedNow()); } onRfq(rfq).catch((e) => log(`[SNIPER] onRfq error: ${e.message}`)); },
     onRfqDeleted: (evt) => { liveSniper.onRfqClosed(evt).catch((e) => log(`[SNIPER] rfq closed error: ${e.message}`)); },

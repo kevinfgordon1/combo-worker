@@ -42,6 +42,21 @@ function createDeletedFilter(forEachRfqId) {
   };
 }
 
+// O(1) per frame: pull the id / rfq_id string values out of the raw frame (no JSON.parse) and
+// look them up with hasRfqId(id) (Set/Map lookups), instead of scanning every open quote id with
+// String.includes. No id found => keep (fail open: the frame is parsed as before).
+const ID_RE = /"(?:rfq_id|id)"\s*:\s*"([^"]+)"/g;
+function createDeletedIdFilter(hasRfqId) {
+  return function shouldDropDeleted(raw) {
+    try {
+      const s = typeof raw === 'string' ? raw : String(raw == null ? '' : raw);
+      ID_RE.lastIndex = 0; let m; let found = false;
+      while ((m = ID_RE.exec(s)) !== null) { found = true; if (hasRfqId(m[1])) return false; }
+      return found;
+    } catch (_) { return false; }
+  };
+}
+
 // -> null (fresh / unknown age) | age in ms (too old)
 function tooOld(rfq, nowMs, maxAgeMs) {
   if (!(maxAgeMs > 0)) return null;
@@ -88,4 +103,4 @@ function createLatencyStats() {
   };
 }
 
-module.exports = { createLoopLagSampler, staleBucket, STAGES, createNflFrameFilter, createDeletedFilter, tooOld, createLatencyStats, NFL_NEEDLES, NBA_NEEDLES };
+module.exports = { createDeletedIdFilter, createLoopLagSampler, staleBucket, STAGES, createNflFrameFilter, createDeletedFilter, tooOld, createLatencyStats, NFL_NEEDLES, NBA_NEEDLES };

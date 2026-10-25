@@ -39,3 +39,15 @@ console.log('sniper intake ok');
   assert.strictEqual(l.snapshot().staleIntake, 0);
   assert.strictEqual(staleBucket(12000), '10-30s');
 }
+
+// O(1) rfq_deleted filter
+{
+  const { createDeletedIdFilter } = require('./intake');
+  const open = new Set(['rfq-hit']);
+  const f = createDeletedIdFilter((id) => open.has(id));
+  assert.strictEqual(f('{"type":"rfq_deleted","sid":3,"msg":{"id":"rfq-hit","market_ticker":"X"}}'), false);
+  assert.strictEqual(f('{"type":"rfq_deleted","sid":3,"msg":{"id":"other"}}'), true);
+  assert.strictEqual(f('{"type":"rfq_deleted","msg":{"rfq_id":"rfq-hit"}}'), false);
+  assert.strictEqual(f(Buffer.from('{"type":"rfq_deleted","msg":{"id":"other"}}')), true);
+  assert.strictEqual(f('{"type":"rfq_deleted","msg":{}}'), false); // no id => keep
+}
