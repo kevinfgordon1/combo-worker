@@ -49,8 +49,25 @@ function tooOld(rfq, nowMs, maxAgeMs) {
   return age != null && age > maxAgeMs ? age : null;
 }
 
+// Stage timing (per RFQ that reaches a stage): kalshi created -> received (ws tick) ->
+// handler start -> decided -> reserved -> posted, plus event-loop lag sampled every 200ms.
+// staleBuckets splits stale_at_intake by age so own-lag (2-5s) vs genuinely old (>10s) is visible.
+const STAGES = ['createdToRecv', 'recvToHandler', 'handlerToDecided', 'decidedToReserved', 'reservedToPosted', 'recvToPosted'];
+function emptyState() {
+  const st = {}; for (const k of STAGES) st[k] = [];
+  return { arrive: [], reserve: [], prePost: [], staleIntake: 0, staleReserve: 0, stage: st, loopLag: [], staleBuckets: { '2-5s': 0, '5-10s': 0, '10-30s': 0, '>30s': 0 } };
+}
+function staleBucket(ms) { return ms <= 5000 ? '2-5s' : ms <= 10000 ? '5-10s' : ms <= 30000 ? '10-30s' : '>30s'; }
+
+function createLoopLagSampler(push, everyMs = 200) {
+  let expected = Date.now() + everyMs;
+  const t = setInterval(() => { const n = Date.now(); push(Math.max(0, n - expected)); expected = n + everyMs; }, everyMs);
+  if (t.unref) t.unref();
+  return { stop: () => clearInterval(t) };
+}
+
 function createLatencyStats() {
-  let s = { arrive: [], reserve: [], prePost: [], staleIntake: 0, staleReserve: 0 };
+  let s = emptyState();
   const pct = (a, p) => (a.length ? a[Math.min(a.length - 1, Math.floor(a.length * p))] : null);
   const summ = (a) => { const x = [...a].sort((m, n) => m - n); return { n: x.length, p50: pct(x, 0.5), p90: pct(x, 0.9), max: x.length ? x[x.length - 1] : null }; };
   const push = (a, v) => { if (Number.isFinite(v)) { if (a.length < 20000) a.push(Math.round(v)); } };
@@ -58,14 +75,17 @@ function createLatencyStats() {
     arrive: (ms) => push(s.arrive, ms),
     reserve: (ms) => push(s.reserve, ms),
     prePost: (ms) => push(s.prePost, ms),
-    staleIntake: () => { s.staleIntake += 1; },
+    staleIntake: (ageMs) => { s.staleIntake += 1; if (Number.isFinite(ageMs)) s.staleBuckets[staleBucket(ageMs)] += 1; },
+    stage: (name, ms) => { if (s.stage[name]) push(s.stage[name], ms); },
+    loopLag: (ms) => push(s.loopLag, ms),
     staleReserve: () => { s.staleReserve += 1; },
     snapshot(reset = true) {
-      const out = { arriveAgeMs: summ(s.arrive), reserveMs: summ(s.reserve), prePostAgeMs: summ(s.prePost), staleIntake: s.staleIntake, staleReserve: s.staleReserve };
-      if (reset) s = { arrive: [], reserve: [], prePost: [], staleIntake: 0, staleReserve: 0 };
+      const stages = {}; for (const k of STAGES) stages[k] = summ(s.stage[k]);
+      const out = { arriveAgeMs: summ(s.arrive), reserveMs: summ(s.reserve), prePostAgeMs: summ(s.prePost), staleIntake: s.staleIntake, staleReserve: s.staleReserve, staleBuckets: { ...s.staleBuckets }, stages, loopLagMs: summ(s.loopLag) };
+      if (reset) s = emptyState();
       return out;
     },
   };
 }
 
-module.exports = { createNflFrameFilter, createDeletedFilter, tooOld, createLatencyStats, NFL_NEEDLES, NBA_NEEDLES };
+module.exports = { createLoopLagSampler, staleBucket, STAGES, createNflFrameFilter, createDeletedFilter, tooOld, createLatencyStats, NFL_NEEDLES, NBA_NEEDLES };
