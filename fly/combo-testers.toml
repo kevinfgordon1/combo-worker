@@ -19,11 +19,13 @@ kill_timeout = "30s"
   strategy = "immediate"
 
 [[vm]]
-  size = "shared-cpu-2x"
-  memory = "1gb"
-  # PROPOSED (not applied, needs Kevin's OK): 6 testers x (live-runner + fills-reader)
-  # plus one intake worker thread each on 2 shared vCPUs is still tight. If loop lag
-  # stays > 1s with TESTERS_PERF=1, move to size = "shared-cpu-4x", memory = "2gb".
+  # Was shared-cpu-2x / 1gb. On 2026-10-25 the machine stalled ~50 min after each
+  # restart: /proc/stat showed ~98% CPU steal (Fly shared-CPU quota exhausted ->
+  # host throttling), load avg 12-17 while the 6 live-runners only used ~0.2 core.
+  # Dedicated cores have no burst quota, so no throttle cliff.
+  # Rollback switch: size = "shared-cpu-2x", memory = "1gb".
+  size = "performance-1x"
+  memory = "2gb"
   # Still ONE machine.
 
 # EXACTLY ONE machine, ever. No [http_service]. Railway combo-testers must stay stopped.
