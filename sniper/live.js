@@ -10,6 +10,7 @@ const { snipeEconomics, minQuotePrice } = require('../auto-sniper');
 const { shouldConfirmAccept } = require('../engine');
 const { RESERVE_TTL_MS } = require('../reserve');
 const { formatFillAlert } = require('./fill-alert');
+const { mapLimit } = require('./release-batch');
 // 'http_409:rfq_closed' | 'stale_drop:queue_wait' | 'error' — Kalshi error body code when present.
 function postFailKey(err) {
   const m = String((err && err.message) || err || '');
@@ -24,7 +25,7 @@ function createLiveSniper({
   config, trader, store, coord, caps, reprice, alert = () => {}, log = console.log,
   now = () => Date.now(), ttlMs = RESERVE_TTL_MS, fillRetries = 4, fillRetryMs = 1500,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)), onHalt = () => {},
-  onHold = () => {}, startedReason = () => null, kickoffOf = () => null, onFilled = () => {}, // onFilled: book-arb check (alert-only) // kickoffOf: ticker -> kickoff ms (fill alert); startedReason: (rfq) -> 'game_started' | 'no_kickoff' | null (rule 9)
+  onHold = () => {}, startedReason = () => null, kickoffOf = () => null, onFilled = () => {}, pullConcurrency = 4, pullGuard = true, // onFilled: book-arb check (alert-only) // kickoffOf: ticker -> kickoff ms (fill alert); startedReason: (rfq) -> 'game_started' | 'no_kickoff' | null (rule 9)
 } = {}) {
   const pending = new Map(); // quoteId -> { d, rfq, accepted, timer }
   const byRfq = new Map(); // rfqId -> quoteId
@@ -126,15 +127,24 @@ function createLiveSniper({
     if (phase === 'declined') { bump(stats.declined, reason); log(`[SNIPER] DECLINE quote_id=${quoteId} rfq=${p.rfq.rfqId} reason=${reason}`); } else stats.cancelled += 1;
   }
   // Rule 9: pull every open (unconfirmed) quote touching a game that has reached commence time.
+  // Rule 9 sweep. One at a time (a 5s interval must never stack sweeps), cancels pullConcurrency wide.
+  let pulling = false; stats.pullSkipped = 0;
   async function pullStarted() {
-    let n = 0;
-    for (const [qid, p] of [...pending]) {
-      if (confirming.has(qid)) continue;
-      const r = startedReason(p.rfq); if (!r) continue;
-      await dropQuote(qid, p.accepted ? 'declined' : 'cancelled', r); n += 1;
-      log(`[SNIPER] PULLED quote_id=${qid} rfq=${p.rfq.rfqId} reason=${r}`);
-    }
-    return n;
+    if (pullGuard && pulling) { stats.pullSkipped += 1; return 0; }
+    pulling = true;
+    try {
+      const todo = [];
+      for (const [qid, p] of [...pending]) {
+        if (confirming.has(qid)) continue;
+        const r = startedReason(p.rfq); if (!r) continue;
+        todo.push([qid, p, r]);
+      }
+      await mapLimit(todo, pullConcurrency, async ([qid, p, r]) => {
+        await dropQuote(qid, p.accepted ? 'declined' : 'cancelled', r);
+        log(`[SNIPER] PULLED quote_id=${qid} rfq=${p.rfq.rfqId} reason=${r}`);
+      });
+      return todo.length;
+    } finally { pulling = false; }
   }
   async function expire(quoteId) {
     const p = pending.get(quoteId);
