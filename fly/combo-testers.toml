@@ -37,3 +37,5 @@ kill_timeout = "30s"
   # KALSHI_WS_SHARD_FACTOR=2, KALSHI_CLOCK_MIDPOINT=1, COMBO_NEAR_MISS_LOG=1.
   # Rollback: TESTERS_PERF = "0" (or TESTER_ENV_<NAME> = "0" for one piece).
   TESTERS_PERF = "1"
+  # Rollback of #278 (AND-per-lock filter dropped real matches 2026-10-25).
+  KALSHI_WS_NEEDLE_ALL = "0"
