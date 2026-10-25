@@ -29,7 +29,19 @@ function createLiveSniper({
   const pending = new Map(); // quoteId -> { d, rfq, accepted, timer }
   const byRfq = new Map(); // rfqId -> quoteId
   const confirming = new Set();
-  const stats = { posted: 0, postFail: 0, staleDrop: 0, postFailBy: {}, postMs: [], accepted: 0, confirmed: 0, declined: {}, fills: 0, cancelled: 0, settled: 0, aborted: {} };
+  // RFQs Kalshi has closed/deleted (ws rfq_deleted etc.). Kalshi drops our quote with the RFQ, so a
+  // routine TTL cancel for these is a wasted DELETE on the shared write budget. Bounded + aged.
+  const closed = new Map(); // rfqId -> closedAtMs
+  const CLOSED_KEEP_MS = 120000; const CLOSED_MAX = 20000;
+  const inflight = new Set(); // rfqIds with a quote POST in flight (no quoteId yet)
+  const ttlCancelling = new Set(); // rfqIds whose routine cancel is queued
+  const noteClosed = (rfqId) => {
+    if (!rfqId) return;
+    const t = now(); closed.set(rfqId, t);
+    if (closed.size > CLOSED_MAX) { for (const [k, v] of closed) { if (closed.size <= CLOSED_MAX && t - v < CLOSED_KEEP_MS) break; closed.delete(k); } }
+  };
+  const isClosed = (rfqId) => { const t = closed.get(rfqId); if (t == null) return false; if (now() - t > CLOSED_KEEP_MS) { closed.delete(rfqId); return false; } return true; };
+  const stats = { cancelSkipped: 0, posted: 0, postFail: 0, staleDrop: 0, postFailBy: {}, postMs: [], accepted: 0, confirmed: 0, declined: {}, fills: 0, cancelled: 0, settled: 0, aborted: {} };
   let halted = false;
   let haltReason = null; let haltDay = null;
   const etDayKey = (ms) => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
@@ -55,7 +67,9 @@ function createLiveSniper({
     if (!e || e.roi < (d.minRoi != null ? d.minRoi : config.minRoi) - 1e-12) return abort('reprice_below_min');
     let res;
     const tPost = now();
+    inflight.add(rfq.rfqId);
     try { res = await trader.postQuote(rfq, d.quoteYes, config.tick, { priority: Number.isFinite(e.ev) ? e.ev : 0 }); } catch (err) {
+      inflight.delete(rfq.rfqId);
       // Free the reservation first so a failed POST never sits in pending risk.
       stats.postMs.push(now() - tPost); if (stats.postMs.length > 200) stats.postMs.shift();
       await store.release(d.rfqId, 'failed', {});
@@ -64,10 +78,17 @@ function createLiveSniper({
       log(`[SNIPER] quote POST failed rfq=${rfq.rfqId} kind=${k} ms=${now() - tPost}: ${String(err.message || err).slice(0, 400)}`);
       return { sent: false, reason: k.startsWith('stale_drop') ? 'post_stale_drop' : 'post_failed' };
     }
+    inflight.delete(rfq.rfqId);
     stats.postMs.push(now() - tPost); if (stats.postMs.length > 200) stats.postMs.shift();
     if (!res.quoteId) { await store.release(d.rfqId, 'failed', {}); return { sent: false, reason: 'no_quote_id' }; }
     stats.posted += 1;
     await store.update(d.rfqId, { phase: 'quoted', quote_id: res.quoteId, no_bid: res.noBid });
+    if (isClosed(rfq.rfqId)) {
+      // RFQ closed while our POST was in flight: the quote died with it. No TTL timer, no cancel.
+      await store.release(d.rfqId, 'cancelled', {}); stats.cancelled += 1; stats.cancelSkipped += 1;
+      log(`[SNIPER] LIVE QUOTE rfq=${rfq.rfqId} quote_id=${res.quoteId} closed during POST, no cancel needed`);
+      return { sent: true, quoteId: res.quoteId };
+    }
     const entry = { d, rfq, accepted: false, yesBid: res.yesBid, timer: null };
     entry.timer = setTimeout(() => { expire(res.quoteId).catch(() => {}); }, ttlMs);
     if (entry.timer.unref) entry.timer.unref();
@@ -79,7 +100,18 @@ function createLiveSniper({
   async function dropQuote(quoteId, phase, reason) {
     const p = pending.get(quoteId); if (!p) return;
     clearTimeout(p.timer); pending.delete(quoteId); byRfq.delete(p.rfq.rfqId);
-    try { await trader.cancel(quoteId, { urgent: reason !== 'ttl' }); } catch (e) { log(`[SNIPER] cancel ${quoteId} failed: ${e.message}`); }
+    const rid = p.rfq.rfqId;
+    if (reason === 'ttl') {
+      // Routine cleanup only. Urgent cancels (price move / started game / decline / shutdown)
+      // always go out, even if we think the RFQ is gone.
+      if (isClosed(rid)) { stats.cancelSkipped += 1; }
+      else {
+        ttlCancelling.add(rid);
+        try { const r = await trader.cancel(quoteId, { urgent: false, skipIf: () => isClosed(rid) }); if (r && r.skipped) stats.cancelSkipped += 1; } catch (e) { log(`[SNIPER] cancel ${quoteId} failed: ${e.message}`); } finally { ttlCancelling.delete(rid); }
+      }
+    } else {
+      try { await trader.cancel(quoteId, { urgent: true }); } catch (e) { log(`[SNIPER] cancel ${quoteId} failed: ${e.message}`); }
+    }
     await store.release(p.d.rfqId, phase, {});
     if (phase === 'declined') { bump(stats.declined, reason); log(`[SNIPER] DECLINE quote_id=${quoteId} rfq=${p.rfq.rfqId} reason=${reason}`); } else stats.cancelled += 1;
   }
@@ -100,6 +132,7 @@ function createLiveSniper({
     await dropQuote(quoteId, 'cancelled', 'ttl');
   }
   async function onRfqClosed(evt) {
+    if (evt && evt.rfqId) noteClosed(evt.rfqId);
     const qid = evt && byRfq.get(evt.rfqId);
     const p = qid && pending.get(qid);
     if (!p || p.accepted || confirming.has(qid)) return;
@@ -211,7 +244,7 @@ function createLiveSniper({
     }
     return n;
   }
-  return { shutdown, stopping: () => stopping, send, forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); }, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, postMs: undefined, postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
+  return { shutdown, stopping: () => stopping, send, forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); for (const id of inflight) cb(id); for (const id of ttlCancelling) cb(id); }, isClosed, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, postMs: undefined, postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
 }
 
 module.exports = { createLiveSniper, postFailKey };

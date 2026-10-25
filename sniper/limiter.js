@@ -10,13 +10,14 @@ function createLimiter({ name, ratePerSec, burst = 1, now = () => Date.now(), sl
   // (routine TTL cancels). A caller yields while anyone at a higher level is waiting for a token.
   const waiting = [0, 0, 0];
   const higherWaiting = (p) => { for (let i = p + 1; i < waiting.length; i += 1) if (waiting[i] > 0) return true; return false; };
-  async function acquire(prio = 1) {
+  async function acquire(prio = 1, abortIf = null) {
     for (;;) {
+      if (abortIf && abortIf()) return false;
       const t = now();
       if (higherWaiting(prio)) { stats.waitedMs += 25; await sleep(25); continue; }
       if (t < backoffUntil) { const w = backoffUntil - t; stats.waitedMs += w; await sleep(w); continue; }
       refill();
-      if (tokens >= 1) { tokens -= 1; return; }
+      if (tokens >= 1) { tokens -= 1; return true; }
       const w = Math.ceil(((1 - tokens) / ratePerSec) * 1000); stats.waitedMs += w; await sleep(w);
     }
   }
@@ -27,10 +28,14 @@ function createLimiter({ name, ratePerSec, burst = 1, now = () => Date.now(), sl
   }
   function onOk() { stats.ok += 1; backoffMs = 0; }
   // fn() -> fetch Response-like ({ status, ok, json() })
-  async function run(fn, { low = false, priority } = {}) {
+  // abortIf(): checked while waiting for a token; true => give up without spending one and
+  // resolve { aborted: true } (used to skip a queued TTL cancel once Kalshi closed the RFQ).
+  async function run(fn, { low = false, priority, abortIf = null } = {}) {
     const prio = Math.max(0, Math.min(2, Number.isInteger(priority) ? priority : (low ? 0 : 1)));
     waiting[prio] += 1;
-    try { await acquire(prio); } finally { waiting[prio] -= 1; }
+    let got;
+    try { got = await acquire(prio, abortIf); } finally { waiting[prio] -= 1; }
+    if (!got) { stats.aborted = (stats.aborted || 0) + 1; return { aborted: true }; }
     stats.requests += 1;
     const r = await fn();
     if (r && r.status === 429) { on429(); const e = new Error(`${name} 429`); e.is429 = true; throw e; }
