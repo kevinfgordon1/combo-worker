@@ -13,7 +13,7 @@ const { lockLegOverlap } = require('../unhedged-boot');
 
 function createLockCoord({ supabase, pollMs = 5000, staleMs = 30000, now = Date.now, log = console.log,
   skipOverlap = /^(1|true|yes|on)$/i.test(String(process.env.SNIPER_SKIP_LOCK_OVERLAP || '')),
-  failClosed = /^(1|true|yes|on)$/i.test(String(process.env.SNIPER_LOCKS_FAIL_CLOSED || '')), warnEveryMs = 60000 } = {}) {
+  failClosed = /^(1|true|yes|on)$/i.test(String(process.env.SNIPER_LOCKS_FAIL_CLOSED || '')), warnEveryMs = 60000, cwTimeoutMs = Number(process.env.SNIPER_CW_CHECK_TIMEOUT_MS) || 300 } = {}) {
   let locks = []; let at = 0; let timer = null;
   const stats = { polls: 0, pollFail: 0, blocked: 0, staleChecks: 0, submissionsUnknown: 0 }; let lastWarn = 0;
   const isStale = () => !at || now() - at > staleMs;
@@ -42,7 +42,13 @@ function createLockCoord({ supabase, pollMs = 5000, staleMs = 30000, now = Date.
   // Async check against combo-worker's live submissions for this RFQ (read-only).
   async function comboWorkerQuoting(rfqId) {
     try {
-      const { data, error } = await supabase.from('combo_submissions').select('quote_id').eq('rfq_id', rfqId).eq('is_live', true).limit(1);
+      // Bounded: this query is on the quote hot path. A slow answer is treated like an unknown one.
+      let timer;
+      const q = supabase.from('combo_submissions').select('quote_id').eq('rfq_id', rfqId).eq('is_live', true).limit(1);
+      const r = await Promise.race([q, new Promise((res) => { timer = setTimeout(() => res({ timedOut: true }), cwTimeoutMs); })]);
+      clearTimeout(timer);
+      if (r && r.timedOut) { stats.cwTimeouts = (stats.cwTimeouts || 0) + 1; return unknownSubs(); }
+      const { data, error } = r;
       if (error) return unknownSubs();
       return (data && data.length) ? 'combo_worker_quoting' : null;
     } catch (_) { return unknownSubs(); }

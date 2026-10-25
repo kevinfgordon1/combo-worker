@@ -57,6 +57,7 @@ function createWriteBehindStore(store, {
     update: (rfqId, patch) => chain(rfqId, () => (failed.has(rfqId) ? false : store.update(rfqId, patch))),
     release: (rfqId, phase, extra) => chain(rfqId, () => (failed.has(rfqId) ? true : store.release(rfqId, phase, extra))),
     confirmCheck: (rfqId, risk, caps) => chain(rfqId, () => (failed.has(rfqId) ? { ok: false, reason: 'reserve_failed' } : store.confirmCheck(rfqId, risk, caps))),
+    backlog: () => stats.inflight + stats.queued,
     flush: () => Promise.allSettled([...tails.values()]),
     wbStats: () => { const s = { ...stats }; stats.maxMs = 0; return s; },
   };

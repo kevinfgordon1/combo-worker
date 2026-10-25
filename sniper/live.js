@@ -41,7 +41,7 @@ function createLiveSniper({
     if (closed.size > CLOSED_MAX) { for (const [k, v] of closed) { if (closed.size <= CLOSED_MAX && t - v < CLOSED_KEEP_MS) break; closed.delete(k); } }
   };
   const isClosed = (rfqId) => { const t = closed.get(rfqId); if (t == null) return false; if (now() - t > CLOSED_KEEP_MS) { closed.delete(rfqId); return false; } return true; };
-  const stats = { cancelSkipped: 0, posted: 0, postFail: 0, staleDrop: 0, postFailBy: {}, postMs: [], accepted: 0, confirmed: 0, declined: {}, fills: 0, cancelled: 0, settled: 0, aborted: {} };
+  const stats = { cancelSkipped: 0, posted: 0, postFail: 0, staleDrop: 0, postFailBy: {}, postMs: [], preMs: [], accepted: 0, confirmed: 0, declined: {}, fills: 0, cancelled: 0, settled: 0, aborted: {} };
   let halted = false;
   let haltReason = null; let haltDay = null;
   const etDayKey = (ms) => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
@@ -56,11 +56,17 @@ function createLiveSniper({
 
   // Called after decide() returned a quote AND the DB reservation succeeded.
   async function send(rfq, d) {
-    const abort = async (reason) => { bump(stats.aborted, reason); await store.release(d.rfqId, 'cancelled', {}); return { sent: false, reason }; };
+    // Releases are fire-and-forget here: with the write-behind store a release is chained after this
+    // RFQ's background reserve, and awaiting it made a failed POST look like it took ~55s (v49).
+    // liveStore.release frees the in-memory reservation synchronously before the DB write.
+    const bg = (p) => { Promise.resolve(p).catch((e) => log(`[SNIPER] release error rfq=${d.rfqId}: ${e && e.message}`)); };
+    const tSend = now();
+    const abort = async (reason) => { bump(stats.aborted, reason); bg(store.release(d.rfqId, 'cancelled', {})); return { sent: false, reason }; };
     if (!live()) return abort(halted ? 'halted' : 'not_live');
     const st = startedReason(rfq); if (st) return abort(st);
     const b = coord.blockReason(rfq); if (b) return abort(b);
     const cw = await coord.comboWorkerQuoting(rfq.rfqId); if (cw) return abort(cw);
+    stats.preMs.push(now() - tSend); if (stats.preMs.length > 200) stats.preMs.shift();
     // Re-price at send time with the freshest books.
     const fresh = reprice(rfq);
     const e = roiAt(d, fresh);
@@ -71,11 +77,12 @@ function createLiveSniper({
     try { res = await trader.postQuote(rfq, d.quoteYes, config.tick, { priority: Number.isFinite(e.ev) ? e.ev : 0 }); } catch (err) {
       inflight.delete(rfq.rfqId);
       // Free the reservation first so a failed POST never sits in pending risk.
-      stats.postMs.push(now() - tPost); if (stats.postMs.length > 200) stats.postMs.shift();
-      await store.release(d.rfqId, 'failed', {});
+      const postMs = now() - tPost;
+      stats.postMs.push(postMs); if (stats.postMs.length > 200) stats.postMs.shift();
+      bg(store.release(d.rfqId, 'failed', {}));
       const k = postFailKey(err); bump(stats.postFailBy, k);
       if (k.startsWith('stale_drop')) stats.staleDrop += 1; else stats.postFail += 1;
-      log(`[SNIPER] quote POST failed rfq=${rfq.rfqId} kind=${k} ms=${now() - tPost}: ${String(err.message || err).slice(0, 400)}`);
+      log(`[SNIPER] quote POST failed rfq=${rfq.rfqId} kind=${k} ms=${postMs} pre=${tPost - tSend}: ${String(err.message || err).slice(0, 400)}`);
       return { sent: false, reason: k.startsWith('stale_drop') ? 'post_stale_drop' : 'post_failed' };
     }
     inflight.delete(rfq.rfqId);
@@ -253,7 +260,7 @@ function createLiveSniper({
     }
     return n;
   }
-  return { shutdown, stopping: () => stopping, send, abortRfq, hasRfqId: (id) => byRfq.has(id) || inflight.has(id) || ttlCancelling.has(id), forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); for (const id of inflight) cb(id); for (const id of ttlCancelling) cb(id); }, isClosed, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, postMs: undefined, postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
+  return { shutdown, stopping: () => stopping, send, abortRfq, hasRfqId: (id) => byRfq.has(id) || inflight.has(id) || ttlCancelling.has(id), forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); for (const id of inflight) cb(id); for (const id of ttlCancelling) cb(id); }, isClosed, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, postMs: undefined, preMs: undefined, preP50: (() => { const b = [...stats.preMs].sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : null; })(), postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
 }
 
 module.exports = { createLiveSniper, postFailKey };

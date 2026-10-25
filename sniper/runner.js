@@ -365,6 +365,8 @@ async function main(env = process.env) {
     { concurrency: num(env.SNIPER_WB_CONCURRENCY, 8), log, alert: (m) => alert(m), onReserveFailed: (id, r) => onReserveFailedRef(id, r) },
   ) : null;
   const hotStore = wbStore || store;
+  const wbMaxBacklog = num(env.SNIPER_WB_MAX_BACKLOG, 16);
+  const tradeRps = Math.max(1, num(env.SNIPER_KALSHI_TRADE_RPS, 8));
   // Startup sweep (live): rows a previous process left 'reserved' / 'quoted' (its 20s quote
   // timers died with it). Cancel the Kalshi quote (404 = already gone), then release the row,
   // BEFORE hydrating so stale reservations never count as open exposure.
@@ -523,6 +525,17 @@ async function main(env = process.env) {
       if (projected != null && projected > postDeadlineMs) {
         ledger.positions.delete(d.rfqId); ledger.hour.pop();
         counts.skips.cant_make_expiry = (counts.skips.cant_make_expiry || 0) + 1; return;
+      }
+    }
+    // Back-pressure (v49 regression): with the reserve off the hot path nothing throttled intake, so
+    // the background reserve queue and the quote-sender queue grew until every POST aged out.
+    if (gate.live && !config.dryRun) {
+      if (wbStore && wbStore.backlog() > wbMaxBacklog) { ledger.positions.delete(d.rfqId); ledger.hour.pop(); counts.skips.wb_backlog = (counts.skips.wb_backlog || 0) + 1; return; }
+      const age = rfqAgeMs(rfq.createdTs, signedNow());
+      const ts = trader.stats();
+      const queueWaitMs = ((ts.queued || 0) + (ts.active || 0)) * 1000 / tradeRps;
+      if (age != null && age + queueWaitMs + Math.min(liveSniper.stats().postP50 || 150, 1000) > postDeadlineMs) {
+        ledger.positions.delete(d.rfqId); ledger.hour.pop(); counts.skips.cant_make_queue = (counts.skips.cant_make_queue || 0) + 1; return;
       }
     }
     const t0 = Date.now();
