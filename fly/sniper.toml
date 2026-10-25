@@ -16,8 +16,8 @@ kill_timeout = "30s"
   strategy = "immediate"
 
 [[vm]]
-  size = "performance-1x"
-  memory = "2gb"
+  size = "performance-2x"   # Kevin Oct 25: event-loop lag, 2 CPUs
+  memory = "4gb"
 
 # One machine. Stays dry-run until Kevin flips it.
 [env]
