@@ -9,6 +9,7 @@
 // SNIPER_LIVE_CONFIRM token, own key). Otherwise every quote/confirm/cancel is refused.
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
+const { createWriteBehindStore, memoryCapReason, isLongPos } = require('./write-behind');
 const { createKalshiFirehose, readShardFactor, DEFAULT_LIVE_SHARD_FACTOR, summarizeThroughput } = require('../kalshi-ws');
 const { normalizePem, authHeaders: kalshiAuthHeaders } = require('../kalshi-auth');
 const { createKalshiBookFeed, createBookRouter } = require('./book-ws');
@@ -354,6 +355,16 @@ async function main(env = process.env) {
   const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
   const store = createLedgerStore({ supabase, log });
   const ledger = createSniperLedger({ dayRiskOnAdd: false });
+  ledger.shortSettleHours = config.shortSettleHours;
+  // Write-behind (SNIPER_WRITE_BEHIND=0 = old blocking reserve). Own Supabase client so ledger
+  // writes never queue behind decision logs / lock polls on the shared client.
+  const writeBehind = String(env.SNIPER_WRITE_BEHIND || '1') !== '0';
+  let onReserveFailedRef = async () => {};
+  const wbStore = writeBehind ? createWriteBehindStore(
+    createLedgerStore({ supabase: createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } }), log }),
+    { concurrency: num(env.SNIPER_WB_CONCURRENCY, 8), log, alert: (m) => alert(m), onReserveFailed: (id, r) => onReserveFailedRef(id, r) },
+  ) : null;
+  const hotStore = wbStore || store;
   // Startup sweep (live): rows a previous process left 'reserved' / 'quoted' (its 20s quote
   // timers died with it). Cancel the Kalshi quote (404 = already gone), then release the row,
   // BEFORE hydrating so stale reservations never count as open exposure.
@@ -386,7 +397,7 @@ async function main(env = process.env) {
   const pendingHoldMs = num(env.SNIPER_PENDING_HOLD_MS, RESERVE_TTL_MS + 60000);
   async function onHold(d) {
     const pos = ledger.positions.get(d.rfqId); if (pos) pos.releaseAt = d.releaseAt;
-    await store.update(d.rfqId, { release_at: new Date(d.releaseAt).toISOString() });
+    await hotStore.update(d.rfqId, { release_at: new Date(d.releaseAt).toISOString() });
   }
   const coord = createLockCoord({ supabase, log });
   coord.start();
@@ -397,12 +408,12 @@ async function main(env = process.env) {
   });
   // Releasing in the DB also frees the in-memory reservation (cancelled/declined/failed/settled).
   const liveStore = {
-    ...store,
+    ...hotStore,
     release: async (rfqId, phase, extra) => {
       const p = ledger.positions.get(rfqId);
       if (p) ledger.positions.delete(rfqId);
       if (phase === 'settled' && extra && Number(extra.realized_pnl) < 0) ledger.recordRealizedLoss(-Number(extra.realized_pnl));
-      return store.release(rfqId, phase, extra);
+      return hotStore.release(rfqId, phase, extra);
     },
   };
   // Sportsbook arb check on fills (alert-only; reads player_prop_cache + odds_cache). SNIPER_BOOK_ARB=0 turns it off.
@@ -520,7 +531,12 @@ async function main(env = process.env) {
     // onHold extends to d.releaseAt (games settle) once a taker accepts.
     const holdAt = gate.live && !config.dryRun ? Date.now() + pendingHoldMs : d.releaseAt;
     const pos0 = ledger.positions.get(d.rfqId); if (pos0) pos0.releaseAt = holdAt;
-    const res = await store.reserve(d, { releaseAt: holdAt, dryRun: config.dryRun, caps: caps(), marketTicker: rfq.marketTicker || null });
+    // In-memory long-settle cap (all other caps already checked in memory by decide()).
+    const lc = memoryCapReason(ledger, d.rfqId, { risk: d.risk, settleAt: d.settleAt, nowMs: Date.now(), longCap: config.longExposureCap, shortHours: config.shortSettleHours });
+    if (lc) { ledger.positions.delete(d.rfqId); ledger.hour.pop(); counts.skips[lc] = (counts.skips[lc] || 0) + 1; return; }
+    { const pm = ledger.positions.get(d.rfqId); if (pm) pm.long = isLongPos(d.settleAt, Date.now(), config.shortSettleHours); }
+    let res = (gate.live && !config.dryRun ? hotStore : store).reserve(d, { releaseAt: holdAt, dryRun: config.dryRun, caps: caps(), marketTicker: rfq.marketTicker || null });
+    if (res && typeof res.then === 'function') res = await res; // blocking path (dry run / SNIPER_WRITE_BEHIND=0)
     lat.reserve(Date.now() - t0); reserveEst.add(Date.now() - t0); lat.stage('decidedToReserved', Date.now() - tDecided);
     const tReserved = Date.now();
     if (!res.ok) {
@@ -574,6 +590,8 @@ async function main(env = process.env) {
     onQuoteExecuted: (evt) => { liveSniper.onExecuted(evt).catch((e) => log(`[SNIPER] executed error: ${e.message}`)); },
     onStatus: (s, info) => log(`[SNIPER] ws ${typeof s === 'string' ? s : JSON.stringify(s)}${info ? ` ${JSON.stringify(info)}` : ''}`),
   });
+  // Background reserve failed (DB cap reason or repeated db_error): free memory + pull the quote.
+  onReserveFailedRef = async (rfqId, reason) => { ledger.positions.delete(rfqId); counts.skips[`wb_${reason}`] = (counts.skips[`wb_${reason}`] || 0) + 1; await liveSniper.abortRfq(rfqId, `reserve_${reason}`); };
   if (ws && typeof ws.start === 'function') ws.start(); else if (ws && typeof ws.connect === 'function') ws.connect();
 
   setInterval(() => { liveSniper.pullStarted().catch((e) => log(`[SNIPER] pullStarted error: ${e.message}`)); }, 5000);
@@ -594,7 +612,7 @@ async function main(env = process.env) {
     log(`[SNIPER] summary mode=${gate.live ? 'LIVE' : 'dry'}${liveSniper.halted() ? ' HALTED' : ''} live=${JSON.stringify(liveSniper.stats())} trade=${JSON.stringify(trader.stats())} locks=${JSON.stringify(coord.stats())} kickoffs=${JSON.stringify(kickoffs.stats())} rfqs=${counts.rfqs} would_quote=${counts.quotes} open=$${t.total.toFixed(2)} positions=${ledger.positions.size} filled_today=$${ledger.day.risk.toFixed(2)} (${ledger.day.fills} fills) pending=$${ledger.day.pending.toFixed(2)} breaker429=${breaker.count()} relayErr=${JSON.stringify(relayErr)} tdOff=${[...tdOff.keys()].join(',') || 'none'} ${disabled ? 'DISABLED' : ''} books=${JSON.stringify({ ...bookRouter.stats(), ws: bookFeed ? bookFeed.stats() : 'off' })} load: ${ls} skips: ${s || 'none'}`);
     const latency = lat.snapshot();
     const wsThroughput = () => { try { if (!ws || typeof ws.takeThroughput !== 'function') return null; const t = summarizeThroughput(ws.takeThroughput()); delete t.perShard; return t; } catch (_) { return null; } };
-    log(`[SNIPER] latency ${JSON.stringify(latency)} ws=${JSON.stringify(wsThroughput())}`);
+    log(`[SNIPER] latency ${JSON.stringify(latency)} wb=${wbStore ? JSON.stringify(wbStore.wbStats()) : 'off'} ws=${JSON.stringify(wsThroughput())}`);
     store.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts: JSON.parse(JSON.stringify(counts)), live: liveSniper.stats(), reserveEstMs: Math.round(reserveEst.get()), caps: effectiveCaps, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
     counts.rfqs = 0; counts.quotes = 0; counts.skips = {};
   }, 60000);
