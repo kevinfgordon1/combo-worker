@@ -11,6 +11,7 @@
 const { createClient } = require('@supabase/supabase-js');
 const { createIntakeWorker } = require('./intake-host');
 const { maybeStartCpuProfile } = require('./cpu-prof');
+const { createReleaseBatcher, withReserveTimeout, isSkipDecision } = require('./release-batch');
 const { writeBehindEnabled, createWriteBehindStore, memoryCapReason, isLongPos } = require('./write-behind');
 const { createKalshiFirehose, readShardFactor, DEFAULT_LIVE_SHARD_FACTOR, summarizeThroughput } = require('../kalshi-ws');
 const { normalizePem, authHeaders: kalshiAuthHeaders } = require('../kalshi-auth');
@@ -358,8 +359,13 @@ async function main(env = process.env) {
   const store = createLedgerStore({ supabase, log });
   // Decision-log writes (one insert per quote / abort / summary) on their own client so they never
   // queue ahead of reserves, lock polls and the combo_submissions check. SNIPER_DECISION_CLIENT=0 = shared.
-  const decisionStore = String(env.SNIPER_DECISION_CLIENT || '1') === '0' ? store
+  const decisionStoreRaw = String(env.SNIPER_DECISION_CLIENT || '1') === '0' ? store
     : createLedgerStore({ supabase: createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } }), log });
+  // SNIPER_DECISION_LOG_SKIPS=1 restores rows for un-quoted RFQs (aborted / rogue_line); default off
+  // (~half of sniper_decisions). Counts still land in the per-minute summary row.
+  const logSkips = String(env.SNIPER_DECISION_LOG_SKIPS || '0') === '1';
+  const decisionStore = logSkips ? decisionStoreRaw
+    : { ...decisionStoreRaw, decision: (rec) => (isSkipDecision(rec) ? Promise.resolve() : decisionStoreRaw.decision(rec)) };
   maybeStartCpuProfile('main', env, log);
   const ledger = createSniperLedger({ dayRiskOnAdd: false });
   ledger.shortSettleHours = config.shortSettleHours;
@@ -371,7 +377,15 @@ async function main(env = process.env) {
     createLedgerStore({ supabase: createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } }), log }),
     { concurrency: num(env.SNIPER_WB_CONCURRENCY, 8), log, alert: (m) => alert(m), onReserveFailed: (id, r) => onReserveFailedRef(id, r) },
   ) : null;
-  const hotStore = wbStore || store;
+  // Reserve path on its OWN client (SNIPER_RESERVE_CLIENT=0 = shared with cancels/updates), so a
+  // burst of release UPDATEs can't queue ahead of reserves (Oct 25 2026: reserve p50 15s).
+  const reserveStore = String(env.SNIPER_RESERVE_CLIENT || '1') === '0' ? store
+    : createLedgerStore({ supabase: createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } }), log });
+  const hotStore = wbStore || reserveStore;
+  const reserveTimeoutMs = num(env.SNIPER_RESERVE_TIMEOUT_MS, 1500); // 0 = no timeout
+  // Routine releases batched every SNIPER_RELEASE_BATCH_MS (0 = one UPDATE per release, old path).
+  const releaseBatchMs = num(env.SNIPER_RELEASE_BATCH_MS, 250);
+  const releaseBatcher = releaseBatchMs > 0 ? createReleaseBatcher({ supabase, flushMs: releaseBatchMs, log, fallback: (id, ph) => store.release(id, ph, {}) }) : null;
   const wbMaxBacklog = num(env.SNIPER_WB_MAX_BACKLOG, 16);
   const tradeRps = Math.max(1, num(env.SNIPER_KALSHI_TRADE_RPS, 8));
   // Startup sweep (live): rows a previous process left 'reserved' / 'quoted' (its 20s quote
@@ -422,6 +436,7 @@ async function main(env = process.env) {
       const p = ledger.positions.get(rfqId);
       if (p) ledger.positions.delete(rfqId);
       if (phase === 'settled' && extra && Number(extra.realized_pnl) < 0) ledger.recordRealizedLoss(-Number(extra.realized_pnl));
+      if (releaseBatcher && !wbStore && releaseBatcher.canBatch(phase, extra)) return releaseBatcher.release(rfqId, phase);
       return hotStore.release(rfqId, phase, extra);
     },
   };
@@ -435,6 +450,7 @@ async function main(env = process.env) {
   if (bookArb && gate.live) loop(() => bookArb.recheckOpen(), 'book_arb', num(env.SNIPER_BOOK_ARB_POLL_MS, 300000));
   const liveSniper = createLiveSniper({
     config, trader, store: liveStore, coord, caps, log, onHold,
+    pullConcurrency: Math.max(1, num(env.SNIPER_PULL_CONCURRENCY, 4)), pullGuard: String(env.SNIPER_PULL_GUARD || '1') !== '0',
     reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook, ncaaf: !!ncaafBook }),
     alert,
     onFilled: (f) => (bookArb ? bookArb.check(f, 'fill') : null),
@@ -556,7 +572,12 @@ async function main(env = process.env) {
     if (lc) { ledger.positions.delete(d.rfqId); ledger.hour.pop(); counts.skips[lc] = (counts.skips[lc] || 0) + 1; return; }
     { const pm = ledger.positions.get(d.rfqId); if (pm) pm.long = isLongPos(d.settleAt, Date.now(), config.shortSettleHours); }
     let res = (gate.live && !config.dryRun ? hotStore : store).reserve(d, { releaseAt: holdAt, dryRun: config.dryRun, caps: caps(), marketTicker: rfq.marketTicker || null });
-    if (res && typeof res.then === 'function') res = await res; // blocking path (dry run / SNIPER_WRITE_BEHIND=0)
+    if (res && typeof res.then === 'function') {
+      // blocking path (dry run / SNIPER_WRITE_BEHIND=0). Live: give up after reserveTimeoutMs so a slow
+      // DB drops this quote fast instead of making it stale; a late 'ok' row is released.
+      const rid = d.rfqId;
+      res = await (gate.live && !config.dryRun ? withReserveTimeout(res, reserveTimeoutMs, () => { store.release(rid, 'failed', {}).catch(() => {}); }) : res);
+    }
     lat.reserve(Date.now() - t0); reserveEst.add(Date.now() - t0); lat.stage('decidedToReserved', Date.now() - tDecided);
     const tReserved = Date.now();
     if (!res.ok) {
