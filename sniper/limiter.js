@@ -6,9 +6,12 @@ function createLimiter({ name, ratePerSec, burst = 1, now = () => Date.now(), sl
   let tokens = burst; let last = now(); let backoffUntil = 0; let backoffMs = 0;
   const stats = { name, requests: 0, ok: 0, errors: 0, r429: 0, waitedMs: 0 };
   function refill() { const t = now(); tokens = Math.min(burst, tokens + ((t - last) / 1000) * ratePerSec); last = t; }
-  async function acquire() {
+  let highWaiting = 0;
+  // low=true callers (e.g. quote cancels) yield while any normal caller is waiting for a token.
+  async function acquire(low = false) {
     for (;;) {
       const t = now();
+      if (low && highWaiting > 0) { stats.waitedMs += 25; await sleep(25); continue; }
       if (t < backoffUntil) { const w = backoffUntil - t; stats.waitedMs += w; await sleep(w); continue; }
       refill();
       if (tokens >= 1) { tokens -= 1; return; }
@@ -22,8 +25,9 @@ function createLimiter({ name, ratePerSec, burst = 1, now = () => Date.now(), sl
   }
   function onOk() { stats.ok += 1; backoffMs = 0; }
   // fn() -> fetch Response-like ({ status, ok, json() })
-  async function run(fn) {
-    await acquire();
+  async function run(fn, { low = false } = {}) {
+    if (!low) highWaiting += 1;
+    try { await acquire(low); } finally { if (!low) highWaiting -= 1; }
     stats.requests += 1;
     const r = await fn();
     if (r && r.status === 429) { on429(); const e = new Error(`${name} 429`); e.is429 = true; throw e; }

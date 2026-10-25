@@ -86,6 +86,8 @@ async function main(env = process.env) {
     kalshiSeries: createLimiter({ name: 'kalshi_series', ratePerSec: 0.2, burst: 2 }),
     // signed calls on the sniper's own key (quote POST/confirm/cancel, fills reads)
     kalshiTrade: createLimiter({ name: 'kalshi_trade', ratePerSec: num(env.SNIPER_KALSHI_TRADE_RPS, 5), burst: 5 }),
+    // Authenticated reads (fill lookups) use Kalshi's separate Read bucket — keep them off the write lane.
+    kalshiTradeRead: createLimiter({ name: 'kalshi_trade_read', ratePerSec: num(env.SNIPER_KALSHI_READ_RPS, 3), burst: 3 }),
     kalshiSettle: createLimiter({ name: 'kalshi_settle', ratePerSec: 0.5, burst: 2 }),
   };
   let disabled = false;
@@ -366,7 +368,8 @@ async function main(env = process.env) {
   coord.start();
   const trader = createSniperTrader({
     gate, keyId: env.SNIPER_KALSHI_KEY_ID, pem: normalizePem(env.SNIPER_KALSHI_PRIVATE_KEY || ''),
-    subaccount: sniperSubaccount(env), limiter: lim.kalshiTrade, log,
+    subaccount: sniperSubaccount(env), limiter: lim.kalshiTrade, readLimiter: lim.kalshiTradeRead, log,
+    maxConcurrent: num(env.SNIPER_QUOTE_CONCURRENCY, 8), maxQueued: num(env.SNIPER_QUOTE_MAX_QUEUED, 24),
   });
   // Releasing in the DB also frees the in-memory reservation (cancelled/declined/failed/settled).
   const liveStore = {

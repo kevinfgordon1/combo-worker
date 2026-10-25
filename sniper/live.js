@@ -55,7 +55,7 @@ function createLiveSniper({
     if (!e || e.roi < (d.minRoi != null ? d.minRoi : config.minRoi) - 1e-12) return abort('reprice_below_min');
     let res;
     const tPost = now();
-    try { res = await trader.postQuote(rfq, d.quoteYes, config.tick); } catch (err) {
+    try { res = await trader.postQuote(rfq, d.quoteYes, config.tick, { priority: Number.isFinite(e.ev) ? e.ev : 0 }); } catch (err) {
       // Free the reservation first so a failed POST never sits in pending risk.
       stats.postMs.push(now() - tPost); if (stats.postMs.length > 200) stats.postMs.shift();
       await store.release(d.rfqId, 'failed', {});
