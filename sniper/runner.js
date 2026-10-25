@@ -17,6 +17,8 @@ const { createProphetXClient, hasProphetXCreds, authMode } = require('../noboost
 const { createSeriesFeeCache, seriesOfTicker } = require('../series-fee');
 const { sniperConfig, createSniperLedger, formatDecision, createTelegramNotifier } = require('../auto-sniper');
 const { createLimiter, createRateBreaker } = require('./limiter');
+const { fetchWithTimeout } = require('./fetch-timeout');
+const { createStaleAlert } = require('./stale-alert');
 const { createLedgerStore } = require('./ledger-store');
 const { createBookArbWatch } = require('./book-arb-watch');
 const { loadBookData } = require('./book-arb');
@@ -92,11 +94,13 @@ async function main(env = process.env) {
     max: num(env.SNIPER_MAX_429, 5), windowMs: num(env.SNIPER_429_WINDOW_MS, 10 * 60 * 1000),
     onTrip: (venue, n) => { disabled = true; if (typeof liveSniperRef === 'function') liveSniperRef(); alert(`[SNIPER] AUTO-DISABLED: ${n} rate-limit (429) errors in window (last: ${venue}). All polling stopped. Restart the sniper service to re-enable.`); },
   });
+  // Hard per-request deadline (incl. body). Without it a hung socket stalled kalshi_books for minutes.
+  const fetchTimeoutMs = num(env.SNIPER_FETCH_TIMEOUT_MS, 8000);
   const getJson = async (limiter, url) => {
     if (disabled) throw new Error('disabled');
     try {
-      const r = await limiter.run(() => fetch(url, { headers: { accept: 'application/json' } }));
-      return r.json();
+      const r = await limiter.run(() => fetchWithTimeout(fetch, url, { headers: { accept: 'application/json' } }, fetchTimeoutMs));
+      return await r.json();
     } catch (e) { if (e.is429) breaker.hit(limiter.stats().name); throw e; }
   };
 
@@ -174,9 +178,14 @@ async function main(env = process.env) {
       sink(j.orderbooks || []);
     }
   }
-  async function pollKalshi() {
+  // NFL ML books (the pricesHealthy gate) poll in their own loop; the slower NCAAF / NBA / lines /
+  // TD books run in pollKalshi so a slow or failing chunk there can't stall the gate.
+  async function pollKalshiMl() {
     if (!listedAt || Date.now() - listedAt > 120000) await refreshLists();
     await books(mlTickers, (o) => pmLive.ingestKalshiOrderbooks(o)); health.ml = Date.now();
+  }
+  async function pollKalshi() {
+    if (!listedAt) return;
     if (ncaafBook) await books(ncaafTickers, (o) => ncaafBook.ingestKalshiOrderbooks(o));
     if (nbaBook) await books(nbaTickers, (o) => nbaBook.ingestKalshiOrderbooks(o));
     if (linesBook) await books(linesBook.mainTickers(lineTickers), (o) => linesBook.ingestKalshiOrderbooks(o)); // main-line strikes only
@@ -276,6 +285,7 @@ async function main(env = process.env) {
     };
     tick();
   };
+  loop(pollKalshiMl, 'kalshi_ml_books', num(env.SNIPER_KALSHI_ML_POLL_MS, 3000));
   loop(pollKalshi, 'kalshi_books', num(env.SNIPER_KALSHI_POLL_MS, 5000));
   loop(pollRelay, 'relay', num(env.SNIPER_RELAY_POLL_MS, 3000));
   async function pollKickoffs() {
@@ -410,6 +420,9 @@ async function main(env = process.env) {
   // ── RFQ intake: own Kalshi WebSocket (push; no REST polling) ──
   const counts = { rfqs: 0, quotes: 0, skips: {}, ledgerFail: 0 };
   const pricesHealthy = () => Date.now() - health.ml < 30000;
+  // >50% of RFQs skipped as prices_stale over 10 min → Telegram (existing alert path), once per episode.
+  const staleAlert = createStaleAlert({ windowMs: num(env.SNIPER_STALE_ALERT_WINDOW_MS, 600000), ratio: num(env.SNIPER_STALE_ALERT_RATIO, 0.5), alert });
+  setInterval(() => staleAlert.check(), 60000).unref?.();
   // Age budget: an RFQ older than this at intake (or after the DB reserve) is skipped before any
   // pricing / reservation work. Quote-sender still hard-drops at 3s right before the POST.
   const maxAgeMs = num(env.SNIPER_MAX_RFQ_AGE_MS, 2000);
@@ -451,6 +464,7 @@ async function main(env = process.env) {
     try { const e = await fees.prefetch(seriesOfTicker(rfq.marketTicker)); makerRate = e ? e.rate : null; } catch (_) { makerRate = null; }
     const nowMs = Date.now();
     const { decision: d } = decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook, linesBook, nbaBook, venues, kickoffFor, makerRate, nowMs, pricesHealthy: pricesHealthy() });
+    staleAlert.record(d.reason === 'prices_stale');
     if (d.rogue && d.rogue.length) logRogue(d);
     if (d.action !== 'quote') { counts.skips[d.reason] = (counts.skips[d.reason] || 0) + 1; return; }
     // Re-check age right before the DB reserve (fees prefetch can await on a cold series).
