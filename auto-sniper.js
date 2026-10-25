@@ -150,14 +150,19 @@ function createSniperLedger({ dayRiskOnAdd = true } = {}) {
   }
   function totals() {
     let total = 0; const games = new Map(); const legs = new Map(); const combos = new Set();
+    // Resting (posted, not accepted) quotes count at restingWeight (SNIPER_RESTING_CAP_WEIGHT, default 1).
+    const w = Number.isFinite(api.restingWeight) ? Math.min(1, Math.max(0, api.restingWeight)) : 1;
+    let committed = 0; let resting = 0;
     for (const p of positions.values()) {
-      total += p.risk; combos.add(p.combo);
-      for (const g of p.games) games.set(g, (games.get(g) || 0) + p.risk);
-      for (const l of p.legs) legs.set(l, (legs.get(l) || 0) + p.risk);
+      const r = p.resting ? p.risk * w : p.risk;
+      if (p.resting) resting += p.risk; else committed += p.risk;
+      total += r; combos.add(p.combo);
+      for (const g of p.games) games.set(g, (games.get(g) || 0) + r);
+      for (const l of p.legs) legs.set(l, (legs.get(l) || 0) + r);
     }
-    return { total, games, legs, combos };
+    return { total, games, legs, combos, committed, resting };
   }
-  return {
+  const api = {
     prune, totals, seenRfqs, day, hour, positions, dayRiskOnAdd,
     // Day totals from the DB (same query as the cap). Marks the ET day so prune() won't zero it.
     setDayExposure({ filled, pending, fills }, nowMs = Date.now()) {
@@ -168,6 +173,8 @@ function createSniperLedger({ dayRiskOnAdd = true } = {}) {
     },
     recordRealizedLoss(amount, nowMs = Date.now()) { prune(nowMs); if (amount > 0) day.loss += amount; },
   };
+  api.restingWeight = 1;
+  return api;
 }
 
 function skip(reason, extra) { return { action: 'skip', reason, ...(extra || {}) }; }

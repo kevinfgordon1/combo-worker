@@ -66,6 +66,13 @@ function etDayStartIso(ms) {
 
 async function main(env = process.env) {
   const config = sniperConfig(env);
+  // Resting-quote controls (Oct 25 2026). Each has its own switch; see PR.
+  //  SNIPER_QUOTE_TTL_MS: unaccepted quote life (old 20000). All 35 fills in 36h came 3.1-10.1s after reserve.
+  //  SNIPER_RESTING_CAP_WEIGHT: share of a resting quote's risk counted toward total/game/leg caps (1 = old).
+  //  SNIPER_RESERVE_LOCK: 'combo' = per-bet lock in sniper_reserve (needs migration 20261025b), 'global' = old.
+  const quoteTtlMs = Math.max(5000, num(env.SNIPER_QUOTE_TTL_MS, 12000));
+  config.restingCapWeight = Math.min(1, Math.max(0, num(env.SNIPER_RESTING_CAP_WEIGHT, 0.5)));
+  config.reserveLock = String(env.SNIPER_RESERVE_LOCK || 'combo') === 'global' ? 'global' : 'combo';
   const venues = venuesFromEnv(env);
   const depth = num(env.SNIPER_FAIR_DEPTH_USD, 1000); // NFL player-TD legs (Kevin: stays $1,000)
   // Game lines (NFL moneyline + college ML, later spreads/totals): Kevin Oct 23 → $2,000 per leg.
@@ -369,6 +376,7 @@ async function main(env = process.env) {
   maybeStartCpuProfile('main', env, log);
   const ledger = createSniperLedger({ dayRiskOnAdd: false });
   ledger.shortSettleHours = config.shortSettleHours;
+  ledger.restingWeight = config.restingCapWeight;
   // Write-behind (SNIPER_WRITE_BEHIND=0 = old blocking reserve). Own Supabase client so ledger
   // writes never queue behind decision logs / lock polls on the shared client.
   const writeBehind = writeBehindEnabled(env);
@@ -417,9 +425,9 @@ async function main(env = process.env) {
     loop(() => closeSnap.tick(), 'close_snapshot', num(env.SNIPER_CLOSE_POLL_MS, 60000));
   }
   const caps = () => capsFrom(config, etDayStartIso(Date.now()), gate.live);
-  const pendingHoldMs = num(env.SNIPER_PENDING_HOLD_MS, RESERVE_TTL_MS + 60000);
+  const pendingHoldMs = num(env.SNIPER_PENDING_HOLD_MS, quoteTtlMs + 60000);
   async function onHold(d) {
-    const pos = ledger.positions.get(d.rfqId); if (pos) pos.releaseAt = d.releaseAt;
+    const pos = ledger.positions.get(d.rfqId); if (pos) { pos.releaseAt = d.releaseAt; pos.resting = false; }
     await hotStore.update(d.rfqId, { release_at: new Date(d.releaseAt).toISOString() });
   }
   const coord = createLockCoord({ supabase, log });
@@ -449,7 +457,7 @@ async function main(env = process.env) {
   });
   if (bookArb && gate.live) loop(() => bookArb.recheckOpen(), 'book_arb', num(env.SNIPER_BOOK_ARB_POLL_MS, 300000));
   const liveSniper = createLiveSniper({
-    config, trader, store: liveStore, coord, caps, log, onHold,
+    config, trader, store: liveStore, coord, caps, log, onHold, ttlMs: quoteTtlMs,
     pullConcurrency: Math.max(1, num(env.SNIPER_PULL_CONCURRENCY, 4)), pullGuard: String(env.SNIPER_PULL_GUARD || '1') !== '0',
     reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook, ncaaf: !!ncaafBook }),
     alert,
@@ -570,7 +578,7 @@ async function main(env = process.env) {
     // In-memory long-settle cap (all other caps already checked in memory by decide()).
     const lc = memoryCapReason(ledger, d.rfqId, { risk: d.risk, settleAt: d.settleAt, nowMs: Date.now(), longCap: config.longExposureCap, shortHours: config.shortSettleHours });
     if (lc) { ledger.positions.delete(d.rfqId); ledger.hour.pop(); counts.skips[lc] = (counts.skips[lc] || 0) + 1; return; }
-    { const pm = ledger.positions.get(d.rfqId); if (pm) pm.long = isLongPos(d.settleAt, Date.now(), config.shortSettleHours); }
+    { const pm = ledger.positions.get(d.rfqId); if (pm) { pm.long = isLongPos(d.settleAt, Date.now(), config.shortSettleHours); pm.resting = !!(gate.live && !config.dryRun); } }
     let res = (gate.live && !config.dryRun ? hotStore : store).reserve(d, { releaseAt: holdAt, dryRun: config.dryRun, caps: caps(), marketTicker: rfq.marketTicker || null });
     if (res && typeof res.then === 'function') {
       // blocking path (dry run / SNIPER_WRITE_BEHIND=0). Live: give up after reserveTimeoutMs so a slow
@@ -671,6 +679,21 @@ async function main(env = process.env) {
   onReserveFailedRef = async (rfqId, reason) => { ledger.positions.delete(rfqId); counts.skips[`wb_${reason}`] = (counts.skips[`wb_${reason}`] || 0) + 1; await liveSniper.abortRfq(rfqId, `reserve_${reason}`); };
   if (ws && typeof ws.start === 'function') ws.start(); else if (ws && typeof ws.connect === 'function') ws.connect();
 
+  // Leak sweep: 'accepted' rows with no fill after SNIPER_STALE_ACCEPTED_MIN (default 60, 0 = off) still
+  // count at full risk forever (one $74 row from Oct 24 was holding cap). Release them.
+  const staleAcceptedMin = num(env.SNIPER_STALE_ACCEPTED_MIN, 60);
+  if (gate.live && staleAcceptedMin > 0) {
+    const sweepAccepted = async () => {
+      const rows = await store.staleAccepted(staleAcceptedMin);
+      for (const r of rows) {
+        if (liveSniper.hasRfqId(r.rfq_id)) continue;
+        await liveStore.release(r.rfq_id, 'declined', {});
+        log(`[SNIPER] released stale accepted rfq=${r.rfq_id} risk=$${Number(r.risk).toFixed(2)} (no fill after ${staleAcceptedMin}m)`);
+      }
+    };
+    setInterval(() => { sweepAccepted().catch((e) => log(`[SNIPER] stale accepted sweep error: ${e.message}`)); }, 300000).unref?.();
+    sweepAccepted().catch(() => {});
+  }
   setInterval(() => { liveSniper.pullStarted().catch((e) => log(`[SNIPER] pullStarted error: ${e.message}`)); }, 5000);
 
   // ── Nightly Telegram recap (~11:59 PM ET), sent even on days with no fills ──

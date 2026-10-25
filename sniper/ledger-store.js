@@ -12,6 +12,9 @@ function capsFrom(config, dayStartIso, live = false) {
     total: config.totalExposureCap, long_total: config.longExposureCap, short_settle_hours: config.shortSettleHours, game: config.perGameCap, leg: config.perLegCap,
     daily_risk: config.dailyRiskCap, daily_loss: config.dailyLossCap,
     per_hour: config.maxQuotesPerHour, day_start: dayStartIso,
+    // Read by migrations/20261025b_sniper_resting_weight.sql (ignored by the old SQL, so safe either way).
+    resting_weight: config.restingCapWeight != null ? config.restingCapWeight : 1,
+    reserve_lock: config.reserveLock || 'global',
   };
 }
 
@@ -29,6 +32,7 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
       if (!(rel > t) && r.phase !== 'accepted' && r.phase !== 'filled') continue;
       const settleMs = r.settle_at ? Date.parse(r.settle_at) : NaN; const createdMs = Date.parse(r.created_at);
       ledger.positions.set(r.rfq_id, { combo: r.combo_key, games: r.games || [], legs: r.legs || [], risk: Number(r.risk) || 0, grossRisk: Number(r.risk) || 0, releaseAt: Math.max(rel, r.phase === 'filled' || r.phase === 'accepted' ? t + 7 * 864e5 : rel),
+        resting: r.phase === 'reserved' || r.phase === 'quoted',
         long: ledger.shortSettleHours != null ? isLongPos(settleMs, Number.isFinite(createdMs) ? createdMs : t, ledger.shortSettleHours) : false });
       ledger.seenRfqs.add(r.rfq_id);
       rows.push(r);
@@ -156,10 +160,18 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
     if (error) throw new Error(`stale open: ${error.message}`);
     return data || [];
   }
+  // 'accepted' rows with nothing filled, older than minutes (the Kalshi confirm window is seconds).
+  async function staleAccepted(minutes) {
+    const cut = new Date(now() - minutes * 60000).toISOString();
+    const { data, error } = await supabase.from('sniper_ledger').select('rfq_id,risk,updated_at')
+      .eq('status', 'open').eq('phase', 'accepted').eq('dry_run', false).lt('updated_at', cut).or('filled_contracts.is.null,filled_contracts.eq.0').limit(500);
+    if (error) throw new Error(`stale accepted: ${error.message}`);
+    return data || [];
+  }
   async function decision(rec) {
     try { await supabase.from('sniper_decisions').insert(rec); } catch (_) { /* audit only */ }
   }
-  return { hydrate, refreshHedges, activeHedges, staleOpen, dayExposure, reserve, confirmCheck, update, release, openFilled, openFilledWithLegs, dayRealized, dayRecap, decision };
+  return { hydrate, refreshHedges, activeHedges, staleOpen, dayExposure, reserve, confirmCheck, update, release, openFilled, openFilledWithLegs, dayRealized, dayRecap, decision, staleAccepted };
 }
 
 module.exports = { createLedgerStore, capsFrom };
