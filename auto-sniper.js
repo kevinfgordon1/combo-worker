@@ -120,8 +120,13 @@ function independentGames(legs) {
 }
 function comboKey(legs) { return legs.map(legKey).sort().join('|'); }
 
+// Cached per UTC minute: toLocaleDateString was ~5% of main-thread CPU (called per RFQ via prune).
+const etDayCache = { min: NaN, v: null };
 function etDay(ms) {
-  return new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  const m = Math.floor(ms / 60000);
+  if (m === etDayCache.min) return etDayCache.v;
+  const v = new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  etDayCache.min = m; etDayCache.v = v; return v;
 }
 // Release open risk the day after the latest leg date (conservative).
 function releaseAtMs(legs, nowMs) {
