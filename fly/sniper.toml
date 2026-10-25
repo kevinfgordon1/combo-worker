@@ -25,7 +25,7 @@ kill_timeout = "30s"
   SNIPER_KALSHI_SUBACCOUNT = "1"
   # Kevin's go-live risk rules (Oct 22)
   SNIPER_MAX_RISK = "200"
-  SNIPER_KALSHI_TRADE_RPS = "8"        # Kevin Oct 24: write lane 5 -> 8/s (Kalshi Basic = 10 writes/s)
+  SNIPER_KALSHI_TRADE_RPS = "15"   # Kevin Oct 25: Advanced tier ~30 writes/s; drop to 8 on any 429
   SNIPER_MAX_PAYOUT = "100000"
   SNIPER_DAILY_LOSS_CAP = "10000"
   SNIPER_DAILY_RISK_CAP = "10000"
