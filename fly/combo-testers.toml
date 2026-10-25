@@ -21,9 +21,17 @@ kill_timeout = "30s"
 [[vm]]
   size = "shared-cpu-2x"
   memory = "1gb"
+  # PROPOSED (not applied, needs Kevin's OK): 6 testers x (live-runner + fills-reader)
+  # plus one intake worker thread each on 2 shared vCPUs is still tight. If loop lag
+  # stays > 1s with TESTERS_PERF=1, move to size = "shared-cpu-4x", memory = "2gb".
+  # Still ONE machine.
 
 # EXACTLY ONE machine, ever. No [http_service]. Railway combo-testers must stay stopped.
 [env]
   WORKER_MODE = "testers"
   KALSHI_BUCKET_AUTO = "0"
   KALSHI_BUCKET_SWEEP = "0"
+  # Oct 25 overload/clock fix (one switch). Children get COMBO_INTAKE_WORKER=1,
+  # KALSHI_WS_SHARD_FACTOR=2, KALSHI_CLOCK_MIDPOINT=1, COMBO_NEAR_MISS_LOG=1.
+  # Rollback: TESTERS_PERF = "0" (or TESTER_ENV_<NAME> = "0" for one piece).
+  TESTERS_PERF = "1"

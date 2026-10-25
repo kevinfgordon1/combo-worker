@@ -582,7 +582,9 @@ assert.ok(
   'quote pool warm must use QUOTE_WARM_MS (15s), not a 45s idle gap'
 );
 assert.ok(
-  /quoteHot\.setPlan\(needlePlan\)/.test(liveSrc) &&
+  // setHotPlan = quoteHot.setPlan + mirror to the COMBO_INTAKE_WORKER thread.
+  /setHotPlan\(needlePlan\)/.test(liveSrc) &&
+    /function setHotPlan\(plan\) \{\n  quoteHot\.setPlan\(plan\);/.test(liveSrc) &&
     /lockNeedlePlan\(parlays\)/.test(liveSrc),
   'refresh must restage lock needles after parlays apply'
 );
