@@ -26,9 +26,32 @@ function normalizePolymarketRfq(raw) {
 // Batched inserts: drains the whole buffer in chunks of maxBatch every batchMs, and flushes early
 // once a chunk is full, so ~100+ rows/sec bursts are written instead of silently dropped.
 // One flush at a time; rows are only dropped past maxBuffer (counted, logged once a minute).
-function createDecisionLogger({ supabase, log = console.log, batchMs = 1000, maxBatch = 500, maxBuffer = 20000, logSkips = true }) {
+// Skip rows (~400/s, ~99% of traffic, never read) are NOT inserted. They're counted per reason and
+// flushed once a minute as one action='skip_summary' row per reason (count in contracts, no legs) plus
+// a log line. skipSample (0..1, env POLY_SNIPER_SKIP_SAMPLE / SNIPER_SKIP_SAMPLE, default 0) keeps a
+// random fraction of full skip rows for debugging. Non-skip rows are inserted as before (batched).
+function createDecisionLogger({ supabase, log = console.log, batchMs = 1000, maxBatch = 500, maxBuffer = 20000, logSkips = true, skipSample = 0, summaryMs = 60000, random = Math.random, now = () => Date.now() }) {
   let buf = []; let warned = false; let busy = false; let inflight = null;
-  const stats = { pushed: 0, written: 0, dropped: 0, failed: 0 };
+  const stats = { pushed: 0, written: 0, dropped: 0, failed: 0, skipped: 0, sampled: 0, summaries: 0 };
+  let skipCounts = new Map(); let windowStart = now();
+  function enqueue(row) {
+    stats.pushed += 1; buf.push(row);
+    if (buf.length > maxBuffer) { const n = buf.length - maxBuffer; buf.splice(0, n); stats.dropped += n; }
+    if (buf.length >= maxBatch && !busy) setImmediate(flush);
+  }
+  function summarize() {
+    const counts = skipCounts; const t0 = windowStart; skipCounts = new Map(); windowStart = now();
+    if (!counts.size) return 0;
+    const tot = [...counts.values()].reduce((a, b) => a + b, 0);
+    log(`[POLY-SNIPER] skip summary ${Math.round((windowStart - t0) / 1000)}s total=${tot} ${[...counts.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}=${v}`).join(' ')}`);
+    if (logSkips) {
+      for (const [reason, c] of counts) {
+        enqueue({ rfq_id: `skip_summary:${new Date(t0).toISOString()}`, venue: 'polymarket', dry_run: true, action: 'skip_summary', reason, contracts: c, legs: null, rfq_created_at: new Date(t0).toISOString() });
+        stats.summaries += 1;
+      }
+    }
+    return counts.size;
+  }
   // Concurrent callers share the in-flight drain and then drain anything that arrived meanwhile.
   function flush() {
     if (inflight) return inflight.then(() => (buf.length && supabase ? flush() : undefined));
@@ -50,16 +73,28 @@ function createDecisionLogger({ supabase, log = console.log, batchMs = 1000, max
     } finally { busy = false; }
   }
   const t = setInterval(flush, batchMs); if (t.unref) t.unref();
+  const st = setInterval(summarize, summaryMs); if (st.unref) st.unref();
   return {
     stats, flush,
     push(row) {
+      if (row && row.action === 'skip') {
+        stats.skipped += 1;
+        const k = row.reason || 'unknown'; skipCounts.set(k, (skipCounts.get(k) || 0) + 1);
+        if (logSkips && skipSample > 0 && random() < skipSample) { stats.sampled += 1; enqueue(row); }
+        return;
+      }
       if (!logSkips && row.action !== 'quote') return;
-      stats.pushed += 1; buf.push(row);
-      if (buf.length > maxBuffer) { const n = buf.length - maxBuffer; buf.splice(0, n); stats.dropped += n; }
-      if (buf.length >= maxBatch && !busy) setImmediate(flush);
+      enqueue(row);
     },
+    summarize,
+    skipCounts: () => Object.fromEntries(skipCounts),
     size: () => buf.length,
   };
+}
+
+function skipSampleFrom(env) {
+  const v = Number(env.POLY_SNIPER_SKIP_SAMPLE != null ? env.POLY_SNIPER_SKIP_SAMPLE : env.SNIPER_SKIP_SAMPLE);
+  return Number.isFinite(v) && v > 0 ? Math.min(1, v) : 0;
 }
 
 // Per-leg record for the tape: every Poly leg with whether it matched a Kalshi-equivalent leg.
@@ -79,7 +114,7 @@ function createPolySniper({ env = process.env, supabase = null, log = console.lo
   const config = polySniperConfig(env);
   const f = feed || createPolySniperFeed({ env, log });
   const ledger = createVenueLedger('polymarket');
-  const logger = createDecisionLogger({ supabase, log, logSkips: String(env.POLY_SNIPER_LOG_SKIPS || '1') !== '0' });
+  const logger = createDecisionLogger({ supabase, log, logSkips: String(env.POLY_SNIPER_LOG_SKIPS || '1') !== '0', skipSample: skipSampleFrom(env) });
   const seen = new Set();
   const counts = { seen: 0, quote: 0, skip: {} };
   function observe(raw, src) {
@@ -116,4 +151,4 @@ function createPolySniper({ env = process.env, supabase = null, log = console.lo
   if (hb.unref) hb.unref();
   return { start: () => { if (!feed) f.start(); log(`[POLY-SNIPER] DRY RUN started (posts nothing). fair venues=${f.venues.join('+')} depth game=$${f.depths ? f.depths.game : '?'} td=$${f.depths ? f.depths.td : '?'} minEdge=ml:${(config.minRoiNflMl * 100).toFixed(1)}%,nfl:${(config.minRoiNfl * 100).toFixed(1)}%,ncaaf:${(config.minRoiNcaaf * 100).toFixed(1)}%,td:${(config.minRoiTd * 100).toFixed(1)}%`); }, observe, counts, ledger, flush: logger.flush };
 }
-module.exports = { createPolySniper, normalizePolymarketRfq, createDecisionLogger, legRows };
+module.exports = { createPolySniper, normalizePolymarketRfq, createDecisionLogger, legRows, skipSampleFrom };
