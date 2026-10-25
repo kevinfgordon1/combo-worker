@@ -6,9 +6,14 @@ function createLimiter({ name, ratePerSec, burst = 1, now = () => Date.now(), sl
   let tokens = burst; let last = now(); let backoffUntil = 0; let backoffMs = 0;
   const stats = { name, requests: 0, ok: 0, errors: 0, r429: 0, waitedMs: 0 };
   function refill() { const t = now(); tokens = Math.min(burst, tokens + ((t - last) / 1000) * ratePerSec); last = t; }
-  async function acquire() {
+  // Priority lanes: 2 = urgent (risk-reducing cancels), 1 = normal (quotes/confirms), 0 = low
+  // (routine TTL cancels). A caller yields while anyone at a higher level is waiting for a token.
+  const waiting = [0, 0, 0];
+  const higherWaiting = (p) => { for (let i = p + 1; i < waiting.length; i += 1) if (waiting[i] > 0) return true; return false; };
+  async function acquire(prio = 1) {
     for (;;) {
       const t = now();
+      if (higherWaiting(prio)) { stats.waitedMs += 25; await sleep(25); continue; }
       if (t < backoffUntil) { const w = backoffUntil - t; stats.waitedMs += w; await sleep(w); continue; }
       refill();
       if (tokens >= 1) { tokens -= 1; return; }
@@ -22,8 +27,10 @@ function createLimiter({ name, ratePerSec, burst = 1, now = () => Date.now(), sl
   }
   function onOk() { stats.ok += 1; backoffMs = 0; }
   // fn() -> fetch Response-like ({ status, ok, json() })
-  async function run(fn) {
-    await acquire();
+  async function run(fn, { low = false, priority } = {}) {
+    const prio = Math.max(0, Math.min(2, Number.isInteger(priority) ? priority : (low ? 0 : 1)));
+    waiting[prio] += 1;
+    try { await acquire(prio); } finally { waiting[prio] -= 1; }
     stats.requests += 1;
     const r = await fn();
     if (r && r.status === 429) { on429(); const e = new Error(`${name} 429`); e.is429 = true; throw e; }

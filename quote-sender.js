@@ -44,15 +44,19 @@ function createQuoteSender({
   // Kalshi-aligned wall clock for RFQ age (created_ts is Kalshi time).
   serverNow = () => Date.now(),
   log = () => {},
+  // Optional: bound the queue. When full, the lowest-priority waiting send is dropped right away
+  // (reason=queue_full) instead of aging out after maxQueueMs and wasting the wait.
+  maxQueued = Infinity,
 } = {}) {
   let active = 0;
   const queue = [];
   const inflightRfqs = new Set();
-  const stats = { sent: 0, staleAge: 0, staleQueue: 0, dup: 0 };
+  const stats = { sent: 0, staleAge: 0, staleQueue: 0, dup: 0, queueFull: 0 };
 
   function drop(item, reason, extra) {
     if (reason === 'rfq_age') stats.staleAge += 1;
     else if (reason === 'queue_wait') stats.staleQueue += 1;
+    else if (reason === 'queue_full') stats.queueFull += 1;
     log(`STALE_DROP reason=${reason} rfq=${item.rfqId}${extra ? ' ' + extra : ''}`);
     item.reject(staleError(reason, extra));
   }
@@ -85,9 +89,11 @@ function createQuoteSender({
     }
   }
 
-  function send(rfqId, createdTs, fn) {
+  // opts.priority: higher sends first (e.g. expected $ edge); ties stay FIFO. Default 0.
+  function send(rfqId, createdTs, fn, opts = {}) {
     return new Promise((resolve, reject) => {
-      const item = { rfqId, createdTs, fn, resolve, reject, enqAt: now() };
+      const priority = Number.isFinite(opts.priority) ? opts.priority : 0;
+      const item = { rfqId, createdTs, fn, resolve, reject, enqAt: now(), priority };
       if (rfqId && inflightRfqs.has(rfqId)) {
         stats.dup += 1;
         log(`STALE_DROP reason=duplicate rfq=${rfqId}`);
@@ -95,7 +101,14 @@ function createQuoteSender({
         return;
       }
       if (rfqId) inflightRfqs.add(rfqId);
-      queue.push(item);
+      let i = queue.length;
+      while (i > 0 && queue[i - 1].priority < priority) i -= 1;
+      queue.splice(i, 0, item);
+      if (queue.length > maxQueued) {
+        const victim = queue.pop(); // lowest priority, newest among equals
+        inflightRfqs.delete(victim.rfqId);
+        drop(victim, 'queue_full', `queued=${queue.length + 1}`);
+      }
       pump();
     });
   }

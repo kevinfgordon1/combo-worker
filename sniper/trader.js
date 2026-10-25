@@ -30,14 +30,14 @@ const sizeSource = (rfq) => (Number(rfq && rfq.contracts) > 0 ? 'contracts' : 'd
 
 class LiveGateClosed extends Error { constructor(op) { super(`LIVE_GATE_CLOSED ${op}`); this.liveGateClosed = true; } }
 
-function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = null, request = null, log = console.log } = {}) {
+function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = null, readLimiter = null, request = null, log = console.log, maxConcurrent = 8, maxQueued = 24 } = {}) {
   const live = !!(gate && gate.live);
   let pair = null;
   const pools = () => { if (!pair) pair = createKalshiRestPair(); return pair; };
-  const sender = createQuoteSender({ maxConcurrent: 4, serverNow: () => signedNow(), log: (m) => log(`[SNIPER] ${m}`) });
+  const sender = createQuoteSender({ maxConcurrent, maxQueued, serverNow: () => signedNow(), log: (m) => log(`[SNIPER] ${m}`) });
   const stats = { posts: 0, confirms: 0, cancels: 0, fillReads: 0, refused: 0 };
 
-  async function raw(method, signPath, { path, body, quote = false, timeoutMs, shouldRetryExpired } = {}) {
+  async function raw(method, signPath, { path, body, quote = false, timeoutMs, shouldRetryExpired, low = false, priority, lim = limiter } = {}) {
     const doReq = request || (async ({ method: m, path: p, headers, body: b }) => {
       const http = quote ? pools().quote : pools().rest;
       const req = { method: m, path: p, headers };
@@ -50,12 +50,12 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
       keyId, pem, method, signPath, path, body, shouldRetryExpired,
       headers: body != null ? { 'Content-Type': 'application/json' } : undefined,
     });
-    const res = limiter ? await limiter.run(async () => { const r = await go(); return { ...r, ok: r.statusCode !== 429, status: r.statusCode }; }) : await go();
+    const res = lim ? await lim.run(async () => { const r = await go(); return { ...r, ok: r.statusCode !== 429, status: r.statusCode }; }, { low, priority }) : await go();
     return res;
   }
   function mustBeLive(op) { if (!live) { stats.refused += 1; throw new LiveGateClosed(op); } }
 
-  async function postQuote(rfq, quoteYes, tick) {
+  async function postQuote(rfq, quoteYes, tick, { priority = 0 } = {}) {
     mustBeLive('quote');
     if (!(subaccount >= 1)) throw new LiveGateClosed('quote_no_subaccount');
     const noBid = noBidFor(quoteYes, tick);
@@ -64,7 +64,7 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
     const { statusCode, text } = await sender.send(rfq.rfqId, rfq.createdTs, () => raw('POST', QUOTE_PATH, {
       body, quote: true, timeoutMs: QUOTE_TIMEOUT_MS,
       shouldRetryExpired: () => { const a = rfqAgeMs(rfq.createdTs, signedNow()); return a == null || a <= DEFAULT_MAX_RFQ_AGE_MS; },
-    }));
+    }), { priority });
     stats.posts += 1;
     if (statusCode < 200 || statusCode >= 300) throw new Error(`Kalshi quote failed ${statusCode}: ${text}`);
     const j = JSON.parse(text || '{}');
@@ -77,9 +77,11 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
     if (statusCode < 200 || statusCode >= 300) throw new Error(`Kalshi confirm failed ${statusCode}: ${text}`);
     return { statusCode };
   }
-  async function cancel(quoteId) {
+  // urgent=true (price move / started game / reprice abort / shutdown): ahead of quotes.
+  // urgent=false (routine 20s TTL): yields to quotes and confirms.
+  async function cancel(quoteId, { urgent = true } = {}) {
     mustBeLive('cancel');
-    const { statusCode, text } = await raw('DELETE', cancelPath(quoteId), { quote: true });
+    const { statusCode, text } = await raw('DELETE', cancelPath(quoteId), { quote: true, priority: urgent ? 2 : 0 });
     stats.cancels += 1;
     if (statusCode === 204 || statusCode === 404 || (statusCode >= 200 && statusCode < 300)) return { statusCode };
     throw new Error(`Kalshi cancel failed ${statusCode}: ${text}`);
@@ -90,7 +92,7 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
     const out = []; let cursor = '';
     for (let page = 0; page < 10; page += 1) {
       const qs = fillsQuery({ orderId, limit: 200, cursor }) + (subaccount >= 1 ? `&subaccount=${subaccount}` : '');
-      const res = await raw('GET', FILLS_PATH, { path: `${FILLS_PATH}?${qs}` });
+      const res = await raw('GET', FILLS_PATH, { path: `${FILLS_PATH}?${qs}`, lim: readLimiter || limiter }); // reads: own (read-bucket) lane
       stats.fillReads += 1;
       if (!res || res.statusCode !== 200) throw new Error(`fills read ${res && res.statusCode}`);
       const j = JSON.parse(res.text || '{}');
