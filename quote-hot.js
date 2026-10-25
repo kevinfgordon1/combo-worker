@@ -108,22 +108,35 @@ function needlesForLeg(ticker) {
 // every rfq_created; nothing can match).
 function lockNeedlePlan(parlays) {
   const needles = new Set();
+  const groups = [];
+  let groupsOk = true;
   let uncovered = 0;
   for (const p of parlays || []) {
     const keys = legKeysOfParlay(p);
     if (!keys.length) continue;
     const found = [];
+    const legGroups = [];
+    let legMissing = false;
     for (const key of keys) {
-      for (const n of needlesForLeg(key)) found.push(n);
+      const ns = needlesForLeg(key);
+      if (!ns.length) legMissing = true;
+      for (const n of ns) found.push(n);
+      legGroups.push(ns);
     }
     if (!found.length) {
       uncovered += 1;
       continue;
     }
     for (const n of found) needles.add(n);
+    // A lock only matches an RFQ whose leg set equals the lock's (rfq.js matchParlay), so
+    // the RFQ text must contain a needle for EVERY leg. A leg with no needle makes the lock
+    // un-groupable: fall back to the OR filter for the whole plan (never drop a match).
+    if (legMissing) groupsOk = false;
+    else groups.push(legGroups);
   }
   return {
     needles: [...needles],
+    groups: groupsOk ? groups : null,
     uncovered,
     enabled: uncovered === 0,
   };
@@ -159,6 +172,49 @@ function compileNeedleMatcher(needles) {
     }
     return re.test(String(raw));
   };
+}
+
+// Per-lock AND matcher: keep a frame only if, for some lock, every leg has at least one of
+// its needles in the frame. Each distinct needle is scanned once per frame (memoized), so the
+// cost stays ~ the old OR scan while dropping combos that merely share one game with a lock.
+function compileGroupMatcher(groups) {
+  if (!Array.isArray(groups) || !groups.length) return null;
+  const ids = new Map();
+  const bufs = [];
+  const strs = [];
+  const locks = groups.map((legs) => legs.map((alts) => alts.map((n) => {
+    const s = String(n);
+    if (!ids.has(s)) { ids.set(s, strs.length); strs.push(s); bufs.push(Buffer.from(s)); }
+    return ids.get(s);
+  })));
+  const seen = new Int8Array(strs.length);
+  return function matchesAll(raw) {
+    if (raw == null) return false;
+    const isBuf = Buffer.isBuffer(raw);
+    const text = isBuf ? null : (typeof raw === 'string' ? raw : String(raw));
+    seen.fill(0);
+    const has = (i) => {
+      if (seen[i] === 0) seen[i] = (isBuf ? raw.indexOf(bufs[i]) !== -1 : text.indexOf(strs[i]) !== -1) ? 1 : -1;
+      return seen[i] === 1;
+    };
+    for (const legs of locks) {
+      let ok = true;
+      for (const alts of legs) {
+        let any = false;
+        for (const i of alts) { if (has(i)) { any = true; break; } }
+        if (!any) { ok = false; break; }
+      }
+      if (ok) return true;
+    }
+    return false;
+  };
+}
+
+// KALSHI_WS_NEEDLE_ALL=0 is the rollback: back to "any lock needle" (OR) filtering.
+function needleAllDisabled(env = process.env) {
+  const raw = env && env.KALSHI_WS_NEEDLE_ALL;
+  if (raw == null || raw === '') return false;
+  return /^(0|false|off|no)$/i.test(String(raw).trim());
 }
 
 function fastDropDisabled(env = process.env) {
@@ -207,7 +263,7 @@ function createDeletedFilter(forEachRfqId) {
   };
 }
 
-function createQuoteHot() {
+function createQuoteHot({ env = process.env } = {}) {
   let n = 0;
   let needles = [];
   let dropEnabled = false;
@@ -219,7 +275,7 @@ function createQuoteHot() {
     needles = Array.isArray(next.needles) ? next.needles.filter(Boolean) : [];
     uncovered = Number(next.uncovered) || 0;
     dropEnabled = !!next.enabled && uncovered === 0;
-    matcher = compileNeedleMatcher(needles);
+    matcher = (!needleAllDisabled(env) && compileGroupMatcher(next.groups)) || compileNeedleMatcher(needles);
   }
 
   function matches(raw) {
@@ -268,4 +324,6 @@ module.exports = {
   dropDeletedDisabled,
   createDeletedFilter,
   createQuoteHot,
+  compileGroupMatcher,
+  needleAllDisabled,
 };
