@@ -10,7 +10,9 @@
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
 const { createKalshiFirehose, readShardFactor, DEFAULT_LIVE_SHARD_FACTOR, summarizeThroughput } = require('../kalshi-ws');
-const { normalizePem } = require('../kalshi-auth');
+const { normalizePem, authHeaders: kalshiAuthHeaders } = require('../kalshi-auth');
+const { createKalshiBookFeed, createBookRouter } = require('./book-ws');
+const WebSocket = require('ws');
 const { createPmLiveBook } = require('../noboost/pm-live');
 const { createTdBook, isTdTicker } = require('../noboost/td-book');
 const { createProphetXClient, hasProphetXCreds, authMode } = require('../noboost/prophetx-live');
@@ -182,17 +184,39 @@ async function main(env = process.env) {
   }
   // NFL ML books (the pricesHealthy gate) poll in their own loop; the slower NCAAF / NBA / lines /
   // TD books run in pollKalshi so a slow or failing chunk there can't stall the gate.
+  // Kalshi websocket order books (orderbook_snapshot/delta) on the sniper's OWN read key, sharded
+  // to stay under the per-subscription buffer. REST pulls below only run for a group the ws has
+  // not refreshed within SNIPER_BOOK_WS_FALLBACK_MS. SNIPER_KALSHI_BOOK_WS=0 = REST only (old path).
+  const tdMeta = () => Object.fromEntries([...kick].filter(([t]) => t.startsWith('KXNFLTD')));
+  const bookGroups = {
+    ml: { tickers: () => mlTickers, sink: (o) => pmLive.ingestKalshiOrderbooks(o), onFresh: (t) => { health.ml = t; } },
+    td: { tickers: () => tdTickers, sink: (o) => tdBook.ingest(o, tdMeta()), onFresh: (t) => { health.td = t; } },
+    ...(ncaafBook ? { ncaaf: { tickers: () => ncaafTickers, sink: (o) => ncaafBook.ingestKalshiOrderbooks(o) } } : {}),
+    ...(nbaBook ? { nba: { tickers: () => nbaTickers, sink: (o) => nbaBook.ingestKalshiOrderbooks(o) } } : {}),
+    ...(linesBook ? { lines: { tickers: () => linesBook.mainTickers(lineTickers), sink: (o) => linesBook.ingestKalshiOrderbooks(o) } } : {}),
+  };
+  const bookWsOn = String(env.SNIPER_KALSHI_BOOK_WS || '1') !== '0' && !!env.SNIPER_KALSHI_KEY_ID && !!env.SNIPER_KALSHI_PRIVATE_KEY;
+  const bookFeed = bookWsOn ? createKalshiBookFeed({
+    WS: WebSocket, url: env.SNIPER_KALSHI_WS_URL || 'wss://external-api-ws.kalshi.com/trade-api/ws/v2',
+    headers: () => kalshiAuthHeaders({ keyId: env.SNIPER_KALSHI_KEY_ID, pem: normalizePem(env.SNIPER_KALSHI_PRIVATE_KEY), method: 'GET', signPath: '/trade-api/ws/v2' }),
+    perShard: num(env.SNIPER_BOOK_WS_PER_SHARD, 60), maxShards: num(env.SNIPER_BOOK_WS_MAX_SHARDS, 8),
+    quietMs: num(env.SNIPER_BOOK_WS_QUIET_MS, 10000), log,
+  }) : null;
+  const bookRouter = createBookRouter({ feed: bookFeed, groups: bookGroups, fallbackMs: num(env.SNIPER_BOOK_WS_FALLBACK_MS, 5000) });
+  const syncBookTickers = () => { if (bookFeed) bookFeed.setTickers(Object.values(bookGroups).flatMap((g) => g.tickers() || [])); };
   async function pollKalshiMl() {
-    if (!listedAt || Date.now() - listedAt > 120000) await refreshLists();
+    if (!listedAt || Date.now() - listedAt > 120000) { await refreshLists(); syncBookTickers(); }
+    if (!bookRouter.restNeeded('ml')) return;
     await books(mlTickers, (o) => pmLive.ingestKalshiOrderbooks(o)); health.ml = Date.now();
   }
   async function pollKalshi() {
     if (!listedAt) return;
-    if (ncaafBook) await books(ncaafTickers, (o) => ncaafBook.ingestKalshiOrderbooks(o));
-    if (nbaBook) await books(nbaTickers, (o) => nbaBook.ingestKalshiOrderbooks(o));
-    if (linesBook) await books(linesBook.mainTickers(lineTickers), (o) => linesBook.ingestKalshiOrderbooks(o)); // main-line strikes only
-    await books(tdTickers, (o) => tdBook.ingest(o, Object.fromEntries([...kick].filter(([t]) => t.startsWith('KXNFLTD'))))); health.td = Date.now();
+    if (ncaafBook && bookRouter.restNeeded('ncaaf')) await books(ncaafTickers, (o) => ncaafBook.ingestKalshiOrderbooks(o));
+    if (nbaBook && bookRouter.restNeeded('nba')) await books(nbaTickers, (o) => nbaBook.ingestKalshiOrderbooks(o));
+    if (linesBook && bookRouter.restNeeded('lines')) await books(linesBook.mainTickers(lineTickers), (o) => linesBook.ingestKalshiOrderbooks(o)); // main-line strikes only
+    if (bookRouter.restNeeded('td')) { await books(tdTickers, (o) => tdBook.ingest(o, tdMeta())); health.td = Date.now(); }
   }
+  if (bookFeed) { const fl = setInterval(() => { if (!disabled) { try { bookRouter.flush(); } catch (e) { log(`[SNIPER] book-ws flush error: ${e.message}`); } } }, num(env.SNIPER_BOOK_WS_FLUSH_MS, 1000)); if (fl.unref) fl.unref(); }
   const relayErr = {}; const tdOff = new Map();
   async function pollRelay() {
     if (!relayBase) return;
@@ -559,7 +583,7 @@ async function main(env = process.env) {
     const t = ledger.totals();
     const s = Object.entries(counts.skips).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, v]) => `${k}=${v}`).join(' ');
     const ls = Object.values(lim).map((l) => { const x = l.stats(); return `${x.name}:${x.requests}req/${x.r429}x429`; }).join(' ');
-    log(`[SNIPER] summary mode=${gate.live ? 'LIVE' : 'dry'}${liveSniper.halted() ? ' HALTED' : ''} live=${JSON.stringify(liveSniper.stats())} trade=${JSON.stringify(trader.stats())} locks=${JSON.stringify(coord.stats())} kickoffs=${JSON.stringify(kickoffs.stats())} rfqs=${counts.rfqs} would_quote=${counts.quotes} open=$${t.total.toFixed(2)} positions=${ledger.positions.size} filled_today=$${ledger.day.risk.toFixed(2)} (${ledger.day.fills} fills) pending=$${ledger.day.pending.toFixed(2)} breaker429=${breaker.count()} relayErr=${JSON.stringify(relayErr)} tdOff=${[...tdOff.keys()].join(',') || 'none'} ${disabled ? 'DISABLED' : ''} load: ${ls} skips: ${s || 'none'}`);
+    log(`[SNIPER] summary mode=${gate.live ? 'LIVE' : 'dry'}${liveSniper.halted() ? ' HALTED' : ''} live=${JSON.stringify(liveSniper.stats())} trade=${JSON.stringify(trader.stats())} locks=${JSON.stringify(coord.stats())} kickoffs=${JSON.stringify(kickoffs.stats())} rfqs=${counts.rfqs} would_quote=${counts.quotes} open=$${t.total.toFixed(2)} positions=${ledger.positions.size} filled_today=$${ledger.day.risk.toFixed(2)} (${ledger.day.fills} fills) pending=$${ledger.day.pending.toFixed(2)} breaker429=${breaker.count()} relayErr=${JSON.stringify(relayErr)} tdOff=${[...tdOff.keys()].join(',') || 'none'} ${disabled ? 'DISABLED' : ''} books=${JSON.stringify({ ...bookRouter.stats(), ws: bookFeed ? bookFeed.stats() : 'off' })} load: ${ls} skips: ${s || 'none'}`);
     const latency = lat.snapshot();
     const wsThroughput = () => { try { if (!ws || typeof ws.takeThroughput !== 'function') return null; const t = summarizeThroughput(ws.takeThroughput()); delete t.perShard; return t; } catch (_) { return null; } };
     log(`[SNIPER] latency ${JSON.stringify(latency)} ws=${JSON.stringify(wsThroughput())}`);
