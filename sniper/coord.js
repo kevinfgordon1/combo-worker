@@ -1,6 +1,7 @@
 // Combo Locks priority, READ-ONLY. The sniper never quotes an RFQ that combo-worker could quote:
 //  - any RFQ that matches an active Combo Lock (same matcher combo-worker uses, rfq.matchParlay),
-//  - any RFQ sharing a leg with an active lock (unhedged-boot.lockLegOverlap),
+//  - (opt-in only, SNIPER_SKIP_LOCK_OVERLAP=1) any RFQ sharing a leg with an active lock.
+//    Default OFF (Oct 25): sharing a leg or two with a lock is fine; only the same parlay is blocked.
 //  - any RFQ with a live combo-worker submission (combo_submissions.is_live for that rfq_id),
 //  - and if the lock list is stale/unreadable, NOTHING (fail closed).
 // It only SELECTs combo_parlays / combo_submissions; it never writes combo-worker tables or holds.
@@ -8,7 +9,8 @@
 const { matchParlay } = require('../rfq');
 const { lockLegOverlap } = require('../unhedged-boot');
 
-function createLockCoord({ supabase, pollMs = 5000, staleMs = 30000, now = Date.now, log = console.log } = {}) {
+function createLockCoord({ supabase, pollMs = 5000, staleMs = 30000, now = Date.now, log = console.log,
+  skipOverlap = /^(1|true|yes|on)$/i.test(String(process.env.SNIPER_SKIP_LOCK_OVERLAP || '')) } = {}) {
   let locks = []; let at = 0; let timer = null;
   const stats = { polls: 0, pollFail: 0, blocked: 0 };
   async function poll() {
@@ -25,7 +27,7 @@ function createLockCoord({ supabase, pollMs = 5000, staleMs = 30000, now = Date.
   function blockReason(rfq) {
     if (!at || now() - at > staleMs) return 'locks_unknown';
     if (matchParlay(rfq, locks)) return 'combo_lock_match';
-    if (lockLegOverlap(rfq, locks) > 0) return 'overlaps_combo_lock';
+    if (skipOverlap && lockLegOverlap(rfq, locks) > 0) return 'overlaps_combo_lock';
     return null;
   }
   // Async check against combo-worker's live submissions for this RFQ (read-only).

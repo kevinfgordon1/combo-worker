@@ -63,7 +63,10 @@ const ALL = { SNIPER_ENABLED: '1', SNIPER_DRY_RUN: '0', SNIPER_LIVE_CONFIRM: LIV
   coord.setLocks([{ id: 'L', leg_keys: ['KXNFLGAME-26OCT25INDMIN-MIN:yes', 'KXNFLGAME-26OCT25CINBAL-BAL:yes'] }]);
   assert.strictEqual(coord.blockReason(rfq), 'combo_lock_match');
   coord.setLocks([{ id: 'L', leg_keys: ['KXNFLGAME-26OCT25INDMIN-MIN:yes', 'KXNFLGAME-26OCT25NYGPHI-NYG:yes'] }]);
-  assert.strictEqual(coord.blockReason(rfq), 'overlaps_combo_lock');
+  assert.strictEqual(coord.blockReason(rfq), null, 'sharing a leg with a lock no longer blocks');
+  const coordOv = createLockCoord({ supabase: null, now: () => clock, log: () => {}, skipOverlap: true });
+  coordOv.setLocks([{ id: 'L', leg_keys: ['KXNFLGAME-26OCT25INDMIN-MIN:yes', 'KXNFLGAME-26OCT25NYGPHI-NYG:yes'] }], clock);
+  assert.strictEqual(coordOv.blockReason(rfq), 'overlaps_combo_lock', 'opt-in overlap skip still works');
   coord.setLocks([]); assert.strictEqual(coord.blockReason(rfq), null);
   clock += 31000; assert.strictEqual(coord.blockReason(rfq), 'locks_unknown');
   assert.strictEqual(await coord.comboWorkerQuoting('R1'), 'combo_worker_quoting');
