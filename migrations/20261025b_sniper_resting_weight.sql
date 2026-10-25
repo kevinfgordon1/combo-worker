@@ -1,3 +1,7 @@
+-- Re-runnable: one transaction, same signatures + defaults as prod (p_long DEFAULT true), so no DROP is
+-- needed and callers (sniper_reserve, sniper_confirm_check) never see a missing function.
+-- Oct 25 2026 11:08 AM ET first attempt failed on the default (42P13) and rolled back; prod unchanged.
+begin;
 -- Resting-quote cap weight + per-bet reserve lock (Oct 25 2026). Kevin runs this by hand.
 -- Safe with the old code: new keys in p_caps default to the old behaviour (weight 1, global lock).
 --
@@ -10,7 +14,7 @@
 --    global ledger lock, so reserves stop queueing one at a time (~180 ms each = ~5/s max). Concurrent
 --    reserves may each see the other's row missing, so RESTING exposure can overshoot by at most
 --    (reserve concurrency x per-quote max risk, ~8 x $200). Confirm keeps the global lock + full check.
-create or replace function public.sniper_cap_reason(p_risk numeric, p_games text[], p_legs text[], p_caps jsonb, p_exclude text, p_count_new boolean, p_long boolean)
+create or replace function public.sniper_cap_reason(p_risk numeric, p_games text[], p_legs text[], p_caps jsonb, p_exclude text, p_count_new boolean, p_long boolean default true)
 returns text language plpgsql stable set search_path to 'public' as $$
 declare v numeric; d timestamptz := (p_caps->>'day_start')::timestamptz;
   lv boolean := coalesce((p_caps->>'live')::boolean, false);
@@ -77,3 +81,10 @@ begin
   return 'ok';
 exception when unique_violation then return 'duplicate';
 end $$;
+
+-- Same privileges as prod: EXECUTE for postgres + service_role only.
+revoke all on function public.sniper_cap_reason(numeric, text[], text[], jsonb, text, boolean, boolean) from public, anon, authenticated;
+revoke all on function public.sniper_reserve(jsonb, jsonb) from public, anon, authenticated;
+grant execute on function public.sniper_cap_reason(numeric, text[], text[], jsonb, text, boolean, boolean) to service_role;
+grant execute on function public.sniper_reserve(jsonb, jsonb) to service_role;
+commit;

@@ -1,4 +1,5 @@
--- Restores the pre-20261025b functions (copied from prod Oct 25 2026, 11:05 AM ET).
+-- Restores the pre-20261025b functions (pg_get_functiondef from prod Oct 25 2026, 11:05 AM ET). Re-runnable.
+begin;
 CREATE OR REPLACE FUNCTION public.sniper_cap_reason(p_risk numeric, p_games text[], p_legs text[], p_caps jsonb, p_exclude text, p_count_new boolean, p_long boolean DEFAULT true)
  RETURNS text
  LANGUAGE plpgsql
@@ -64,3 +65,10 @@ begin
 exception when unique_violation then return 'duplicate';
 end $function$
 ;
+
+-- Same privileges as prod: EXECUTE for postgres + service_role only.
+revoke all on function public.sniper_cap_reason(numeric, text[], text[], jsonb, text, boolean, boolean) from public, anon, authenticated;
+revoke all on function public.sniper_reserve(jsonb, jsonb) from public, anon, authenticated;
+grant execute on function public.sniper_cap_reason(numeric, text[], text[], jsonb, text, boolean, boolean) to service_role;
+grant execute on function public.sniper_reserve(jsonb, jsonb) to service_role;
+commit;
