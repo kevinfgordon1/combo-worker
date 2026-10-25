@@ -16,7 +16,10 @@ function createLockCoord({ supabase, pollMs = 5000, staleMs = 30000, now = Date.
   failClosed = /^(1|true|yes|on)$/i.test(String(process.env.SNIPER_LOCKS_FAIL_CLOSED || '')), warnEveryMs = 60000, cwTimeoutMs = Number(process.env.SNIPER_CW_CHECK_TIMEOUT_MS) || 300,
   // 'query' (default): one combo_submissions query per send (on the hot path, shared client).
   // 'poll': one query every cwPollMs into an in-memory Set; send-time check is a Set lookup.
-  cwMode = String(process.env.SNIPER_CW_CHECK_MODE || 'query'), cwPollMs = Number(process.env.SNIPER_CW_POLL_MS) || 500 } = {}) {
+  cwMode = String(process.env.SNIPER_CW_CHECK_MODE || 'query'), cwPollMs = Number(process.env.SNIPER_CW_POLL_MS) || 500,
+  // Kevin Oct 25: SNIPER_LOCK_COORD=0 turns off ALL Combo Locks checks (no lock poll, no combo_submissions
+  // lookup). Combo Locks wins those RFQs anyway on price, so the sniper never waits on it.
+  enabled = !/^(0|false|no|off)$/i.test(String(process.env.SNIPER_LOCK_COORD || '1')) } = {}) {
   let cwLive = new Set(); let cwAt = 0; let cwTimer = null;
   async function pollSubs() {
     try {
@@ -37,12 +40,14 @@ function createLockCoord({ supabase, pollMs = 5000, staleMs = 30000, now = Date.
     } catch (e) { stats.pollFail += 1; log(`[SNIPER] lock poll failed: ${e.message}`); }
   }
   function start() {
+    if (!enabled) { log('[SNIPER] Combo Locks coordination OFF (SNIPER_LOCK_COORD=0)'); return; }
     poll(); timer = setInterval(poll, pollMs); if (timer.unref) timer.unref();
     if (cwMode === 'poll') { pollSubs(); cwTimer = setInterval(pollSubs, cwPollMs); if (cwTimer.unref) cwTimer.unref(); }
   }
   function stop() { if (timer) clearInterval(timer); if (cwTimer) clearInterval(cwTimer); }
   // Synchronous check (memory only) — used at decide, before POST and before confirm.
   function blockReason(rfq) {
+    if (!enabled) return null;
     if (isStale()) {
       if (failClosed) return 'locks_unknown';
       stats.staleChecks += 1;
@@ -55,6 +60,7 @@ function createLockCoord({ supabase, pollMs = 5000, staleMs = 30000, now = Date.
   function unknownSubs() { if (failClosed) return 'submissions_unknown'; stats.submissionsUnknown += 1; return null; }
   // Async check against combo-worker's live submissions for this RFQ (read-only).
   async function comboWorkerQuoting(rfqId) {
+    if (!enabled) return null;
     if (cwMode === 'poll') {
       if (!cwAt || now() - cwAt > Math.max(5000, cwPollMs * 10)) return unknownSubs();
       return cwLive.has(rfqId) ? 'combo_worker_quoting' : null;
