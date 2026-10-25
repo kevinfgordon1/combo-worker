@@ -99,8 +99,11 @@ assert.strictEqual(N.oddsNcaafKickoffs([{ commence_time: '2026-10-24T23:30:00Z',
 assert.strictEqual(createNflFrameFilter()(Buffer.from(`{"mve_selected_legs":[{"market_ticker":"${LIB}"}]}`)), false);
 assert.strictEqual(createNflFrameFilter()(Buffer.from('{"mve_selected_legs":[{"market_ticker":"KXNBAGAME-X"}]}')), true);
 
-// ── Combo Locks overlap skip still works for NCAAF legs ──
-const coord = createLockCoord({ supabase: null });
+// ── Combo Locks overlap skip (opt-in) still works for NCAAF legs; default only blocks exact matches ──
+const coord0 = createLockCoord({ supabase: null });
+coord0.setLocks([{ id: 'L1', leg_keys: [`${LIB}:yes`, 'KXNFLGAME-26OCT25NYGPHI-NYG:yes'] }]);
+assert.strictEqual(coord0.blockReason({ rfqId: 'x', legKeys: [`${LIB}:yes`, `${NFL}:yes`] }), null);
+const coord = createLockCoord({ supabase: null, skipOverlap: true });
 coord.setLocks([{ id: 'L1', leg_keys: [`${LIB}:yes`, 'KXNFLGAME-26OCT25NYGPHI-NYG:yes'] }]);
 assert.strictEqual(coord.blockReason({ rfqId: 'x', legKeys: [`${LIB}:yes`, `${NFL}:yes`] }), 'overlaps_combo_lock');
 coord.setLocks([{ id: 'L2', leg_keys: [`${TXST}:yes`, 'KXNFLGAME-26OCT25NYGPHI-NYG:yes'] }]);

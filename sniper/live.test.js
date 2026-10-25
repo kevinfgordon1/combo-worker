@@ -59,13 +59,25 @@ const ALL = { SNIPER_ENABLED: '1', SNIPER_DRY_RUN: '0', SNIPER_LIVE_CONFIRM: LIV
   let clock = 1e6;
   const coord = createLockCoord({ supabase: { from: () => ({ select: () => ({ eq: () => ({ eq: () => ({ limit: async () => ({ data: [{ quote_id: 'cw' }], error: null }) }) }) }) }) }, now: () => clock, log: () => {} });
   const rfq = { rfqId: 'R1', marketTicker: 'KXMVECROSSCATEGORY0-X', legKeys: ['KXNFLGAME-26OCT25INDMIN-MIN:yes', 'KXNFLGAME-26OCT25CINBAL-BAL:yes'], contracts: 20, createdTs: Date.now() };
-  assert.strictEqual(coord.blockReason(rfq), 'locks_unknown');
+  assert.strictEqual(coord.blockReason(rfq), null, 'never loaded => fail open');
+  assert.strictEqual(coord.stats().locksStale, true);
   coord.setLocks([{ id: 'L', leg_keys: ['KXNFLGAME-26OCT25INDMIN-MIN:yes', 'KXNFLGAME-26OCT25CINBAL-BAL:yes'] }]);
   assert.strictEqual(coord.blockReason(rfq), 'combo_lock_match');
   coord.setLocks([{ id: 'L', leg_keys: ['KXNFLGAME-26OCT25INDMIN-MIN:yes', 'KXNFLGAME-26OCT25NYGPHI-NYG:yes'] }]);
-  assert.strictEqual(coord.blockReason(rfq), 'overlaps_combo_lock');
+  assert.strictEqual(coord.blockReason(rfq), null, 'sharing a leg with a lock no longer blocks');
+  const coordOv = createLockCoord({ supabase: null, now: () => clock, log: () => {}, skipOverlap: true });
+  coordOv.setLocks([{ id: 'L', leg_keys: ['KXNFLGAME-26OCT25INDMIN-MIN:yes', 'KXNFLGAME-26OCT25NYGPHI-NYG:yes'] }], clock);
+  assert.strictEqual(coordOv.blockReason(rfq), 'overlaps_combo_lock', 'opt-in overlap skip still works');
   coord.setLocks([]); assert.strictEqual(coord.blockReason(rfq), null);
-  clock += 31000; assert.strictEqual(coord.blockReason(rfq), 'locks_unknown');
+  clock += 31000; assert.strictEqual(coord.blockReason(rfq), null, 'stale empty list => quote');
+  coord.setLocks([{ id: 'L', leg_keys: ['KXNFLGAME-26OCT25INDMIN-MIN:yes', 'KXNFLGAME-26OCT25CINBAL-BAL:yes'] }], clock);
+  clock += 31000; assert.strictEqual(coord.blockReason(rfq), 'combo_lock_match', 'stale list still blocks exact match');
+  assert.ok(coord.stats().locksStale && coord.stats().staleChecks > 0);
+  const fc = createLockCoord({ supabase: null, now: () => clock, log: () => {}, failClosed: true });
+  assert.strictEqual(fc.blockReason(rfq), 'locks_unknown', 'SNIPER_LOCKS_FAIL_CLOSED restores old rule');
+  const badSb = { from: () => ({ select: () => ({ eq: () => ({ eq: () => ({ limit: async () => ({ data: null, error: { message: 'x' } }) }) }) }) }) };
+  assert.strictEqual(await createLockCoord({ supabase: badSb, log: () => {} }).comboWorkerQuoting('R'), null, 'submissions read error => no block');
+  assert.strictEqual(await createLockCoord({ supabase: badSb, log: () => {}, failClosed: true }).comboWorkerQuoting('R'), 'submissions_unknown');
   assert.strictEqual(await coord.comboWorkerQuoting('R1'), 'combo_worker_quoting');
 
   // ── live lifecycle with fakes ──
