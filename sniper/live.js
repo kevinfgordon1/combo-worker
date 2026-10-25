@@ -244,7 +244,7 @@ function createLiveSniper({
     }
     return n;
   }
-  return { shutdown, stopping: () => stopping, send, forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); for (const id of inflight) cb(id); for (const id of ttlCancelling) cb(id); }, isClosed, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, postMs: undefined, postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
+  return { shutdown, stopping: () => stopping, send, hasRfqId: (id) => byRfq.has(id) || inflight.has(id) || ttlCancelling.has(id), forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); for (const id of inflight) cb(id); for (const id of ttlCancelling) cb(id); }, isClosed, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, postMs: undefined, postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
 }
 
 module.exports = { createLiveSniper, postFailKey };
