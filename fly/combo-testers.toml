@@ -1,0 +1,29 @@
+# Fly app for the Combo Locks testers supervisor (non-Kevin users).
+# Deploy: flyctl deploy . -c fly/combo-testers.toml -a kaygo-combo-testers --local-only --ha=false
+# Secrets (fly secrets, never here): SUPABASE_URL, SUPABASE_SERVICE_KEY only.
+# NEVER set Kevin's KALSHI_*/SNIPER_KALSHI_* or any POLYMARKET_* keys on this app;
+# tester keys come from Supabase (combo_exchange_keys_for_worker) per child.
+app = "kaygo-combo-testers"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "../Dockerfile"
+
+[processes]
+  app = "npm run start:testers"
+
+[deploy]
+  # never rolling/bluegreen: no overlap of two copies
+  strategy = "immediate"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "1gb"
+
+# EXACTLY ONE machine, ever. No [http_service]. Railway combo-testers must stay stopped.
+[env]
+  WORKER_MODE = "testers"
+  KALSHI_BUCKET_AUTO = "0"
+  KALSHI_BUCKET_SWEEP = "0"
