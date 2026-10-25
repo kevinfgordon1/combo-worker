@@ -23,3 +23,7 @@ kill_timeout = "30s"
 # Never 'fly scale count' above 1; stop Railway combo-worker before the first start.
 [env]
   COMBO_POLY_ENABLED = "0"
+  # Oct 25: decode the Kalshi feed on a worker thread (main thread was lagging ~1.1s at kickoff volume).
+  COMBO_INTAKE_WORKER = "1"
+  # Keep the old any-lock-game filter (#278 AND filter dropped real matches on testers).
+  KALSHI_WS_NEEDLE_ALL = "0"
