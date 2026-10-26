@@ -1452,3 +1452,39 @@ main().catch((err) => {
   }
   console.log('bucket pct target ok');
 }
+
+// A hung balance read must not pin the single in-flight check forever (Oct 24 outage).
+(async () => {
+  let current = WED;
+  let hang = true;
+  let calls = 0;
+  const client = {
+    async getShard(i) {
+      calls += 1;
+      if (hang) return new Promise(() => {}); // never settles
+      return { availableCents: i === 0 ? 1_000_000 : 5_000_000, portfolioCents: 0 };
+    },
+    async transfer() { throw new Error('no transfer expected'); },
+    async getTransfers() { return []; },
+    async shardActivity() { return { restingOrders: false }; },
+  };
+  const logs = [];
+  const mgr = createBucketManager({
+    env: { ...LEGACY_LIMITS }, now: () => current, alert() {}, log(l) { logs.push(String(l)); },
+    sleep: async () => {}, client, readPolyCash: null,
+  });
+  const stuck = mgr.check('interval');
+  void stuck;
+  await new Promise((r) => setImmediate(r));
+  // Within the stuck window the same in-flight check is reused (no second read).
+  const again = mgr.check('interval');
+  assert.strictEqual(again, stuck);
+  // After 2+ minutes the stuck check is abandoned and a fresh read runs.
+  hang = false;
+  current = new Date(WED.getTime() + 130_000);
+  const out = await mgr.check('insufficient_balance');
+  assert.ok(!out || !out.error, JSON.stringify(out));
+  assert.ok(calls >= 2);
+  assert.ok(logs.some((l) => /previous check stuck/.test(l)));
+  console.log('bucket stuck-check unstick ok');
+})().catch((e) => { console.error(e); process.exit(1); });
