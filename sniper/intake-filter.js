@@ -2,7 +2,7 @@
 'use strict';
 const { tooOld } = require('./intake');
 const { rfqAgeMs } = require('../quote-sender');
-const { classifyLegs } = require('./engine');
+const { classifyLegs, maxLegDaysCheck } = require('./engine');
 
 // cfg.earlyFilter (SNIPER_INTAKE_EARLY_FILTER, default on): also drop, before main ever sees them,
 //   duplicate RFQ ids (60s) and RFQs with a leg on a game main has marked started (`started`, a
@@ -38,6 +38,8 @@ function createCandidateFilter(cfg, { now = () => Date.now(), clock = () => Date
     if (cfg.earlyFilter && dup(rfq.rfqId, recvAt)) { bump('dup_rfq_intake'); return null; }
     if (tooOld(rfq, clock(), cfg.maxAgeMs) != null) { bump('stale_at_intake'); return null; }
     if (cfg.earlyFilter && startedLeg(rfq)) { bump('game_started_intake'); return null; }
+    // cfg.maxLegDays (SNIPER_MAX_LEG_DAYS): ticker-date check only (no kickoffs in the worker); main re-checks with real kickoffs.
+    if (cfg.maxLegDays > 0 && maxLegDaysCheck(rfq.legKeys, null, clock(), cfg.maxLegDays)) { bump('leg_beyond_max_days_intake'); return null; }
     const sr = scopeReason(rfq); if (sr) { bump(sr); return null; }
     return { ...rfq, recvAt, recvAge, workerAt: now() };
   };
