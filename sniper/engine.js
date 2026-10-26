@@ -96,7 +96,7 @@ function classifyLegs(rfq, { td, ncaaf, lines = false, nba = false }) {
 }
 
 // -> { decision, row } ; decision.action 'quote' | 'skip'
-function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBook = null, nbaBook = null, venues, kickoffFor, makerRate, nowMs, bufferMs = 30 * 60 * 1000, pricesHealthy = true }) {
+function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBook = null, nbaBook = null, venues, kickoffFor, makerRate, nowMs, bufferMs = 30 * 60 * 1000, pricesHealthy = true, totalCapFor = null }) {
   const skip = (reason) => ({ decision: { action: 'skip', reason } });
   if (!config.enabled) return skip('kill_switch');
   if (!rfq || !rfq.rfqId || !Array.isArray(rfq.legKeys)) return skip('bad_rfq');
@@ -140,7 +140,10 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
   // Any NBA leg (moneyline, spread or total): SNIPER_MIN_ROI_NBA (Kevin Oct 24: 6%).
   const hasNba = cls.legs.some((l) => l && (l.kind === 'nba' || (l.kind === 'line' && l.league === 'nba')));
   if (hasNba) minRoi = Math.max(minRoi, config.minRoiNba != null ? config.minRoiNba : 0.06);
-  const d = evaluateSnipe(row, { config: { ...config, minRoi }, ledger, nowMs, makerRate });
+  // Per-parlay total cap (sniper/soon-cap.js): <= soonHours to settle may use the sniper's cash.
+  const settleAt0 = settleAtMs(keys, kickoffFor, config.gameHours, config.nbaGameHours);
+  const totalCap = totalCapFor ? totalCapFor(settleAt0, nowMs) : config.totalExposureCap;
+  const d = evaluateSnipe(row, { config: { ...config, minRoi, totalExposureCap: totalCap }, ledger, nowMs, makerRate });
   if (d.action === 'skip' && d.reason === 'roi_below_min' && hasNba) d.reason = 'roi_below_min_nba';
   else if (d.action === 'skip' && d.reason === 'roi_below_min' && hasNcaaf) d.reason = 'roi_below_min_ncaaf';
   else if (d.action === 'skip' && d.reason === 'roi_below_min' && hasTd) d.reason = 'roi_below_min_td';
@@ -148,7 +151,8 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
   if (rogue.length) d.rogue = rogue;
   if (d.action === 'quote') {
     d.releaseAt = releaseAtMs(legs, nowMs);
-    d.settleAt = settleAtMs(keys, kickoffFor, config.gameHours, config.nbaGameHours);
+    d.settleAt = settleAt0;
+    if (totalCap > config.totalExposureCap) d.totalCap = totalCap;
     d.minRoi = minRoi; d.hasTd = hasTd; d.hasLine = hasLine; d.hasNcaaf = hasNcaaf; d.hasNba = hasNba;
     // Per-leg detail for the fill alert + audit (sniper_decisions.details.legDetail).
     d.legDetail = legs.map((l) => ({ ticker: l.ticker, side: l.side, fair: l.fair_yes, venue: l.venue, depthUsd: l.depth_usd, name: l.name }));

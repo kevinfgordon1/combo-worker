@@ -50,7 +50,9 @@ function sniperConfig(env = process.env) {
     minRoiNba: num(env.SNIPER_MIN_ROI_NBA, 0.06),               // any NBA leg: 6% (highest rule wins)
     nbaHours: num(env.SNIPER_NBA_HOURS, 36),                    // NBA legs must tip within this many hours
     nbaGameHours: num(env.SNIPER_NBA_GAME_HOURS, 3),            // NBA settle = last tip + this
-    maxLegDays: num(env.SNIPER_MAX_LEG_DAYS, 7),                // Kevin Oct 26: reject any leg whose game is > this many days out (0 = off)
+    maxLegDays: num(env.SNIPER_MAX_LEG_DAYS, 7),
+    soonCap: String(env.SNIPER_SOON_CAP == null ? '1' : env.SNIPER_SOON_CAP) !== '0', // Kevin Oct 26: <=soonHours parlays cap = sniper cash
+    soonHours: num(env.SNIPER_SOON_HOURS, 24),                // Kevin Oct 26: reject any leg whose game is > this many days out (0 = off)
     maxPayout: num(env.SNIPER_MAX_PAYOUT, 100),        // $ per quote (contracts × $1)
     maxRisk: num(env.SNIPER_MAX_RISK, 100),            // $ worst-case loss per quote (NO cost + maker fee)
     totalExposureCap: num(env.SNIPER_TOTAL_EXPOSURE_CAP, 10000), // $ open worst-case risk
