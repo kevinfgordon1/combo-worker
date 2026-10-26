@@ -94,3 +94,18 @@ assert.strictEqual(ageMs(iso(t + 500), t), 0, 'tiny skew clamps to 0');
 }
 
 console.log('latency-stats.test.js ok');
+
+{ // noteStages splits RFQ age into feed / worker / handoff / post
+  const s = createLatencyStats({ now: () => 1700000020000 });
+  const sp = s.noteStages({ createdTs: 1700000010000, wsRecvAt: 1700000012000, workerAt: 1700000012010, handlerAt: 1700000014510, postAt: 1700000014560, offsetMs: 500 });
+  assert.deepStrictEqual(sp, { feed_ms: 2500, ws_to_worker_ms: 10, handoff_ms: 2500, handler_to_post_ms: 50 });
+  const sp2 = s.noteStages({ createdTs: 1700000010000, wsRecvAt: 1700000010100, handlerAt: 1700000010150 });
+  assert.strictEqual(sp2.ws_to_worker_ms, null);
+  assert.strictEqual(sp2.handoff_ms, 50);
+  const snap = s.rollInterval();
+  assert.strictEqual(snap.age_breakdown.feed_ms.n, 2);
+  assert.strictEqual(snap.age_breakdown.handler_to_post_ms.n, 1);
+  assert.match(s.formatLine(snap), /age_split p50\/p90 feed=/);
+  assert.strictEqual(s.takeSlowLogSlot(1), true);
+  assert.strictEqual(s.takeSlowLogSlot(1), false);
+}
