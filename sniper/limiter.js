@@ -48,7 +48,15 @@ function createLimiter({ name, ratePerSec, ratePerSecOn429 = null, burst = 1, lo
     onOk();
     return r;
   }
-  return { run, stats: () => ({ ...stats, backoffMs, ratePerSec }), on429, _state: () => ({ tokens, backoffUntil }) };
+  // Retune the refill rate at runtime (sniper borrowing Combo Locks' idle slots). After a 429
+  // step-down the rate can never go back above the degraded rate until restart.
+  function setRate(r) {
+    const n = Number(r); if (!Number.isFinite(n) || n <= 0) return ratePerSec;
+    refill();
+    ratePerSec = stats.degraded && ratePerSecOn429 != null ? Math.min(n, ratePerSecOn429) : n;
+    return ratePerSec;
+  }
+  return { run, setRate, stats: () => ({ ...stats, backoffMs, ratePerSec }), on429, _state: () => ({ tokens, backoffUntil }) };
 }
 
 // Trips when total 429s across venues within windowMs reach max. onTrip fires once.
