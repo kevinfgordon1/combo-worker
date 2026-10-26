@@ -30,6 +30,46 @@ function createNflFrameFilter(needles = NFL_NEEDLES) {
   };
 }
 
+// EVERY-leg prefix filter (SNIPER_WS_NEEDLE_ALL, default on; =0 rolls back to the any-leg needle
+// filter above). Reads the leg ticker values straight out of the raw frame (no JSON.parse) and drops
+// the frame when ANY leg ticker is outside the supported series prefixes, so a combo with one NFL leg
+// plus soccer / props never gets parsed. The parent combo market (KXMVE...) is ignored. No leg ticker
+// found, or anything unexpected => keep (fail open: the worker's scope check still runs).
+const LEG_TICKER_RE = /"(?:market_ticker|ticker|selected_ticker|selected_market)"\s*:\s*"([^"]+)"/g;
+function frameText(raw) {
+  if (Buffer.isBuffer(raw)) return raw.toString('utf8');
+  if (Array.isArray(raw)) return Buffer.concat(raw.map((b) => (Buffer.isBuffer(b) ? b : Buffer.from(String(b))))).toString('utf8');
+  return String(raw == null ? '' : raw);
+}
+function createAllLegsFrameFilter(needles) {
+  const prefixes = needles.map((n) => n.toString().toUpperCase());
+  return function shouldDropCreated(raw) {
+    try {
+      if (!frameHas(raw, needles)) return true; // no supported leg at all (same as the any-leg filter)
+      const s = frameText(raw);
+      LEG_TICKER_RE.lastIndex = 0; let m; let legs = 0;
+      while ((m = LEG_TICKER_RE.exec(s)) !== null) {
+        const t = m[1].toUpperCase();
+        if (t.startsWith('KXMVE')) continue;
+        legs += 1;
+        if (!prefixes.some((pfx) => t.startsWith(pfx))) return true;
+      }
+      return false; // every leg supported, or none found (fail open)
+    } catch (_) { return false; }
+  };
+}
+
+// Needles for the sports actually on: college football only when NCAAF is on, NBA only when NBA is on.
+function sniperNeedles({ ncaaf = true, nba = false } = {}) {
+  const base = NFL_NEEDLES.filter((n) => ncaaf || !n.toString().startsWith('KXNCAAF'));
+  return nba ? [...base, ...NBA_NEEDLES] : base;
+}
+const needleAllDisabled = (env = process.env) => /^(0|false|no|off)$/i.test(String((env && env.SNIPER_WS_NEEDLE_ALL) || ''));
+function createSniperFrameFilter({ ncaaf = true, nba = false, all = true } = {}) {
+  const needles = sniperNeedles({ ncaaf, nba });
+  return all ? createAllLegsFrameFilter(needles) : createNflFrameFilter(needles);
+}
+
 // forEachRfqId(cb) walks the RFQ ids we hold open quotes for.
 function createDeletedFilter(forEachRfqId) {
   return function shouldDropDeleted(raw) {
@@ -103,4 +143,4 @@ function createLatencyStats() {
   };
 }
 
-module.exports = { createDeletedIdFilter, createLoopLagSampler, staleBucket, STAGES, createNflFrameFilter, createDeletedFilter, tooOld, createLatencyStats, NFL_NEEDLES, NBA_NEEDLES };
+module.exports = { createAllLegsFrameFilter, sniperNeedles, needleAllDisabled, createSniperFrameFilter, createDeletedIdFilter, createLoopLagSampler, staleBucket, STAGES, createNflFrameFilter, createDeletedFilter, tooOld, createLatencyStats, NFL_NEEDLES, NBA_NEEDLES };

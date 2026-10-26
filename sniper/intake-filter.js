@@ -1,4 +1,6 @@
-// Pure candidate filter used by the intake worker (age + leg scope). Exported for tests.
+// Pure candidate filter used by the intake worker (age + leg count + leg scope). Exported for tests.
+// Scope (cfg.scope) runs classifyLegs, which also rejects same-game combos (correlated_same_game),
+// so those never reach the main thread. cfg.maxLegs (SNIPER_MAX_LEGS) drops too-many-leg RFQs here.
 'use strict';
 const { tooOld } = require('./intake');
 const { rfqAgeMs } = require('../quote-sender');
@@ -6,7 +8,7 @@ const { classifyLegs, maxLegDaysCheck } = require('./engine');
 
 // cfg.earlyFilter (SNIPER_INTAKE_EARLY_FILTER, default on): also drop, before main ever sees them,
 //   duplicate RFQ ids (60s) and RFQs with a leg on a game main has marked started (`started`, a
-//   ticker Set main syncs every 2s; game_started is permanent, so this only repeats main's skip).
+//   ticker Set main syncs every SNIPER_STARTED_SYNC_MS (default 500ms); game_started is permanent, so this only repeats main's skip).
 function createCandidateFilter(cfg, { now = () => Date.now(), clock = () => Date.now(), bump = () => {}, started = new Set(), dedupeMs = 60000, dedupeMax = 200000 } = {}) {
   const seen = new Map(); // rfqId -> ms
   function dup(id, t) {
@@ -40,6 +42,7 @@ function createCandidateFilter(cfg, { now = () => Date.now(), clock = () => Date
     if (cfg.earlyFilter && startedLeg(rfq)) { bump('game_started_intake'); return null; }
     // cfg.maxLegDays (SNIPER_MAX_LEG_DAYS): ticker-date check only (no kickoffs in the worker); main re-checks with real kickoffs.
     if (cfg.maxLegDays > 0 && maxLegDaysCheck(rfq.legKeys, null, clock(), cfg.maxLegDays)) { bump('leg_beyond_max_days_intake'); return null; }
+    if (cfg.maxLegs > 0 && (rfq.legKeys || []).length > cfg.maxLegs) { bump('too_many_legs_intake'); return null; }
     const sr = scopeReason(rfq); if (sr) { bump(sr); return null; }
     return { ...rfq, recvAt, recvAge, workerAt: now() };
   };
