@@ -25,11 +25,13 @@ kill_timeout = "60s"   # Oct 25: room to cancel every open quote on SIGTERM
   SNIPER_KALSHI_SUBACCOUNT = "1"
   # Kevin's go-live risk rules (Oct 22)
   SNIPER_MAX_RISK = "400"   # Kevin Oct 26: per-quote risk $200 -> $400
-  # Kevin Oct 26: split account writes. Sniper max 6/s (steps down to 4/s after any 429);
-  # 9/s reserved for Kevin's Combo Locks on kaygo-combo-worker. Code clamps to 15 - 9.
-  SNIPER_KALSHI_TRADE_RPS = "6"
-  SNIPER_KALSHI_TRADE_RPS_ON_429 = "4"
-  KALSHI_ACCOUNT_WRITE_RPS = "15"
+  # Kevin Oct 26: account is Kalshi Advanced (~150 quote writes/s). Our budget 30/s:
+  # sniper 20/s (steps down to 10/s after any 429), 2/s guaranteed for routine cancels;
+  # 9/s reserved for Kevin's Combo Locks on kaygo-combo-worker. Code clamps to 30 - 9.
+  SNIPER_KALSHI_TRADE_RPS = "20"
+  SNIPER_KALSHI_TRADE_RPS_ON_429 = "10"
+  SNIPER_CANCEL_SHARE_RPS = "2"
+  KALSHI_ACCOUNT_WRITE_RPS = "30"
   COMBO_LOCKS_RESERVED_RPS = "9"
   SNIPER_MAX_PAYOUT = "100000"
   SNIPER_DAILY_LOSS_CAP = "10000"
