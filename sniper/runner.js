@@ -25,6 +25,7 @@ const { createProphetXClient, hasProphetXCreds, authMode } = require('../noboost
 const { createSeriesFeeCache, seriesOfTicker } = require('../series-fee');
 const { sniperConfig, createSniperLedger, formatDecision, createTelegramNotifier } = require('../auto-sniper');
 const { createLimiter, createRateBreaker } = require('./limiter');
+const { sniperKalshiTradeBudget } = require('./kalshi-budget');
 const { fetchWithTimeout } = require('./fetch-timeout');
 const { createStaleAlert } = require('./stale-alert');
 const { createLedgerStore } = require('./ledger-store');
@@ -94,13 +95,16 @@ async function main(env = process.env) {
   if (gate.live) alert('[SNIPER] ⚠️ LIVE MODE: all gates set — this service will send and confirm real Kalshi RFQ quotes.');
 
   // ── Request budgets (well under venue limits) ──
+  const tradeBudget = sniperKalshiTradeBudget(env);
+  if (tradeBudget.clamped) log(`[SNIPER] SNIPER_KALSHI_TRADE_RPS ${tradeBudget.requested} above budget; clamped to ${tradeBudget.rps}/s (account ${tradeBudget.account}/s, Combo Locks reserved ${tradeBudget.reserved}/s)`);
   const lim = {
     kalshi: createLimiter({ name: 'kalshi_public', ratePerSec: num(env.SNIPER_KALSHI_RPS, 2), burst: 3 }),
     relay: createLimiter({ name: 'odds_relay', ratePerSec: num(env.SNIPER_RELAY_RPS, config.ncaaf ? 2 : 1), burst: 2 }), // our own relay; 2/s when NCAAF boards are polled too
     prophetx: createLimiter({ name: 'prophetx', ratePerSec: num(env.SNIPER_PROPHETX_RPS, 0.2), burst: 1 }),
     kalshiSeries: createLimiter({ name: 'kalshi_series', ratePerSec: 0.2, burst: 2 }),
     // signed calls on the sniper's own key (quote POST/confirm/cancel, fills reads)
-    kalshiTrade: createLimiter({ name: 'kalshi_trade', ratePerSec: num(env.SNIPER_KALSHI_TRADE_RPS, 5), burst: 5 }),
+    // Capped at Kevin's account budget minus the 9/s reserved for his Combo Locks (sniper/kalshi-budget.js).
+    kalshiTrade: createLimiter({ name: 'kalshi_trade', ratePerSec: tradeBudget.rps, ratePerSecOn429: tradeBudget.on429, burst: Math.min(5, Math.ceil(tradeBudget.rps)) }),
     // Authenticated reads (fill lookups) use Kalshi's separate Read bucket — keep them off the write lane.
     kalshiTradeRead: createLimiter({ name: 'kalshi_trade_read', ratePerSec: num(env.SNIPER_KALSHI_READ_RPS, 3), burst: 3 }),
     kalshiSettle: createLimiter({ name: 'kalshi_settle', ratePerSec: 0.5, burst: 2 }),
@@ -404,7 +408,7 @@ async function main(env = process.env) {
   const releaseBatchMs = num(env.SNIPER_RELEASE_BATCH_MS, 250);
   const releaseBatcher = releaseBatchMs > 0 ? createReleaseBatcher({ supabase, flushMs: releaseBatchMs, log, fallback: (id, ph) => store.release(id, ph, {}) }) : null;
   const wbMaxBacklog = num(env.SNIPER_WB_MAX_BACKLOG, 16);
-  const tradeRps = Math.max(1, num(env.SNIPER_KALSHI_TRADE_RPS, 8));
+  const tradeRps = tradeBudget.rps;
   // Startup sweep (live): rows a previous process left 'reserved' / 'quoted' (its 20s quote
   // timers died with it). Cancel the Kalshi quote (404 = already gone), then release the row,
   // BEFORE hydrating so stale reservations never count as open exposure.

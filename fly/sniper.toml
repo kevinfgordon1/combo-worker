@@ -25,7 +25,12 @@ kill_timeout = "60s"   # Oct 25: room to cancel every open quote on SIGTERM
   SNIPER_KALSHI_SUBACCOUNT = "1"
   # Kevin's go-live risk rules (Oct 22)
   SNIPER_MAX_RISK = "200"
-  SNIPER_KALSHI_TRADE_RPS = "15"   # Kevin Oct 25: Advanced tier ~30 writes/s; drop to 8 on any 429
+  # Kevin Oct 26: split account writes. Sniper max 6/s (steps down to 4/s after any 429);
+  # 9/s reserved for Kevin's Combo Locks on kaygo-combo-worker. Code clamps to 15 - 9.
+  SNIPER_KALSHI_TRADE_RPS = "6"
+  SNIPER_KALSHI_TRADE_RPS_ON_429 = "4"
+  KALSHI_ACCOUNT_WRITE_RPS = "15"
+  COMBO_LOCKS_RESERVED_RPS = "9"
   SNIPER_MAX_PAYOUT = "100000"
   SNIPER_DAILY_LOSS_CAP = "10000"
   SNIPER_DAILY_RISK_CAP = "15000"

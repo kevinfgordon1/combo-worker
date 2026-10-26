@@ -2,7 +2,7 @@
 // a breaker that trips (and stays tripped until restart) when 429s exceed a threshold.
 'use strict';
 
-function createLimiter({ name, ratePerSec, burst = 1, now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+function createLimiter({ name, ratePerSec, ratePerSecOn429 = null, burst = 1, now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
   let tokens = burst; let last = now(); let backoffUntil = 0; let backoffMs = 0;
   const stats = { name, requests: 0, ok: 0, errors: 0, r429: 0, waitedMs: 0 };
   function refill() { const t = now(); tokens = Math.min(burst, tokens + ((t - last) / 1000) * ratePerSec); last = t; }
@@ -23,6 +23,8 @@ function createLimiter({ name, ratePerSec, burst = 1, now = () => Date.now(), sl
   }
   function on429() {
     stats.r429 += 1;
+    // Optional permanent step-down after any 429 (e.g. sniper 6/s -> 4/s) until restart.
+    if (ratePerSecOn429 != null && ratePerSecOn429 > 0 && ratePerSecOn429 < ratePerSec) { ratePerSec = ratePerSecOn429; stats.degraded = true; }
     backoffMs = Math.min(60000, backoffMs ? backoffMs * 2 : 2000);
     backoffUntil = now() + backoffMs;
   }
@@ -43,7 +45,7 @@ function createLimiter({ name, ratePerSec, burst = 1, now = () => Date.now(), sl
     onOk();
     return r;
   }
-  return { run, stats: () => ({ ...stats, backoffMs }), on429, _state: () => ({ tokens, backoffUntil }) };
+  return { run, stats: () => ({ ...stats, backoffMs, ratePerSec }), on429, _state: () => ({ tokens, backoffUntil }) };
 }
 
 // Trips when total 429s across venues within windowMs reach max. onTrip fires once.
