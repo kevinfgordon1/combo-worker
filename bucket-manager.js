@@ -42,6 +42,15 @@ const TRANSFER_PATH = '/trade-api/v2/portfolio/intra_exchange_instance_transfer'
 // Kalshi's own record of each transfer (newest first): transfer_id, status,
 // amount (dollars string), source/destination_exchange_shard.
 const TRANSFERS_PATH = '/trade-api/v2/portfolio/intra_exchange_instance_transfers';
+const BUCKET_HTTP_TIMEOUT_MS = 10_000;
+// A check (balance reads + alerts) that has not settled after this long is treated as stuck.
+const CHECK_STUCK_MS = 120_000;
+const ALERT_TIMEOUT_MS = 10_000;
+function withTimeout(p, ms, what) {
+  let t;
+  const timer = new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`${what} timed out after ${ms}ms`)), ms); if (t.unref) t.unref(); });
+  return Promise.race([Promise.resolve(p), timer]).finally(() => clearTimeout(t));
+}
 const BALANCE_PATH = '/trade-api/v2/portfolio/balance';
 const POSITIONS_PATH = '/trade-api/v2/portfolio/positions';
 const ORDERS_PATH = '/trade-api/v2/portfolio/orders';
@@ -506,6 +515,9 @@ async function kalshiCall(signed, method, signPath, { query, body } = {}) {
     if (s) qs = `?${s}`;
   }
   const res = await signed(method, signPath, {
+    // Bound every bucket call: a hung balance read used to pin the single in-flight check
+    // forever (Oct 24 9:54 PM–~2 AM ET: snapshot frozen at 3:33 PM, every combo quote 400'd).
+    timeoutMs: BUCKET_HTTP_TIMEOUT_MS,
     path: `${signPath}${qs}`,
     headers: body != null ? { 'Content-Type': 'application/json' } : undefined,
     body: body != null ? JSON.stringify(body) : undefined,
@@ -669,6 +681,9 @@ function createBucketManager({
   let snap = null;
   let lastNeedUsed = 0;
   let inflight = null;
+  let inflightAt = 0;
+  let inflightGen = 0;
+  let transferInRun = false;
   let timer = null;
   let balanceErrorAt = 0;
   let polyErrorAt = 0;
@@ -703,7 +718,7 @@ function createBucketManager({
 
   async function emit(text) {
     try {
-      await alert(text);
+      await withTimeout(alert(text), ALERT_TIMEOUT_MS, 'alert');
     } catch (e) {
       log(`[BUCKET] alert failed ${e && e.message ? e.message : e}`);
     }
@@ -735,7 +750,7 @@ function createBucketManager({
   async function inApp(spec) {
     if (!appAlerts || typeof appAlerts.raise !== 'function') return false;
     try {
-      return await appAlerts.raise(spec);
+      return await withTimeout(appAlerts.raise(spec), ALERT_TIMEOUT_MS, 'in-app alert');
     } catch (e) {
       log(`[BUCKET] in-app alert failed ${e && e.message ? e.message : e}`);
       return false;
@@ -1199,6 +1214,7 @@ function createBucketManager({
 
     const amountCenticents = centsToCenticents(decision.amountCents);
     try {
+      transferInRun = true;
       const sent = await kalshi.transfer({
         amountCenticents,
         fromShard: decision.fromShard,
@@ -1276,14 +1292,24 @@ function createBucketManager({
   }
 
   function requestCheck(reason) {
-    if (inflight) return inflight;
+    if (inflight) {
+      const age = clock().getTime() - inflightAt;
+      // Never let one hung check block every later check (and the insufficient-balance
+      // re-check). Only abandon it when it has not sent a transfer, so a stuck run can
+      // never lead to a second transfer.
+      if (age < CHECK_STUCK_MS || transferInRun) return inflight;
+      log(`[BUCKET] previous check stuck ${Math.round(age / 1000)}s — abandoning it and re-checking (${reason})`);
+    }
+    const gen = ++inflightGen;
+    inflightAt = clock().getTime();
+    transferInRun = false;
     inflight = Promise.resolve()
       .then(() => evaluate(reason))
       .catch((e) => {
         log(`[BUCKET] check failed ${e && e.message ? e.message : e}`);
         return { error: e && e.message ? e.message : String(e) };
       })
-      .finally(() => { inflight = null; });
+      .finally(() => { if (gen === inflightGen) { inflight = null; transferInRun = false; } });
     return inflight;
   }
 
