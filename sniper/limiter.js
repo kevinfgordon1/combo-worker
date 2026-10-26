@@ -2,22 +2,25 @@
 // a breaker that trips (and stays tripped until restart) when 429s exceed a threshold.
 'use strict';
 
-function createLimiter({ name, ratePerSec, ratePerSecOn429 = null, burst = 1, now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+function createLimiter({ name, ratePerSec, ratePerSecOn429 = null, burst = 1, lowShareRps = 0, now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
   let tokens = burst; let last = now(); let backoffUntil = 0; let backoffMs = 0;
   const stats = { name, requests: 0, ok: 0, errors: 0, r429: 0, waitedMs: 0 };
   function refill() { const t = now(); tokens = Math.min(burst, tokens + ((t - last) / 1000) * ratePerSec); last = t; }
   // Priority lanes: 2 = urgent (risk-reducing cancels), 1 = normal (quotes/confirms), 0 = low
   // (routine TTL cancels). A caller yields while anyone at a higher level is waiting for a token.
-  const waiting = [0, 0, 0];
+  const waiting = [0, 0, 0]; let lastLow = -Infinity;
   const higherWaiting = (p) => { for (let i = p + 1; i < waiting.length; i += 1) if (waiting[i] > 0) return true; return false; };
   async function acquire(prio = 1, abortIf = null) {
     for (;;) {
       if (abortIf && abortIf()) return false;
       const t = now();
-      if (higherWaiting(prio)) { stats.waitedMs += 25; await sleep(25); continue; }
+      // Low lane (routine cancels) gets a guaranteed share (lowShareRps, e.g. 1/s) out of the SAME
+      // bucket, so it can't starve behind a steady queue of quotes. It still yields to urgent (2).
+      const lowTurn = prio === 0 && lowShareRps > 0 && t - lastLow >= 1000 / lowShareRps && waiting[2] === 0;
+      if (!lowTurn && higherWaiting(prio)) { stats.waitedMs += 25; await sleep(25); continue; }
       if (t < backoffUntil) { const w = backoffUntil - t; stats.waitedMs += w; await sleep(w); continue; }
       refill();
-      if (tokens >= 1) { tokens -= 1; return true; }
+      if (tokens >= 1) { tokens -= 1; if (prio === 0) lastLow = t; return true; }
       const w = Math.ceil(((1 - tokens) / ratePerSec) * 1000); stats.waitedMs += w; await sleep(w);
     }
   }

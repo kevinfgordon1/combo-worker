@@ -47,8 +47,14 @@ function createBatchedLedgerStore(store, { supabase, flushMs = 300, maxQueue = 2
         // drop rows that are permanently rejected (logged), requeue the rest.
         log(`[SNIPER] ledger batch upsert (${inserts.length}) failed: ${error.message} — retrying per row`);
         for (const r of inserts) {
-          const one = await supabase.from('sniper_ledger').upsert([r], { onConflict: 'rfq_id' });
+          let one = await supabase.from('sniper_ledger').upsert([r], { onConflict: 'rfq_id' });
           if (!one.error) { stats.inserted += 1; continue; }
+          // Oct 26 2026: a stale (past-hold, unfilled, no order) row on the same combo must not block
+          // a fresh quote. Release it and retry once; live/filled rows still block (unchanged).
+          if (/open_combo/i.test(one.error.message || '') && r.status === 'open' && !r.dry_run && store.releaseStaleCombo) {
+            let n = 0; try { n = await store.releaseStaleCombo(r.combo_key); } catch (e) { log(`[SNIPER] ${e.message}`); }
+            if (n > 0) { stats.staleFreed = (stats.staleFreed || 0) + n; one = await supabase.from('sniper_ledger').upsert([r], { onConflict: 'rfq_id' }); if (!one.error) { stats.inserted += 1; continue; } }
+          }
           if (/23505|duplicate|unique|violates/i.test(one.error.message || '')) { stats.rejected = (stats.rejected || 0) + 1; rejected.add(r.rfq_id); log(`[SNIPER] ledger row rejected rfq=${r.rfq_id}: ${one.error.message}`); }
           else ok = false;
         }

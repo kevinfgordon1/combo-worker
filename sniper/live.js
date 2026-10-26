@@ -115,11 +115,19 @@ function createLiveSniper({
     if (reason === 'ttl') {
       // Routine cleanup only. Urgent cancels (price move / started game / decline / shutdown)
       // always go out, even if we think the RFQ is gone.
+      // Oct 26 2026: release the ledger row NOW and send the routine cancel in the background.
+      // Awaiting the (low-priority) DELETE first left ~210 rows / $9.6K 'quoted' in the DB for
+      // minutes and blocked fresh quotes on the same combo (open-combo unique index). An expired
+      // quote can't fill without our confirm (onAccepted -> not_ours), so releasing first is safe.
+      await store.release(p.d.rfqId, phase, {}); stats.cancelled += 1;
       if (isClosed(rid)) { stats.cancelSkipped += 1; }
       else {
         ttlCancelling.add(rid);
-        try { const r = await trader.cancel(quoteId, { urgent: false, skipIf: () => isClosed(rid) }); if (r && r.skipped) stats.cancelSkipped += 1; } catch (e) { log(`[SNIPER] cancel ${quoteId} failed: ${e.message}`); } finally { ttlCancelling.delete(rid); }
+        (async () => {
+          try { const r = await trader.cancel(quoteId, { urgent: false, skipIf: () => isClosed(rid) }); if (r && r.skipped) stats.cancelSkipped += 1; } catch (e) { log(`[SNIPER] cancel ${quoteId} failed: ${e.message}`); } finally { ttlCancelling.delete(rid); }
+        })();
       }
+      return;
     } else {
       try { await trader.cancel(quoteId, { urgent: true }); } catch (e) { log(`[SNIPER] cancel ${quoteId} failed: ${e.message}`); }
     }

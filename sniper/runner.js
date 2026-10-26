@@ -105,7 +105,7 @@ async function main(env = process.env) {
     kalshiSeries: createLimiter({ name: 'kalshi_series', ratePerSec: 0.2, burst: 2 }),
     // signed calls on the sniper's own key (quote POST/confirm/cancel, fills reads)
     // Capped at Kevin's account budget minus the 9/s reserved for his Combo Locks (sniper/kalshi-budget.js).
-    kalshiTrade: createLimiter({ name: 'kalshi_trade', ratePerSec: tradeBudget.rps, ratePerSecOn429: tradeBudget.on429, burst: Math.min(5, Math.ceil(tradeBudget.rps)) }),
+    kalshiTrade: createLimiter({ name: 'kalshi_trade', ratePerSec: tradeBudget.rps, ratePerSecOn429: tradeBudget.on429, burst: Math.min(5, Math.ceil(tradeBudget.rps)), lowShareRps: Math.max(0, num(env.SNIPER_CANCEL_SHARE_RPS, 1)) }),
     // Authenticated reads (fill lookups) use Kalshi's separate Read bucket — keep them off the write lane.
     kalshiTradeRead: createLimiter({ name: 'kalshi_trade_read', ratePerSec: num(env.SNIPER_KALSHI_READ_RPS, 3), burst: 3 }),
     kalshiSettle: createLimiter({ name: 'kalshi_settle', ratePerSec: 0.5, burst: 2 }),
@@ -499,6 +499,17 @@ async function main(env = process.env) {
   process.once('SIGTERM', () => { onStop('SIGTERM'); });
   process.once('SIGINT', () => { onStop('SIGINT'); });
   liveSniperRef = () => liveSniper.halt('rate_limit');
+  // Oct 26 2026 stale-quote sweep (SNIPER_STALE_SWEEP_MS, default 30000; 0 = off): live rows still
+  // 'reserved'/'quoted' past release_at, with no order and no fills, that this process is no longer
+  // tracking -> cancel the Kalshi quote (404 = gone) and release the row. Backstop for any leak.
+  const staleSweepMs = num(env.SNIPER_STALE_SWEEP_MS, 30000);
+  if (gate.live && staleSweepMs > 0 && store.stalePastHold) {
+    const { sweepStaleQuotes } = require('./stale-sweep');
+    loop(async () => {
+      const r = await sweepStaleQuotes({ store, trader, release: (id) => liveStore.release(id, 'cancelled', {}), tracked: (id) => liveSniper.hasRfqId(id), log, graceMs: num(env.SNIPER_STALE_GRACE_MS, 15000) });
+      if (r.released) log(`[SNIPER] stale sweep: released ${r.released} row(s) $${r.usd.toFixed(2)}, kalshi cancels=${r.cancelled} failed=${r.failed}`);
+    }, 'stale_sweep', staleSweepMs);
+  }
   async function marketResult(ticker) {
     const j = await getJson(lim.kalshiSettle, `${ORIGIN}${P}/markets/${encodeURIComponent(ticker)}`);
     const m = (j && j.market) || {};
