@@ -38,6 +38,7 @@ const { rogueConfig, americanOf } = require('./rogue');
 const { decide, repriceFair, pregameCheck } = require('./engine');
 const { liveGate, sniperSubaccount } = require('./gates');
 const { createSniperTrader } = require('./trader');
+const { createSoonCap } = require('./soon-cap');
 const { createLockCoord } = require('./coord');
 const { createLiveSniper } = require('./live');
 const { capsFrom } = require('./ledger-store');
@@ -437,7 +438,8 @@ async function main(env = process.env) {
     const closeSnap = createCloseSnapshot({ supabase, kickoffFor, books: { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook }, live: gate.live, log });
     loop(() => closeSnap.tick(), 'close_snapshot', num(env.SNIPER_CLOSE_POLL_MS, 60000));
   }
-  const caps = () => capsFrom(config, etDayStartIso(Date.now()), gate.live);
+  // d.totalCap (soon-cap tier) raises only that parlay's DB total cap; everything else unchanged.
+  const caps = (d) => { const c = capsFrom(config, etDayStartIso(Date.now()), gate.live); if (d && d.totalCap > c.total) c.total = d.totalCap; return c; };
   const pendingHoldMs = num(env.SNIPER_PENDING_HOLD_MS, quoteTtlMs + 60000);
   async function onHold(d) {
     const pos = ledger.positions.get(d.rfqId); if (pos) { pos.releaseAt = d.releaseAt; pos.resting = false; }
@@ -450,6 +452,10 @@ async function main(env = process.env) {
     subaccount: sniperSubaccount(env), limiter: lim.kalshiTrade, readLimiter: lim.kalshiTradeRead, log,
     maxConcurrent: num(env.SNIPER_QUOTE_CONCURRENCY, 8), maxQueued: num(env.SNIPER_QUOTE_MAX_QUEUED, 24),
   });
+  // Kevin Oct 26: parlays settling within soonHours may use the sniper's live cash as total cap.
+  const soonCap = createSoonCap({ totalCap: config.totalExposureCap, hours: config.soonHours, enabled: !!config.soonCap && sniperSubaccount(env) >= 1, fetchBalanceUsd: () => trader.subBalanceUsd(), log });
+  soonCap.refresh().then((b) => log(`[SNIPER] soon-cap ${config.soonCap ? 'on' : 'off'} hours=${config.soonHours} balance=${b != null ? `$${b.toFixed(2)}` : 'unknown'} normalTotal=$${config.totalExposureCap}`));
+  setInterval(() => { soonCap.refresh(); }, num(env.SNIPER_SOON_CAP_REFRESH_MS, 60000)).unref?.();
   // Releasing in the DB also frees the in-memory reservation (cancelled/declined/failed/settled).
   const liveStore = {
     ...hotStore,
@@ -553,7 +559,7 @@ async function main(env = process.env) {
     let makerRate = null;
     try { const e = await fees.prefetch(seriesOfTicker(rfq.marketTicker)); makerRate = e ? e.rate : null; } catch (_) { makerRate = null; }
     const nowMs = Date.now();
-    const { decision: d } = decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook, linesBook, nbaBook, venues, kickoffFor, makerRate, nowMs, pricesHealthy: pricesHealthy() });
+    const { decision: d } = decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook, linesBook, nbaBook, venues, kickoffFor, makerRate, nowMs, pricesHealthy: pricesHealthy(), totalCapFor: soonCap.capFor });
     lat.stage('handlerToDecided', Date.now() - tH);
     staleAlert.record(d.reason === 'prices_stale');
     if (d.rogue && d.rogue.length) logRogue(d);
@@ -595,7 +601,7 @@ async function main(env = process.env) {
     const lc = memoryCapReason(ledger, d.rfqId, { risk: d.risk, settleAt: d.settleAt, nowMs: Date.now(), longCap: config.longExposureCap, shortHours: config.shortSettleHours });
     if (lc) { ledger.positions.delete(d.rfqId); ledger.hour.pop(); counts.skips[lc] = (counts.skips[lc] || 0) + 1; return; }
     { const pm = ledger.positions.get(d.rfqId); if (pm) { pm.long = isLongPos(d.settleAt, Date.now(), config.shortSettleHours); pm.resting = !!(gate.live && !config.dryRun); } }
-    let res = (gate.live && !config.dryRun ? hotStore : store).reserve(d, { releaseAt: holdAt, dryRun: config.dryRun, caps: caps(), marketTicker: rfq.marketTicker || null });
+    let res = (gate.live && !config.dryRun ? hotStore : store).reserve(d, { releaseAt: holdAt, dryRun: config.dryRun, caps: caps(d), marketTicker: rfq.marketTicker || null });
     if (res && typeof res.then === 'function') {
       // blocking path (dry run / SNIPER_WRITE_BEHIND=0). Live: give up after reserveTimeoutMs so a slow
       // DB drops this quote fast instead of making it stale; a late 'ok' row is released.

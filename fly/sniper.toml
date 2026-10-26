@@ -39,6 +39,8 @@ kill_timeout = "60s"   # Oct 25: room to cancel every open quote on SIGTERM
   SNIPER_LOCK_COORD = "0"      # Kevin Oct 25: no Combo Locks checks; locks win on price anyway
   SNIPER_LONG_EXPOSURE_CAP = "5000"     # Kevin Oct 23: parlays settling >48h after quote (Kevin Oct 24: 32h->48h)
   SNIPER_SHORT_SETTLE_HOURS = "48"
+  SNIPER_SOON_CAP = "1"          # Kevin Oct 26: parlays settling within SNIPER_SOON_HOURS: total cap = sniper cash (never below the normal total cap)
+  SNIPER_SOON_HOURS = "24"
   SNIPER_MAX_LEG_DAYS = "7"      # Kevin Oct 26: reject any RFQ with a leg whose game is > 7 days out (all sports)
   SNIPER_FETCH_TIMEOUT_MS = "30000"   # Kevin Oct 24: 8s cut off Kalshi book pulls
   SNIPER_PER_GAME_CAP = "1500"

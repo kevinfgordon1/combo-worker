@@ -8,6 +8,7 @@
 // engine.buildQuoteBody/quoteYesBid/shouldConfirmAccept.
 // Mutations are refused unless the live gate is open. Own key only (SNIPER_KALSHI_*).
 'use strict';
+const { parseSubBalanceUsd } = require('./soon-cap');
 const { signedRequest, signedNow } = require('../kalshi-auth');
 const { createKalshiRestPair, QUOTE_TIMEOUT_MS } = require('../kalshi-http');
 const { createQuoteSender, rfqAgeMs, DEFAULT_MAX_RFQ_AGE_MS } = require('../quote-sender');
@@ -106,7 +107,14 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
     }
     return bookFromQuoteExecution({ orderId, fills: out });
   }
-  return { live, postQuote, confirm, cancel, fillsForOrder, stats: () => ({ ...stats, queued: sender.queued, active: sender.active }) };
+  // Read-only: this sniper subaccount's cash ($) for the soon-cap tier (sniper/soon-cap.js).
+  async function subBalanceUsd() {
+    const p = '/trade-api/v2/portfolio/subaccounts/balances';
+    const res = await raw('GET', p, { path: p, lim: readLimiter || limiter, low: true });
+    if (!res || res.statusCode !== 200) throw new Error(`subaccount balance read ${res && res.statusCode}`);
+    return parseSubBalanceUsd(JSON.parse(res.text || '{}'), subaccount);
+  }
+  return { live, postQuote, confirm, cancel, fillsForOrder, subBalanceUsd, stats: () => ({ ...stats, queued: sender.queued, active: sender.active }) };
 }
 
 module.exports = { createSniperTrader, noBidFor, sizeSource, LiveGateClosed, YES_DECLINE };

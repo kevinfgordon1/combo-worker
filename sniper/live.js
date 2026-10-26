@@ -184,7 +184,7 @@ function createLiveSniper({
       const fresh = reprice(rfq);
       const e = roiAt(d, fresh, n);
       if (!e || e.roi < (d.minRoi != null ? d.minRoi : config.minRoi) - 1e-12) return decline('reprice_below_min');
-      const cap = await store.confirmCheck(d.rfqId, Math.round(e.risk * 100) / 100, caps());
+      const cap = await store.confirmCheck(d.rfqId, Math.round(e.risk * 100) / 100, caps(d));
       if (!cap.ok) return decline(`cap_${cap.reason}`);
       // Accepted: hold the exposure until the games settle (was only the short quote hold).
       try { await onHold(d); } catch (err) { log(`[SNIPER] hold extend failed rfq=${d.rfqId}: ${err.message}`); }
