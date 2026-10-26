@@ -2422,8 +2422,29 @@ async function onQuoteExecuted(evt) {
   ).catch(() => {});
 }
 
+// RFQ age breakdown (observability only): Kalshi created_ts → our socket → intake worker →
+// main handler → POST. Histograms go in the [LATENCY] line / combo_worker_stats.latency.age_breakdown;
+// a capped handful of per-RFQ lines per interval are logged when the RFQ is > AGE_SPLIT_SLOW_MS old.
+const AGE_SPLIT_SLOW_MS = 2500;
+function noteAgeSplit(rfq, handlerAt, postAt, outcome) {
+  try {
+    const sp = latency.noteStages({
+      createdTs: rfq.createdTs, wsRecvAt: rfq.wsRecvAt, workerAt: rfq.workerAt,
+      handlerAt, postAt, offsetMs: clockOffset(),
+    });
+    const total = (sp.feed_ms || 0) + (sp.ws_to_worker_ms || 0) + (sp.handoff_ms || 0) + (sp.handler_to_post_ms || 0);
+    if (total > AGE_SPLIT_SLOW_MS && latency.takeSlowLogSlot()) {
+      console.log(
+        `[${MODE}] AGE-SPLIT ${outcome} rfq=${rfq.rfqId} feed=${sp.feed_ms}ms ws>worker=${sp.ws_to_worker_ms}ms ` +
+        `handoff=${sp.handoff_ms}ms handler>post=${sp.handler_to_post_ms}ms`
+      );
+    }
+  } catch (_) { /* metrics only */ }
+}
+
 async function onRfq(rfq, env) {
   const t0 = performance.now(); // Step 0
+  const handlerAt = Date.now(); // wall clock, for the RFQ age breakdown
   counts.rfqs++;
 
   // Step 4 — cheapest rejects first
@@ -2459,6 +2480,7 @@ async function onRfq(rfq, env) {
     // rfq_closed 409s had a median RFQ age of 15s) and no quote older than 1s ever filled.
     // Skip the POST instead of burning a request + a 409.
     latency.noteStaleSkip();
+    noteAgeSplit(rfq, handlerAt, null, 'stale_skip');
     if (latency.staleSkipsTotal() <= 5 || latency.staleSkipsTotal() % 50 === 0) {
       console.log(`[${MODE}] STALE RFQ skipped rfq=${rfq.rfqId} age=${Math.round(intakeAgeMs)}ms (> ${STALE_RFQ_MS}ms) n=${latency.staleSkipsTotal()}`);
     }
@@ -2725,6 +2747,7 @@ async function onRfq(rfq, env) {
 
       counts.posted++;
       const postNote = latency.notePost({ totalMs: t3 - t0, createdTs: rfq.createdTs, ok: true });
+      noteAgeSplit(rfq, handlerAt, Date.now(), 'posted');
       if (postNote.late) {
         console.log(`[${MODE}] LATE POST ok rfq=${rfq.rfqId} rfq_age=${Math.round(postNote.ageMs)}ms post=${(t3 - t2).toFixed(1)}ms`);
       }
@@ -2780,6 +2803,7 @@ async function onRfq(rfq, env) {
       counts.postFailed++;
       const closed = isRfqClosedFailure(e.message);
       const failNote = latency.notePost({ totalMs: t3 - t0, createdTs: rfq.createdTs, ok: false, rfqClosed: closed });
+      noteAgeSplit(rfq, handlerAt, Date.now(), 'failed');
       console.error(
         `[${MODE}] POST FAILED${closed ? ' rfq_closed' : ''} ${p.label} ` +
         `rfq=${rfq.rfqId} in ${totalMs}ms` +

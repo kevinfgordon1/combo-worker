@@ -80,6 +80,9 @@ function createLatencyStats({ now = () => Date.now(), lateMs = LATE_POST_MS } = 
       quote: emptyHist(), intake: emptyHist(), postedAge: emptyHist(),
       posted: 0, post_failed: 0, rfq_closed: 0, late_posts: 0, late_failed: 0,
       subcent_fallback: 0, stale_skipped: 0,
+      // Age breakdown (lock-matched RFQs only): where does an RFQ's age come from?
+      feed: emptyHist(), wsToWorker: emptyHist(), handoff: emptyHist(), handlerToPost: emptyHist(),
+      slowLogged: 0,
     };
   }
 
@@ -107,6 +110,40 @@ function createLatencyStats({ now = () => Date.now(), lateMs = LATE_POST_MS } = 
     return { ageMs: a, late };
   }
 
+  // Per-RFQ age breakdown. All *At are local wall-clock ms (Date.now()); offsetMs maps local→Kalshi
+  // time so created→recv is not skewed by our clock. Returns the stage split (ms, null when unknown).
+  //   feed_ms           Kalshi created_ts → our socket received the frame (Kalshi/network side)
+  //   ws_to_worker_ms   socket recv → intake worker accepted it (worker path only)
+  //   handoff_ms        worker (or socket) → main-thread onRfq started (our lane / event loop)
+  //   handler_to_post_ms onRfq start → POST returned (match, pricing, HTTP)
+  function noteStages({ createdTs, wsRecvAt, workerAt, handlerAt, postAt, offsetMs = 0 } = {}) {
+    const fin = (x) => Number.isFinite(Number(x)) && Number(x) > 0;
+    const off = Number.isFinite(Number(offsetMs)) ? Number(offsetMs) : 0;
+    let createdAt = null;
+    if (createdTs != null && createdTs !== '') {
+      const t = typeof createdTs === 'number' ? (createdTs < 1e12 ? createdTs * 1000 : createdTs) : Date.parse(createdTs);
+      if (Number.isFinite(t)) createdAt = t;
+    }
+    const d = (a, b) => (a != null && b != null ? Math.max(0, a - b) : null);
+    const recv = fin(wsRecvAt) ? Number(wsRecvAt) : null;
+    const wk = fin(workerAt) ? Number(workerAt) : null;
+    const h = fin(handlerAt) ? Number(handlerAt) : null;
+    const pa = fin(postAt) ? Number(postAt) : null;
+    const out = {
+      feed_ms: recv != null && createdAt != null ? Math.max(0, recv + off - createdAt) : null,
+      ws_to_worker_ms: d(wk, recv),
+      handoff_ms: d(h, wk != null ? wk : recv),
+      handler_to_post_ms: d(pa, h),
+    };
+    if (out.feed_ms != null) histAdd(cur.feed, out.feed_ms);
+    if (out.ws_to_worker_ms != null) histAdd(cur.wsToWorker, out.ws_to_worker_ms);
+    if (out.handoff_ms != null) histAdd(cur.handoff, out.handoff_ms);
+    if (out.handler_to_post_ms != null) histAdd(cur.handlerToPost, out.handler_to_post_ms);
+    return out;
+  }
+  // Cap per-RFQ slow logs to a handful per interval so a backlog cannot flood stdout.
+  function takeSlowLogSlot(max = 10) { if (cur.slowLogged >= max) return false; cur.slowLogged += 1; return true; }
+
   function noteStaleSkip() { cur.stale_skipped += 1; total.stale_skipped += 1; }
   function staleSkipsTotal() { return total.stale_skipped; }
 
@@ -129,6 +166,12 @@ function createLatencyStats({ now = () => Date.now(), lateMs = LATE_POST_MS } = 
       late_post_ms: lateMs,
       subcent_fallback: cur.subcent_fallback,
       stale_skipped: cur.stale_skipped,
+      age_breakdown: {
+        feed_ms: histJson(cur.feed),
+        ws_to_worker_ms: histJson(cur.wsToWorker),
+        handoff_ms: histJson(cur.handoff),
+        handler_to_post_ms: histJson(cur.handlerToPost),
+      },
       reconnects: ws ? ws.count : 0,
       reconnect_by_reason: ws ? ws.byReason : {},
       resubscribe_gap_max_ms: ws && ws.maxGapMs != null ? ws.maxGapMs : null,
@@ -152,13 +195,19 @@ function createLatencyStats({ now = () => Date.now(), lateMs = LATE_POST_MS } = 
       `intake_age_ms p50=${i.p50} p99=${i.p99} max=${i.max} n=${i.n} ` +
       `reconnects=${s.reconnects} gap_max_ms=${s.resubscribe_gap_max_ms} ` +
       `loop_lag_ms p99=${loop.p99} max=${loop.max}` +
+      (s.age_breakdown && s.age_breakdown.feed_ms.n
+        ? ` age_split p50/p90 feed=${s.age_breakdown.feed_ms.p50}/${s.age_breakdown.feed_ms.p90}` +
+          ` ws>worker=${s.age_breakdown.ws_to_worker_ms.p50}/${s.age_breakdown.ws_to_worker_ms.p90}` +
+          ` handoff=${s.age_breakdown.handoff_ms.p50}/${s.age_breakdown.handoff_ms.p90}` +
+          ` handler>post=${s.age_breakdown.handler_to_post_ms.p50}/${s.age_breakdown.handler_to_post_ms.p90}`
+        : '') +
       (s.stale_skipped ? ` stale_skipped=${s.stale_skipped}` : '') +
       (s.subcent_fallback ? ` subcent_fallback=${s.subcent_fallback}` : '')
     );
   }
 
   return {
-    noteIntake, notePost, noteSubcentFallback, noteStaleSkip, staleSkipsTotal, noteReconnects, rollInterval, formatLine,
+    noteIntake, notePost, noteStages, takeSlowLogSlot, noteSubcentFallback, noteStaleSkip, staleSkipsTotal, noteReconnects, rollInterval, formatLine,
     totals: () => ({ ...total }),
     peek: () => ({ posted: cur.posted, post_failed: cur.post_failed, late_posts: cur.late_posts, rfq_closed: cur.rfq_closed }),
   };

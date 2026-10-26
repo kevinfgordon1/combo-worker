@@ -421,7 +421,7 @@ function createKalshiWs({
       onHandshakeFail(req, res);
     });
 
-    function handleRaw(raw) {
+    function handleRaw(raw, recvAt) {
       stats.parse++;
       stats.windowParse++;
       const env = parseEnvelope(raw);
@@ -453,7 +453,12 @@ function createKalshiWs({
       // RFQ created → existing path. Runs before RFQ-DEBUG so a matched
       // lock can start POST before any debug stringify.
       if (isRfqCreated(env) && onRfqCreated) {
-        try { onRfqCreated(normalizeRfq(env), env); } catch (e) { console.error('onRfqCreated', e); }
+        try {
+          const rfqN = normalizeRfq(env);
+          // Wall-clock ms our socket received this frame (age breakdown: feed lag vs our lane).
+          if (rfqN && typeof rfqN === 'object' && recvAt) rfqN.wsRecvAt = recvAt;
+          onRfqCreated(rfqN, env);
+        } catch (e) { console.error('onRfqCreated', e); }
       }
 
       // RFQ closed (deleted / expired / replaced) — release any reserve for that rfq_id
@@ -507,6 +512,7 @@ function createKalshiWs({
 
     ws.on('message', (d) => {
       const started = process.hrtime.bigint();
+      const recvAt = Date.now();
       stats.recv++;
       stats.windowRecv++;
       touchComm();
@@ -548,12 +554,12 @@ function createKalshiWs({
         stats.backlog++;
         setImmediate(() => {
           stats.backlog = Math.max(0, stats.backlog - 1);
-          handleRaw(raw);
+          handleRaw(raw, recvAt);
         });
         noteHandler(started);
         return;
       }
-      handleRaw(raw);
+      handleRaw(raw, recvAt);
       noteHandler(started);
     });
 
