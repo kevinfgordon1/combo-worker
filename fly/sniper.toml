@@ -31,6 +31,8 @@ kill_timeout = "60s"   # Oct 25: room to cancel every open quote on SIGTERM
   SNIPER_KALSHI_TRADE_RPS_ON_429 = "4"
   KALSHI_ACCOUNT_WRITE_RPS = "15"
   COMBO_LOCKS_RESERVED_RPS = "9"
+  # Borrow Combo Locks' idle reserved slots (needs migrations/20261026_kalshi_write_lane.sql). Fails safe to 6/s.
+  SNIPER_KALSHI_BORROW = "1"
   SNIPER_MAX_PAYOUT = "100000"
   SNIPER_DAILY_LOSS_CAP = "10000"
   SNIPER_DAILY_RISK_CAP = "15000"

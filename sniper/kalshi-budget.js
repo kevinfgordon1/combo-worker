@@ -5,6 +5,9 @@
 // Static per-app budgets (no cross-app shared counter): the two apps are separate Fly machines,
 // and a shared Redis/Supabase token bucket would add a network hop to every order write plus a
 // new failure mode. A hard ceiling on the sniper is enough to guarantee Combo Locks its share.
+// Borrowing: with SNIPER_KALSHI_BORROW=1 the sniper may add up to (reserved - safety) slots/s
+// while Combo Locks is verifiably idle (sniper/kalshi-lane.js). KALSHI_ACCOUNT_WRITE_RPS stays the
+// configurable account total.
 // Other users (testers app) use their own Kalshi keys and are not affected.
 'use strict';
 

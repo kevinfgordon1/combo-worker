@@ -2996,6 +2996,15 @@ async function main() {
   loopLag = createLoopLagSampler();
   const partialTimer = setInterval(() => { partialQuote.tick(); }, 60 * 1000);
   if (partialTimer.unref) partialTimer.unref();
+  // Publish Combo Locks' Kalshi write usage so the sniper can borrow ONLY idle reserved slots
+  // (sniper/kalshi-lane.js). Kevin's main worker only; tester children use their own keys.
+  if (!SCOPE.writeUserId && String(process.env.KALSHI_LANE_PUBLISH || '1') !== '0') {
+    require('./sniper/kalshi-lane').startLanePublisher({
+      supabase, getActive: () => parlays.length,
+      writeCount: () => (counts.posted || 0) + (counts.postFailed || 0),
+      log: (m) => console.log(`[${MODE}] ${m}`),
+    });
+  }
   let polyHeartbeatSnap = null;
   startHeartbeat(
     supabase, MODE, counts, () => parlays.length, 60000,

@@ -26,6 +26,7 @@ const { createSeriesFeeCache, seriesOfTicker } = require('../series-fee');
 const { sniperConfig, createSniperLedger, formatDecision, createTelegramNotifier } = require('../auto-sniper');
 const { createLimiter, createRateBreaker } = require('./limiter');
 const { sniperKalshiTradeBudget } = require('./kalshi-budget');
+const { borrowConfig, startBorrower } = require('./kalshi-lane');
 const { fetchWithTimeout } = require('./fetch-timeout');
 const { createStaleAlert } = require('./stale-alert');
 const { createLedgerStore } = require('./ledger-store');
@@ -105,11 +106,20 @@ async function main(env = process.env) {
     kalshiSeries: createLimiter({ name: 'kalshi_series', ratePerSec: 0.2, burst: 2 }),
     // signed calls on the sniper's own key (quote POST/confirm/cancel, fills reads)
     // Capped at Kevin's account budget minus the 9/s reserved for his Combo Locks (sniper/kalshi-budget.js).
-    kalshiTrade: createLimiter({ name: 'kalshi_trade', ratePerSec: tradeBudget.rps, ratePerSecOn429: tradeBudget.on429, burst: Math.min(5, Math.ceil(tradeBudget.rps)), lowShareRps: Math.max(0, num(env.SNIPER_CANCEL_SHARE_RPS, 1)) }),
+    kalshiTrade: createLimiter({ name: 'kalshi_trade', ratePerSec: tradeBudget.rps, ratePerSecOn429: tradeBudget.on429, burst: 5, lowShareRps: Math.max(0, num(env.SNIPER_CANCEL_SHARE_RPS, 1)) }),
     // Authenticated reads (fill lookups) use Kalshi's separate Read bucket — keep them off the write lane.
     kalshiTradeRead: createLimiter({ name: 'kalshi_trade_read', ratePerSec: num(env.SNIPER_KALSHI_READ_RPS, 3), burst: 3 }),
     kalshiSettle: createLimiter({ name: 'kalshi_settle', ratePerSec: 0.5, burst: 2 }),
   };
+  // Borrow Combo Locks' idle reserved slots (off unless SNIPER_KALSHI_BORROW=1). Fails safe to base.
+  const borrowCfg = borrowConfig(env);
+  let borrower = null;
+  if (borrowCfg.enabled && env.SUPABASE_URL && env.SUPABASE_SERVICE_KEY) {
+    borrower = startBorrower({ supabase: createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } }), limiter: lim.kalshiTrade, baseRps: tradeBudget.rps, reserved: tradeBudget.reserved, cfg: borrowCfg, log });
+    // Any sniper 429 stops borrowing for the cooldown (watch the limiter's 429 counter).
+    let seen = 0; setInterval(() => { const n = lim.kalshiTrade.stats().r429; if (n > seen) { seen = n; borrower.on429(); } }, 250).unref?.();
+    log(`[SNIPER] kalshi borrow ON: base ${tradeBudget.rps}/s + up to ${Math.max(0, tradeBudget.reserved - borrowCfg.safetyRps)}/s of Combo Locks' idle ${tradeBudget.reserved}/s`);
+  }
   let disabled = false;
   let liveSniperRef = null; // set once the live sniper exists, so a 429 trip also halts quoting
   const breaker = createRateBreaker({
