@@ -231,6 +231,7 @@ const { createComboIntakeHost, comboIntakeWorkerEnabled } = require('./combo-int
 // NEAR-MISS leg-key log for active locks (COMBO_NEAR_MISS_LOG=1, default off; rate-limited).
 const nearMiss = require('./near-miss').createNearMissLogger({ env: process.env, mode: MODE });
 const { createSingleLegRunner } = require('./single-leg-runner');
+const { createLockAutoCheck } = require('./lock-auto-check');
 let singleLeg = null;
 let bucketManager = null;
 // Tester children only: moves the tester's own Kalshi Default -> Combos money
@@ -2973,6 +2974,23 @@ async function main() {
     pollUserCancels().catch((e) => console.error(`[${MODE}] user-cancel poll`, e.message));
   }), 5000);
   // Kalshi skip-tape lookups need the Kalshi key; poly-worker (COMBO_ROLE=poly) has none.
+  if (SPLIT.runKalshi) {
+    // Server-side Combo Locks auto market check (COMBO_AUTO_CHECK=1; default off). See lock-auto-check.js.
+    createLockAutoCheck({
+      supabase,
+      getParlays: () => parlays,
+      sendAlert,
+      log: (m) => console.log(`[${MODE}] ${m}`),
+      kalshi: async (method, fullPath, body) => {
+        const signPath = String(fullPath).split('?')[0];
+        const opts = { path: fullPath };
+        if (body != null) { opts.body = JSON.stringify(body); opts.headers = { 'Content-Type': 'application/json' }; }
+        const { statusCode, text } = await kalshiSigned(method, signPath, opts);
+        let data = null; try { data = text ? JSON.parse(text) : null; } catch (_) { /* non-JSON */ }
+        return { status: statusCode, data };
+      },
+    }).start();
+  }
   if (SPLIT.runKalshi) {
     setInterval(unlessQuoteHot(() => {
       reconcileSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape tick`, e.message));
