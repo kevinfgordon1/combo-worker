@@ -669,7 +669,7 @@ async function main(env = process.env) {
       workerData: {
         shardFactor: readShardFactor(env.SNIPER_WS_SHARD_FACTOR, env, DEFAULT_LIVE_SHARD_FACTOR), fastDrop, nba: !!nbaBook, maxAgeMs,
         scope: { td: !!tdBook, ncaaf: config.ncaaf !== false, lines: !!linesBook, nba: !!nbaBook && !!config.nba },
-        earlyFilter,
+        earlyFilter, maxLegDays: config.maxLegDays,
       },
       startedAll: () => [...startedTickers],
       ...wsCallbacks,

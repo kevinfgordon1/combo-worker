@@ -33,6 +33,22 @@ function nbaHorizonCheck(keys, kickoffFor, nowMs, hours) {
   return null;
 }
 
+// Kevin Oct 26: never quote an RFQ with ANY leg whose game is more than `days` days away (all
+// sports). Known kickoff -> ko - now > days. Unknown kickoff -> reject only when the ticker date
+// proves it: that date's start (00:00 ET, taken as 04:00Z, the earliest it can mean) is > days out.
+function tickerDayStartMs(t) { const d = legDate(t); if (!d) return null; const ms = Date.parse(`${d}T04:00:00Z`); return Number.isFinite(ms) ? ms : null; }
+function maxLegDaysCheck(keys, kickoffFor, nowMs, days) {
+  if (!Number.isFinite(days) || days <= 0) return null;
+  const lim = days * 864e5;
+  for (const k of keys || []) {
+    const t = String(k).split(':')[0];
+    const ko = kickoffFor ? kickoffFor(t) : null;
+    if (Number.isFinite(ko) && ko > 0) { if (ko - nowMs > lim) return 'leg_beyond_max_days'; continue; }
+    const ds = tickerDayStartMs(t); if (ds != null && ds - nowMs > lim) return 'leg_beyond_max_days';
+  }
+  return null;
+}
+
 function pregameCheck(keys, kickoffFor, nowMs, bufferMs) {
   for (const k of keys) {
     const t = String(k).split(':')[0];
@@ -89,6 +105,8 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
   if (!cls.ok) return skip(`scope_${cls.reason}`);
   const keys = rfq.legKeys;
   if (keys.length !== cls.legs.length) return skip('leg_mismatch');
+  const md = maxLegDaysCheck(keys, kickoffFor, nowMs, config.maxLegDays != null ? config.maxLegDays : 7);
+  if (md) return skip(md);
   const pg = pregameCheck(keys, kickoffFor, nowMs, bufferMs);
   if (pg) return skip(pg);
   const hz = nbaHorizonCheck(keys, kickoffFor, nowMs, config.nbaHours != null ? config.nbaHours : 36);
@@ -151,4 +169,4 @@ function repriceFair(rfq, { pmLive, tdBook, venues, ncaafBook = null, linesBook 
   return fair;
 }
 
-module.exports = { decide, settleAtMs, pregameCheck, nbaHorizonCheck, legDate, repriceFair, classifyLegs };
+module.exports = { decide, settleAtMs, pregameCheck, nbaHorizonCheck, maxLegDaysCheck, legDate, repriceFair, classifyLegs };
