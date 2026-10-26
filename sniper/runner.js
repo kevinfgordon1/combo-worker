@@ -43,7 +43,7 @@ const { createLockCoord } = require('./coord');
 const { createLiveSniper } = require('./live');
 const { capsFrom } = require('./ledger-store');
 const { createNightlyRecap } = require('./recap');
-const { createNflFrameFilter, createDeletedFilter, createDeletedIdFilter, tooOld, createLatencyStats, createLoopLagSampler, NFL_NEEDLES, NBA_NEEDLES } = require('./intake');
+const { createSniperFrameFilter, needleAllDisabled, createNflFrameFilter, createDeletedFilter, createDeletedIdFilter, tooOld, createLatencyStats, createLoopLagSampler, NFL_NEEDLES, NBA_NEEDLES } = require('./intake');
 const { signedNow } = require('../kalshi-auth');
 const { rfqAgeMs } = require('../quote-sender');
 const { createKickoffResolver, ESPN_NFL } = require('./kickoff');
@@ -679,14 +679,14 @@ async function main(env = process.env) {
       const nowMs = Date.now(); const fresh = [];
       for (const t of legTickersSeen) { const ko = kickoffFor(t); if (Number.isFinite(ko) && ko > 0 && nowMs >= ko - 30 * 60 * 1000) { legTickersSeen.delete(t); startedTickers.add(t); fresh.push(t); } }
       if (fresh.length) wsWorker.addStarted(fresh);
-    }, 2000).unref?.();
+    }, Math.max(100, num(env.SNIPER_STARTED_SYNC_MS, 500))).unref?.();
   }
   if (intakeWorker) {
     wsWorker = createIntakeWorker({
       workerData: {
         shardFactor: readShardFactor(env.SNIPER_WS_SHARD_FACTOR, env, DEFAULT_LIVE_SHARD_FACTOR), fastDrop, nba: !!nbaBook, maxAgeMs,
         scope: { td: !!tdBook, ncaaf: config.ncaaf !== false, lines: !!linesBook, nba: !!nbaBook && !!config.nba },
-        earlyFilter, maxLegDays: config.maxLegDays,
+        earlyFilter, maxLegDays: config.maxLegDays, maxLegs: config.maxLegs, needleAll: !needleAllDisabled(env),
       },
       startedAll: () => [...startedTickers],
       ...wsCallbacks,
@@ -703,7 +703,7 @@ async function main(env = process.env) {
     pem: normalizePem(env.SNIPER_KALSHI_PRIVATE_KEY),
     // ~97% of rfq_created frames have no NFL leg: drop them before JSON.parse. rfq_deleted for
     // RFQs we hold no quote on are dropped too (we only act on closes of our own quotes).
-    shouldDropCreated: String(env.SNIPER_WS_FAST_DROP) === '0' ? undefined : createNflFrameFilter(nbaBook ? [...NFL_NEEDLES, ...NBA_NEEDLES] : NFL_NEEDLES),
+    shouldDropCreated: String(env.SNIPER_WS_FAST_DROP) === '0' ? undefined : createSniperFrameFilter({ ncaaf: !!ncaafBook, nba: !!nbaBook && !!config.nba, all: !needleAllDisabled(env) }),
     shouldDropDeleted: String(env.SNIPER_WS_FAST_DROP) === '0' ? undefined : createDeletedIdFilter((id) => liveSniper.hasRfqId(id)),
     // Stamp receive time in the ws message tick (before any await) for stage timing.
     ...wsCallbacks,
