@@ -160,6 +160,24 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
     if (error) throw new Error(`stale open: ${error.message}`);
     return data || [];
   }
+  // Live 'reserved'/'quoted' rows past their hold (release_at + graceMs), no order, no fills.
+  async function stalePastHold(graceMs = 15000, limit = 500) {
+    const cut = new Date(now() - graceMs).toISOString();
+    const { data, error } = await supabase.from('sniper_ledger')
+      .select('rfq_id,quote_id,phase,risk,filled_contracts,order_id').eq('status', 'open').eq('dry_run', false)
+      .in('phase', ['reserved', 'quoted']).is('order_id', null).lt('release_at', cut)
+      .or('filled_contracts.is.null,filled_contracts.eq.0').limit(limit);
+    if (error) throw new Error(`stale past hold: ${error.message}`);
+    return data || [];
+  }
+  // Frees the open-combo unique slot held by an expired (past release_at) unfilled quote row.
+  async function releaseStaleCombo(comboKey) {
+    const { data, error } = await supabase.from('sniper_ledger').update({ status: 'released', phase: 'cancelled', updated_at: new Date(now()).toISOString() })
+      .eq('status', 'open').eq('dry_run', false).eq('combo_key', comboKey).in('phase', ['reserved', 'quoted'])
+      .is('order_id', null).lt('release_at', new Date(now()).toISOString()).or('filled_contracts.is.null,filled_contracts.eq.0').select('rfq_id');
+    if (error) throw new Error(`release stale combo: ${error.message}`);
+    return (data || []).length;
+  }
   // 'accepted' rows with nothing filled, older than minutes (the Kalshi confirm window is seconds).
   async function staleAccepted(minutes) {
     const cut = new Date(now() - minutes * 60000).toISOString();
@@ -171,7 +189,7 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
   async function decision(rec) {
     try { await supabase.from('sniper_decisions').insert(rec); } catch (_) { /* audit only */ }
   }
-  return { hydrate, refreshHedges, activeHedges, staleOpen, dayExposure, reserve, confirmCheck, update, release, openFilled, openFilledWithLegs, dayRealized, dayRecap, decision, staleAccepted };
+  return { hydrate, refreshHedges, activeHedges, staleOpen, dayExposure, reserve, confirmCheck, update, release, openFilled, openFilledWithLegs, dayRealized, dayRecap, decision, staleAccepted, stalePastHold, releaseStaleCombo };
 }
 
 module.exports = { createLedgerStore, capsFrom };
