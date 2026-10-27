@@ -143,6 +143,18 @@ async function main(env = process.env) {
   const kick = new Map();
   const kickoffs = createKickoffResolver({ log });
   const kickoffFor = (t) => kickoffs.kickoffFor(t);
+  // Canonical schedule (official ESPN times for every league, written to public.game_schedule, alerts on legs with
+  // no verified start). Preferred kickoff source; the older ESPN/odds_cache/Kalshi−3h chain stays as fallback.
+  if (env.GAME_SCHEDULE_SYNC !== '0') {
+    try {
+      const { createScheduleSync } = require('../schedule-sync');
+      const { createAppAlerts } = require('../app-alerts');
+      const schedAlerts = env.SUPABASE_URL && env.SUPABASE_SERVICE_KEY ? createAppAlerts({ client: createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } }), log }) : null;
+      const sched = createScheduleSync({ env, log, alerts: schedAlerts });
+      kickoffs.setCanonical((t) => sched.resolve(t));
+      sched.start();
+    } catch (e) { log(`[SNIPER] schedule sync failed to start: ${e.message}`); }
+  }
   const health = { ml: 0, td: 0, relay: 0 };
   const relayBase = env.SNIPER_ODDS_RELAY_URL || (env.RAILWAY_SERVICE_ODDS_RELAY_URL ? `https://${env.RAILWAY_SERVICE_ODDS_RELAY_URL}` : '');
 

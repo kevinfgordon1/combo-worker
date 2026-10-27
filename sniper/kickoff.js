@@ -1,4 +1,5 @@
 // Real kickoff times for the sniper (rule 9). Priority per game:
+//   0. Canonical game schedule (game-schedule.js / public.game_schedule: official ESPN time, all leagues) when wired
 //   1. ESPN scoreboard (date + live state pre/in/post; 'in'/'post' => started regardless of clock)
 //   2. odds_cache commence_time (Supabase, Odds-API shape)
 //   3. LAST RESORT: Kalshi occurrence_datetime − 3h (logged once per game when used)
@@ -45,6 +46,8 @@ function createKickoffResolver({ log = () => {} } = {}) {
   const real = { espn: new Map(), odds_cache: new Map() }; // gameId -> { kickoffMs, state }
   const kalshi = new Map(); // ticker -> occurrence_datetime ms
   const warned = new Set();
+  let canonical = null; // (ticker) => resolveStart result
+  function setCanonical(fn) { canonical = typeof fn === 'function' ? fn : null; }
   function setKickoffs(entries) {
     let n = 0;
     for (const e of entries || []) {
@@ -58,6 +61,10 @@ function createKickoffResolver({ log = () => {} } = {}) {
   function resolve(ticker) {
     const t = String(ticker || '').split(':')[0].toUpperCase();
     const gid = gameIdOfTicker(t);
+    if (canonical) {
+      let c = null; try { c = canonical(t); } catch (_) { c = null; }
+      if (c && c.verified && Number.isFinite(c.startMs)) return { kickoffMs: c.startMs, source: 'canonical', state: c.state || null, gameId: gid };
+    }
     if (gid) {
       for (const src of ['espn', 'odds_cache']) {
         const hit = lookup(real[src], gid);
@@ -76,7 +83,7 @@ function createKickoffResolver({ log = () => {} } = {}) {
     const r = resolve(ticker); if (!r) return null;
     return r.state === 'in' || r.state === 'post' ? 0 : r.kickoffMs;
   }
-  return { setKickoffs, setKalshiOccurrence, resolve, kickoffFor, stats: () => ({ espn: real.espn.size, odds: real.odds_cache.size, kalshi: kalshi.size, fallbacks: warned.size }) };
+  return { setCanonical, setKickoffs, setKalshiOccurrence, resolve, kickoffFor, stats: () => ({ espn: real.espn.size, odds: real.odds_cache.size, kalshi: kalshi.size, fallbacks: warned.size }) };
 }
 
 module.exports = { createKickoffResolver, gameIdOfTicker, ESPN_NFL, ncaafCandidates };
