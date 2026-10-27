@@ -159,9 +159,10 @@ function createLinesBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 2
     const sources = [];
     for (const v of ['kalshi', 'polymarket', 'novig', 'prophetx']) { const r = evalVenue(v, o[v]); if (r) sources.push(r); }
     const used = sources.filter((s) => s.used);
-    if (!used.length) return { p: null, reason: 'no_venue_depth', sources };
+    const own = []; { const m0 = asks.get(`${leg.gameId}|${leg.outcome}`) || {}; for (const v of ['kalshi', 'polymarket', 'novig', 'prophetx']) { const r = evalVenue(v, m0[v]); if (r && r.reason !== 'stale' && r.topAmerican != null) own.push({ venue: v, topAmerican: r.topAmerican }); } }
+    if (!used.length) return { p: null, reason: 'no_venue_depth', sources, own };
     const best = used.reduce((x, y) => (y.cost < x.cost ? y : x));
-    return { p: 1 - best.cost, american: american(1 - best.cost), best: best.venue, sources };
+    return { p: 1 - best.cost, american: american(1 - best.cost), best: best.venue, sources, own };
   }
   // Kalshi tickers worth polling: only strikes that equal a current main line (keeps the budget small).
   function mainTickers(allTickers) {

@@ -175,10 +175,11 @@ function createPmLiveBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 
     const rn = evalVenue('kalshi', kn);
     if (rn) sources.push({ ...rn, via: 'no_own' });
     const used = sources.filter((s) => s.used);
-    if (!used.length) return { p: null, american: null, sources };
+    const own = []; { const m0 = asks.get(`${gameId}:${team}`) || {}; for (const v of ['kalshi', 'polymarket', 'novig', 'prophetx']) { const r = evalVenue(v, m0[v]); if (r && r.reason !== 'stale' && r.topAmerican != null) own.push({ venue: v, topAmerican: r.topAmerican }); } }
+    if (!used.length) return { p: null, american: null, sources, own };
     const best = used.reduce((a, b) => (b.cost < a.cost ? b : a));
     const p = 1 - best.cost;
-    return { p, american: american(p), best: `${best.venue}${best.via ? ':' + best.via : ''}`, sources };
+    return { p, american: american(p), best: `${best.venue}${best.via ? ':' + best.via : ''}`, sources, own };
   }
 
   // Combo fair (moneyline legs, different games): Π leg fair. Any non-ML or unpriced leg => p null.

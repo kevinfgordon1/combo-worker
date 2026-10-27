@@ -153,9 +153,10 @@ function createNcaafBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 1
     const rn = evalVenue('kalshi', (kalshiNo.get(`${gameId}:${team}`) || {}).kalshi);
     if (rn) sources.push({ ...rn, via: 'no_own' });
     const used = sources.filter((s) => s.used);
-    if (!used.length) return { p: null, american: null, sources };
+    const own = []; { const m0 = asks.get(`${gameId}:${team}`) || {}; for (const v of ['kalshi', 'polymarket', 'novig', 'prophetx']) { const r = evalVenue(v, m0[v]); if (r && r.reason !== 'stale' && r.topAmerican != null) own.push({ venue: v, topAmerican: r.topAmerican }); } }
+    if (!used.length) return { p: null, american: null, sources, own };
     const best = used.reduce((x, y) => (y.cost < x.cost ? y : x));
-    return { p: 1 - best.cost, american: american(1 - best.cost), best: `${best.venue}${best.via ? ':' + best.via : ''}`, sources };
+    return { p: 1 - best.cost, american: american(1 - best.cost), best: `${best.venue}${best.via ? ':' + best.via : ''}`, sources, own };
   }
   return { ingestKalshiOrderbooks, ingestRelay, legFair, gameCount: () => games.size, _asks: asks };
 }
