@@ -2,7 +2,7 @@
 'use strict';
 const { evaluateSnipe, releaseAtMs } = require('../auto-sniper');
 const { classifyNfl } = require('../noboost/shadow');
-const { legFairDepth } = require('./fair');
+const { legFairDepth, MID_GUARD_REASONS } = require('./fair');
 const { isNcaafTicker, classifyNcaafLeg } = require('./ncaaf');
 const { isLineTicker, classifyLineLeg } = require('./lines');
 const { isNbaTicker, isNbaAny, classifyNbaLeg } = require('./nba');
@@ -111,13 +111,18 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
   if (pg) return skip(pg);
   const hz = nbaHorizonCheck(keys, kickoffFor, nowMs, config.nbaHours != null ? config.nbaHours : 36);
   if (hz) return skip(hz);
+  const guardHits = []; // thin-book guard (sniper/mid-guard.js)
   const rogue = []; // rogue-line guard events (sniper/rogue.js), logged by the runner
   const legs = keys.map((k, i) => {
     const [ticker, side] = String(k).split(':');
     const f = legFairDepth(cls.legs[i], { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook });
     if (f.rogue && f.rogue.length) rogue.push(...f.rogue.map((e) => ({ ...e, ticker, side: side || 'yes' })));
-    return { ticker, side: side || 'yes', fair_yes: f.p, fair_best: f.best || null, venue: f.venue || null, depth_usd: f.depthUsd != null ? Math.round(f.depthUsd) : null, name: (tdBook && tdBook.names && tdBook.names.get && tdBook.names.get(String(ticker).toUpperCase())) || null, date: legDate(ticker) };
+    if (f.p == null && MID_GUARD_REASONS.has(f.reason)) guardHits.push({ ...(f.guard || { kind: f.reason }), ticker, side: side || 'yes' });
+    else if (f.guardShadow) guardHits.push({ ...f.guardShadow, ticker, side: side || 'yes', shadow: true });
+    return { ticker, side: side || 'yes', fair_yes: f.p, ref: f.ref != null ? f.ref : null, fair_best: f.best || null, venue: f.venue || null, depth_usd: f.depthUsd != null ? Math.round(f.depthUsd) : null, name: (tdBook && tdBook.names && tdBook.names.get && tdBook.names.get(String(ticker).toUpperCase())) || null, date: legDate(ticker) };
   });
+  const hardGuard = guardHits.filter((h) => !h.shadow);
+  if (hardGuard.length) return { decision: { action: 'skip', reason: hardGuard[0].kind, rfqId: rfq.rfqId, guard: guardHits, rogue: rogue.length ? rogue : undefined } };
   if (rogue.some((e) => e.kind === 'rogue_low') && legs.some((l) => l.fair_yes == null)) {
     return { decision: { action: 'skip', reason: 'rogue_fair_low', rfqId: rfq.rfqId, rogue } };
   }
@@ -149,13 +154,14 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
   else if (d.action === 'skip' && d.reason === 'roi_below_min' && hasTd) d.reason = 'roi_below_min_td';
   else if (d.action === 'skip' && d.reason === 'roi_below_min' && hasLine) d.reason = 'roi_below_min_lines';
   if (rogue.length) d.rogue = rogue;
+  if (guardHits.length) d.guard = guardHits;
   if (d.action === 'quote') {
     d.releaseAt = releaseAtMs(legs, nowMs);
     d.settleAt = settleAt0;
     if (totalCap > config.totalExposureCap) d.totalCap = totalCap;
     d.minRoi = minRoi; d.hasTd = hasTd; d.hasLine = hasLine; d.hasNcaaf = hasNcaaf; d.hasNba = hasNba;
     // Per-leg detail for the fill alert + audit (sniper_decisions.details.legDetail).
-    d.legDetail = legs.map((l) => ({ ticker: l.ticker, side: l.side, fair: l.fair_yes, venue: l.venue, depthUsd: l.depth_usd, name: l.name }));
+    d.legDetail = legs.map((l) => ({ ticker: l.ticker, side: l.side, fair: l.fair_yes, venue: l.venue, depthUsd: l.depth_usd, name: l.name, ref: l.ref }));
   }
   return { decision: d, row };
 }

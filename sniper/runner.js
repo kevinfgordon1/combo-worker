@@ -538,6 +538,20 @@ async function main(env = process.env) {
     const cur = () => base + (v - base) * Math.pow(0.5, (Date.now() - at) / 5000);
     return { add: (ms) => { if (Number.isFinite(ms)) { v = 0.8 * cur() + 0.2 * ms; at = Date.now(); } }, get: cur }; })();
   // Rogue-line guard log (sniper/rogue.js): one sniper_decisions row per leg+venue+kind per minute.
+  // Thin-book guard log (sniper/mid-guard.js): console + one sniper_decisions row per leg+kind per minute.
+  const guardSeen = new Map();
+  const midCfg = require('./mid-guard').midGuardConfig(env);
+  log(`[SNIPER] thin-book guard mode=${midCfg.mode} maxBelowMid=${(midCfg.maxBelow * 100).toFixed(1)}pp thinSlip=${(midCfg.thinSlip * 100).toFixed(1)}pp secondVenueTol=${(midCfg.secondTol * 100).toFixed(1)}pp`);
+  function logGuard(d) {
+    const t = Date.now();
+    for (const e of d.guard) {
+      const k = `${e.ticker}:${e.side}:${e.kind}`;
+      if (t - (guardSeen.get(k) || 0) < 60000) continue;
+      guardSeen.set(k, t); if (guardSeen.size > 5000) guardSeen.delete(guardSeen.keys().next().value);
+      log(`[SNIPER] guard ${e.kind}${e.shadow ? ' (shadow)' : ''} ${e.ticker}:${e.side} fair=${americanOf(e.fair)} mkt=${e.ref != null ? americanOf(e.ref) : 'n/a'}(${e.refVenue || '-'}) gap=${e.gapPp != null ? (e.gapPp * 100).toFixed(1) : '?'}pp`);
+      try { decisionStore.decision({ rfq_id: d.rfqId || null, action: 'guard', reason: e.kind, details: { ...e, outcome: d.action === 'skip' ? d.reason : 'quoted_anyway' } }); } catch (_) { /* never block quoting */ }
+    }
+  }
   const rogueSeen = new Map();
   const rogueCfg = rogueConfig(env);
   log(`[SNIPER] rogue-line guard mode=${rogueCfg.mode} maxDev=${(rogueCfg.maxDev * 100).toFixed(1)}pp maxLogit=${rogueCfg.maxLogit} minDev=${(rogueCfg.minDev * 100).toFixed(1)}pp dropHigh=${rogueCfg.dropHigh}`);
@@ -574,6 +588,7 @@ async function main(env = process.env) {
     lat.stage('handlerToDecided', Date.now() - tH);
     staleAlert.record(d.reason === 'prices_stale');
     if (d.rogue && d.rogue.length) logRogue(d);
+    if (d.guard && d.guard.length) logGuard(d);
     if (d.action !== 'quote') { counts.skips[d.reason] = (counts.skips[d.reason] || 0) + 1; return; }
     // Re-check age right before the DB reserve (fees prefetch can await on a cold series).
     if (tooOld(rfq, signedNow(), maxAgeMs) != null) {
