@@ -63,15 +63,19 @@ function ncaafNames() {
 }
 
 /** Does Kalshi code `code` name ESPN team `t` ({abbr, location, name, display, short})? */
-function codeMatches(league, code, t) {
-  const c = code.toUpperCase();
-  const a = String(t.abbr || '').toUpperCase();
-  if (c === a || canon(league, c) === canon(league, a)) return true;
-  if (league === 'NCAAF' || league === 'NCAAMB' || league === 'NCAAB') {
-    const names = ncaafNames()[c] || [];
-    const espn = [t.location, t.display, t.short, t.name].map(norm).filter(Boolean);
-    if (names.some((n) => espn.includes(n))) return true;
-  }
+function codeMatches(league, code, t) { return sideMatches(league, code, sideKeys(league, t)); }
+
+// Precomputed per-side match keys (canonical abbr + normalized names for college). Built once per game object.
+const NCAA = new Set(['NCAAF', 'NCAAMB', 'NCAAB']);
+function sideKeys(league, t) {
+  const abbr = canon(league, String((t && t.abbr) || ''));
+  const names = NCAA.has(league) ? new Set([t.location, t.display, t.short, t.name].map(norm).filter(Boolean)) : null;
+  return { abbr, names };
+}
+function sideMatches(league, code, k) {
+  const c = String(code).toUpperCase();
+  if (canon(league, c) === k.abbr) return true;
+  if (k.names) { const names = ncaafNames()[c]; if (names) for (const n of names) if (k.names.has(n)) return true; }
   return false;
 }
 
@@ -105,24 +109,68 @@ async function fetchEspnDay(league, ymd, fetchFn = globalThis.fetch) {
   return rows;
 }
 
-const etDate = (ms) => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ms));
+// One formatter for the process: building an Intl.DateTimeFormat per call cost ~20 µs and was done ~650× per leg
+// in #298 (14 ms per sniper leg → event-loop stall + OOM on kaygo-sniper, Oct 27 2026).
+const ET_FMT = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' });
+const etDate = (ms) => ET_FMT.format(new Date(ms));
 
-/** Match a Kalshi event to exactly one ESPN game (away+home codes, either order, on ticker date or allowed shift). */
+/** Small LRU (Map insertion order). */
+function makeLru(cap) {
+  const m = new Map();
+  return {
+    get(k) { if (!m.has(k)) return undefined; const v = m.get(k); m.delete(k); m.set(k, v); return v; },
+    has: (k) => m.has(k),
+    set(k, v) { if (m.has(k)) m.delete(k); m.set(k, v); if (m.size > cap) m.delete(m.keys().next().value); },
+    get size() { return m.size; },
+  };
+}
+const MATCH_CACHE_MAX = 5000;
+
+// Index of a games array: games by league|ET date with precomputed side keys, plus a per-event match memo (LRU).
+// Keyed by the array itself (WeakMap), so a schedule refresh (new array) drops the old index and memo automatically.
+// Rebuilt if the array length changes (callers that push into an array they already resolved against).
+const INDEX = new WeakMap();
+function indexGames(games) {
+  const arr = games || [];
+  let idx = INDEX.get(arr);
+  if (idx && idx.n === arr.length) return idx;
+  const byDay = new Map();
+  for (const g of arr) {
+    if (!g || !LEAGUES[g.league] || !Number.isFinite(g.start_ms)) continue;
+    const e = { g, day: etDate(g.start_ms), home: sideKeys(g.league, g.home || {}), away: sideKeys(g.league, g.away || {}) };
+    const k = `${g.league}|${e.day}`; const list = byDay.get(k); if (list) list.push(e); else byDay.set(k, [e]);
+  }
+  idx = { n: arr.length, byDay, memo: makeLru(MATCH_CACHE_MAX) };
+  if (arr.length) INDEX.set(arr, idx); // (a fresh [] literal per call is never cached)
+  return idx;
+}
+
+/** Match a Kalshi event to exactly one ESPN game (away+home codes, either order, on ticker date or allowed shift).
+ *  Uses the games index (only that league's games on the allowed dates) and memoizes per event. */
 function matchEvent(ev, games) {
   const p = typeof ev === 'string' ? parseEvent(ev) : ev; if (!p) return null;
-  const shifts = (LEAGUES[p.league].dateShift || [0]).concat([]);
-  const dates = new Set(shifts.map((s) => addDays(p.date, s)));
+  const idx = indexGames(games);
+  const key = `${p.league}|${p.event}`;
+  if (idx.memo.has(key)) return idx.memo.get(key);
+  const res = matchUncached(p, idx);
+  if (idx.n) idx.memo.set(key, res);
+  return res;
+}
+function matchUncached(p, idx) {
+  const shifts = LEAGUES[p.league].dateShift || [0];
   const hits = [];
-  for (const g of games) {
-    if (g.league !== p.league || !dates.has(etDate(g.start_ms))) continue;
-    for (let i = 1; i < p.teams.length; i += 1) {
-      const a = p.teams.slice(0, i), b = p.teams.slice(i);
-      if ((codeMatches(p.league, a, g.away) && codeMatches(p.league, b, g.home)) || (codeMatches(p.league, a, g.home) && codeMatches(p.league, b, g.away))) { hits.push(g); break; }
+  for (const s of shifts) {
+    const list = idx.byDay.get(`${p.league}|${addDays(p.date, s)}`); if (!list) continue;
+    for (const e of list) {
+      for (let i = 1; i < p.teams.length; i += 1) {
+        const a = p.teams.slice(0, i), b = p.teams.slice(i);
+        if ((sideMatches(p.league, a, e.away) && sideMatches(p.league, b, e.home)) || (sideMatches(p.league, a, e.home) && sideMatches(p.league, b, e.away))) { hits.push(e); break; }
+      }
     }
   }
   // Prefer an exact-date hit when the shifted day has a different meeting of the same teams.
-  const exact = hits.filter((g) => etDate(g.start_ms) === p.date);
-  const pick = hits.length === 1 ? hits[0] : (exact.length === 1 ? exact[0] : null);
+  const exact = hits.filter((e) => e.day === p.date);
+  const pick = hits.length === 1 ? hits[0].g : (exact.length === 1 ? exact[0].g : null);
   return pick ? { ...pick, ambiguous: false } : (hits.length > 1 ? { ambiguous: true, candidates: hits.length } : null);
 }
 
@@ -204,4 +252,4 @@ function buildRows(events, games, checks = {}, now = Date.now()) {
   return { rows, misses };
 }
 
-module.exports = { gameToRow, rowToGame, parseEvent, espnRows, fetchEspnDay, matchEvent, resolveStart, buildRows, kalshiStartGuess, codeMatches, LEAGUES, ALIAS, DISAGREE_MS, etDate, addDays };
+module.exports = { indexGames, makeLru, MATCH_CACHE_MAX, gameToRow, rowToGame, parseEvent, espnRows, fetchEspnDay, matchEvent, resolveStart, buildRows, kalshiStartGuess, codeMatches, LEAGUES, ALIAS, DISAGREE_MS, etDate, addDays };

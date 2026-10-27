@@ -10,12 +10,18 @@ const G = require('./game-schedule');
 
 const SYNC_LEAGUES = ['NFL', 'NCAAF', 'NBA', 'NHL', 'MLB', 'WNBA', 'MLS', 'EPL', 'NCAAMB'];
 const H = 3600000;
+const yieldLoop = () => new Promise((r) => setImmediate(r)); // let quoting run between ESPN pulls / parses
 
 function createScheduleSync({ env = process.env, fetchFn = globalThis.fetch, log = console.log, alerts = null, now = () => Date.now() } = {}) {
   const base = env.SUPABASE_URL; const key = env.SUPABASE_SERVICE_KEY;
   const hdr = { apikey: key, Authorization: `Bearer ${key}`, 'content-type': 'application/json' };
   let games = []; let tableMissing = false; const alerted = new Map(); let lastFull = 0;
-  const stats = { passes: 0, upserted: 0, espnErrors: 0, unverifiedLegs: 0, disputedLegs: 0, lastPass: null };
+  const stats = { passes: 0, upserted: 0, espnErrors: 0, unverifiedLegs: 0, disputedLegs: 0, lastPass: null, lookups: 0, lookupErrors: 0, lagTrips: 0, lookupsOff: false };
+  // Hot-path cache: resolved result per ticker (LRU), dropped on every schedule refresh.
+  const RESOLVE_MAX = Number(env.SCHEDULE_RESOLVE_CACHE || 20000);
+  let resolveCache = G.makeLru(RESOLVE_MAX);
+  // Safety: lookups are switched off (callers fall back to the old kickoff chain) when the event loop lags.
+  let lookupsOff = false; let offUntil = 0; let lagTimer = null; let lagHigh = 0;
 
   async function rest(path, opts = {}) {
     const r = await fetchFn(`${base}/rest/v1/${path}`, { ...opts, headers: { ...hdr, ...(opts.headers || {}) } });
@@ -26,7 +32,8 @@ function createScheduleSync({ env = process.env, fetchFn = globalThis.fetch, log
   async function pullEspn(days) {
     const out = []; const today = G.etDate(now());
     for (const lg of SYNC_LEAGUES) for (const d of days) {
-      try { out.push(...await G.fetchEspnDay(lg, G.addDays(today, d), fetchFn)); } catch (e) { stats.espnErrors += 1; log(`[SCHEDULE] ESPN ${lg} ${d}: ${e.message}`); }
+      try { const rows = await G.fetchEspnDay(lg, G.addDays(today, d), fetchFn); for (const r of rows) out.push(r); } catch (e) { stats.espnErrors += 1; log(`[SCHEDULE] ESPN ${lg} ${d}: ${e.message}`); }
+      await yieldLoop();
     }
     return out;
   }
@@ -52,7 +59,47 @@ function createScheduleSync({ env = process.env, fetchFn = globalThis.fetch, log
   function merge(fresh) {
     const m = new Map(games.map((g) => [`${g.league}|${g.espn_id}`, g]));
     for (const g of fresh) m.set(`${g.league}|${g.espn_id}`, g);
-    const cut = now() - 3 * 24 * H; games = [...m.values()].filter((g) => g.start_ms > cut);
+    const cut = now() - 3 * 24 * H; const next = [...m.values()].filter((g) => g.start_ms > cut);
+    G.indexGames(next); // build the index here (off the hot path) so the first sniper lookup is already O(1)
+    games = next; resolveCache = G.makeLru(RESOLVE_MAX);
+  }
+
+  /** Hot path (sniper, every RFQ leg). Never throws, never blocks: null => caller uses its old fallback chain. */
+  function resolve(ticker, extras) {
+    if (lookupsOff || !games.length) return null;
+    try {
+      const k = extras ? null : String(ticker || '');
+      if (k) { const c = resolveCache.get(k); if (c !== undefined) return c; }
+      stats.lookups += 1;
+      const r = G.resolveStart(ticker, games, extras || {});
+      if (k) resolveCache.set(k, r);
+      return r;
+    } catch (e) { stats.lookupErrors += 1; return null; }
+  }
+
+  // Event-loop lag guard. Every SCHEDULE_LAG_CHECK_MS, measure how late the check timer fired; above SCHEDULE_LAG_MS on two checks
+  // in a row => lookups off for SCHEDULE_LAG_OFF_MS (sniper keeps quoting on the old kickoff chain), log + alert once.
+  // After SCHEDULE_LAG_MAX_TRIPS trips lookups stay off until restart.
+  function lagGuard() {
+    const limit = Number(env.SCHEDULE_LAG_MS || 1500); const every = Number(env.SCHEDULE_LAG_CHECK_MS || 10000);
+    const offMs = Number(env.SCHEDULE_LAG_OFF_MS || 15 * 60000); const maxTrips = Number(env.SCHEDULE_LAG_MAX_TRIPS || 3);
+    // Lag = how late this timer fires (a blocked loop delays every timer by the same amount).
+    let expected = Date.now() + every;
+    lagTimer = setInterval(() => {
+      const t = Date.now(); const maxMs = Math.max(0, t - expected); expected = t + every;
+      if (lookupsOff && stats.lagTrips < maxTrips && now() >= offUntil && maxMs < limit) { lookupsOff = false; stats.lookupsOff = false; log(`[SCHEDULE] lag ok (${Math.round(maxMs)} ms) — canonical lookups back on`); }
+      lagHigh = maxMs > limit ? lagHigh + 1 : 0;
+      if (!lookupsOff && lagHigh >= 2) {
+        lookupsOff = true; stats.lookupsOff = true; stats.lagTrips += 1; offUntil = now() + offMs; lagHigh = 0;
+        const final = stats.lagTrips >= maxTrips;
+        const msg = `event-loop lag ${Math.round(maxMs)} ms > ${limit} ms — canonical schedule lookups OFF ${final ? 'until restart' : `for ${Math.round(offMs / 60000)} min`} (trip ${stats.lagTrips}); sniper uses the old kickoff chain`;
+        log(`[SCHEDULE] ${msg}`);
+        const day = G.etDate(now());
+        if (alerts && alerts.raise) Promise.resolve(alerts.raise({ kind: 'game_schedule', severity: 'warning', title: 'Schedule lookups paused (event-loop lag)', body: msg, dedupeKey: `lag|${day}|${stats.lagTrips}` })).catch(() => {});
+        telegram(`Schedule lookups paused\n${msg}`);
+      }
+    }, every);
+    if (lagTimer.unref) lagTimer.unref();
   }
 
   async function telegram(text) {
@@ -92,17 +139,22 @@ function createScheduleSync({ env = process.env, fetchFn = globalThis.fetch, log
       await save(fresh).catch((e) => log(`[SCHEDULE] save error: ${e.message}`));
       await auditLocks().catch((e) => log(`[SCHEDULE] audit error: ${e.message}`));
       stats.passes += 1; stats.lastPass = new Date(now()).toISOString();
+      log(`[SCHEDULE] pass ${stats.passes} ${full ? 'full' : 'quick'} fetched=${fresh.length} games=${games.length} lookups=${stats.lookups} cache=${resolveCache.size} unverifiedLegs=${stats.unverifiedLegs} lookupsOff=${lookupsOff}`);
     } catch (e) { log(`[SCHEDULE] tick error: ${e.message}`); }
   }
 
   function start() {
     const quick = Number(env.SCHEDULE_QUICK_MS || 3 * 60000);
+    const delay = Number(env.SCHEDULE_START_DELAY_MS || 30000); // let the sniper's own startup finish first
     const run = async () => { await tick(); const tm = setTimeout(run, quick); if (tm.unref) tm.unref(); };
-    run();
+    const first = setTimeout(run, delay); if (first.unref) first.unref();
+    if (env.SCHEDULE_LAG_GUARD !== '0') lagGuard();
     log(`[SCHEDULE] canonical schedule sync on (quick ${Math.round(quick / 1000)}s, full ${Math.round(Number(env.SCHEDULE_FULL_MS || 1800000) / 60000)} min)`);
   }
 
-  return { tick, start, auditLocks, resolve: (ticker, extras) => G.resolveStart(ticker, games, extras), games: () => games, stats: () => ({ ...stats, games: games.length, tableMissing }) };
+  function stop() { if (lagTimer) clearInterval(lagTimer); }
+  return { tick, start, stop, auditLocks, resolve, games: () => games, stats: () => ({ ...stats, games: games.length, tableMissing, resolveCache: resolveCache.size }),
+    _load: (list) => merge(list), _setLookupsOff: (v) => { lookupsOff = !!v; stats.lookupsOff = !!v; } };
 }
 
 module.exports = { createScheduleSync, SYNC_LEAGUES };
