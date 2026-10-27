@@ -23,6 +23,7 @@ function fmtCause(info) {
   const p = i.ping || {};
   const parts = [`silent ${Math.round((i.silentMs || 0) / 1000)}s`];
   if (i.lastMessageType !== undefined) parts.push(`last message: ${i.lastMessageType || 'none this connection'}`);
+  if (i.lastError) parts.push(`error: ${String(i.lastError).slice(0, 140)}`);
   if (i.messagesThisConn != null) parts.push(`${i.messagesThisConn} msgs on this socket`);
   if (p.state) parts.push(`ping/pong: ${p.state}`);
   return parts.join('; ');
@@ -76,6 +77,8 @@ function createPolyStallAlerts({ appAlerts, now = () => Date.now(), log = () => 
         stalls: info && info.stalls,
         reconnects: info && info.reconnects,
         last_message_type: info && info.lastMessageType,
+        last_error: info && info.lastError,
+        last_error_payload: info && info.lastErrorPayload,
         messages_this_conn: info && info.messagesThisConn,
         socket_age_ms: info && info.socketAgeMs,
         ping: info && info.ping,

@@ -2876,7 +2876,8 @@ function startPolymarketRfqLoop(ctx = {}) {
         console.error(
           `[${MODE}] WS STALL no message for ${Math.round(info.silentMs / 1000)}s ` +
           `(stalls=${info.stalls}) - terminating socket and reconnecting | cause: ` +
-          `lastMsg=${info.lastMessageType || 'none'} msSinceLastMsg=${info.silentMs} ` +
+          `lastMsg=${info.lastMessageType || 'none'} ` +
+          `${info.lastErrorPayload ? `wsError=${info.lastErrorPayload} ` : ''}msSinceLastMsg=${info.silentMs} ` +
           `msgsOnSocket=${info.messagesThisConn} socketAgeMs=${info.socketAgeMs} ` +
           `readyState=${info.readyState} ping=${info.ping ? info.ping.state : 'n/a'} ` +
           `pings=${info.ping ? info.ping.sent : 0}/pongs=${info.ping ? info.ping.pongs : 0} ` +

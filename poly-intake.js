@@ -216,6 +216,14 @@ async function crawlOpenRfqs(http, {
   shouldPause = null,   // () => truthy while the Kalshi quote path is mid-POST/confirm
   pauseStepMs = 25,
   maxPauseMs = 2000,
+  // 429 / Cloudflare 1015 mid-crawl: wait (Retry-After / client backoff, else
+  // jittered exponential) and retry the same cursor up to max429Retries times,
+  // and widen the page spacing for the rest of the crawl so we stay under the limit.
+  max429Retries = 2,
+  retryBaseMs = 2000,
+  maxRetryWaitMs = 20000,
+  maxPageDelayMs = 5000,
+  random = Math.random,
 } = {}) {
   const rows = [];
   const seenIds = new Set();
@@ -224,6 +232,9 @@ async function crawlOpenRfqs(http, {
   let truncated = false;
   let error = null;
   let pending = firstPage;
+  let delay = pageDelayMs;
+  let retries429 = 0;
+  let rateLimited = 0;
   for (;;) {
     if (isStopped()) { truncated = true; break; }
     // Yield to the Kalshi quote path: do not start another page (HTTP + JSON.parse + signing)
@@ -241,12 +252,23 @@ async function crawlOpenRfqs(http, {
         listed = await http.listRfqs(q);
       }
     } catch (e) {
+      if (e && e.statusCode === 429 && !e.limiterDrop && retries429 < max429Retries && !isStopped()) {
+        retries429 += 1;
+        rateLimited += 1;
+        const hinted = Number(e.retryInMs || e.backoffMs) || 0;
+        const exp = retryBaseMs * (2 ** (retries429 - 1));
+        const wait = Math.min(maxRetryWaitMs, Math.round(Math.max(hinted, exp) * (0.75 + random() * 0.5)));
+        delay = Math.min(maxPageDelayMs, Math.max(delay * 2, 1000));
+        await sleep(wait);
+        continue; // same cursor
+      }
       if (pages === 0) throw e;
       truncated = true;
       error = { statusCode: e && e.statusCode, forbidden: isForbidden(e), rateLimited: !!(e && e.statusCode === 429), message: String((e && e.message) || e).slice(0, 120) };
       break;
     }
     pages += 1;
+    retries429 = 0;
     const page = (listed && listed.rfqs) || [];
     for (const r of page) {
       const id = r && (r.id || r.rfqId || (r.rfq && r.rfq.id));
@@ -257,9 +279,9 @@ async function crawlOpenRfqs(http, {
     if (!page.length || !next || next === cursor) break;
     if (pages >= maxPages) { truncated = true; break; }
     cursor = next;
-    if (pageDelayMs > 0) await sleep(pageDelayMs);
+    if (delay > 0) await sleep(delay);
   }
-  return { rows, pages, truncated, error };
+  return { rows, pages, truncated, error, rateLimited, pageDelayMs: delay };
 }
 
 // Candidates first; otherwise stable. `classify(row)` returns 2 (exact lock

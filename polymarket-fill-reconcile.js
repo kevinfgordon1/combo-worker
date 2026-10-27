@@ -1380,12 +1380,19 @@ function matchActivitiesToLocks(activities, locks, {
   return events;
 }
 
-async function listActivitiesPage(http, { limit = 100, maxPages = 8, marketSlug } = {}) {
+// Spacing between activities GETs (pages and per-slug scans) so a fill check
+// is a trickle, not a burst that trips Cloudflare 1015.
+const ACT_PAGE_DELAY_MS = Number(process.env.POLY_ACT_PAGE_DELAY_MS) >= 0 && process.env.POLY_ACT_PAGE_DELAY_MS !== undefined && process.env.POLY_ACT_PAGE_DELAY_MS !== ''
+  ? Number(process.env.POLY_ACT_PAGE_DELAY_MS) : 300;
+const actSleep = (ms) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
+
+async function listActivitiesPage(http, { limit = 100, maxPages = 8, marketSlug, pageDelayMs = ACT_PAGE_DELAY_MS, sleep = actSleep } = {}) {
   if (!http || typeof http.listActivities !== 'function') return [];
   const out = [];
   let cursor;
   for (let page = 0; page < maxPages; page += 1) {
     let listed;
+    if (page > 0) await sleep(pageDelayMs);
     try {
       listed = await http.listActivities({
         types: 'ACTIVITY_TYPE_TRADE',
@@ -1444,7 +1451,7 @@ let slugFullPassDone = false;
 const SLUGS_PER_TICK = Number(process.env.POLY_ACT_SLUGS_PER_TICK) > 0
   ? Number(process.env.POLY_ACT_SLUGS_PER_TICK) : 8;
 
-async function listActivitiesForMarketSlugs(http, slugs, { limit = 100, maxPages = 4, perTick = SLUGS_PER_TICK, full } = {}) {
+async function listActivitiesForMarketSlugs(http, slugs, { limit = 100, maxPages = 4, perTick = SLUGS_PER_TICK, full, pageDelayMs = ACT_PAGE_DELAY_MS, sleep = actSleep } = {}) {
   const out = [];
   const all = (slugs || []).map(normalizeMarketSlug).filter((k) => isComboActivitySlug(k));
   const doFull = full != null ? full : !slugFullPassDone;
@@ -1455,9 +1462,12 @@ async function listActivitiesForMarketSlugs(http, slugs, { limit = 100, maxPages
     slugScanOffset = (slugScanOffset + perTick) % all.length;
   }
   if (doFull) slugFullPassDone = true;
+  let first = true;
   for (const key of pick) {
+    if (!first) await sleep(pageDelayMs);
+    first = false;
     try {
-      const rows = await listActivitiesPage(http, { limit, maxPages, marketSlug: key });
+      const rows = await listActivitiesPage(http, { limit, maxPages, marketSlug: key, pageDelayMs, sleep });
       out.push(...rows);
     } catch (e) {
       if (e && e.statusCode === 429) break; // rate limited: stop, next tick continues

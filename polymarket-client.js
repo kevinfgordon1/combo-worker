@@ -57,6 +57,15 @@ function queryHasKeys(query) {
   return Object.entries(query).some(([, v]) => v != null && v !== '');
 }
 
+// Retry-After is either delta-seconds or an HTTP-date (RFC 9110). Returns ms or null.
+function parseRetryAfterMs(v, nowMs = Date.now()) {
+  if (v == null || v === '') return null;
+  const str = String(Array.isArray(v) ? v[0] : v).trim();
+  if (/^\d+(\.\d+)?$/.test(str)) return Math.round(Number(str) * 1000);
+  const t = Date.parse(str);
+  return Number.isFinite(t) ? Math.max(0, t - nowMs) : null;
+}
+
 function throwHttpError(method, path, res, extra = {}) {
   const classify = classifyPolymarketAuthError({
     statusCode: res.statusCode,
@@ -72,6 +81,7 @@ function throwHttpError(method, path, res, extra = {}) {
   err.auth = classify;
   err.signMode = extra.signMode || null;
   if (res.localBackoff) { err.localBackoff = true; err.retryInMs = res.retryInMs; }
+  if (res.limiterDrop) err.limiterDrop = true;
   if (res.backoffMs) err.backoffMs = res.backoffMs;
   throw err;
 }
@@ -133,8 +143,8 @@ function createPolymarketHttp({
     b.hits += 1;
     b.step = Math.min(b.step + 1, 10);
     const exp = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * (2 ** (b.step - 1)));
-    const ra = Number(res && res.headers && (res.headers['retry-after'] || res.headers['Retry-After']));
-    const base = Number.isFinite(ra) && ra > 0 ? Math.min(BACKOFF_MAX_MS, ra * 1000) : exp;
+    const raMs = parseRetryAfterMs(res && res.headers && (res.headers['retry-after'] || res.headers['Retry-After']), nowMs());
+    const base = raMs != null && raMs > 0 ? Math.min(BACKOFF_MAX_MS, raMs) : exp;
     const wait = Math.round(base * (0.75 + Math.random() * 0.5)); // +/-25% jitter
     b.until = nowMs() + wait;
     b.last = nowMs();
@@ -526,6 +536,42 @@ function messageTypeOf(raw) {
   }
 }
 
+// Sanitized, truncated copy of a non-feed WS message (error replies, acks) for
+// logs/alerts. Never includes auth material: any key that looks like a
+// credential is redacted, recursively.
+const SENSITIVE_KEY_RE = /auth|key|secret|signature|sig$|token|passphrase|password|cookie|credential/i;
+function sanitizeWsPayload(obj, depth = 0) {
+  if (obj == null || typeof obj !== 'object') return obj;
+  if (depth > 6) return '[depth]';
+  if (Array.isArray(obj)) return obj.slice(0, 20).map((v) => sanitizeWsPayload(v, depth + 1));
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    out[k] = SENSITIVE_KEY_RE.test(k) ? '[redacted]' : sanitizeWsPayload(v, depth + 1);
+  }
+  return out;
+}
+function wsPayloadText(raw, max = 1000) {
+  let txt;
+  try { txt = JSON.stringify(sanitizeWsPayload(raw)); } catch (_) { txt = String(raw); }
+  return txt.length > max ? `${txt.slice(0, max)}...` : txt;
+}
+function isWsErrorMessage(raw) {
+  return !!(raw && typeof raw === 'object' && (raw.error || raw.err || raw.errors
+    || (typeof raw.type === 'string' && /error/i.test(raw.type))));
+}
+// One-line summary of an error payload for alert text (<= max chars).
+function shortWsError(raw, max = 140) {
+  const e = raw && (raw.error || raw.err || raw.errors || raw);
+  let msg;
+  if (typeof e === 'string') msg = e;
+  else if (e && typeof e === 'object') {
+    const bits = [e.code, e.status, e.message || e.msg || e.reason || e.description].filter((x) => x != null && x !== '');
+    msg = bits.length ? bits.join(' ') : wsPayloadText(e, max);
+  } else msg = String(e);
+  msg = String(msg).replace(/\s+/g, ' ');
+  return msg.length > max ? `${msg.slice(0, max)}...` : msg;
+}
+
 function isRealFeedMessage(parsed) {
   return !!(parsed && parsed.type && parsed.type !== 'other');
 }
@@ -566,6 +612,9 @@ function createPolymarketRfqWs({
   // Cause diagnostics for the stall log: what the last message was and
   // whether the socket still answers pings (a "zombie" socket keeps ponging).
   let lastMessageType = null;
+  let lastErrorShort = null;   // short text of the last WS error reply (this connection)
+  let lastErrorPayload = null; // sanitized full payload of it
+  let errorLogsThisConn = 0;
   let messagesThisConn = 0;
   let pingsSent = 0;
   let pongsRecv = 0;
@@ -610,6 +659,8 @@ function createPolymarketRfqWs({
       silentMs, stalls, reconnects, lastMessageAt: lastMessageAt || null,
       // cause details
       lastMessageType,
+      lastError: lastErrorShort,
+      lastErrorPayload,
       messagesThisConn,
       socketAgeMs: connectedAt ? t - connectedAt : null,
       readyState: ws && ws.readyState != null ? ws.readyState : null,
@@ -641,6 +692,9 @@ function createPolymarketRfqWs({
     connectedAt = now();
     lastMessageAt = 0;
     lastMessageType = null;
+    lastErrorShort = null;
+    lastErrorPayload = null;
+    errorLogsThisConn = 0;
     messagesThisConn = 0;
     pingsSent = 0; pongsRecv = 0; lastPingAt = 0; lastPongAt = 0; pingsAtLastPong = 0;
     const sock = new WebSocketImpl(url, { headers });
@@ -690,6 +744,14 @@ function createPolymarketRfqWs({
       lastMessageType = !parsed ? messageTypeOf(d)
         : (parsed.type === 'other' && parsed.raw && typeof parsed.raw === 'object'
           ? `other:${Object.keys(parsed.raw)[0] || '{}'}` : parsed.type);
+      if (parsed && parsed.type === 'other' && isWsErrorMessage(parsed.raw)) {
+        lastErrorShort = shortWsError(parsed.raw);
+        lastErrorPayload = wsPayloadText(parsed.raw);
+        if (errorLogsThisConn < 5) {
+          errorLogsThisConn += 1;
+          console.warn(`[POLY] ws error message (conn msg #${messagesThisConn}): ${lastErrorPayload}`);
+        }
+      }
       if (!parsed) return;
       try { onEvent && onEvent(parsed); } catch (e) { console.error('[POLY] ws event', e && e.message); }
     });
@@ -730,6 +792,11 @@ function createPolymarketRfqWs({
 }
 
 module.exports = {
+  parseRetryAfterMs,
+  sanitizeWsPayload,
+  wsPayloadText,
+  shortWsError,
+  isWsErrorMessage,
   READ_CONNECTIONS,
   QUOTE_CONNECTIONS,
   polyPoolOptions,
