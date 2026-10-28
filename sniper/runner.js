@@ -43,6 +43,9 @@ const { createSniperTrader } = require('./trader');
 const { createSoonCap } = require('./soon-cap');
 const { createLockCoord } = require('./coord');
 const { createLiveSniper } = require('./live');
+const { createPostGate, createQtoBreaker } = require('./cancel-backlog');
+const { startupCancelOpen } = require('./startup-cancel');
+const { createUntrackedSweep } = require('./untracked-sweep');
 const { capsFrom } = require('./ledger-store');
 const { createNightlyRecap } = require('./recap');
 const { createSniperFrameFilter, needleAllDisabled, createNflFrameFilter, createDeletedFilter, createDeletedIdFilter, tooOld, createLatencyStats, createLoopLagSampler, NFL_NEEDLES, NBA_NEEDLES } = require('./intake');
@@ -111,7 +114,9 @@ async function main(env = process.env) {
     kalshiSeries: createLimiter({ name: 'kalshi_series', ratePerSec: 0.2, burst: 2 }),
     // signed calls on the sniper's own key (quote POST/confirm/cancel, fills reads)
     // Capped at Kevin's account budget minus the 9/s reserved for his Combo Locks (sniper/kalshi-budget.js).
-    kalshiTrade: createLimiter({ name: 'kalshi_trade', ratePerSec: tradeBudget.rps, ratePerSecOn429: tradeBudget.on429, burst: Math.min(5, Math.ceil(tradeBudget.rps)), lowShareRps: Math.max(0, num(env.SNIPER_CANCEL_SHARE_RPS, 1)) }),
+    kalshiTrade: createLimiter({ name: 'kalshi_trade', ratePerSec: tradeBudget.rps, ratePerSecOn429: tradeBudget.on429, burst: Math.min(5, Math.ceil(tradeBudget.rps)), lowShareRps: Math.max(0, num(env.SNIPER_CANCEL_SHARE_RPS, 1)),
+      // Fix 1 (Oct 28 2026): SNIPER_CANCEL_SHARE_RPS is a real reservation (quotes get rate - N/s). SNIPER_CANCEL_RESERVE=0 = old turn-taking share.
+      reserveLow: String(env.SNIPER_CANCEL_RESERVE || '1') !== '0' }),
     // Authenticated reads (fill lookups) use Kalshi's separate Read bucket — keep them off the write lane.
     kalshiTradeRead: createLimiter({ name: 'kalshi_trade_read', ratePerSec: num(env.SNIPER_KALSHI_READ_RPS, 3), burst: 3 }),
     kalshiSettle: createLimiter({ name: 'kalshi_settle', ratePerSec: 0.5, burst: 2 }),
@@ -500,8 +505,30 @@ async function main(env = process.env) {
     summaryMs: num(env.SNIPER_BOOK_ARB_SUMMARY_MS, 6 * 3600e3),
   });
   if (bookArb && gate.live) loop(() => bookArb.recheckOpen(), 'book_arb', num(env.SNIPER_BOOK_ARB_POLL_MS, 300000));
+  // Oct 28 2026 cancel-backlog fixes (each with its own off switch):
+  //   SNIPER_CANCEL_FIFO=0              routine DELETEs race for tokens again (default: oldest first, SNIPER_CANCEL_CONCURRENCY=8 wide)
+  //   SNIPER_BACKLOG_GATE=0             never drop posts for a cancel backlog (default: drop lowest-EV posts while
+  //                                     > SNIPER_BACKLOG_MAX_QUEUED (50) DELETEs are queued or the oldest queued quote
+  //                                     is > SNIPER_BACKLOG_MAX_AGE_MS (15000) old)
+  //   SNIPER_QTO_BREAKER=0              no pause on Kalshi 409 quote_timed_out bursts (default: > SNIPER_QTO_BREAKER_RATIO
+  //                                     (0.5) of >= SNIPER_QTO_BREAKER_MIN (20) POSTs in SNIPER_QTO_BREAKER_WINDOW_MS
+  //                                     (10000) -> pause posts SNIPER_QTO_BREAKER_PAUSE_MS (10000), doubling to
+  //                                     SNIPER_QTO_BREAKER_MAX_PAUSE_MS (30000) on consecutive trips)
+  //   SNIPER_QTO_SAMPLE_EVERY (50)      1-in-N sampled QTO_SAMPLE log line (first 10 always); 0 = first 10 only
+  const postGate = String(env.SNIPER_BACKLOG_GATE || '1') === '0' ? null : createPostGate({
+    maxQueued: Math.max(1, num(env.SNIPER_BACKLOG_MAX_QUEUED, 50)), maxAgeMs: Math.max(1000, num(env.SNIPER_BACKLOG_MAX_AGE_MS, 15000)),
+  });
+  const qtoBreaker = String(env.SNIPER_QTO_BREAKER || '1') === '0' ? null : createQtoBreaker({
+    windowMs: Math.max(1000, num(env.SNIPER_QTO_BREAKER_WINDOW_MS, 10000)), ratio: Math.min(0.99, Math.max(0.05, num(env.SNIPER_QTO_BREAKER_RATIO, 0.5))),
+    minSamples: Math.max(1, num(env.SNIPER_QTO_BREAKER_MIN, 20)), pauseMs: Math.max(1000, num(env.SNIPER_QTO_BREAKER_PAUSE_MS, 10000)),
+    maxPauseMs: Math.max(1000, num(env.SNIPER_QTO_BREAKER_MAX_PAUSE_MS, 30000)),
+    onTrip: (o) => log(`[SNIPER] QTO_BREAKER trip: ${(o.frac * 100).toFixed(0)}% of ${o.samples} POSTs were 409 quote_timed_out -> posts paused ${o.pauseMs}ms (streak ${o.streak}); cancels keep the write budget`),
+    onResume: (o) => log(`[SNIPER] QTO_BREAKER resume after streak ${o.streak}`),
+  });
   const liveSniper = createLiveSniper({
     config, trader, store: liveStore, coord, caps, log, onHold, ttlMs: quoteTtlMs, requoteMemo,
+    cancelFifo: String(env.SNIPER_CANCEL_FIFO || '1') !== '0', cancelConcurrency: Math.max(1, num(env.SNIPER_CANCEL_CONCURRENCY, 8)),
+    postGate, qtoBreaker, qtoSampleEvery: Math.max(0, num(env.SNIPER_QTO_SAMPLE_EVERY, 50)),
     // Fix 3 (Oct 28 2026): accepts for quotes we no longer track -> one sniper_decisions row each
     // (fire-and-forget, deferred off the WS handler). ~100-200/day. SNIPER_LATE_ACCEPT_LOG=0 = counters only.
     onLateAccept: String(env.SNIPER_LATE_ACCEPT_LOG || '1') === '0' ? () => {} : (rec) => decisionStore.decision({ rfq_id: rec.rfqId, action: 'late_accept', reason: rec.cls, details: rec }),
@@ -519,6 +546,25 @@ async function main(env = process.env) {
   // Fix 2 (Oct 28 2026): a new RFQ on a parlay we only hold as a WAITING quote may replace it
   // (SNIPER_REPLACE_RESTING=0 = old already_hold_combo skip). SNIPER_REPLACE_MIN_AGE_MS (3000): the
   // waiting quote must be at least this old, or worth less than the new one.
+  // Fix 4 (Oct 28 2026; SNIPER_STARTUP_CANCEL_OPEN=0 = off): cancel every OPEN quote a previous process left
+  // on Kalshi, sniper subaccount only (creator_subaccount must match), created before this boot. The
+  // snapshot (read lane) is taken now, before intake starts; the DELETEs run in the background, paced
+  // at SNIPER_STARTUP_CANCEL_RPS (8/s) in the urgent lane.
+  // Untracked-quote sweep (Oct 28 2026; SNIPER_UNTRACKED_SWEEP=0 = off): on each complete open-quote
+  // snapshot, cancel OPEN sniper-subaccount quotes we don't track that are older than
+  // SNIPER_UNTRACKED_MIN_AGE_MS (30000); at most SNIPER_UNTRACKED_MAX_PER_TICK (25) per snapshot.
+  const untrackedSweep = gate.live && !config.dryRun && String(env.SNIPER_UNTRACKED_SWEEP || '1') !== '0' ? createUntrackedSweep({
+    trader, subaccount: sniperSubaccount(env), isTracked: (id) => liveSniper.isTrackedQuote(id), log,
+    minAgeMs: Math.max(15000, num(env.SNIPER_UNTRACKED_MIN_AGE_MS, 30000)), maxPerTick: Math.max(1, num(env.SNIPER_UNTRACKED_MAX_PER_TICK, 25)),
+  }) : null;
+  if (gate.live && !config.dryRun && String(env.SNIPER_STARTUP_CANCEL_OPEN || '1') !== '0') {
+    const cutoffMs = signedNow();
+    try {
+      const snap = await trader.openQuotesSnapshot({ maxPages: Math.max(1, num(env.SNIPER_STARTUP_CANCEL_MAX_PAGES, 10)) });
+      startupCancelOpen({ trader, subaccount: sniperSubaccount(env), cutoffMs, snapshot: snap, rps: Math.max(1, num(env.SNIPER_STARTUP_CANCEL_RPS, 8)), log, onTargets: (ids) => { if (untrackedSweep) untrackedSweep.mark(ids); } })
+        .catch((e) => log(`[SNIPER] startup open-quote cancel error: ${e.message}`));
+    } catch (e) { log(`[SNIPER] startup open-quote cancel skipped: snapshot failed: ${String(e.message || e).slice(0, 200)}`); }
+  }
   const replaceMinAgeMs = Math.max(0, num(env.SNIPER_REPLACE_MIN_AGE_MS, 3000));
   ledger.canReplace = (ids, o = {}) => !!(gate.live && !config.dryRun) && ids.every((id) => liveSniper.canSupersede(id, { ev: o.ev, minAgeMs: replaceMinAgeMs }));
   // Quote-status poll (Oct 28 2026; SNIPER_QUOTE_STATUS_POLL_MS, default 1000; 0 = off). One read on
@@ -534,13 +580,16 @@ async function main(env = process.env) {
   const quoteGraceMs = Math.max(500, num(env.SNIPER_QUOTE_STATUS_GRACE_MS, 2000));
   const quotePoll = { mode: quotePollMode, ticks: 0, ok: 0, errors: 0, seen: 0, released: 0, marked: 0, partial: 0, lastOpen: null, lastOkAt: null };
   if (gate.live && quotePollMs > 0 && quotePollMode === 'open') {
+    let lastSweepAt = 0;
     loop(async () => {
-      if (!liveSniper.pending.size && !liveSniper.queuedCancelCount()) return;
-      const startedAt = Date.now();
+      // With the untracked sweep on, read at least every 10s even when we track nothing (orphans).
+      if (!liveSniper.pending.size && !liveSniper.queuedCancelCount() && !(untrackedSweep && Date.now() - lastSweepAt >= 10000)) return;
+      const startedAt = Date.now(); lastSweepAt = startedAt;
       quotePoll.ticks += 1;
       try {
         const snap = await trader.openQuotesSnapshot({ maxPages: num(env.SNIPER_QUOTE_STATUS_MAX_PAGES, 6) });
         quotePoll.ok += 1; quotePoll.seen += snap.count; quotePoll.lastOpen = snap.count; quotePoll.lastOkAt = Date.now();
+        if (untrackedSweep) untrackedSweep.onSnapshot(snap, signedNow());
         if (!snap.complete) { quotePoll.partial += 1; return; }
         // Kalshi created_ts is server time; compare in local ms (signedNow carries the measured offset).
         const off = signedNow() - Date.now();
@@ -723,6 +772,12 @@ async function main(env = process.env) {
         ledger.positions.delete(d.rfqId); ledger.hour.pop(); counts.skips.cant_make_queue = (counts.skips.cant_make_queue || 0) + 1; return;
       }
     }
+    // Cancel-backlog gate / 409 breaker (Oct 28 2026): before the replacement and the DB reserve, so a
+    // dropped post costs nothing (no lock, no supersede). Only posts are dropped, never cancels.
+    if (gate.live && !config.dryRun) {
+      const pb = liveSniper.postBlockReason(Number.isFinite(d.ev) ? d.ev : 0);
+      if (pb) { ledger.positions.delete(d.rfqId); ledger.hour.pop(); counts.skips[pb] = (counts.skips[pb] || 0) + 1; return; }
+    }
     // Fix 2: the new quote replaces our waiting quote(s) on the same parlay. Re-checked here (after every
     // admission gate, right before the reserve) so a quote accepted meanwhile is never pulled.
     if (d.replaces && d.replaces.length) {
@@ -879,10 +934,12 @@ async function main(env = process.env) {
     const wsThroughput = () => { if (wsWorker) return wsThroughputLast; try { if (!ws || typeof ws.takeThroughput !== 'function') return null; const t = summarizeThroughput(ws.takeThroughput()); delete t.perShard; return t; } catch (_) { return null; } };
     { const ls = liveSniper.stats(); const ss = trader.senderStats(); const qs = trader.queueState();
       log(`[SNIPER] cancels sent=${ls.cancelSent || 0} avoided=${JSON.stringify(ls.cancelAvoided || {})} released_ws=${ls.releasedByWs || 0} released_poll=${ls.releasedByPoll || 0} poll=${JSON.stringify(quotePoll)}`);
+      { const bl = ls.backlog || {}; const pg = ls.postGate || {}; const qb = ls.qtoBreaker || {}; const tl = lim.kalshiTrade.stats();
+        log(`[SNIPER] cancel_backlog queued=${bl.queued || 0} oldest=${bl.oldestAgeMs == null ? 'n/a' : `${Math.round(bl.oldestAgeMs / 1000)}s`} fifo=${bl.fifo ? `on(${bl.fifoActive}/${bl.fifoQueued})` : 'off'} gate=${ls.postGate ? `level=${pg.level} cut_ev=${pg.cutEv == null ? '-' : pg.cutEv} dropped=${pg.dropped}` : 'off'} qto_breaker=${ls.qtoBreaker ? `${qb.paused ? `PAUSED(${Math.round(qb.pausedForMs / 1000)}s)` : 'ok'} trips=${qb.trips} paused_drops=${qb.pausedDrops} qto_sampled=${ls.qtoSampled || 0}/${ls.qtoSeen || 0}` : 'off'} lane=${tl.reserveLow ? `reserved main=${tl.mainRps}/s cancels=${tl.lowRps}/s used=${tl.reservedLow} borrowed=${tl.borrowedLow}` : 'shared'} untracked=${untrackedSweep ? (() => { const u = untrackedSweep.stats(); return `sent=${u.sent} gone=${u.gone} failed=${u.failed} partial=${u.partial}`; })() : 'off'}`); }
       log(`[SNIPER] late_accepts ${JSON.stringify(ls.lateAccepts || {})} by_side=${JSON.stringify(ls.lateAcceptsBySide || {})} early_replayed=${ls.earlyAcceptReplayed || 0} superseded=${ls.superseded || 0} replaced=${counts.replaced || 0}`);
       log(`[SNIPER] sendq window=${sendWin.windowMs}ms dropped_expired=${sendq.droppedExpired + (ls.droppedExpired || 0)} (pre_reserve=${sendq.droppedExpired} queue=${ls.droppedExpired || 0}) dropped_low_priority=${sendq.droppedLowPriority + (ls.droppedLowPriority || 0)} requote_skipped=${sendq.requoteSkipped} send_p50=${ls.sendP50 == null ? 'n/a' : ls.sendP50}ms send_p90=${ls.sendP90 == null ? 'n/a' : ls.sendP90}ms post_est=${Math.round(trader.postEstMs())}ms rps=${trader.quoteRps()} queued=${qs.queued}/${qs.capacity} active=${qs.active} sender=${JSON.stringify(ss)}`); }
     log(`[SNIPER] latency ${JSON.stringify(latency)} wb=${wbStore ? JSON.stringify(wbStore.wbStats()) : "off"} batch=${batchStore ? JSON.stringify(batchStore.batchStats()) : "off"} dbb=${JSON.stringify(dbBreaker.stats())} ws=${JSON.stringify(wsThroughput())}`);
-    decisionStore.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts: JSON.parse(JSON.stringify(counts)), quotePoll: { ...quotePoll }, sendq: { ...sendq, windowMs: sendWin.windowMs, enabled: sendWin.enabled, postEstMs: Math.round(trader.postEstMs()), ...trader.queueState(), sender: trader.senderStats() }, live: liveSniper.stats(), reserveEstMs: Math.round(reserveEst.get()), caps: effectiveCaps, open: t.total, openCommitted: t.committed, openResting: t.resting, restingWeight: config.restingCapWeight, replaced: counts.replaced || 0, load: Object.values(lim).map((l) => l.stats()) } });
+    decisionStore.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts: JSON.parse(JSON.stringify(counts)), quotePoll: { ...quotePoll }, untrackedSweep: untrackedSweep ? untrackedSweep.stats() : null, sendq: { ...sendq, windowMs: sendWin.windowMs, enabled: sendWin.enabled, postEstMs: Math.round(trader.postEstMs()), ...trader.queueState(), sender: trader.senderStats() }, live: liveSniper.stats(), reserveEstMs: Math.round(reserveEst.get()), caps: effectiveCaps, open: t.total, openCommitted: t.committed, openResting: t.resting, restingWeight: config.restingCapWeight, replaced: counts.replaced || 0, load: Object.values(lim).map((l) => l.stats()) } });
     counts.rfqs = 0; counts.quotes = 0; counts.skips = {};
   }, 60000);
   setInterval(() => {

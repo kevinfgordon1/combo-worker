@@ -2,10 +2,26 @@
 // a breaker that trips (and stays tripped until restart) when 429s exceed a threshold.
 'use strict';
 
-function createLimiter({ name, ratePerSec, ratePerSecOn429 = null, burst = 1, lowShareRps = 0, now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+function createLimiter({ name, ratePerSec, ratePerSecOn429 = null, burst = 1, lowShareRps = 0, reserveLow = false, now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
   let tokens = burst; let last = now(); let backoffUntil = 0; let backoffMs = 0;
   const stats = { name, requests: 0, ok: 0, errors: 0, r429: 0, waitedMs: 0 };
-  function refill() { const t = now(); tokens = Math.min(burst, tokens + ((t - last) / 1000) * ratePerSec); last = t; }
+  // reserveLow (Oct 28 2026, SNIPER_CANCEL_RESERVE): lowShareRps is a REAL reservation. A separate
+  // bucket refills at lowShareRps and only routine cancels (lane 0) and urgent cancels (lane 2, after
+  // the main bucket) may spend it; the main bucket refills at ratePerSec - lowShareRps, so quotes get
+  // at most rate - N/s. Idle reserve tokens may be borrowed by a quote only when no lane-0 caller is
+  // waiting (costs a newly arriving cancel at most one 1/N s interval). Total never exceeds ratePerSec.
+  // reserveLow=false = the old "turn-taking" share (same bucket; quotes usually won the token).
+  const reserved = () => reserveLow && lowShareRps > 0;
+  const lowRate = () => Math.min(lowShareRps, ratePerSec * 0.5);
+  const mainRate = () => (reserved() ? Math.max(0.5, ratePerSec - lowRate()) : ratePerSec);
+  const lowBurst = Math.max(1, Math.ceil(lowShareRps / 2));
+  let lowTokens = lowBurst;
+  function refill() {
+    const t = now(); const dt = (t - last) / 1000; last = t;
+    tokens = Math.min(burst, tokens + dt * mainRate());
+    if (reserved()) lowTokens = Math.min(lowBurst, lowTokens + dt * lowRate());
+  }
+  stats.reservedLow = 0; stats.borrowedLow = 0;
   // Priority lanes: 2 = urgent (risk-reducing cancels), 1 = normal (quotes/confirms), 0 = low
   // (routine TTL cancels). A caller yields while anyone at a higher level is waiting for a token.
   const waiting = [0, 0, 0]; let lastLow = -Infinity;
@@ -16,6 +32,24 @@ function createLimiter({ name, ratePerSec, ratePerSecOn429 = null, burst = 1, lo
       const t = now();
       // Low lane (routine cancels) gets a guaranteed share (lowShareRps, e.g. 1/s) out of the SAME
       // bucket, so it can't starve behind a steady queue of quotes. It still yields to urgent (2).
+      if (reserved()) {
+        if (t < backoffUntil) { const w = backoffUntil - t; stats.waitedMs += w; await sleep(w); continue; }
+        refill();
+        if (prio === 0) {
+          // Own reserved bucket first (never waits behind quotes), else spare main tokens.
+          if (lowTokens >= 1) { lowTokens -= 1; stats.reservedLow += 1; lastLow = t; return true; }
+          if (!higherWaiting(0) && tokens >= 1) { tokens -= 1; lastLow = t; return true; }
+        } else if (prio === 2) {
+          if (tokens >= 1) { tokens -= 1; return true; }
+          if (lowTokens >= 1) { lowTokens -= 1; stats.reservedLow += 1; return true; }
+        } else {
+          if (!higherWaiting(1) && tokens >= 1) { tokens -= 1; return true; }
+          if (!higherWaiting(1) && waiting[0] === 0 && lowTokens >= 1) { lowTokens -= 1; stats.borrowedLow += 1; return true; }
+        }
+        const need = Math.min(prio === 1 ? Infinity : (1 - lowTokens) / lowRate(), (1 - tokens) / mainRate());
+        const w = Math.max(5, Math.min(25, Math.ceil(Math.max(0, need) * 1000))); stats.waitedMs += w; await sleep(w);
+        continue;
+      }
       const lowTurn = prio === 0 && lowShareRps > 0 && t - lastLow >= 1000 / lowShareRps && waiting[2] === 0;
       if (!lowTurn && higherWaiting(prio)) { stats.waitedMs += 25; await sleep(25); continue; }
       if (t < backoffUntil) { const w = backoffUntil - t; stats.waitedMs += w; await sleep(w); continue; }
@@ -49,7 +83,7 @@ function createLimiter({ name, ratePerSec, ratePerSecOn429 = null, burst = 1, lo
     return r;
   }
   // waitingAt(p): callers currently waiting for a token in lane p (send-queue deadline estimate).
-  return { run, stats: () => ({ ...stats, backoffMs, ratePerSec }), on429, waitingAt: (p) => waiting[p] || 0, rate: () => ratePerSec, lowShareRps: () => lowShareRps, _state: () => ({ tokens, backoffUntil }) };
+  return { run, stats: () => ({ ...stats, backoffMs, ratePerSec, reserveLow: reserved(), mainRps: mainRate(), lowRps: reserved() ? lowRate() : lowShareRps }), on429, waitingAt: (p) => waiting[p] || 0, rate: () => ratePerSec, lowShareRps: () => (reserved() ? lowRate() : lowShareRps), reserveLow: () => reserved(), _state: () => ({ tokens, lowTokens, backoffUntil }) };
 }
 
 // Trips when total 429s across venues within windowMs reach max. onTrip fires once.
