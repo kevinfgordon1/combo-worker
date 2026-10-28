@@ -3065,7 +3065,25 @@ async function main() {
       if (polySniper) polySniper.start();
     } catch (e) { console.error(`[${MODE}] poly-sniper not started: ${e.message}`); polySniper = null; }
   }
+  // Polymarket loss tape: for RFQs we quoted but did not fill, record the anonymous trade print that won
+  // (or that none did). Reads prints already on the RFQ websocket; no keys, no requests. POLY_LOSS_TAPE=0 = off.
+  let polyLossTape = null;
+  if (SPLIT.runPoly && process.env.COMBO_ROLE === 'poly' && !SCOPE.isTester && supabase) {
+    try {
+      const { createPolyLossTape, createLossRowWriter, lossTapeEnabled } = require('./poly-loss-tape');
+      if (lossTapeEnabled(process.env)) {
+        const lossWriter = createLossRowWriter({ supabase, log: console.log });
+        polyLossTape = createPolyLossTape({ persistRow: (row) => lossWriter.push(row), log: console.log });
+        const sweepT = setInterval(() => { try { polyLossTape.sweep(); } catch (_) { /* observe only */ } }, 10000);
+        if (sweepT.unref) sweepT.unref();
+        const statT = setInterval(() => { try { console.log(`[${MODE}] [POLY-LOSS] ${JSON.stringify({ ...polyLossTape.stats(), ...lossWriter.stats() })}`); } catch (_) {} }, 15 * 60 * 1000);
+        if (statT.unref) statT.unref();
+        console.log(`[${MODE}] [POLY-LOSS] loss tape on (POLY_LOSS_TAPE=0 to disable)`);
+      }
+    } catch (e) { console.error(`[${MODE}] poly loss tape not started: ${e.message}`); polyLossTape = null; }
+  }
   const poly = !SPLIT.runPoly ? null : startPolymarketRfqLoop({
+    lossTape: polyLossTape,
     onRfqObserved: polySniper ? (raw, src) => { setImmediate(() => { try { polySniper.observe(raw, src); } catch (_) { /* dry run only */ } }); } : null,
     pendingQuotes: polyPendingQuotes,
     kalshiPendingQuotes: pendingQuotes,

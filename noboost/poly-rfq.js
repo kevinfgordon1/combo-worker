@@ -71,6 +71,23 @@ const legKey = (l) => {
   return `${sym}:${side}`;
 };
 
+// ── Shared print-matching rules (also used by poly-loss-tape.js) ─────────────────────────────
+const MATCH_DEFAULTS = Object.freeze({ closeGraceMs: 5000, maxOpenMs: 120000, preCreateMs: 1000, sizeSlack: 0.02, multiFillMs: 3000 });
+/** End of an RFQ's print window: close (or created + maxOpenMs when no close was seen) + grace. */
+function printWindowEnd(createdMs, closeMs, o = MATCH_DEFAULTS) {
+  return (closeMs != null ? closeMs : createdMs + o.maxOpenMs) + o.closeGraceMs;
+}
+/** Print time inside [created − 1s, windowEnd]. */
+function printInWindow(createdMs, closeMs, printMs, o = MATCH_DEFAULTS) {
+  return printMs >= createdMs - (o.preCreateMs != null ? o.preCreateMs : 1000) && printMs <= printWindowEnd(createdMs, closeMs, o);
+}
+/** Size-consistent: qty ≤ RFQ contracts (+2%), or for a cash RFQ notional ≤ cost (+2%). */
+function printSizeOk(contracts, targetCost, count, yes, slack = MATCH_DEFAULTS.sizeSlack) {
+  if (contracts > 0) return count <= contracts * (1 + slack) + 0.01 ? { ok: true, ratio: count / contracts } : { ok: false };
+  if (targetCost > 0) { const n = count * yes; return n <= targetCost * (1 + slack) + 0.01 ? { ok: true, ratio: n / targetCost } : { ok: false }; }
+  return { ok: true, ratio: null, unknown: true };
+}
+
 function hash100(x) { let h = 0; for (let i = 0; i < x.length; i += 1) h = (h * 31 + x.charCodeAt(i)) >>> 0; return h % 100; }
 
 function createPolyRfqTracker({
@@ -91,7 +108,8 @@ function createPolyRfqTracker({
     return out;
   }
 
-  function windowEnd(rec) { return (rec.close_ms != null ? rec.close_ms : rec.created_ms + maxOpenMs) + closeGraceMs; }
+  const mo = { ...MATCH_DEFAULTS, closeGraceMs, maxOpenMs };
+  function windowEnd(rec) { return printWindowEnd(rec.created_ms, rec.close_ms, mo); }
 
   // Every row carries the SAME key set (undefined -> null): PostgREST rejects a batch whose keys differ (PGRST102).
   function row(rec) {
@@ -157,12 +175,7 @@ function createPolyRfqTracker({
     return rec;
   }
 
-  function sizeOk(rec, count, yes) {
-    const c = rec.rfq_contracts; const tc = rec.rfq_target_cost;
-    if (c > 0) return count <= c * 1.02 + 0.01 ? { ok: true, ratio: count / c } : { ok: false };
-    if (tc > 0) { const n = count * yes; return n <= tc * 1.02 + 0.01 ? { ok: true, ratio: n / tc } : { ok: false }; }
-    return { ok: true, ratio: null, unknown: true };
-  }
+  function sizeOk(rec, count, yes) { return printSizeOk(rec.rfq_contracts, rec.rfq_target_cost, count, yes); }
 
   // tr: normalizePolyTrade() output
   function onTrade(tr) {
@@ -176,7 +189,7 @@ function createPolyRfqTracker({
     const cands = []; let mismatch = 0;
     for (const r of list) {
       if (r.outcome !== 'pending') continue;
-      if (!(tr.ms >= r.created_ms - 1000 && tr.ms <= windowEnd(r))) continue;
+      if (!printInWindow(r.created_ms, r.close_ms, tr.ms, mo)) continue;
       const s = sizeOk(r, tr.count, tr.yes);
       if (s.ok) cands.push([r, s]); else mismatch += 1;
     }
@@ -223,4 +236,7 @@ function createPolyRfqTracker({
   return { onRfq, onClosed, onTrade, sweep, takeStats, byId, bySymbol, _row: row };
 }
 
-module.exports = { createPolyRfqTracker, normalizePolyRfq, normalizePolyTrade, polyComboTakerFee, legKey };
+module.exports = {
+  createPolyRfqTracker, normalizePolyRfq, normalizePolyTrade, polyComboTakerFee, legKey,
+  MATCH_DEFAULTS, printWindowEnd, printInWindow, printSizeOk,
+};
