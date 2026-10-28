@@ -1874,8 +1874,17 @@ function startPolymarketRfqLoop(ctx = {}) {
   // dead auction. REST-crawled RFQs are exempt (an open RFQ found by a crawl is still quotable). 0 = off.
   const staleRfqMs = ctx.staleRfqMs != null ? ctx.staleRfqMs : envIntLocal('POLY_STALE_RFQ_MS', 30000);
 
+  // Loss tape (poly-loss-tape.js): what price won RFQs we quoted but did not fill. Observe-only:
+  // every call is deferred with setImmediate and swallowed, so it adds nothing to the quote path.
+  const lossTape = ctx.lossTape || null;
+  function tape(fn, ...args) {
+    if (!lossTape || typeof lossTape[fn] !== 'function') return;
+    setImmediate(() => { try { lossTape[fn](...args); } catch (_) { /* observe only */ } });
+  }
+
   // Every RFQ the Poly path handles is tallied (seen / source / reason).
   async function handleRfq(raw, src) {
+    tape('noteRfq', raw);
     // Polymarket combo sniper DRY RUN (poly-sniper/): observe-only, never awaited, never throws into the quote path.
     if (typeof ctx.onRfqObserved === 'function') { try { ctx.onRfqObserved(raw, src); } catch (_) { /* observe only */ } }
     const out = await handleRfqCore(raw, src);
@@ -2014,6 +2023,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         pendingQuotes.set(quoteId, pendingEntry(p, rfq, d.contracts, sizeMeta));
       }
       bump('polyPosted');
+      tape('onQuoted', rfq, { quoteId: quoteId || null, parlayId: p.id, label: p.label, buyPrice: q.buyPrice, contracts: d.contracts });
       console.log(
         `[${MODE}] QUOTED ${p.label} rfq=${rfq.rfqId} quote_id=${quoteId || '?'} ` +
         `buy=${q.buyPrice} sell=${q.sellPrice} contracts=${d.contracts} ` +
@@ -2812,19 +2822,27 @@ function startPolymarketRfqLoop(ctx = {}) {
 
   function onWsEvent(evt) {
     if (!evt || stopped) return;
+    // Anonymous RFQ trade prints (rfqEvent.rfqTrade) arrive on the existing RFQ subscription as type 'other'.
+    if (lossTape && evt.type === 'other') {
+      const rt = evt.raw && evt.raw.rfqEvent && evt.raw.rfqEvent.rfqTrade;
+      if (rt) tape('onTrade', rt.trade || rt);
+    }
     if (evt.type === 'rfqCreated') {
       const wsRaw = evt.rfq || evt;
       const wsId = rowId(wsRaw);
       if (wsId) wsSeen.add(wsId);
       handleRfq(wsRaw, 'ws').catch((e) => console.error(`[${MODE}] onRfq`, e.message));
     } else if (evt.type === 'rfqClosed') {
+      tape('onClosed', evt.rfq || evt);
       handleRfqClosed(evt);
     } else if (evt.type === 'quoteAccepted') {
+      if (lossTape) { const a = acceptedFromEvent(evt); tape('onOurs', { quoteId: a.quoteId, rfqId: a.rfqId }); }
       handleQuoteAccepted(evt).catch((e) => console.error(`[${MODE}] onAccept`, e.message));
       noteUnhedgedFillEvent(evt);
     } else if (evt.type === 'quoteConfirmed') {
       noteUnhedgedFillEvent(evt);
     } else if (evt.type === 'quoteExecuted') {
+      if (lossTape) { const qe = evt.quote || {}; tape('onOurs', { quoteId: qe.id || qe.quoteId || null, rfqId: qe.rfqId || qe.rfq_id || null }); }
       handleQuoteExecuted(evt);
       noteUnhedgedFillEvent(evt);
     } else if (evt.type === 'quoteDeleted') {
