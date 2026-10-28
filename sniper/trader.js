@@ -28,6 +28,13 @@ function noBidFor(quoteYes, tick = 0.001) {
   const no = Math.floor((1 - quoteYes) * m + 1e-7) / m;
   return no.toFixed(dp);
 }
+// Kalshi / CDN request id from response headers, for support tickets (first one present).
+const REQ_ID_HEADERS = ['x-request-id', 'request-id', 'x-kalshi-request-id', 'x-amzn-requestid', 'x-amz-cf-id', 'cf-ray'];
+function requestIdOf(h) {
+  if (!h || typeof h !== 'object') return null;
+  for (const k of REQ_ID_HEADERS) { const v = h[k] != null ? h[k] : h[k.toUpperCase()]; if (v != null && v !== '') return `${k}=${Array.isArray(v) ? v[0] : v}`; }
+  return null;
+}
 const sizeSource = (rfq) => (Number(rfq && rfq.contracts) > 0 ? 'contracts' : 'dollar');
 
 class LiveGateClosed extends Error { constructor(op) { super(`LIVE_GATE_CLOSED ${op}`); this.liveGateClosed = true; } }
@@ -79,12 +86,13 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
     const noBid = noBidFor(quoteYes, tick);
     const yesBid = quoteYesBid(sizeSource(rfq), noBid);
     const body = JSON.stringify({ ...buildQuoteBody(rfq.rfqId, noBid, yesBid, false), subaccount });
+    let wireMs = null;
     const r = await sender.send(rfq.rfqId, rfq.createdTs, (ctx) => raw('POST', QUOTE_PATH, {
       body, quote: true, timeoutMs: QUOTE_TIMEOUT_MS,
       shouldRetryExpired: () => { const a = rfqAgeMs(rfq.createdTs, serverNow()); return a == null || a <= maxAge; },
       // Deadline mode: give up the token wait once the POST can't land inside the window.
       abortIf: ctx && ctx.abortIf ? ctx.abortIf : null,
-      onWireMs: (ms) => postEst.add(ms),
+      onWireMs: (ms) => { wireMs = ms; postEst.add(ms); },
     }), { priority });
     if (r && r.aborted) {
       stats.expiredAtToken = (stats.expiredAtToken || 0) + 1;
@@ -94,7 +102,12 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
     }
     const { statusCode, text } = r;
     stats.posts += 1;
-    if (statusCode < 200 || statusCode >= 300) throw new Error(`Kalshi quote failed ${statusCode}: ${text}`);
+    if (statusCode < 200 || statusCode >= 300) {
+      // Sampled 409 logging (live.js QTO_SAMPLE) reads these; never secrets (response only).
+      const e = new Error(`Kalshi quote failed ${statusCode}: ${text}`);
+      e.statusCode = statusCode; e.body = String(text || '').slice(0, 500); e.wireMs = wireMs; e.requestId = requestIdOf(r.headers);
+      throw e;
+    }
     const j = JSON.parse(text || '{}');
     return { quoteId: j.id || (j.quote && j.quote.id) || null, noBid, yesBid };
   }
@@ -173,13 +186,13 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
       const list = Array.isArray(j.quotes) ? j.quotes : [];
       for (const q of list) {
         if (String(q.status || 'open').toLowerCase() !== 'open') continue;
-        out.push(q);
+        out.push({ id: q.id, status: q.status || 'open', created_ts: q.created_ts || null, creator_subaccount: q.creator_subaccount, rfq_id: q.rfq_id || null });
         const c = Date.parse(q.created_ts || ''); if (Number.isFinite(c) && (newestCreatedMs == null || c > newestCreatedMs)) newestCreatedMs = c;
       }
       if (!j.cursor || !list.length) { complete = true; break; }
       cursor = j.cursor;
     }
-    return { ids: new Set(out.map((q) => q.id).filter(Boolean)), count: out.length, complete, newestCreatedMs };
+    return { ids: new Set(out.map((q) => q.id).filter(Boolean)), count: out.length, complete, newestCreatedMs, quotes: out };
   }
   // Read-only: this sniper subaccount's cash ($) for the soon-cap tier (sniper/soon-cap.js).
   async function subBalanceUsd() {
@@ -202,4 +215,4 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
   };
 }
 
-module.exports = { createSniperTrader, noBidFor, sizeSource, LiveGateClosed, YES_DECLINE };
+module.exports = { createSniperTrader, noBidFor, sizeSource, LiveGateClosed, YES_DECLINE, requestIdOf };
