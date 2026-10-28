@@ -82,6 +82,9 @@ function sniperConfig(env = process.env) {
     fairDepthUsd: num(env.SNIPER_FAIR_DEPTH_USD, 1000),
     venues: String(env.SNIPER_VENUES || 'kalshi').toLowerCase().split(',').map((v) => v.trim()).filter(Boolean),
     tick: num(env.SNIPER_TICK, 0.001), // KALSHI_SUBCENT confirmed on in prod
+    // Oct 28 2026 (fix 2): a new RFQ may replace our waiting (unaccepted) quote on the same parlay
+    // instead of skipping already_hold_combo. SNIPER_REPLACE_RESTING=0 = old behaviour.
+    replaceResting: flag(env.SNIPER_REPLACE_RESTING, true),
   };
 }
 
@@ -151,19 +154,30 @@ function createSniperLedger({ dayRiskOnAdd = true } = {}) {
     if (day.key !== k) { day.key = k; day.risk = 0; day.loss = 0; day.pending = 0; day.fills = 0; }
     while (hour.length && hour[0] < nowMs - 3600e3) hour.shift();
   }
-  function totals() {
+  // exclude: Set of rfqIds left out (resting quotes a new RFQ is about to replace).
+  function totals(exclude = null) {
     let total = 0; const games = new Map(); const legs = new Map(); const combos = new Set();
+    // Committed-only (accepted / filled / not resting) exposure, always at full risk: a new quote must
+    // fit every cap on committed exposure alone too (same HARD PROTECTION as sniper_cap_reason).
+    const cGames = new Map(); const cLegs = new Map(); const committedCombos = new Set();
+    const restingCombos = new Map(); // combo -> [rfqId] for combos held ONLY by resting quotes (so far)
     // Resting (posted, not accepted) quotes count at restingWeight (SNIPER_RESTING_CAP_WEIGHT, default 1).
     const w = Number.isFinite(api.restingWeight) ? Math.min(1, Math.max(0, api.restingWeight)) : 1;
     let committed = 0; let resting = 0;
-    for (const p of positions.values()) {
+    for (const [id, p] of positions) {
+      if (exclude && exclude.has(id)) continue;
       const r = p.resting ? p.risk * w : p.risk;
       if (p.resting) resting += p.risk; else committed += p.risk;
       total += r; combos.add(p.combo);
       for (const g of p.games) games.set(g, (games.get(g) || 0) + r);
       for (const l of p.legs) legs.set(l, (legs.get(l) || 0) + r);
+      if (p.resting) { const a = restingCombos.get(p.combo); if (a) a.push(id); else restingCombos.set(p.combo, [id]); } else {
+        committedCombos.add(p.combo);
+        for (const g of p.games) cGames.set(g, (cGames.get(g) || 0) + p.risk);
+        for (const l of p.legs) cLegs.set(l, (cLegs.get(l) || 0) + p.risk);
+      }
     }
-    return { total, games, legs, combos, committed, resting };
+    return { total, games, legs, combos, committed, resting, committedCombos, restingCombos, cGames, cLegs };
   }
   const api = {
     prune, totals, seenRfqs, day, hour, positions, dayRiskOnAdd,
@@ -229,11 +243,22 @@ function evaluateSnipe(row, { config, ledger, nowMs = Date.now(), lockOverlap = 
   const combo = comboKey(legs);
   const games = [...new Set(legs.map(gameKey))];
   const lkeys = legs.map(legKey);
-  const t = ledger.totals();
-  if (t.combos.has(combo)) return skip('already_hold_combo');
-  if (t.total + px.risk > c.totalExposureCap) return skip('total_cap', { open: t.total });
-  for (const g of games) if ((t.games.get(g) || 0) + px.risk > c.perGameCap) return skip('game_cap', { game: g });
-  for (const l of lkeys) if ((t.legs.get(l) || 0) + px.risk > c.perLegCap) return skip('leg_cap', { leg: l });
+  let t = ledger.totals();
+  // Oct 28 2026 (fix 2): a combo held ONLY by waiting (resting, unaccepted) quotes no longer blocks a
+  // new RFQ on the same parlay. If ledger.canReplace (runner: liveSniper.canSupersede) agrees, the new
+  // quote REPLACES the waiting one(s): they are left out of the cap totals here and the runner pulls
+  // them (routine cancel) right before the new quote is reserved. Accepted / filled combos still skip.
+  let replaces = null;
+  if (t.combos.has(combo)) {
+    const ids = t.restingCombos.get(combo);
+    if (!c.replaceResting || t.committedCombos.has(combo) || !ids || !ids.length
+      || typeof ledger.canReplace !== 'function' || !ledger.canReplace(ids, { ev: px.ev, nowMs })) return skip('already_hold_combo');
+    replaces = ids.slice();
+    t = ledger.totals(new Set(replaces));
+  }
+  if (t.total + px.risk > c.totalExposureCap || t.committed + px.risk > c.totalExposureCap) return skip('total_cap', { open: t.total });
+  for (const g of games) if ((t.games.get(g) || 0) + px.risk > c.perGameCap || (t.cGames.get(g) || 0) + px.risk > c.perGameCap) return skip('game_cap', { game: g });
+  for (const l of lkeys) if ((t.legs.get(l) || 0) + px.risk > c.perLegCap || (t.cLegs.get(l) || 0) + px.risk > c.perLegCap) return skip('leg_cap', { leg: l });
   if (ledger.day.risk + px.risk > c.dailyRiskCap) return skip('daily_risk_cap');
   if (ledger.day.loss >= c.dailyLossCap) return skip('daily_loss_halt');
   if (ledger.hour.length >= c.maxQuotesPerHour) return skip('hourly_rate_cap');
@@ -258,6 +283,7 @@ function evaluateSnipe(row, { config, ledger, nowMs = Date.now(), lockOverlap = 
     ev: Math.round(px.ev * 100) / 100,
     roi: px.roi,
   };
+  if (replaces) decision.replaces = replaces;
   // Reserve exposure in dry run too, so caps bind exactly as they would live.
   ledger.add(rfqId, { combo, games, legs: lkeys, risk: px.risk, releaseAt: releaseAtMs(legs, nowMs) }, nowMs);
   return decision;

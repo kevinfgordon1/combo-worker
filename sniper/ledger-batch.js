@@ -39,6 +39,14 @@ function createBatchedLedgerStore(store, { supabase, flushMs = 300, maxQueue = 2
       }
     }
     let ok = true;
+    // Oct 28 2026: UPDATEs (releases) first, then inserts. A new quote that replaces our waiting quote on
+    // the same parlay (fix 2) inserts an open row with the same combo_key in the same flush as the old
+    // row's release; releasing first keeps sniper_ledger_open_combo_uq from rejecting the new row.
+    // Safe: an UPDATE here only targets rows inserted by an earlier flush (same-batch rows merge into the insert).
+    for (const g of groups.values()) {
+      const { error } = await supabase.from('sniper_ledger').update({ ...g.patch, updated_at: ts() }).in('rfq_id', g.ids);
+      if (error) { ok = false; log(`[SNIPER] ledger batch update (${g.ids.length}) failed: ${error.message}`); } else stats.updated += g.ids.length;
+    }
     if (inserts.length) {
       const { error } = await supabase.from('sniper_ledger').upsert(inserts, { onConflict: 'rfq_id' });
       if (!error) stats.inserted += inserts.length;
@@ -59,10 +67,6 @@ function createBatchedLedgerStore(store, { supabase, flushMs = 300, maxQueue = 2
           else ok = false;
         }
       }
-    }
-    for (const g of groups.values()) {
-      const { error } = await supabase.from('sniper_ledger').update({ ...g.patch, updated_at: ts() }).in('rfq_id', g.ids);
-      if (error) { ok = false; log(`[SNIPER] ledger batch update (${g.ids.length}) failed: ${error.message}`); } else stats.updated += g.ids.length;
     }
     return ok;
   }
