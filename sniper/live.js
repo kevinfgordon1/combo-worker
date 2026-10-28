@@ -25,7 +25,7 @@ function createLiveSniper({
   config, trader, store, coord, caps, reprice, alert = () => {}, log = console.log,
   now = () => Date.now(), ttlMs = RESERVE_TTL_MS, fillRetries = 4, fillRetryMs = 1500,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)), onHalt = () => {},
-  onHold = () => {}, startedReason = () => null, kickoffOf = () => null, onFilled = () => {}, pullConcurrency = 4, pullGuard = true, // onFilled: book-arb check (alert-only) // kickoffOf: ticker -> kickoff ms (fill alert); startedReason: (rfq) -> 'game_started' | 'no_kickoff' | null (rule 9)
+  onHold = () => {}, startedReason = () => null, kickoffOf = () => null, onFilled = () => {}, pullConcurrency = 4, pullGuard = true, requoteMemo = null, // requoteMemo: sniper/send-window createRequoteMemo (same-price re-quote skip) // onFilled: book-arb check (alert-only) // kickoffOf: ticker -> kickoff ms (fill alert); startedReason: (rfq) -> 'game_started' | 'no_kickoff' | null (rule 9)
 } = {}) {
   const pending = new Map(); // quoteId -> { d, rfq, accepted, timer }
   const byRfq = new Map(); // rfqId -> quoteId
@@ -41,8 +41,18 @@ function createLiveSniper({
     const t = now(); closed.set(rfqId, t);
     if (closed.size > CLOSED_MAX) { for (const [k, v] of closed) { if (closed.size <= CLOSED_MAX && t - v < CLOSED_KEEP_MS) break; closed.delete(k); } }
   };
+  // Quotes Kalshi itself reports as no longer open (GET /communications/quotes poll, read lane):
+  // cancelled with the RFQ (expired / executed with another maker / deleted). A DELETE for these is
+  // a wasted write. quoteId -> status. Bounded + aged like `closed`.
+  const gone = new Map(); const GONE_MAX = 20000;
+  const isGone = (quoteId) => { const g = gone.get(quoteId); if (!g) return false; if (now() - g.at > CLOSED_KEEP_MS) { gone.delete(quoteId); return false; } return true; };
   const isClosed = (rfqId) => { const t = closed.get(rfqId); if (t == null) return false; if (now() - t > CLOSED_KEEP_MS) { closed.delete(rfqId); return false; } return true; };
-  const stats = { cancelSkipped: 0, posted: 0, postFail: 0, staleDrop: 0, postFailBy: {}, postMs: [], preMs: [], cwMs: [], accepted: 0, confirmed: 0, declined: {}, fills: 0, cancelled: 0, settled: 0, aborted: {} };
+  const stats = { cancelSkipped: 0, posted: 0, postFail: 0, staleDrop: 0, postFailBy: {}, postMs: [], preMs: [], cwMs: [], sendMs: [], accepted: 0, confirmed: 0, declined: {}, fills: 0, cancelled: 0, settled: 0, aborted: {}, droppedExpired: 0, droppedLowPriority: 0,
+    // Cancel accounting (Oct 28 2026): DELETEs actually requested vs avoided, and why.
+    cancelSent: 0, cancelAvoided: { rfq_closed_ws: 0, quote_gone_kalshi: 0, closed_while_queued: 0, closed_during_post: 0 }, releasedByWs: 0, releasedByPoll: 0 };
+  // Send latency = RFQ age (Kalshi created_ts, via the receive-time age) when our POST returned.
+  const sendAgeMs = (rfq) => (rfq && rfq.recvAt ? now() - rfq.recvAt + (Number(rfq.recvAge) || 0) : null);
+  const pushSend = (ms) => { if (Number.isFinite(ms)) { stats.sendMs.push(ms); if (stats.sendMs.length > 500) stats.sendMs.shift(); } };
   let halted = false;
   let haltReason = null; let haltDay = null;
   const etDayKey = (ms) => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
@@ -85,21 +95,25 @@ function createLiveSniper({
       bg(store.release(d.rfqId, 'failed', {}));
       const k = postFailKey(err); bump(stats.postFailBy, k);
       if (k.startsWith('stale_drop')) stats.staleDrop += 1; else stats.postFail += 1;
-      log(`[SNIPER] quote POST failed rfq=${rfq.rfqId} kind=${k} ms=${postMs} pre=${tPost - tSend}: ${String(err.message || err).slice(0, 400)}`);
+      if (k === 'stale_drop:expired') stats.droppedExpired += 1;
+      else if (k === 'stale_drop:low_priority') stats.droppedLowPriority += 1;
+      // Deadline drops are routine under load (counted + summarized each minute); log the rest.
+      if (k !== 'stale_drop:expired' && k !== 'stale_drop:low_priority') log(`[SNIPER] quote POST failed rfq=${rfq.rfqId} kind=${k} ms=${postMs} pre=${tPost - tSend}: ${String(err.message || err).slice(0, 400)}`);
       return { sent: false, reason: k.startsWith('stale_drop') ? 'post_stale_drop' : 'post_failed' };
     }
     inflight.delete(rfq.rfqId);
     stats.postMs.push(now() - tPost); if (stats.postMs.length > 200) stats.postMs.shift();
     if (!res.quoteId) { await store.release(d.rfqId, 'failed', {}); return { sent: false, reason: 'no_quote_id' }; }
-    stats.posted += 1;
+    stats.posted += 1; pushSend(sendAgeMs(rfq));
+    if (requoteMemo) requoteMemo.note(d, res.noBid);
     await store.update(d.rfqId, { phase: 'quoted', quote_id: res.quoteId, no_bid: res.noBid });
     if (isClosed(rfq.rfqId)) {
       // RFQ closed while our POST was in flight: the quote died with it. No TTL timer, no cancel.
-      await store.release(d.rfqId, 'cancelled', {}); stats.cancelled += 1; stats.cancelSkipped += 1;
+      await store.release(d.rfqId, 'cancelled', {}); stats.cancelled += 1; stats.cancelSkipped += 1; stats.cancelAvoided.closed_during_post += 1;
       log(`[SNIPER] LIVE QUOTE rfq=${rfq.rfqId} quote_id=${res.quoteId} closed during POST, no cancel needed`);
       return { sent: true, quoteId: res.quoteId };
     }
-    const entry = { d, rfq, accepted: false, yesBid: res.yesBid, timer: null };
+    const entry = { d, rfq, accepted: false, yesBid: res.yesBid, timer: null, postedAt: now() };
     entry.timer = setTimeout(() => { expire(res.quoteId).catch(() => {}); }, ttlMs);
     if (entry.timer.unref) entry.timer.unref();
     pending.set(res.quoteId, entry); byRfq.set(rfq.rfqId, res.quoteId);
@@ -120,16 +134,22 @@ function createLiveSniper({
       // minutes and blocked fresh quotes on the same combo (open-combo unique index). An expired
       // quote can't fill without our confirm (onAccepted -> not_ours), so releasing first is safe.
       await store.release(p.d.rfqId, phase, {}); stats.cancelled += 1;
-      if (isClosed(rid)) { stats.cancelSkipped += 1; }
+      if (isClosed(rid)) { stats.cancelSkipped += 1; stats.cancelAvoided.rfq_closed_ws += 1; }
+      else if (isGone(quoteId)) { stats.cancelSkipped += 1; stats.cancelAvoided.quote_gone_kalshi += 1; }
       else {
         ttlCancelling.add(rid);
         (async () => {
-          try { const r = await trader.cancel(quoteId, { urgent: false, skipIf: () => isClosed(rid) }); if (r && r.skipped) stats.cancelSkipped += 1; } catch (e) { log(`[SNIPER] cancel ${quoteId} failed: ${e.message}`); } finally { ttlCancelling.delete(rid); }
+          // Re-checked while the routine DELETE waits for a token: the RFQ closing on the WS or Kalshi
+          // reporting the quote cancelled (status poll) both make the DELETE pointless.
+          try {
+            const r = await trader.cancel(quoteId, { urgent: false, skipIf: () => isClosed(rid) || isGone(quoteId) });
+            if (r && r.skipped) { stats.cancelSkipped += 1; stats.cancelAvoided.closed_while_queued += 1; } else stats.cancelSent += 1;
+          } catch (e) { log(`[SNIPER] cancel ${quoteId} failed: ${e.message}`); } finally { ttlCancelling.delete(rid); }
         })();
       }
       return;
     } else {
-      try { await trader.cancel(quoteId, { urgent: true }); } catch (e) { log(`[SNIPER] cancel ${quoteId} failed: ${e.message}`); }
+      try { await trader.cancel(quoteId, { urgent: true }); stats.cancelSent += 1; } catch (e) { log(`[SNIPER] cancel ${quoteId} failed: ${e.message}`); }
     }
     await store.release(p.d.rfqId, phase, {});
     if (phase === 'declined') { bump(stats.declined, reason); log(`[SNIPER] DECLINE quote_id=${quoteId} rfq=${p.rfq.rfqId} reason=${reason}`); } else stats.cancelled += 1;
@@ -173,7 +193,25 @@ function createLiveSniper({
     const p = qid && pending.get(qid);
     if (!p || p.accepted || confirming.has(qid)) return;
     clearTimeout(p.timer); pending.delete(qid); byRfq.delete(p.rfq.rfqId);
-    await store.release(p.d.rfqId, 'cancelled', {}); stats.cancelled += 1;
+    await store.release(p.d.rfqId, 'cancelled', {}); stats.cancelled += 1; stats.releasedByWs += 1;
+  }
+
+  // Kalshi quote-status poll (read lane, no write budget): quotes Kalshi reports as `cancelled` are
+  // already dead on the exchange (their RFQ expired / was deleted / executed with another maker),
+  // so the pending one is released with no DELETE and a queued routine DELETE is skipped.
+  // accepted / confirmed / executed are left to the WS handlers (onAccepted / onExecuted).
+  async function onQuoteStatuses(list) {
+    let released = 0;
+    for (const q of list || []) {
+      const id = q && (q.id || q.quote_id); const st = String((q && q.status) || '').toLowerCase();
+      if (!id || st !== 'cancelled') continue;
+      gone.set(id, { status: st, at: now() }); if (gone.size > GONE_MAX) gone.delete(gone.keys().next().value);
+      const p = pending.get(id);
+      if (!p || p.accepted || confirming.has(id)) continue;
+      clearTimeout(p.timer); pending.delete(id); byRfq.delete(p.rfq.rfqId);
+      await store.release(p.d.rfqId, 'cancelled', {}); stats.cancelled += 1; stats.releasedByPoll += 1; released += 1;
+    }
+    return released;
   }
 
   async function onAccepted(evt) {
@@ -278,7 +316,8 @@ function createLiveSniper({
     await mapLimit(todo, 8, ([qid]) => dropQuote(qid, 'cancelled', 'shutdown'));
     return todo.length;
   }
-  return { shutdown, stopping: () => stopping, send, abortRfq, hasRfqId: (id) => byRfq.has(id) || inflight.has(id) || ttlCancelling.has(id), forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); for (const id of inflight) cb(id); for (const id of ttlCancelling) cb(id); }, isClosed, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, postMs: undefined, preMs: undefined, cwMs: undefined, cwP50: (() => { const b = [...stats.cwMs].sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : null; })(), preP50: (() => { const b = [...stats.preMs].sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : null; })(), postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
+  const pct = (arr, q) => { if (!arr.length) return null; const b = [...arr].sort((x, y) => x - y); return Math.round(b[Math.min(b.length - 1, Math.floor(b.length * q))]); };
+  return { sendLatency: () => ({ n: stats.sendMs.length, p50: pct(stats.sendMs, 0.5), p90: pct(stats.sendMs, 0.9) }), shutdown, stopping: () => stopping, send, abortRfq, hasRfqId: (id) => byRfq.has(id) || inflight.has(id) || ttlCancelling.has(id), forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); for (const id of inflight) cb(id); for (const id of ttlCancelling) cb(id); }, isClosed, isGone, onQuoteStatuses, oldestPendingMs: () => { let m = null; for (const p of pending.values()) { const t = p.postedAt; if (t != null && (m == null || t < m)) m = t; } return m; }, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, cancelAvoided: { ...stats.cancelAvoided }, postMs: undefined, preMs: undefined, cwMs: undefined, sendMs: undefined, sendP50: pct(stats.sendMs, 0.5), sendP90: pct(stats.sendMs, 0.9), cwP50: (() => { const b = [...stats.cwMs].sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : null; })(), preP50: (() => { const b = [...stats.preMs].sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : null; })(), postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
 }
 
 module.exports = { createLiveSniper, postFailKey };

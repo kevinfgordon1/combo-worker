@@ -48,7 +48,8 @@ function createLimiter({ name, ratePerSec, ratePerSecOn429 = null, burst = 1, lo
     onOk();
     return r;
   }
-  return { run, stats: () => ({ ...stats, backoffMs, ratePerSec }), on429, _state: () => ({ tokens, backoffUntil }) };
+  // waitingAt(p): callers currently waiting for a token in lane p (send-queue deadline estimate).
+  return { run, stats: () => ({ ...stats, backoffMs, ratePerSec }), on429, waitingAt: (p) => waiting[p] || 0, rate: () => ratePerSec, lowShareRps: () => lowShareRps, _state: () => ({ tokens, backoffUntil }) };
 }
 
 // Trips when total 429s across venues within windowMs reach max. onTrip fires once.
