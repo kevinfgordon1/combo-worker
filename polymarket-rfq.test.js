@@ -1108,13 +1108,13 @@ const cashEval = evaluatePolymarketRfq({
   filledSoFar: 0,
   outstanding: sharedOut,
 });
-assert.strictEqual(cashEval.quote.estimatedContracts, 45);
-// Cash RFQ whose full size (45) exceeds what is left (116 - 2*SIZE = 30): the venue
-// would fill all 45, so Poly declines instead of "clipping" to 30.
+assert.strictEqual(cashEval.quote.estimatedContracts, 41.84);
+// Cash RFQ whose full size (41.84 after the requester's taker fee) exceeds what is left (116 - 2*SIZE = 30): the venue
+// would fill all 41.84, so Poly declines instead of "clipping" to 30.
 assert.strictEqual(cashEval.action, 'skip');
 assert.strictEqual(cashEval.reason, 'rfq_too_large');
 assert.strictEqual(cashEval.decision.remaining, 116 - SIZE * 2);
-assert.strictEqual(cashEval.decision.rfqContracts, 45);
+assert.strictEqual(cashEval.decision.rfqContracts, 41.84);
 assert.strictEqual(formatQtyDecimal(30), '30');
 
 const cashAlone = evaluatePolymarketRfq({
@@ -1124,11 +1124,32 @@ const cashAlone = evaluatePolymarketRfq({
   outstanding: SIZE,
 });
 assert.strictEqual(cashAlone.action, 'quoteable');
-assert.strictEqual(cashAlone.decision.contracts, 45);
+assert.strictEqual(cashAlone.decision.contracts, 41.84);
 assert.strictEqual(cashAlone.decision.outstanding, SIZE);
 assert.deepStrictEqual(quoteBodyFromEval(cashAlone), {
   rfqId: 'rfq_cash_45', buyPrice: '0.222', sellPrice: '0', restRemainder: false,
 });
+
+// Cash RFQ near the cap: 43 contracts left. floor(10 / 0.222) = 45 called it rfq_too_large, but the
+// venue only creates 41.84 ($10 covers 41.84 × 0.222 + $0.71 taker fee), so it fits and is quoted.
+const cashNearCap = evaluatePolymarketRfq({
+  rfq: cashRfq, parlays: [pmParlay], filledSoFar: 0, outstanding: 116 - 43,
+});
+assert.strictEqual(cashNearCap.action, 'quoteable', cashNearCap.reason);
+assert.strictEqual(cashNearCap.decision.contracts, 41.84);
+{
+  const prevSizing = process.env.POLY_CASH_FEE_SIZING;
+  process.env.POLY_CASH_FEE_SIZING = '0'; // kill switch: old floor(cash / price)
+  const legacy = evaluatePolymarketRfq({ rfq: cashRfq, parlays: [pmParlay], filledSoFar: 0, outstanding: 116 - 43 });
+  assert.strictEqual(legacy.reason, 'rfq_too_large');
+  assert.strictEqual(legacy.decision.rfqContracts, 45);
+  if (prevSizing == null) delete process.env.POLY_CASH_FEE_SIZING; else process.env.POLY_CASH_FEE_SIZING = prevSizing;
+}
+// …and a cash RFQ that really is over the cap is still declined (caps unchanged).
+const cashOver = evaluatePolymarketRfq({
+  rfq: cashRfq, parlays: [pmParlay], filledSoFar: 0, outstanding: 116 - 41,
+});
+assert.strictEqual(cashOver.reason, 'rfq_too_large');
 
 const qtyFit = evaluatePolymarketRfq({
   rfq: { ...pmRfq, id: 'rfq_qty_10', qtyDecimal: '10' },

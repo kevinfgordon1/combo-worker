@@ -117,7 +117,16 @@ assert.strictEqual(CLOSED_CONTEXT_TTL_MS, 60_000);
   assert.strictEqual(maxPolymarketFillSize(quoted, null), 377.5);
   const cash = { contracts: 227.25, cashOrderQty: '200', buyPrice: '0.3532' };
   const cashMax = maxPolymarketFillSize(cash, null);
-  assert.ok(cashMax > 566 && cashMax < 567, `cash/price max was ${cashMax}`);
+  // venue cash sizing: 536.49 × 0.3532 + $10.51 taker fee ≤ $200 (cash / price = 566.25 ignored the fee)
+  assert.strictEqual(cashMax, 536.49, `cash max was ${cashMax}`);
+  {
+    const prev = process.env.POLY_CASH_FEE_SIZING;
+    process.env.POLY_CASH_FEE_SIZING = '0';
+    assert.ok(Math.abs(maxPolymarketFillSize(cash, null) - 200 / 0.3532) < 1e-9, 'legacy cash / price');
+    if (prev == null) delete process.env.POLY_CASH_FEE_SIZING; else process.env.POLY_CASH_FEE_SIZING = prev;
+  }
+  // the accept's own venue size always wins when it is larger
+  assert.strictEqual(maxPolymarketFillSize(cash, { quote: { buyQtyDecimal: '566.25' } }), 566.25);
   const fromAccept = maxPolymarketFillSize(
     { contracts: 227.25 },
     { quote: { acceptedQty: '566.2' } },
