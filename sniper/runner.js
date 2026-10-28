@@ -75,9 +75,13 @@ async function main(env = process.env) {
   // Resting-quote controls (Oct 25 2026). Each has its own switch; see PR.
   //  SNIPER_QUOTE_TTL_MS: unaccepted quote life (old 20000). All 35 fills in 36h came 3.1-10.1s after reserve.
   //  SNIPER_RESTING_CAP_WEIGHT: share of a resting quote's risk counted toward total/game/leg caps (1 = old).
+  //    Oct 28 2026 (fix 2): default 0.5 -> 0.25. Caps are unchanged and committed (accepted/filled)
+  //    exposure still counts in full: committed + new risk must fit every cap on its own (memory and
+  //    DB), and sniper_confirm_check re-checks the FULL accepted risk under the global lock, so a fill
+  //    can never take exposure past a cap. ~0.04% of posted quotes are ever accepted.
   //  SNIPER_RESERVE_LOCK: 'combo' = per-bet lock in sniper_reserve (needs migration 20261025b), 'global' = old.
   const quoteTtlMs = Math.max(5000, num(env.SNIPER_QUOTE_TTL_MS, 12000));
-  config.restingCapWeight = Math.min(1, Math.max(0, num(env.SNIPER_RESTING_CAP_WEIGHT, 0.5)));
+  config.restingCapWeight = Math.min(1, Math.max(0, num(env.SNIPER_RESTING_CAP_WEIGHT, 0.25)));
   config.reserveLock = String(env.SNIPER_RESERVE_LOCK || 'combo') === 'global' ? 'global' : 'combo';
   const venues = venuesFromEnv(env);
   const depth = num(env.SNIPER_FAIR_DEPTH_USD, 1000); // NFL player-TD legs (Kevin: stays $1,000)
@@ -498,6 +502,11 @@ async function main(env = process.env) {
   if (bookArb && gate.live) loop(() => bookArb.recheckOpen(), 'book_arb', num(env.SNIPER_BOOK_ARB_POLL_MS, 300000));
   const liveSniper = createLiveSniper({
     config, trader, store: liveStore, coord, caps, log, onHold, ttlMs: quoteTtlMs, requoteMemo,
+    // Fix 3 (Oct 28 2026): accepts for quotes we no longer track -> one sniper_decisions row each
+    // (fire-and-forget, deferred off the WS handler). ~100-200/day. SNIPER_LATE_ACCEPT_LOG=0 = counters only.
+    onLateAccept: String(env.SNIPER_LATE_ACCEPT_LOG || '1') === '0' ? () => {} : (rec) => decisionStore.decision({ rfq_id: rec.rfqId, action: 'late_accept', reason: rec.cls, details: rec }),
+    // Accept-race fix: SNIPER_EARLY_REGISTER=0 restores the old order (ledger write, then track).
+    earlyRegister: String(env.SNIPER_EARLY_REGISTER || '1') !== '0',
     pullConcurrency: Math.max(1, num(env.SNIPER_PULL_CONCURRENCY, 4)), pullGuard: String(env.SNIPER_PULL_GUARD || '1') !== '0',
     reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook, ncaaf: !!ncaafBook }),
     alert,
@@ -507,6 +516,11 @@ async function main(env = process.env) {
     startedReason: (rfq) => pregameCheck(rfq.legKeys || [], kickoffFor, Date.now(), 0),
     onHalt: () => { /* halted flag inside liveSniper blocks new sends/confirms */ },
   });
+  // Fix 2 (Oct 28 2026): a new RFQ on a parlay we only hold as a WAITING quote may replace it
+  // (SNIPER_REPLACE_RESTING=0 = old already_hold_combo skip). SNIPER_REPLACE_MIN_AGE_MS (3000): the
+  // waiting quote must be at least this old, or worth less than the new one.
+  const replaceMinAgeMs = Math.max(0, num(env.SNIPER_REPLACE_MIN_AGE_MS, 3000));
+  ledger.canReplace = (ids, o = {}) => !!(gate.live && !config.dryRun) && ids.every((id) => liveSniper.canSupersede(id, { ev: o.ev, minAgeMs: replaceMinAgeMs }));
   // Quote-status poll (Oct 28 2026; SNIPER_QUOTE_STATUS_POLL_MS, default 1000; 0 = off). One read on
   // the READ lane per tick, only while quotes are pending: quotes Kalshi already cancelled (their RFQ
   // expired / executed elsewhere / deleted) are released without a DELETE, and any routine DELETE
@@ -685,6 +699,16 @@ async function main(env = process.env) {
         ledger.positions.delete(d.rfqId); ledger.hour.pop(); counts.skips.cant_make_queue = (counts.skips.cant_make_queue || 0) + 1; return;
       }
     }
+    // Fix 2: the new quote replaces our waiting quote(s) on the same parlay. Re-checked here (after every
+    // admission gate, right before the reserve) so a quote accepted meanwhile is never pulled.
+    if (d.replaces && d.replaces.length) {
+      if (!ledger.canReplace(d.replaces, { ev: d.ev })) {
+        ledger.positions.delete(d.rfqId); ledger.hour.pop();
+        counts.skips.already_hold_combo = (counts.skips.already_hold_combo || 0) + 1; return;
+      }
+      for (const id of d.replaces) liveSniper.supersede(id);
+      counts.replaced = (counts.replaced || 0) + 1;
+    }
     const t0 = Date.now();
     const tDecided = t0;
     // Live: reserved / quoted rows only hold exposure for the quote's life (20s TTL + buffer);
@@ -831,9 +855,10 @@ async function main(env = process.env) {
     const wsThroughput = () => { if (wsWorker) return wsThroughputLast; try { if (!ws || typeof ws.takeThroughput !== 'function') return null; const t = summarizeThroughput(ws.takeThroughput()); delete t.perShard; return t; } catch (_) { return null; } };
     { const ls = liveSniper.stats(); const ss = trader.senderStats(); const qs = trader.queueState();
       log(`[SNIPER] cancels sent=${ls.cancelSent || 0} avoided=${JSON.stringify(ls.cancelAvoided || {})} released_ws=${ls.releasedByWs || 0} released_poll=${ls.releasedByPoll || 0} poll=${JSON.stringify(quotePoll)}`);
+      log(`[SNIPER] late_accepts ${JSON.stringify(ls.lateAccepts || {})} by_side=${JSON.stringify(ls.lateAcceptsBySide || {})} early_replayed=${ls.earlyAcceptReplayed || 0} superseded=${ls.superseded || 0} replaced=${counts.replaced || 0}`);
       log(`[SNIPER] sendq window=${sendWin.windowMs}ms dropped_expired=${sendq.droppedExpired + (ls.droppedExpired || 0)} (pre_reserve=${sendq.droppedExpired} queue=${ls.droppedExpired || 0}) dropped_low_priority=${sendq.droppedLowPriority + (ls.droppedLowPriority || 0)} requote_skipped=${sendq.requoteSkipped} send_p50=${ls.sendP50 == null ? 'n/a' : ls.sendP50}ms send_p90=${ls.sendP90 == null ? 'n/a' : ls.sendP90}ms post_est=${Math.round(trader.postEstMs())}ms rps=${trader.quoteRps()} queued=${qs.queued}/${qs.capacity} active=${qs.active} sender=${JSON.stringify(ss)}`); }
     log(`[SNIPER] latency ${JSON.stringify(latency)} wb=${wbStore ? JSON.stringify(wbStore.wbStats()) : "off"} batch=${batchStore ? JSON.stringify(batchStore.batchStats()) : "off"} dbb=${JSON.stringify(dbBreaker.stats())} ws=${JSON.stringify(wsThroughput())}`);
-    decisionStore.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts: JSON.parse(JSON.stringify(counts)), quotePoll: { ...quotePoll }, sendq: { ...sendq, windowMs: sendWin.windowMs, enabled: sendWin.enabled, postEstMs: Math.round(trader.postEstMs()), ...trader.queueState(), sender: trader.senderStats() }, live: liveSniper.stats(), reserveEstMs: Math.round(reserveEst.get()), caps: effectiveCaps, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
+    decisionStore.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts: JSON.parse(JSON.stringify(counts)), quotePoll: { ...quotePoll }, sendq: { ...sendq, windowMs: sendWin.windowMs, enabled: sendWin.enabled, postEstMs: Math.round(trader.postEstMs()), ...trader.queueState(), sender: trader.senderStats() }, live: liveSniper.stats(), reserveEstMs: Math.round(reserveEst.get()), caps: effectiveCaps, open: t.total, openCommitted: t.committed, openResting: t.resting, restingWeight: config.restingCapWeight, replaced: counts.replaced || 0, load: Object.values(lim).map((l) => l.stats()) } });
     counts.rfqs = 0; counts.quotes = 0; counts.skips = {};
   }, 60000);
   setInterval(() => {
