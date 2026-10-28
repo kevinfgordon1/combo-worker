@@ -507,6 +507,31 @@ async function main(env = process.env) {
     startedReason: (rfq) => pregameCheck(rfq.legKeys || [], kickoffFor, Date.now(), 0),
     onHalt: () => { /* halted flag inside liveSniper blocks new sends/confirms */ },
   });
+  // Quote-status poll (Oct 28 2026; SNIPER_QUOTE_STATUS_POLL_MS, default 1000; 0 = off). One read on
+  // the READ lane per tick, only while quotes are pending: quotes Kalshi already cancelled (their RFQ
+  // expired / executed elsewhere / deleted) are released without a DELETE, and any routine DELETE
+  // still waiting for a write token is skipped. Fails safe: if the read fails, cancels go out as before.
+  const quotePollMs = num(env.SNIPER_QUOTE_STATUS_POLL_MS, 1000);
+  const quotePoll = { ticks: 0, ok: 0, errors: 0, seen: 0, released: 0, lastOkAt: null };
+  if (gate.live && quotePollMs > 0) {
+    let since = null;
+    loop(async () => {
+      if (!liveSniper.pending.size) { since = null; return; }
+      const startMs = Date.now();
+      const oldest = liveSniper.oldestPendingMs();
+      // min_ts: a little before the previous poll (overlap), never earlier than the oldest pending post.
+      const fromMs = since != null ? since - 3000 : (oldest != null ? oldest - 1000 : startMs - quoteTtlMs - 5000);
+      quotePoll.ticks += 1;
+      try {
+        const list = await trader.listQuotes({ minTsSec: fromMs / 1000, status: 'cancelled' });
+        quotePoll.ok += 1; quotePoll.seen += list.length; quotePoll.lastOkAt = Date.now(); since = startMs;
+        quotePoll.released += await liveSniper.onQuoteStatuses(list);
+      } catch (e) {
+        quotePoll.errors += 1;
+        if (quotePoll.errors <= 5 || quotePoll.errors % 100 === 0) log(`[SNIPER] quote status poll failed (${quotePoll.errors}): ${String(e.message || e).slice(0, 200)}`);
+      }
+    }, 'quote_status', quotePollMs);
+  }
   // Graceful stop (Fly sends SIGTERM on deploy/restart, kill_timeout 30s): cancel our open
   // quotes on Kalshi and release their rows so nothing is left holding exposure.
   let stoppingSig = false;
@@ -805,9 +830,10 @@ async function main(env = process.env) {
     if (wsWorker) wsWorker.takeThroughputAsync().then((v) => { wsThroughputLast = v ? { ...v, worker: wsWorker.stats() } : null; }).catch(() => {});
     const wsThroughput = () => { if (wsWorker) return wsThroughputLast; try { if (!ws || typeof ws.takeThroughput !== 'function') return null; const t = summarizeThroughput(ws.takeThroughput()); delete t.perShard; return t; } catch (_) { return null; } };
     { const ls = liveSniper.stats(); const ss = trader.senderStats(); const qs = trader.queueState();
+      log(`[SNIPER] cancels sent=${ls.cancelSent || 0} avoided=${JSON.stringify(ls.cancelAvoided || {})} released_ws=${ls.releasedByWs || 0} released_poll=${ls.releasedByPoll || 0} poll=${JSON.stringify(quotePoll)}`);
       log(`[SNIPER] sendq window=${sendWin.windowMs}ms dropped_expired=${sendq.droppedExpired + (ls.droppedExpired || 0)} (pre_reserve=${sendq.droppedExpired} queue=${ls.droppedExpired || 0}) dropped_low_priority=${sendq.droppedLowPriority + (ls.droppedLowPriority || 0)} requote_skipped=${sendq.requoteSkipped} send_p50=${ls.sendP50 == null ? 'n/a' : ls.sendP50}ms send_p90=${ls.sendP90 == null ? 'n/a' : ls.sendP90}ms post_est=${Math.round(trader.postEstMs())}ms rps=${trader.quoteRps()} queued=${qs.queued}/${qs.capacity} active=${qs.active} sender=${JSON.stringify(ss)}`); }
     log(`[SNIPER] latency ${JSON.stringify(latency)} wb=${wbStore ? JSON.stringify(wbStore.wbStats()) : "off"} batch=${batchStore ? JSON.stringify(batchStore.batchStats()) : "off"} dbb=${JSON.stringify(dbBreaker.stats())} ws=${JSON.stringify(wsThroughput())}`);
-    decisionStore.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts: JSON.parse(JSON.stringify(counts)), sendq: { ...sendq, windowMs: sendWin.windowMs, enabled: sendWin.enabled, postEstMs: Math.round(trader.postEstMs()), ...trader.queueState(), sender: trader.senderStats() }, live: liveSniper.stats(), reserveEstMs: Math.round(reserveEst.get()), caps: effectiveCaps, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
+    decisionStore.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts: JSON.parse(JSON.stringify(counts)), quotePoll: { ...quotePoll }, sendq: { ...sendq, windowMs: sendWin.windowMs, enabled: sendWin.enabled, postEstMs: Math.round(trader.postEstMs()), ...trader.queueState(), sender: trader.senderStats() }, live: liveSniper.stats(), reserveEstMs: Math.round(reserveEst.get()), caps: effectiveCaps, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
     counts.rfqs = 0; counts.quotes = 0; counts.skips = {};
   }, 60000);
   setInterval(() => {

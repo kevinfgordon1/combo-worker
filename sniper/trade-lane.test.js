@@ -43,6 +43,6 @@ const { createLimiter } = require('./limiter');
   try { await tr.cancel('q1', { urgent: false }); await tr.cancel('q2'); } catch (_) { /* signing with a dummy key may throw before request */ }
   if (seen.length === 2) assert.deepStrictEqual(seen, [0, 2]);
   const src = require('fs').readFileSync(require('path').join(__dirname, 'live.js'), 'utf8');
-  assert.match(src, /trader\.cancel\(quoteId, \{ urgent: false, skipIf: \(\) => isClosed\(rid\) \}\)[\s\S]*trader\.cancel\(quoteId, \{ urgent: true \}\)/);
+  assert.match(src, /trader\.cancel\(quoteId, \{ urgent: false, skipIf: \(\) => isClosed\(rid\) \|\| isGone\(quoteId\) \}\)[\s\S]*trader\.cancel\(quoteId, \{ urgent: true \}\)/);
   console.log('trade-lane.test.js ok');
 })().catch((e) => { console.error(e); process.exit(1); });

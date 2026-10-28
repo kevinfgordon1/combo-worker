@@ -134,6 +134,27 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
     }
     return bookFromQuoteExecution({ orderId, fills: out });
   }
+  // Read-only (read lane, never the write budget): our quotes Kalshi updated since minTsSec with the
+  // given status (default cancelled), e.g. killed with an expired / executed / deleted RFQ.
+  // GET /communications/quotes?user_filter=self&status=…&min_ts=… (limit 500, cursor pages).
+  async function listQuotes({ minTsSec, status = 'cancelled', maxPages = 4 } = {}) {
+    const out = []; let cursor = '';
+    for (let page = 0; page < maxPages; page += 1) {
+      const qs = new URLSearchParams({ user_filter: 'self', limit: '500' });
+      if (status) qs.set('status', status);
+      if (Number.isFinite(minTsSec)) qs.set('min_ts', String(Math.floor(minTsSec)));
+      if (cursor) qs.set('cursor', cursor);
+      const res = await raw('GET', QUOTE_PATH, { path: `${QUOTE_PATH}?${qs.toString()}`, lim: readLimiter || limiter, low: true });
+      stats.quoteReads = (stats.quoteReads || 0) + 1;
+      if (!res || res.statusCode !== 200) throw new Error(`quotes read ${res && res.statusCode}`);
+      const j = JSON.parse(res.text || '{}');
+      const qsList = Array.isArray(j.quotes) ? j.quotes : [];
+      out.push(...qsList);
+      if (!j.cursor || !qsList.length) break;
+      cursor = j.cursor;
+    }
+    return out;
+  }
   // Read-only: this sniper subaccount's cash ($) for the soon-cap tier (sniper/soon-cap.js).
   async function subBalanceUsd() {
     const p = '/trade-api/v2/portfolio/subaccounts/balances';
@@ -148,7 +169,7 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
   }
   const queueState = () => ({ queued: sender.queued, active: sender.active, capacity: typeof sender.capacity === 'function' ? sender.capacity() : Infinity });
   return {
-    live, postQuote, confirm, cancel, fillsForOrder, subBalanceUsd, admission, queueState,
+    live, postQuote, confirm, cancel, fillsForOrder, subBalanceUsd, listQuotes, admission, queueState,
     postEstMs: () => postEst.get(), quoteRps, sendWindow: win,
     senderStats: () => (typeof sender.stats === 'function' ? sender.stats() : {}),
     stats: () => ({ ...stats, queued: sender.queued, active: sender.active }),
