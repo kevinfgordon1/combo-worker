@@ -73,7 +73,8 @@ const TEAM_ALIASES = {
     kcr: 'kc', oak: 'ath', ari: 'az',
   },
   nfl: { gnb: 'gb', jac: 'jax', wsh: 'was' },
-  nba: { uta: 'utah', pho: 'phx', gsw: 'gs', nyk: 'ny', nop: 'no' },
+  // Kalshi KXNBAGAME uses SAS; Polymarket US slugs use sa (aec-nba-okc-sa-…).
+  nba: { uta: 'utah', pho: 'phx', gsw: 'gs', nyk: 'ny', nop: 'no', sas: 'sa' },
   // Polymarket US slugs use mon/nas/veg/was; Kalshi KXNHLGAME uses MTL/NSH/VGK/WSH.
   nhl: { mon: 'mtl', nas: 'nsh', veg: 'vgk', was: 'wsh', utah: 'uta', lak: 'la', njd: 'nj', sjs: 'sj', tbl: 'tb', cal: 'cgy' },
 };
@@ -625,13 +626,12 @@ function identityFromPolymarketLine(symbol, rfqSide, market) {
       const T2 = NCAAF.teamByPoly(t2);
       if (!T1 || !T2 || t1 === t2) return { identity: null, reason: 'meta_mismatch' };
       if (kind === 'spread') {
-        const nm = (x) => NCAAF.norm(((x && x.team) || {}).name);
-        if (nm(longs[0]) !== NCAAF.norm(T1.pname) || nm(shorts[0]) !== NCAAF.norm(T2.pname)) {
+        const nm = (x) => ((x && x.team) || {}).name;
+        if (!NCAAF.polyNameIs(T1, nm(longs[0])) || !NCAAF.polyNameIs(T2, nm(shorts[0]))) {
           return { identity: null, reason: 'meta_mismatch' };
         }
       } else {
-        const q = NCAAF.norm(mk.question);
-        if (!q || !q.includes(NCAAF.norm(T1.pname)) || !q.includes(NCAAF.norm(T2.pname))) {
+        if (!NCAAF.polyTextNames(T1, mk.question) || !NCAAF.polyTextNames(T2, mk.question)) {
           return { identity: null, reason: 'meta_mismatch' };
         }
       }
@@ -998,7 +998,7 @@ function identityFromNcaafMlMarket(market, rfqSide) {
   const L = NCAAF.teamByPoly(lAbbr);
   const S = NCAAF.teamByPoly(sAbbr);
   if (!L || !S) return bad('not_priceable');
-  if (NCAAF.norm(tl.name) !== NCAAF.norm(L.pname) || NCAAF.norm(ts.name) !== NCAAF.norm(S.pname)) {
+  if (!NCAAF.polyNameIs(L, tl.name) || !NCAAF.polyNameIs(S, ts.name)) {
     return bad('meta_mismatch');
   }
   const date = `${sm[3]}-${sm[4]}-${sm[5]}`;

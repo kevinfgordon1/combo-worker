@@ -23,6 +23,7 @@
 
 const { wouldExceedCap } = require('./reserve');
 const { formatAlertStatus } = require('./venue-alert');
+const { polyCashContracts, polyCashFeeSizingEnabled } = require('./polymarket-quote');
 
 const CLOSED_CONTEXT_TTL_MS = 60_000;
 // A confirm hold older than this is UNRESOLVED, not expired: it keeps counting
@@ -408,7 +409,7 @@ function maxSizeFields(obj) {
 }
 
 // Largest Polymarket fill this accept could still produce. Quoted size, the
-// RFQ's own qty, the unclipped estimate, cash/price, and any size on the
+// RFQ's own qty, the unclipped estimate, the venue's cash sizing, and any size on the
 // accept all count. Confirm caps against that, not only the number we posted.
 function maxPolymarketFillSize(pending, evt) {
   const quoted = positive(pending && pending.contracts);
@@ -416,7 +417,11 @@ function maxPolymarketFillSize(pending, evt) {
   const estimated = positive(pending && pending.estimatedContracts);
   const cash = positive(pending && pending.cashOrderQty);
   const px = positive(pending && pending.buyPrice);
-  const cashShares = (cash > 0 && px > 0 && px < 1) ? cash / px : 0;
+  // Cash RFQ: the venue sizes C·p + the requester's combo taker fee ≤ cash (polyCashContracts), so
+  // cash / price overstates it 7–11% and would decline at last look the near-cap quotes we now post.
+  // The accept's own buyQtyDecimal (maxSizeFields below) still wins whenever the venue sends it.
+  const cashShares = (cash > 0 && px > 0 && px < 1) ? (polyCashFeeSizingEnabled() ? polyCashContracts(cash, px) : cash / px)
+    : 0;
   return Math.max(
     quoted,
     rfqQty,

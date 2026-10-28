@@ -111,7 +111,8 @@ assert.strictEqual(Q.fillAmericanToExactQuote(-100000, { contracts: 100, env: R 
   // cash RFQ: contracts sized from the quoted price; rebate sized from a haircut estimate
   const cash = Q.buildPolymarketQuote({ fillAmerican: 910, cashOrderQty: '10', env: R });
   assert.strictEqual(cash.buyPrice, '0.098');
-  assert.strictEqual(cash.estimatedContracts, Math.floor(10 / 0.098));
+  assert.strictEqual(cash.estimatedContracts, Q.polyCashContracts(10, 0.098));
+  assert.strictEqual(cash.estimatedContracts, 92.55); // floor(10 / 0.098) = 102 ignored the taker fee
   // tiny cash RFQ ($1 ~ 10 contracts): no rebate credit, ceil(target)
   const tiny = Q.buildPolymarketQuote({ fillAmerican: 910, cashOrderQty: '1', env: R });
   assert.strictEqual(tiny.buyPrice, '0.100');

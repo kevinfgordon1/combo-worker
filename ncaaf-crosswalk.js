@@ -26,7 +26,7 @@ for (const [code, t] of Object.entries(data.teams || {})) {
   }
   if (byPoly.get(t.p) === null) continue;
   byCode.set(code, { p: t.p, name: t.name, pname: t.pname });
-  byPoly.set(t.p, { code, name: t.name, pname: t.pname });
+  byPoly.set(t.p, { code, p: t.p, name: t.name, pname: t.pname });
 }
 for (const [p, v] of [...byPoly]) if (v === null) byPoly.delete(p);
 const CODES = [...byCode.keys()].sort((a, b) => b.length - a.length);
@@ -50,6 +50,34 @@ function splitBlob(blob) {
   return { codes: [a, b], pair: [ta.p, tb.p] };
 }
 
+// Polymarket renamed a few teams after the crosswalk was generated. Each extra name
+// here was checked by hand against the live gateway (team.abbreviation + team.name on
+// every cfb market, 2026-10-28: 264 teams, these 2 were the only name changes).
+// Keyed by Polymarket abbreviation; the abbreviation itself must still match.
+const POLY_NAME_ALIASES = Object.freeze({
+  kanst: Object.freeze(['K-State']),
+  loutch: Object.freeze(['LA Tech']),
+});
+
+/** All names Polymarket may use for this crosswalk team (pname first). */
+function polyNames(team) {
+  if (!team) return [];
+  const extra = (team.p && POLY_NAME_ALIASES[team.p]) || [];
+  return [team.pname, ...extra].filter(Boolean);
+}
+
+/** Exact (normalized) name match against the team's Polymarket name or a verified alias. */
+function polyNameIs(team, name) {
+  const n = norm(name);
+  return !!n && polyNames(team).some((x) => norm(x) === n);
+}
+
+/** Normalized text names the team by its Polymarket name or a verified alias. */
+function polyTextNames(team, text) {
+  const q = norm(text);
+  return !!q && polyNames(team).some((x) => { const n = norm(x); return !!n && q.includes(n); });
+}
+
 const teamByCode = (code) => byCode.get(String(code || '').toUpperCase()) || null;
 const teamByPoly = (abbr) => byPoly.get(String(abbr || '').toLowerCase()) || null;
 
@@ -71,6 +99,10 @@ module.exports = {
   teamByPoly,
   gameNamesAgree,
   norm,
+  polyNames,
+  polyNameIs,
+  polyTextNames,
+  POLY_NAME_ALIASES,
   generatedAt: data.generatedAt || null,
   teamCount: byCode.size,
   unmatchedKalshi: data.unmatchedKalshi || [],

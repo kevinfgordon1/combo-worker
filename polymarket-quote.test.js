@@ -48,12 +48,12 @@ assert.ok(cash);
 assert.strictEqual(cash.buyPrice, '0.222');
 assert.strictEqual(cash.sellPrice, '0');
 assert.notStrictEqual(cash.sellPrice, '0.00');
-assert.strictEqual(cash.estimatedContracts, Math.floor(10 / 0.222));
-assert.strictEqual(cash.estimatedContracts, 45);
+// Venue sizing: largest C with C·p + combo taker fee ≤ cash (floor(10 / 0.222) = 45 ran 7.5% high).
+assert.strictEqual(cash.estimatedContracts, 41.84);
 assert.ok(shouldPostPolymarketQuote(cash));
 
 const cashStr = buildPolymarketQuote({ fillAmerican: 350, cashOrderQty: '10.0000' });
-assert.strictEqual(cashStr.estimatedContracts, 45);
+assert.strictEqual(cashStr.estimatedContracts, 41.84);
 assert.strictEqual(cashStr.sellPrice, '0');
 
 const qty = buildPolymarketQuote({ fillAmerican: 350, qtyDecimal: 10 });

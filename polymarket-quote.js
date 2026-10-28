@@ -27,6 +27,52 @@ const REBATE_ROUNDING_MARGIN = 0.005;
 // rebate credit off a deliberately low contract estimate.
 const CASH_QTY_CREDIT_FACTOR = 0.85;
 
+// Cash RFQs: Polymarket sizes the order so contracts × price PLUS the requester's combo taker fee fits
+// inside the cash (docs.polymarket.us/fees, Combo Taker Fees, schedule effective 2026-10-19 1:00 PM ET):
+//   fee = C × p × [0.0695 × (1 − p) + 0.06 × (1 − p)^4], rounded half-to-even to the cent.
+// That fee is 7% of notional at +300, ~10% at +900, ~11.5% near +1900 — exactly the 7–11% by which
+// floor(cash / price) overstated the venue's real size and pushed RFQs over the lock cap (rfq_too_large).
+// Verified on real fills: $5 @ 0.1471 → 31.13 contracts (floor said 33); $3 @ 0.138 → 19.86 (floor said 21).
+// POLY_CASH_FEE_SIZING=0/false/off/no restores floor(cash / price). Caps are unchanged: this only
+// estimates the size the venue will create; confirm still checks the venue's accepted size against the cap.
+const POLY_COMBO_TAKER_RATE = 0.0695;
+const POLY_COMBO_TAKER_TAIL = 0.06;
+const CASH_SIZE_STEP = 0.01; // venue contract grid on cash fills
+function polyCashFeeSizingEnabled(env = process.env) {
+  const raw = env && env.POLY_CASH_FEE_SIZING;
+  if (raw == null || raw === '') return true;
+  return !/^(0|false|off|no)$/i.test(String(raw).trim());
+}
+function roundHalfEvenCents(x) {
+  const c = x * 100;
+  const f = Math.floor(c);
+  const d = c - f;
+  if (Math.abs(d - 0.5) < 1e-9) return (f % 2 === 0 ? f : f + 1) / 100;
+  return Math.round(c) / 100;
+}
+/** Requester's combo taker fee in dollars (cent-rounded) for C contracts at price p. */
+function polyComboTakerFeeDollars(contracts, price) {
+  const C = Number(contracts);
+  const p = Number(price);
+  if (!(C > 0) || !(p > 0 && p < 1)) return 0;
+  return roundHalfEvenCents(C * p * (POLY_COMBO_TAKER_RATE * (1 - p) + POLY_COMBO_TAKER_TAIL * (1 - p) ** 4));
+}
+/** Largest C on the 0.01 grid with C·p + fee(C, p) ≤ cash. Cost is monotone in C, so bisect. */
+function polyCashContracts(cash, price, env = process.env) {
+  const k = Number(cash);
+  const p = Number(price);
+  if (!(k > 0) || !(p > 0 && p < 1)) return 0;
+  if (!polyCashFeeSizingEnabled(env)) return Math.floor(k / p);
+  let lo = 0;
+  let hi = Math.floor((k / p) / CASH_SIZE_STEP + 1e-9);
+  const fits = (n) => { const C = n * CASH_SIZE_STEP; return C * p + polyComboTakerFeeDollars(C, p) <= k + 1e-9; };
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (fits(mid)) lo = mid; else hi = mid - 1;
+  }
+  return Math.round(lo) / 100;
+}
+
 // POLY_EXACT_TARGET: price at the exact lock target (ceil to the 0.001 tick, minus the maker rebate on big
 // fills) instead of flooring to the tick. Default ON; 0/false/off/no restores the old floor.
 function polyExactTargetEnabled(env = process.env) {
@@ -132,7 +178,8 @@ function fillAmericanToExactQuote(fillAmerican, { contracts = 0, env = process.e
 }
 
 // qtyDecimal RFQ: that quantity on the offered (buy) side.
-// cashOrderQty RFQ: floor(cash / buyPrice) — venue derives this server-side too.
+// cashOrderQty RFQ: the venue derives size server-side as the largest C with C·p + taker fee ≤ cash
+// (polyCashContracts). The old floor(cash / buyPrice) ran 7–11% high.
 function buildPolymarketQuote({ fillAmerican, cashOrderQty, qtyDecimal, exact, env, tickSize } = {}) {
   const useExact = exact != null ? !!exact : polyExactTargetEnabled(env || process.env);
   const qty = parsePositive(qtyDecimal);
@@ -144,7 +191,7 @@ function buildPolymarketQuote({ fillAmerican, cashOrderQty, qtyDecimal, exact, e
     buyPrice = fillAmericanToBuyPrice(fillAmerican);
     if (buyPrice == null) return null;
     if (qty != null) estimatedContracts = qty;
-    else if (cash != null) estimatedContracts = Math.floor(cash / parseFloat(buyPrice));
+    else if (cash != null) estimatedContracts = polyCashContracts(cash, parseFloat(buyPrice), env || process.env);
   } else {
     // Contracts decide whether the rebate may be credited, and for a cash RFQ the contracts depend on the
     // price: size it off the no-rebate price (highest, so fewest contracts), then haircut it.
@@ -158,7 +205,7 @@ function buildPolymarketQuote({ fillAmerican, cashOrderQty, qtyDecimal, exact, e
     buyPrice = q.buyPrice;
     rebateCredit = q.credit;
     if (qty != null) estimatedContracts = qty;
-    else if (cash != null) estimatedContracts = Math.floor(cash / parseFloat(buyPrice));
+    else if (cash != null) estimatedContracts = polyCashContracts(cash, parseFloat(buyPrice), env || process.env);
   }
   return {
     buyPrice,
@@ -191,6 +238,9 @@ module.exports = {
   CASH_QTY_CREDIT_FACTOR,
   polyExactTargetEnabled,
   polyFineTickEnabled,
+  polyCashFeeSizingEnabled,
+  polyComboTakerFeeDollars,
+  polyCashContracts,
   resolveTick,
   rebateCreditPerContract,
   fillAmericanToExactQuote,

@@ -146,9 +146,9 @@ function createPolySniper({ env = process.env, supabase = null, log = console.lo
   }
   const hb = setInterval(() => {
     const top = Object.entries(counts.skip).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => `${k}=${v}`).join(' ');
-    log(`[POLY-SNIPER] DRY RUN seen=${counts.seen} would_quote=${counts.quote} index=${f.index.size()} td_index=${f.index.tdStats ? `${f.index.tdStats().indexed}/${f.index.tdStats().seen}` : '?'} tape=${logger.stats.written}w/${logger.stats.dropped}d healthy=${f.pricesHealthy()} venues=${f.venues.join('+')} ${top}`);
+    log(`[POLY-SNIPER] DRY RUN seen=${counts.seen} would_quote=${counts.quote} index=${f.index.size()} td_index=${f.index.tdStats ? `${f.index.tdStats().indexed}/${f.index.tdStats().seen}` : '?'} tape=${logger.stats.written}w/${logger.stats.dropped}d line_index=${f.index.lineStats ? f.index.lineStats().indexed : '?'} line_meta=${f.lineMeta ? f.lineMeta.stats().cached : '-'} healthy=${f.pricesHealthy()} venues=${f.venues.join('+')} ${top}`);
   }, 60000);
   if (hb.unref) hb.unref();
-  return { start: () => { if (!feed) f.start(); log(`[POLY-SNIPER] DRY RUN started (posts nothing). fair venues=${f.venues.join('+')} depth game=$${f.depths ? f.depths.game : '?'} td=$${f.depths ? f.depths.td : '?'} minEdge=ml:${(config.minRoiNflMl * 100).toFixed(1)}%,nfl:${(config.minRoiNfl * 100).toFixed(1)}%,ncaaf:${(config.minRoiNcaaf * 100).toFixed(1)}%,td:${(config.minRoiTd * 100).toFixed(1)}%`); }, observe, counts, ledger, flush: logger.flush };
+  return { start: () => { if (!feed) f.start(); log(`[POLY-SNIPER] DRY RUN started (posts nothing). fair venues=${f.venues.join('+')} depth game=$${f.depths ? f.depths.game : '?'} td=$${f.depths ? f.depths.td : '?'} minEdge=ml:${(config.minRoiNflMl * 100).toFixed(1)}%,nfl:${(config.minRoiNfl * 100).toFixed(1)}%,ncaaf:${(config.minRoiNcaaf * 100).toFixed(1)}%,td:${(config.minRoiTd * 100).toFixed(1)}%,nba:${(config.minRoiNba * 100).toFixed(1)}% nba=${config.nba && !!f.nbaBook ? 'on' : 'off'} lines=${config.lines && !!f.linesBook ? 'on' : 'off'}`); }, observe, counts, ledger, flush: logger.flush };
 }
 module.exports = { createPolySniper, normalizePolymarketRfq, createDecisionLogger, legRows, skipSampleFrom };

@@ -52,7 +52,8 @@ for (const lock of locks) {
 
 // Cash RFQ sizing follows the price actually sent.
 const cash = Q.buildPolymarketQuote({ fillAmerican: 2300, cashOrderQty: '10', exact: true, env, tickSize: 0.0001 });
-assert.strictEqual(cash.estimatedContracts, Math.floor(10 / 0.0417));
+assert.strictEqual(cash.estimatedContracts, Q.polyCashContracts(10, 0.0417));
+assert.strictEqual(cash.estimatedContracts, 214.62); // floor(10 / 0.0417) = 239 ignored the taker fee
 
 // normalizePolymarketRfq keeps tickSize.
 const { normalizePolymarketRfq } = require('./polymarket-rfq');

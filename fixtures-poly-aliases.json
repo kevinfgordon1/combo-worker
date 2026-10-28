@@ -1,0 +1,2002 @@
+{
+ "note": "REAL Polymarket US gateway metadata (fetched 2026-10-28) + REAL Combo Locks that failed to tie: Kalshi SAS vs Poly sa; Poly cfb renamed K-State / LA Tech.",
+ "markets": {
+  "aec-nba-okc-sa-2026-10-20": {
+   "id": "1146301",
+   "question": "Who will win in the upcoming basketball event OKC Thunder vs SA Spurs scheduled for October 21, 2026 at 1:30 AM UTC?",
+   "slug": "aec-nba-okc-sa-2026-10-20",
+   "endDate": "2026-10-21T04:25:11Z",
+   "category": "sports",
+   "startDate": "2026-09-30T17:24:42Z",
+   "description": "This market will settle to the winner of the OKC Thunder vs SA Spurs professional basketball game originally scheduled for Oct 20, 2026 at 9:30PM ET. Overtime is included if played. If the game is delayed, postponed, suspended, or otherwise rescheduled and is not rescheduled to start within two calendar days of the originally scheduled date and time, the market will settle to the last fair market price. Outcome sourced from the relevant governing body.",
+   "active": false,
+   "marketType": "moneyline",
+   "closed": true,
+   "createdAt": "2026-09-30T17:24:44Z",
+   "updatedAt": "2026-10-23T06:49:22Z",
+   "archived": false,
+   "orderPriceMinTickSize": 0.01,
+   "gameStartTime": "2026-10-21T01:30:00Z",
+   "manualActivation": false,
+   "sportsMarketType": "basketball_team_full_game_winner",
+   "marketSides": [
+    {
+     "id": "2292084",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "aec-nba-okc-sa-2026-10-20",
+     "createdAt": "2026-09-30T17:24:44Z",
+     "updatedAt": "2026-09-30T17:24:44Z",
+     "description": "Thunder",
+     "price": "1",
+     "marketId": 1146301,
+     "long": true,
+     "teamId": 27,
+     "team": {
+      "id": 27,
+      "name": "Oklahoma City Thunder",
+      "abbreviation": "okc",
+      "league": "nba",
+      "record": "4-0",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/NBA+Team+Logos/OKC.png",
+      "alias": "Oklahoma City Thunder",
+      "safeName": "Thunder",
+      "homeIcon": "https://static.polymarket.us/images/teams/nba-okc/OKC_light_inset6.png",
+      "awayIcon": "https://static.polymarket.us/images/teams/nba-okc/OKC_light_inset6.png",
+      "colorPrimary": "#007cc3",
+      "providerId": 18,
+      "ordering": "away",
+      "longIcon": "https://static.polymarket.us/images/teams/nba-okc/OKC_light_inset6.png",
+      "shortIcon": "https://static.polymarket.us/images/teams/nba-okc/OKC_light_inset6.png",
+      "displayAbbreviation": "OKC",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "18"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "583ecfff-fb46-11e1-82cb-f4ce4684ea4c"
+       },
+       {
+        "provider": "PROVIDER_OPTICODDS",
+        "providerId": "D8EC6878976A"
+       }
+      ],
+      "longIconDark": "https://static.polymarket.us/images/teams/nba-okc/OKC_dark_inset6.png",
+      "shortIconDark": "https://static.polymarket.us/images/teams/nba-okc/OKC_dark_inset6.png",
+      "color": {
+       "light": "#007cc3",
+       "dark": "#007cc3"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    },
+    {
+     "id": "2292085",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "aec-nba-okc-sa-2026-10-20",
+     "createdAt": "2026-09-30T17:24:44Z",
+     "updatedAt": "2026-09-30T17:24:44Z",
+     "description": "Spurs",
+     "price": "0",
+     "marketId": 1146301,
+     "long": false,
+     "teamId": 33,
+     "team": {
+      "id": 33,
+      "name": "San Antonio Spurs",
+      "abbreviation": "sa",
+      "league": "nba",
+      "record": "2-2",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/NBA+Team+Logos/SAS.png",
+      "alias": "San Antonio Spurs",
+      "safeName": "Spurs",
+      "homeIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "awayIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "colorPrimary": "#8492a4",
+      "providerId": 24,
+      "ordering": "home",
+      "longIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "shortIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "displayAbbreviation": "SA",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "583ecd4f-fb46-11e1-82cb-f4ce4684ea4c"
+       },
+       {
+        "provider": "PROVIDER_OPTICODDS",
+        "providerId": "E89F51275352"
+       },
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "24"
+       }
+      ],
+      "longIconDark": "https://static.polymarket.us/images/teams/nba-sa/SAS_dark_inset6.png",
+      "shortIconDark": "https://static.polymarket.us/images/teams/nba-sa/SAS_dark_inset6.png",
+      "color": {
+       "light": "#8492a4",
+       "dark": "#8492a4"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    }
+   ],
+   "outcomes": "[\"Thunder\",\"Spurs\"]",
+   "outcomePrices": "[\"1\",\"0\"]",
+   "ep3Status": "EXPIRED",
+   "status": "MARKET_STATUS_RESOLVED",
+   "assetPriceTerms": null,
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "hidden": false,
+   "tags": [],
+   "feeCoefficient": 0.0695,
+   "ep3SyncedAt": "2026-10-23T06:49:22Z",
+   "minimumTradeQty": 0.01,
+   "comboEnabled": true,
+   "politics": null
+  },
+  "asc-nba-okc-sa-2026-10-20-neg-1pt5": {
+   "id": "1620258",
+   "question": "Will the OKC Thunder cover -1.5 vs the SA Spurs in OKC Thunder vs. SA Spurs?",
+   "slug": "asc-nba-okc-sa-2026-10-20-neg-1pt5",
+   "endDate": "2026-10-21T04:25:16Z",
+   "category": "sports",
+   "startDate": "2026-10-20T15:00:23Z",
+   "description": "This market will settle to Yes if Thunder covers a -1.5 point spread in the Thunder vs Spurs professional basketball game scheduled for October 20, 2026 at 9:30PM ET (as of the listing of the event's first instrument). Overtime is included if played. If the game is delayed, postponed, suspended or otherwise rescheduled to a date and time not within two days of the originally scheduled date and time, the market will settle to the last fair market price. Outcome sourced from the relevant governing body.",
+   "active": false,
+   "marketType": "spreads",
+   "closed": true,
+   "createdAt": "2026-10-20T15:00:24Z",
+   "updatedAt": "2026-10-23T06:49:38Z",
+   "archived": false,
+   "orderPriceMinTickSize": 0.01,
+   "gameStartTime": "2026-10-21T01:30:00Z",
+   "manualActivation": false,
+   "sportsMarketType": "basketball_team_full_game_spread",
+   "line": -1.5,
+   "marketSides": [
+    {
+     "id": "3239990",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "asc-nba-okc-sa-2026-10-20-neg-1pt5",
+     "createdAt": "2026-10-20T15:00:24Z",
+     "updatedAt": "2026-10-20T15:00:24Z",
+     "description": "-1.50",
+     "price": "1",
+     "marketId": 1620258,
+     "long": true,
+     "teamId": 27,
+     "team": {
+      "id": 27,
+      "name": "Oklahoma City Thunder",
+      "abbreviation": "okc",
+      "league": "nba",
+      "record": "4-0",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/NBA+Team+Logos/OKC.png",
+      "alias": "Oklahoma City Thunder",
+      "safeName": "Thunder",
+      "homeIcon": "https://static.polymarket.us/images/teams/nba-okc/OKC_light_inset6.png",
+      "awayIcon": "https://static.polymarket.us/images/teams/nba-okc/OKC_light_inset6.png",
+      "colorPrimary": "#007cc3",
+      "providerId": 18,
+      "ordering": "away",
+      "longIcon": "https://static.polymarket.us/images/teams/nba-okc/OKC_light_inset6.png",
+      "shortIcon": "https://static.polymarket.us/images/teams/nba-okc/OKC_light_inset6.png",
+      "displayAbbreviation": "OKC",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "18"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "583ecfff-fb46-11e1-82cb-f4ce4684ea4c"
+       },
+       {
+        "provider": "PROVIDER_OPTICODDS",
+        "providerId": "D8EC6878976A"
+       }
+      ],
+      "longIconDark": "https://static.polymarket.us/images/teams/nba-okc/OKC_dark_inset6.png",
+      "shortIconDark": "https://static.polymarket.us/images/teams/nba-okc/OKC_dark_inset6.png",
+      "color": {
+       "light": "#007cc3",
+       "dark": "#007cc3"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    },
+    {
+     "id": "3239991",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "asc-nba-okc-sa-2026-10-20-neg-1pt5",
+     "createdAt": "2026-10-20T15:00:24Z",
+     "updatedAt": "2026-10-20T15:00:24Z",
+     "description": "+1.50",
+     "price": "0",
+     "marketId": 1620258,
+     "long": false,
+     "teamId": 33,
+     "team": {
+      "id": 33,
+      "name": "San Antonio Spurs",
+      "abbreviation": "sa",
+      "league": "nba",
+      "record": "2-2",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/NBA+Team+Logos/SAS.png",
+      "alias": "San Antonio Spurs",
+      "safeName": "Spurs",
+      "homeIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "awayIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "colorPrimary": "#8492a4",
+      "providerId": 24,
+      "ordering": "home",
+      "longIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "shortIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "displayAbbreviation": "SA",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "583ecd4f-fb46-11e1-82cb-f4ce4684ea4c"
+       },
+       {
+        "provider": "PROVIDER_OPTICODDS",
+        "providerId": "E89F51275352"
+       },
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "24"
+       }
+      ],
+      "longIconDark": "https://static.polymarket.us/images/teams/nba-sa/SAS_dark_inset6.png",
+      "shortIconDark": "https://static.polymarket.us/images/teams/nba-sa/SAS_dark_inset6.png",
+      "color": {
+       "light": "#8492a4",
+       "dark": "#8492a4"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    }
+   ],
+   "outcomes": "[\"-1.50\",\"+1.50\"]",
+   "outcomePrices": "[\"1\",\"0\"]",
+   "ep3Status": "EXPIRED",
+   "status": "MARKET_STATUS_RESOLVED",
+   "assetPriceTerms": null,
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "hidden": false,
+   "tags": [],
+   "feeCoefficient": 0.0695,
+   "spreadTotalSuffix": "points",
+   "ep3SyncedAt": "2026-10-23T06:49:38Z",
+   "minimumTradeQty": 0.01,
+   "comboEnabled": true,
+   "politics": null
+  },
+  "asc-nba-okc-sa-2026-10-20-pos-1pt5": {
+   "id": "1557768",
+   "question": "Will the OKC Thunder cover 1.5 vs the SA Spurs in OKC Thunder vs. SA Spurs?",
+   "slug": "asc-nba-okc-sa-2026-10-20-pos-1pt5",
+   "endDate": "2026-10-21T04:25:11Z",
+   "category": "sports",
+   "startDate": "2026-10-18T14:45:16Z",
+   "description": "This market will settle to Yes if Thunder covers a +1.5 point spread in the Thunder vs Spurs professional basketball game scheduled for October 20, 2026 at 9:30PM ET (as of the listing of the event's first instrument). Overtime is included if played. If the game is delayed, postponed, suspended or otherwise rescheduled to a date and time not within two days of the originally scheduled date and time, the market will settle to the last fair market price. Outcome sourced from the relevant governing body.",
+   "active": false,
+   "marketType": "spreads",
+   "closed": true,
+   "createdAt": "2026-10-18T14:45:16Z",
+   "updatedAt": "2026-10-23T06:49:38Z",
+   "archived": false,
+   "orderPriceMinTickSize": 0.01,
+   "gameStartTime": "2026-10-21T01:30:00Z",
+   "manualActivation": false,
+   "sportsMarketType": "basketball_team_full_game_spread",
+   "line": 1.5,
+   "marketSides": [
+    {
+     "id": "3115012",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "asc-nba-okc-sa-2026-10-20-pos-1pt5",
+     "createdAt": "2026-10-18T14:45:16Z",
+     "updatedAt": "2026-10-18T14:45:16Z",
+     "description": "+1.50",
+     "price": "1",
+     "marketId": 1557768,
+     "long": true,
+     "teamId": 27,
+     "team": {
+      "id": 27,
+      "name": "Oklahoma City Thunder",
+      "abbreviation": "okc",
+      "league": "nba",
+      "record": "4-0",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/NBA+Team+Logos/OKC.png",
+      "alias": "Oklahoma City Thunder",
+      "safeName": "Thunder",
+      "homeIcon": "https://static.polymarket.us/images/teams/nba-okc/OKC_light_inset6.png",
+      "awayIcon": "https://static.polymarket.us/images/teams/nba-okc/OKC_light_inset6.png",
+      "colorPrimary": "#007cc3",
+      "providerId": 18,
+      "ordering": "away",
+      "longIcon": "https://static.polymarket.us/images/teams/nba-okc/OKC_light_inset6.png",
+      "shortIcon": "https://static.polymarket.us/images/teams/nba-okc/OKC_light_inset6.png",
+      "displayAbbreviation": "OKC",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "18"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "583ecfff-fb46-11e1-82cb-f4ce4684ea4c"
+       },
+       {
+        "provider": "PROVIDER_OPTICODDS",
+        "providerId": "D8EC6878976A"
+       }
+      ],
+      "longIconDark": "https://static.polymarket.us/images/teams/nba-okc/OKC_dark_inset6.png",
+      "shortIconDark": "https://static.polymarket.us/images/teams/nba-okc/OKC_dark_inset6.png",
+      "color": {
+       "light": "#007cc3",
+       "dark": "#007cc3"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    },
+    {
+     "id": "3115013",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "asc-nba-okc-sa-2026-10-20-pos-1pt5",
+     "createdAt": "2026-10-18T14:45:16Z",
+     "updatedAt": "2026-10-18T14:45:16Z",
+     "description": "-1.50",
+     "price": "0",
+     "marketId": 1557768,
+     "long": false,
+     "teamId": 33,
+     "team": {
+      "id": 33,
+      "name": "San Antonio Spurs",
+      "abbreviation": "sa",
+      "league": "nba",
+      "record": "2-2",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/NBA+Team+Logos/SAS.png",
+      "alias": "San Antonio Spurs",
+      "safeName": "Spurs",
+      "homeIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "awayIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "colorPrimary": "#8492a4",
+      "providerId": 24,
+      "ordering": "home",
+      "longIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "shortIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "displayAbbreviation": "SA",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "583ecd4f-fb46-11e1-82cb-f4ce4684ea4c"
+       },
+       {
+        "provider": "PROVIDER_OPTICODDS",
+        "providerId": "E89F51275352"
+       },
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "24"
+       }
+      ],
+      "longIconDark": "https://static.polymarket.us/images/teams/nba-sa/SAS_dark_inset6.png",
+      "shortIconDark": "https://static.polymarket.us/images/teams/nba-sa/SAS_dark_inset6.png",
+      "color": {
+       "light": "#8492a4",
+       "dark": "#8492a4"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    }
+   ],
+   "outcomes": "[\"+1.50\",\"-1.50\"]",
+   "outcomePrices": "[\"1\",\"0\"]",
+   "ep3Status": "EXPIRED",
+   "status": "MARKET_STATUS_RESOLVED",
+   "assetPriceTerms": null,
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "hidden": false,
+   "tags": [],
+   "feeCoefficient": 0.0695,
+   "spreadTotalSuffix": "points",
+   "ep3SyncedAt": "2026-10-23T06:49:38Z",
+   "minimumTradeQty": 0.01,
+   "comboEnabled": true,
+   "politics": null
+  },
+  "tsc-nba-okc-sa-2026-10-20-232pt5": {
+   "id": "1578723",
+   "question": "Will the total in OKC Thunder vs. SA Spurs be more than 232.5?",
+   "slug": "tsc-nba-okc-sa-2026-10-20-232pt5",
+   "endDate": "2026-10-21T04:25:20Z",
+   "category": "sports",
+   "startDate": "2026-10-19T03:09:52Z",
+   "description": "This market will settle to Yes if OKC Thunder and SA Spurs combine for over 232.5 points in the OKC Thunder vs SA Spurs professional basketball game scheduled for October 20, 2026 at 9:30PM ET (as of the listing of the event's first instrument). Overtime is included if played. If the game is delayed, postponed, suspended or otherwise rescheduled to a date and time not within two days of the originally scheduled date and time, the market will settle to the last fair market price. Outcome sourced from the relevant governing body.",
+   "active": false,
+   "marketType": "totals",
+   "closed": true,
+   "createdAt": "2026-10-19T03:09:53Z",
+   "updatedAt": "2026-10-23T14:43:15Z",
+   "archived": false,
+   "orderPriceMinTickSize": 0.01,
+   "gameStartTime": "2026-10-21T01:30:00Z",
+   "manualActivation": false,
+   "sportsMarketType": "basketball_team_full_game_total",
+   "line": 232.5,
+   "marketSides": [
+    {
+     "id": "3156922",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "tsc-nba-okc-sa-2026-10-20-232pt5",
+     "createdAt": "2026-10-19T03:09:53Z",
+     "updatedAt": "2026-10-19T03:09:53Z",
+     "description": "Over",
+     "price": "0",
+     "marketId": 1578723,
+     "long": true,
+     "tradable": true
+    },
+    {
+     "id": "3156923",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "tsc-nba-okc-sa-2026-10-20-232pt5",
+     "createdAt": "2026-10-19T03:09:53Z",
+     "updatedAt": "2026-10-19T03:09:53Z",
+     "description": "Under",
+     "price": "1",
+     "marketId": 1578723,
+     "long": false,
+     "tradable": true
+    }
+   ],
+   "outcomes": "[\"Over\",\"Under\"]",
+   "outcomePrices": "[\"0\",\"1\"]",
+   "ep3Status": "EXPIRED",
+   "status": "MARKET_STATUS_RESOLVED",
+   "assetPriceTerms": null,
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "hidden": false,
+   "tags": [],
+   "feeCoefficient": 0.0695,
+   "spreadTotalSuffix": "points",
+   "ep3SyncedAt": "2026-10-23T14:43:15Z",
+   "minimumTradeQty": 0.01,
+   "comboEnabled": true,
+   "politics": null
+  },
+  "aec-nba-sac-sa-2026-10-27": {
+   "id": "1409133",
+   "question": "Who will win in the upcoming basketball event SAC Kings vs SA Spurs scheduled for October 28, 2026 at 12:00 AM UTC?",
+   "slug": "aec-nba-sac-sa-2026-10-27",
+   "endDate": "2026-10-28T02:25:57Z",
+   "category": "sports",
+   "startDate": "2026-10-13T04:00:22Z",
+   "description": "This market will settle to the winner of the SAC Kings vs SA Spurs professional basketball game scheduled for October 27, 2026 at 8:00PM ET (as of the listing of the event's first instrument). Overtime is included if played. If the game is delayed, postponed, suspended or otherwise rescheduled to a date and time not within two days of the originally scheduled date and time, the market will settle to the last fair market price. Outcome sourced from the relevant governing body.",
+   "active": true,
+   "marketType": "moneyline",
+   "closed": true,
+   "createdAt": "2026-10-13T04:00:22Z",
+   "updatedAt": "2026-10-28T16:11:13Z",
+   "archived": false,
+   "orderPriceMinTickSize": 0.01,
+   "gameStartTime": "2026-10-28T00:00:00Z",
+   "manualActivation": false,
+   "sportsMarketType": "basketball_team_full_game_winner",
+   "marketSides": [
+    {
+     "id": "2817744",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "aec-nba-sac-sa-2026-10-27",
+     "createdAt": "2026-10-13T04:00:22Z",
+     "updatedAt": "2026-10-13T04:00:22Z",
+     "description": "Kings",
+     "price": "0",
+     "marketId": 1409133,
+     "long": true,
+     "teamId": 32,
+     "team": {
+      "id": 32,
+      "name": "Sacramento Kings",
+      "abbreviation": "sac",
+      "league": "nba",
+      "record": "0-4",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/NBA+Team+Logos/SAC.png",
+      "alias": "Sacramento Kings",
+      "safeName": "Kings",
+      "homeIcon": "https://static.polymarket.us/images/teams/nba-sac/SAC_light_inset6.png",
+      "awayIcon": "https://static.polymarket.us/images/teams/nba-sac/SAC_light_inset6.png",
+      "colorPrimary": "#6c318b",
+      "providerId": 30,
+      "ordering": "away",
+      "longIcon": "https://static.polymarket.us/images/teams/nba-sac/SAC_light_inset6.png",
+      "shortIcon": "https://static.polymarket.us/images/teams/nba-sac/SAC_light_inset6.png",
+      "displayAbbreviation": "SAC",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "30"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "583ed0ac-fb46-11e1-82cb-f4ce4684ea4c"
+       },
+       {
+        "provider": "PROVIDER_OPTICODDS",
+        "providerId": "04E36C744934"
+       }
+      ],
+      "longIconDark": "https://static.polymarket.us/images/teams/nba-sac/SAC_dark_inset6.png",
+      "shortIconDark": "https://static.polymarket.us/images/teams/nba-sac/SAC_dark_inset6.png",
+      "color": {
+       "light": "#6c318b",
+       "dark": "#6c318b"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    },
+    {
+     "id": "2817745",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "aec-nba-sac-sa-2026-10-27",
+     "createdAt": "2026-10-13T04:00:22Z",
+     "updatedAt": "2026-10-13T04:00:22Z",
+     "description": "Spurs",
+     "price": "1",
+     "marketId": 1409133,
+     "long": false,
+     "teamId": 33,
+     "team": {
+      "id": 33,
+      "name": "San Antonio Spurs",
+      "abbreviation": "sa",
+      "league": "nba",
+      "record": "2-2",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/NBA+Team+Logos/SAS.png",
+      "alias": "San Antonio Spurs",
+      "safeName": "Spurs",
+      "homeIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "awayIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "colorPrimary": "#8492a4",
+      "providerId": 24,
+      "ordering": "home",
+      "longIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "shortIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "displayAbbreviation": "SA",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "583ecd4f-fb46-11e1-82cb-f4ce4684ea4c"
+       },
+       {
+        "provider": "PROVIDER_OPTICODDS",
+        "providerId": "E89F51275352"
+       },
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "24"
+       }
+      ],
+      "longIconDark": "https://static.polymarket.us/images/teams/nba-sa/SAS_dark_inset6.png",
+      "shortIconDark": "https://static.polymarket.us/images/teams/nba-sa/SAS_dark_inset6.png",
+      "color": {
+       "light": "#8492a4",
+       "dark": "#8492a4"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    }
+   ],
+   "outcomes": "[\"Kings\",\"Spurs\"]",
+   "outcomePrices": "[\"0\",\"1\"]",
+   "ep3Status": "EXPIRED",
+   "status": "MARKET_STATUS_RESOLVED",
+   "assetPriceTerms": null,
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "hidden": false,
+   "tags": [],
+   "feeCoefficient": 0.0695,
+   "ep3SyncedAt": "2026-10-28T02:25:57Z",
+   "minimumTradeQty": 0.01,
+   "comboEnabled": true,
+   "politics": null
+  },
+  "asc-nba-sac-sa-2026-10-27-pos-18pt5": {
+   "id": "1845600",
+   "question": "Will the SAC Kings cover 18.5 vs the SA Spurs in SAC Kings vs. SA Spurs?",
+   "slug": "asc-nba-sac-sa-2026-10-27-pos-18pt5",
+   "endDate": "2026-10-28T02:26:01Z",
+   "category": "sports",
+   "startDate": "2026-10-26T20:18:21Z",
+   "description": "This market will settle to Yes if Sacramento Kings covers a +18.5 point spread in the Sacramento Kings vs San Antonio Spurs professional basketball game scheduled for October 27, 2026 at 8:00PM ET (as of the listing of the event's first instrument). Overtime is included if played. If the game is delayed, postponed, suspended or otherwise rescheduled to a date and time not within two days of the originally scheduled date and time, the market will settle to the last fair market price. Outcome sourced from the relevant governing body.",
+   "active": true,
+   "marketType": "spreads",
+   "closed": true,
+   "createdAt": "2026-10-26T20:18:21Z",
+   "updatedAt": "2026-10-28T16:11:24Z",
+   "archived": false,
+   "orderPriceMinTickSize": 0.01,
+   "gameStartTime": "2026-10-28T00:00:00Z",
+   "manualActivation": false,
+   "sportsMarketType": "basketball_team_full_game_spread",
+   "line": 18.5,
+   "marketSides": [
+    {
+     "id": "3690666",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "asc-nba-sac-sa-2026-10-27-pos-18pt5",
+     "createdAt": "2026-10-26T20:18:21Z",
+     "updatedAt": "2026-10-26T20:18:21Z",
+     "description": "+18.50",
+     "price": "0",
+     "marketId": 1845600,
+     "long": true,
+     "teamId": 32,
+     "team": {
+      "id": 32,
+      "name": "Sacramento Kings",
+      "abbreviation": "sac",
+      "league": "nba",
+      "record": "0-4",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/NBA+Team+Logos/SAC.png",
+      "alias": "Sacramento Kings",
+      "safeName": "Kings",
+      "homeIcon": "https://static.polymarket.us/images/teams/nba-sac/SAC_light_inset6.png",
+      "awayIcon": "https://static.polymarket.us/images/teams/nba-sac/SAC_light_inset6.png",
+      "colorPrimary": "#6c318b",
+      "providerId": 30,
+      "ordering": "away",
+      "longIcon": "https://static.polymarket.us/images/teams/nba-sac/SAC_light_inset6.png",
+      "shortIcon": "https://static.polymarket.us/images/teams/nba-sac/SAC_light_inset6.png",
+      "displayAbbreviation": "SAC",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "30"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "583ed0ac-fb46-11e1-82cb-f4ce4684ea4c"
+       },
+       {
+        "provider": "PROVIDER_OPTICODDS",
+        "providerId": "04E36C744934"
+       }
+      ],
+      "longIconDark": "https://static.polymarket.us/images/teams/nba-sac/SAC_dark_inset6.png",
+      "shortIconDark": "https://static.polymarket.us/images/teams/nba-sac/SAC_dark_inset6.png",
+      "color": {
+       "light": "#6c318b",
+       "dark": "#6c318b"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    },
+    {
+     "id": "3690667",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "asc-nba-sac-sa-2026-10-27-pos-18pt5",
+     "createdAt": "2026-10-26T20:18:21Z",
+     "updatedAt": "2026-10-26T20:18:21Z",
+     "description": "-18.50",
+     "price": "1",
+     "marketId": 1845600,
+     "long": false,
+     "teamId": 33,
+     "team": {
+      "id": 33,
+      "name": "San Antonio Spurs",
+      "abbreviation": "sa",
+      "league": "nba",
+      "record": "2-2",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/NBA+Team+Logos/SAS.png",
+      "alias": "San Antonio Spurs",
+      "safeName": "Spurs",
+      "homeIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "awayIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "colorPrimary": "#8492a4",
+      "providerId": 24,
+      "ordering": "home",
+      "longIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "shortIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "displayAbbreviation": "SA",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "583ecd4f-fb46-11e1-82cb-f4ce4684ea4c"
+       },
+       {
+        "provider": "PROVIDER_OPTICODDS",
+        "providerId": "E89F51275352"
+       },
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "24"
+       }
+      ],
+      "longIconDark": "https://static.polymarket.us/images/teams/nba-sa/SAS_dark_inset6.png",
+      "shortIconDark": "https://static.polymarket.us/images/teams/nba-sa/SAS_dark_inset6.png",
+      "color": {
+       "light": "#8492a4",
+       "dark": "#8492a4"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    }
+   ],
+   "outcomes": "[\"+18.50\",\"-18.50\"]",
+   "outcomePrices": "[\"0\",\"1\"]",
+   "ep3Status": "EXPIRED",
+   "status": "MARKET_STATUS_RESOLVED",
+   "assetPriceTerms": null,
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "hidden": false,
+   "tags": [],
+   "feeCoefficient": 0.0695,
+   "spreadTotalSuffix": "points",
+   "ep3SyncedAt": "2026-10-28T02:26:01Z",
+   "minimumTradeQty": 0.01,
+   "comboEnabled": true,
+   "politics": null
+  },
+  "asc-nba-sac-sa-2026-10-27-pos-1pt5": {
+   "id": "1845589",
+   "question": "Will the SAC Kings cover 1.5 vs the SA Spurs in SAC Kings vs. SA Spurs?",
+   "slug": "asc-nba-sac-sa-2026-10-27-pos-1pt5",
+   "endDate": "2026-10-28T02:25:58Z",
+   "category": "sports",
+   "startDate": "2026-10-26T20:18:08Z",
+   "description": "This market will settle to Yes if Sacramento Kings covers a +1.5 point spread in the Sacramento Kings vs San Antonio Spurs professional basketball game scheduled for October 27, 2026 at 8:00PM ET (as of the listing of the event's first instrument). Overtime is included if played. If the game is delayed, postponed, suspended or otherwise rescheduled to a date and time not within two days of the originally scheduled date and time, the market will settle to the last fair market price. Outcome sourced from the relevant governing body.",
+   "active": true,
+   "marketType": "spreads",
+   "closed": true,
+   "createdAt": "2026-10-26T20:18:08Z",
+   "updatedAt": "2026-10-28T02:25:58Z",
+   "archived": false,
+   "orderPriceMinTickSize": 0.01,
+   "gameStartTime": "2026-10-28T00:00:00Z",
+   "manualActivation": false,
+   "sportsMarketType": "basketball_team_full_game_spread",
+   "line": 1.5,
+   "marketSides": [
+    {
+     "id": "3690644",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "asc-nba-sac-sa-2026-10-27-pos-1pt5",
+     "createdAt": "2026-10-26T20:18:08Z",
+     "updatedAt": "2026-10-26T20:18:08Z",
+     "description": "+1.50",
+     "price": "0",
+     "marketId": 1845589,
+     "long": true,
+     "teamId": 32,
+     "team": {
+      "id": 32,
+      "name": "Sacramento Kings",
+      "abbreviation": "sac",
+      "league": "nba",
+      "record": "0-4",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/NBA+Team+Logos/SAC.png",
+      "alias": "Sacramento Kings",
+      "safeName": "Kings",
+      "homeIcon": "https://static.polymarket.us/images/teams/nba-sac/SAC_light_inset6.png",
+      "awayIcon": "https://static.polymarket.us/images/teams/nba-sac/SAC_light_inset6.png",
+      "colorPrimary": "#6c318b",
+      "providerId": 30,
+      "ordering": "away",
+      "longIcon": "https://static.polymarket.us/images/teams/nba-sac/SAC_light_inset6.png",
+      "shortIcon": "https://static.polymarket.us/images/teams/nba-sac/SAC_light_inset6.png",
+      "displayAbbreviation": "SAC",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "30"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "583ed0ac-fb46-11e1-82cb-f4ce4684ea4c"
+       },
+       {
+        "provider": "PROVIDER_OPTICODDS",
+        "providerId": "04E36C744934"
+       }
+      ],
+      "longIconDark": "https://static.polymarket.us/images/teams/nba-sac/SAC_dark_inset6.png",
+      "shortIconDark": "https://static.polymarket.us/images/teams/nba-sac/SAC_dark_inset6.png",
+      "color": {
+       "light": "#6c318b",
+       "dark": "#6c318b"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    },
+    {
+     "id": "3690645",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "asc-nba-sac-sa-2026-10-27-pos-1pt5",
+     "createdAt": "2026-10-26T20:18:08Z",
+     "updatedAt": "2026-10-26T20:18:08Z",
+     "description": "-1.50",
+     "price": "1",
+     "marketId": 1845589,
+     "long": false,
+     "teamId": 33,
+     "team": {
+      "id": 33,
+      "name": "San Antonio Spurs",
+      "abbreviation": "sa",
+      "league": "nba",
+      "record": "2-2",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/NBA+Team+Logos/SAS.png",
+      "alias": "San Antonio Spurs",
+      "safeName": "Spurs",
+      "homeIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "awayIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "colorPrimary": "#8492a4",
+      "providerId": 24,
+      "ordering": "home",
+      "longIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "shortIcon": "https://static.polymarket.us/images/teams/nba-sa/SAS_light_inset6.png",
+      "displayAbbreviation": "SA",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "583ecd4f-fb46-11e1-82cb-f4ce4684ea4c"
+       },
+       {
+        "provider": "PROVIDER_OPTICODDS",
+        "providerId": "E89F51275352"
+       },
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "24"
+       }
+      ],
+      "longIconDark": "https://static.polymarket.us/images/teams/nba-sa/SAS_dark_inset6.png",
+      "shortIconDark": "https://static.polymarket.us/images/teams/nba-sa/SAS_dark_inset6.png",
+      "color": {
+       "light": "#8492a4",
+       "dark": "#8492a4"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    }
+   ],
+   "outcomes": "[\"+1.50\",\"-1.50\"]",
+   "outcomePrices": "[\"0\",\"1\"]",
+   "ep3Status": "EXPIRED",
+   "status": "MARKET_STATUS_RESOLVED",
+   "assetPriceTerms": null,
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "hidden": false,
+   "tags": [],
+   "feeCoefficient": 0.0695,
+   "spreadTotalSuffix": "points",
+   "ep3SyncedAt": "2026-10-28T02:25:58Z",
+   "minimumTradeQty": 0.01,
+   "comboEnabled": true,
+   "politics": null
+  },
+  "tsc-nba-sac-sa-2026-10-27-232pt5": {
+   "id": "1870530",
+   "question": "Will the total in SAC Kings vs. SA Spurs be more than 232.5?",
+   "slug": "tsc-nba-sac-sa-2026-10-27-232pt5",
+   "endDate": "2026-10-28T02:26:14Z",
+   "category": "sports",
+   "startDate": "2026-10-27T14:30:21Z",
+   "description": "This market will settle to Yes if SAC Kings and SA Spurs combine for over 232.5 points in the SAC Kings vs SA Spurs professional basketball game scheduled for October 27, 2026 at 8:00PM ET (as of the listing of the event's first instrument). Overtime is included if played. If the game is delayed, postponed, suspended or otherwise rescheduled to a date and time not within two days of the originally scheduled date and time, the market will settle to the last fair market price. Outcome sourced from the relevant governing body.",
+   "active": true,
+   "marketType": "totals",
+   "closed": true,
+   "createdAt": "2026-10-27T14:30:21Z",
+   "updatedAt": "2026-10-28T16:12:34Z",
+   "archived": false,
+   "orderPriceMinTickSize": 0.01,
+   "gameStartTime": "2026-10-28T00:00:00Z",
+   "manualActivation": false,
+   "sportsMarketType": "basketball_team_full_game_total",
+   "line": 232.5,
+   "marketSides": [
+    {
+     "id": "3740526",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "tsc-nba-sac-sa-2026-10-27-232pt5",
+     "createdAt": "2026-10-27T14:30:21Z",
+     "updatedAt": "2026-10-27T14:30:21Z",
+     "description": "Over",
+     "price": "1",
+     "marketId": 1870530,
+     "long": true,
+     "tradable": true
+    },
+    {
+     "id": "3740527",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "tsc-nba-sac-sa-2026-10-27-232pt5",
+     "createdAt": "2026-10-27T14:30:21Z",
+     "updatedAt": "2026-10-27T14:30:21Z",
+     "description": "Under",
+     "price": "0",
+     "marketId": 1870530,
+     "long": false,
+     "tradable": true
+    }
+   ],
+   "outcomes": "[\"Over\",\"Under\"]",
+   "outcomePrices": "[\"1\",\"0\"]",
+   "ep3Status": "EXPIRED",
+   "status": "MARKET_STATUS_RESOLVED",
+   "assetPriceTerms": null,
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "hidden": false,
+   "tags": [],
+   "feeCoefficient": 0.0695,
+   "spreadTotalSuffix": "points",
+   "ep3SyncedAt": "2026-10-28T02:26:14Z",
+   "minimumTradeQty": 0.01,
+   "comboEnabled": true,
+   "politics": null
+  },
+  "aec-cfb-kanst-arzst-2026-10-24": {
+   "id": "1559233",
+   "question": "Who will win in the upcoming football event K-State vs Arizona State scheduled for October 24, 2026 at 7:45 PM UTC?",
+   "slug": "aec-cfb-kanst-arzst-2026-10-24",
+   "endDate": "2026-10-24T23:30:50Z",
+   "category": "sports",
+   "startDate": "2026-10-18T15:30:12Z",
+   "description": "This market will settle to the winner of the K-State vs Arizona State college football game scheduled for October 24, 2026 at 3:45PM ET (as of the listing of the event's first instrument). Overtime is included if played. If the game is delayed, postponed, suspended or otherwise rescheduled to a date and time not within two days of the originally scheduled date and time, the market will settle to the last fair market price. Outcome sourced from the relevant governing body.",
+   "active": false,
+   "marketType": "moneyline",
+   "closed": true,
+   "createdAt": "2026-10-18T15:30:12Z",
+   "updatedAt": "2026-10-27T03:22:59Z",
+   "archived": false,
+   "orderPriceMinTickSize": 0.005,
+   "gameStartTime": "2026-10-24T19:45:00Z",
+   "manualActivation": false,
+   "sportsMarketType": "football_team_full_game_winner",
+   "marketSides": [
+    {
+     "id": "3117942",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "aec-cfb-kanst-arzst-2026-10-24",
+     "createdAt": "2026-10-18T15:30:12Z",
+     "updatedAt": "2026-10-18T15:30:12Z",
+     "description": "Wildcats",
+     "price": "0",
+     "marketId": 1559233,
+     "long": true,
+     "teamId": 1143,
+     "team": {
+      "id": 1143,
+      "name": "K-State",
+      "abbreviation": "kanst",
+      "league": "cfb",
+      "record": "4-3",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/team_logos/football/cfb/_kanst_50000112.png",
+      "alias": "Wildcats",
+      "safeName": "K-State",
+      "homeIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Kansas+State+Wildcats_R%40160x160.png",
+      "awayIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Kansas+State+Wildcats_L%40160x160.png",
+      "colorPrimary": "#512888",
+      "providerId": 112,
+      "ordering": "away",
+      "longIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Kansas-State-Wildcats_L@320x320.png",
+      "shortIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Kansas-State-Wildcats_R@320x320.png",
+      "displayAbbreviation": "KSU",
+      "ranking": "0",
+      "conference": "Big 12",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "112"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "0dd26ea7-79fb-4ea8-bf48-7c31108e14a3"
+       }
+      ],
+      "longIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Kansas-State-Wildcats_L@320x320.png",
+      "shortIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Kansas-State-Wildcats_R@320x320.png",
+      "color": {
+       "light": "#512888",
+       "dark": "#512888"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    },
+    {
+     "id": "3117943",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "aec-cfb-kanst-arzst-2026-10-24",
+     "createdAt": "2026-10-18T15:30:12Z",
+     "updatedAt": "2026-10-18T15:30:12Z",
+     "description": "Sun Devils",
+     "price": "1",
+     "marketId": 1559233,
+     "long": false,
+     "teamId": 1242,
+     "team": {
+      "id": 1242,
+      "name": "Arizona State",
+      "abbreviation": "arzst",
+      "league": "cfb",
+      "record": "4-3",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/team_logos/football/cfb/_arzst_50000255.png",
+      "alias": "Sun Devils",
+      "safeName": "Arizona State",
+      "homeIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Arizona+State+Sun+Devils_R%40160x160.png",
+      "awayIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Arizona+State+Sun+Devils_L%40160x160.png",
+      "colorPrimary": "#8C1D40",
+      "providerId": 255,
+      "ordering": "home",
+      "longIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Arizona-State-Sun-Devils_L@320x320.png",
+      "shortIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Arizona-State-Sun-Devils_R@320x320.png",
+      "displayAbbreviation": "ASU",
+      "ranking": "0",
+      "conference": "Big 12",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "255"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "00fd8418-0e62-4366-9a2a-d5f72850066c"
+       }
+      ],
+      "longIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Arizona-State-Sun-Devils_L@320x320.png",
+      "shortIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Arizona-State-Sun-Devils_R@320x320.png",
+      "color": {
+       "light": "#8C1D40",
+       "dark": "#8C1D40"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    }
+   ],
+   "outcomes": "[\"Wildcats\",\"Sun Devils\"]",
+   "outcomePrices": "[\"0\",\"1\"]",
+   "ep3Status": "EXPIRED",
+   "status": "MARKET_STATUS_RESOLVED",
+   "assetPriceTerms": null,
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "hidden": false,
+   "tags": [],
+   "feeCoefficient": 0.0695,
+   "ep3SyncedAt": "2026-10-27T03:22:59Z",
+   "minimumTradeQty": 0.01,
+   "comboEnabled": true,
+   "politics": null
+  },
+  "asc-cfb-kanst-arzst-2026-10-24-neg-1pt5": {
+   "id": "1563455",
+   "question": "Will the K-State cover -1.5 vs the Arizona State in K-State vs. Arizona State?",
+   "slug": "asc-cfb-kanst-arzst-2026-10-24-neg-1pt5",
+   "endDate": "2026-10-24T23:30:56Z",
+   "category": "sports",
+   "startDate": "2026-10-18T16:35:45Z",
+   "description": "This market will settle to Yes if K-State covers a -1.5 point spread in the K-State vs Arizona State college football game scheduled for October 24, 2026 at 3:45PM ET (as of the listing of the event's first instrument). Overtime is included if played. If the game is delayed, postponed, suspended or otherwise rescheduled to a date and time not within two days of the originally scheduled date and time, the market will settle to the last fair market price. Outcome sourced from the relevant governing body.",
+   "active": false,
+   "marketType": "spreads",
+   "closed": true,
+   "createdAt": "2026-10-18T16:35:45Z",
+   "updatedAt": "2026-10-27T03:23:48Z",
+   "archived": false,
+   "orderPriceMinTickSize": 0.005,
+   "gameStartTime": "2026-10-24T19:45:00Z",
+   "manualActivation": false,
+   "sportsMarketType": "football_team_full_game_spread",
+   "line": -1.5,
+   "marketSides": [
+    {
+     "id": "3126386",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "asc-cfb-kanst-arzst-2026-10-24-neg-1pt5",
+     "createdAt": "2026-10-18T16:35:45Z",
+     "updatedAt": "2026-10-18T16:35:45Z",
+     "description": "-1.50",
+     "price": "0",
+     "marketId": 1563455,
+     "long": true,
+     "teamId": 1143,
+     "team": {
+      "id": 1143,
+      "name": "K-State",
+      "abbreviation": "kanst",
+      "league": "cfb",
+      "record": "4-3",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/team_logos/football/cfb/_kanst_50000112.png",
+      "alias": "Wildcats",
+      "safeName": "K-State",
+      "homeIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Kansas+State+Wildcats_R%40160x160.png",
+      "awayIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Kansas+State+Wildcats_L%40160x160.png",
+      "colorPrimary": "#512888",
+      "providerId": 112,
+      "ordering": "away",
+      "longIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Kansas-State-Wildcats_L@320x320.png",
+      "shortIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Kansas-State-Wildcats_R@320x320.png",
+      "displayAbbreviation": "KSU",
+      "ranking": "0",
+      "conference": "Big 12",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "112"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "0dd26ea7-79fb-4ea8-bf48-7c31108e14a3"
+       }
+      ],
+      "longIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Kansas-State-Wildcats_L@320x320.png",
+      "shortIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Kansas-State-Wildcats_R@320x320.png",
+      "color": {
+       "light": "#512888",
+       "dark": "#512888"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    },
+    {
+     "id": "3126387",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "asc-cfb-kanst-arzst-2026-10-24-neg-1pt5",
+     "createdAt": "2026-10-18T16:35:45Z",
+     "updatedAt": "2026-10-18T16:35:45Z",
+     "description": "+1.50",
+     "price": "1",
+     "marketId": 1563455,
+     "long": false,
+     "teamId": 1242,
+     "team": {
+      "id": 1242,
+      "name": "Arizona State",
+      "abbreviation": "arzst",
+      "league": "cfb",
+      "record": "4-3",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/team_logos/football/cfb/_arzst_50000255.png",
+      "alias": "Sun Devils",
+      "safeName": "Arizona State",
+      "homeIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Arizona+State+Sun+Devils_R%40160x160.png",
+      "awayIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Arizona+State+Sun+Devils_L%40160x160.png",
+      "colorPrimary": "#8C1D40",
+      "providerId": 255,
+      "ordering": "home",
+      "longIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Arizona-State-Sun-Devils_L@320x320.png",
+      "shortIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Arizona-State-Sun-Devils_R@320x320.png",
+      "displayAbbreviation": "ASU",
+      "ranking": "0",
+      "conference": "Big 12",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "255"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "00fd8418-0e62-4366-9a2a-d5f72850066c"
+       }
+      ],
+      "longIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Arizona-State-Sun-Devils_L@320x320.png",
+      "shortIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Arizona-State-Sun-Devils_R@320x320.png",
+      "color": {
+       "light": "#8C1D40",
+       "dark": "#8C1D40"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    }
+   ],
+   "outcomes": "[\"-1.50\",\"+1.50\"]",
+   "outcomePrices": "[\"0\",\"1\"]",
+   "ep3Status": "EXPIRED",
+   "status": "MARKET_STATUS_RESOLVED",
+   "assetPriceTerms": null,
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "hidden": false,
+   "tags": [],
+   "feeCoefficient": 0.0695,
+   "spreadTotalSuffix": "points",
+   "ep3SyncedAt": "2026-10-27T03:23:48Z",
+   "minimumTradeQty": 0.01,
+   "comboEnabled": true,
+   "politics": null
+  },
+  "asc-cfb-kanst-arzst-2026-10-24-pos-1pt5": {
+   "id": "1563456",
+   "question": "Will the K-State cover 1.5 vs the Arizona State in K-State vs. Arizona State?",
+   "slug": "asc-cfb-kanst-arzst-2026-10-24-pos-1pt5",
+   "endDate": "2026-10-24T23:30:56Z",
+   "category": "sports",
+   "startDate": "2026-10-18T16:35:46Z",
+   "description": "This market will settle to Yes if K-State covers a +1.5 point spread in the K-State vs Arizona State college football game scheduled for October 24, 2026 at 3:45PM ET (as of the listing of the event's first instrument). Overtime is included if played. If the game is delayed, postponed, suspended or otherwise rescheduled to a date and time not within two days of the originally scheduled date and time, the market will settle to the last fair market price. Outcome sourced from the relevant governing body.",
+   "active": false,
+   "marketType": "spreads",
+   "closed": true,
+   "createdAt": "2026-10-18T16:35:46Z",
+   "updatedAt": "2026-10-27T03:23:49Z",
+   "archived": false,
+   "orderPriceMinTickSize": 0.005,
+   "gameStartTime": "2026-10-24T19:45:00Z",
+   "manualActivation": false,
+   "sportsMarketType": "football_team_full_game_spread",
+   "line": 1.5,
+   "marketSides": [
+    {
+     "id": "3126388",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "asc-cfb-kanst-arzst-2026-10-24-pos-1pt5",
+     "createdAt": "2026-10-18T16:35:46Z",
+     "updatedAt": "2026-10-18T16:35:46Z",
+     "description": "+1.50",
+     "price": "0",
+     "marketId": 1563456,
+     "long": true,
+     "teamId": 1143,
+     "team": {
+      "id": 1143,
+      "name": "K-State",
+      "abbreviation": "kanst",
+      "league": "cfb",
+      "record": "4-3",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/team_logos/football/cfb/_kanst_50000112.png",
+      "alias": "Wildcats",
+      "safeName": "K-State",
+      "homeIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Kansas+State+Wildcats_R%40160x160.png",
+      "awayIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Kansas+State+Wildcats_L%40160x160.png",
+      "colorPrimary": "#512888",
+      "providerId": 112,
+      "ordering": "away",
+      "longIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Kansas-State-Wildcats_L@320x320.png",
+      "shortIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Kansas-State-Wildcats_R@320x320.png",
+      "displayAbbreviation": "KSU",
+      "ranking": "0",
+      "conference": "Big 12",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "112"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "0dd26ea7-79fb-4ea8-bf48-7c31108e14a3"
+       }
+      ],
+      "longIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Kansas-State-Wildcats_L@320x320.png",
+      "shortIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Kansas-State-Wildcats_R@320x320.png",
+      "color": {
+       "light": "#512888",
+       "dark": "#512888"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    },
+    {
+     "id": "3126389",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "asc-cfb-kanst-arzst-2026-10-24-pos-1pt5",
+     "createdAt": "2026-10-18T16:35:46Z",
+     "updatedAt": "2026-10-18T16:35:46Z",
+     "description": "-1.50",
+     "price": "1",
+     "marketId": 1563456,
+     "long": false,
+     "teamId": 1242,
+     "team": {
+      "id": 1242,
+      "name": "Arizona State",
+      "abbreviation": "arzst",
+      "league": "cfb",
+      "record": "4-3",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/team_logos/football/cfb/_arzst_50000255.png",
+      "alias": "Sun Devils",
+      "safeName": "Arizona State",
+      "homeIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Arizona+State+Sun+Devils_R%40160x160.png",
+      "awayIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Arizona+State+Sun+Devils_L%40160x160.png",
+      "colorPrimary": "#8C1D40",
+      "providerId": 255,
+      "ordering": "home",
+      "longIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Arizona-State-Sun-Devils_L@320x320.png",
+      "shortIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Arizona-State-Sun-Devils_R@320x320.png",
+      "displayAbbreviation": "ASU",
+      "ranking": "0",
+      "conference": "Big 12",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "255"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "00fd8418-0e62-4366-9a2a-d5f72850066c"
+       }
+      ],
+      "longIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Arizona-State-Sun-Devils_L@320x320.png",
+      "shortIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Arizona-State-Sun-Devils_R@320x320.png",
+      "color": {
+       "light": "#8C1D40",
+       "dark": "#8C1D40"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "tradable": true
+    }
+   ],
+   "outcomes": "[\"+1.50\",\"-1.50\"]",
+   "outcomePrices": "[\"0\",\"1\"]",
+   "ep3Status": "EXPIRED",
+   "status": "MARKET_STATUS_RESOLVED",
+   "assetPriceTerms": null,
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "hidden": false,
+   "tags": [],
+   "feeCoefficient": 0.0695,
+   "spreadTotalSuffix": "points",
+   "ep3SyncedAt": "2026-10-27T03:23:49Z",
+   "minimumTradeQty": 0.01,
+   "comboEnabled": true,
+   "politics": null
+  },
+  "tsc-cfb-kanst-arzst-2026-10-24-total-51pt5": {
+   "id": "1564033",
+   "question": "Will the total in K-State vs. Arizona State be more than 51.5?",
+   "slug": "tsc-cfb-kanst-arzst-2026-10-24-total-51pt5",
+   "endDate": "2026-10-24T23:31:03Z",
+   "category": "sports",
+   "startDate": "2026-10-18T16:43:44Z",
+   "description": "This market will settle to Yes if K-State and Arizona State combine for over 51.5 points in the K-State vs Arizona State college football game scheduled for October 24, 2026 at 3:45PM ET (as of the listing of the event's first instrument). Overtime is included if played. If the game is delayed, postponed, suspended or otherwise rescheduled to a date and time not within two days of the originally scheduled date and time, the market will settle to the last fair market price. Outcome sourced from the relevant governing body.",
+   "active": false,
+   "marketType": "totals",
+   "closed": true,
+   "createdAt": "2026-10-18T16:43:44Z",
+   "updatedAt": "2026-10-27T07:24:24Z",
+   "archived": false,
+   "orderPriceMinTickSize": 0.01,
+   "gameStartTime": "2026-10-24T19:45:00Z",
+   "manualActivation": false,
+   "sportsMarketType": "football_team_full_game_total",
+   "line": 51.5,
+   "marketSides": [
+    {
+     "id": "3127542",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "tsc-cfb-kanst-arzst-2026-10-24-total-51pt5",
+     "createdAt": "2026-10-18T16:43:44Z",
+     "updatedAt": "2026-10-18T16:43:44Z",
+     "description": "Over",
+     "price": "0",
+     "marketId": 1564033,
+     "long": true,
+     "tradable": true
+    },
+    {
+     "id": "3127543",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "tsc-cfb-kanst-arzst-2026-10-24-total-51pt5",
+     "createdAt": "2026-10-18T16:43:44Z",
+     "updatedAt": "2026-10-18T16:43:44Z",
+     "description": "Under",
+     "price": "1",
+     "marketId": 1564033,
+     "long": false,
+     "tradable": true
+    }
+   ],
+   "outcomes": "[\"Over\",\"Under\"]",
+   "outcomePrices": "[\"0\",\"1\"]",
+   "ep3Status": "EXPIRED",
+   "status": "MARKET_STATUS_RESOLVED",
+   "assetPriceTerms": null,
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_TOTAL",
+   "hidden": false,
+   "tags": [],
+   "feeCoefficient": 0.0695,
+   "spreadTotalSuffix": "points",
+   "ep3SyncedAt": "2026-10-27T07:24:24Z",
+   "minimumTradeQty": 0.01,
+   "comboEnabled": true,
+   "politics": null
+  },
+  "aec-cfb-loutch-sala-2026-10-31": {
+   "id": "1597121",
+   "question": "Who will win in the upcoming football event LA Tech vs South Alabama scheduled for October 31, 2026 at 7:00 PM UTC?",
+   "slug": "aec-cfb-loutch-sala-2026-10-31",
+   "endDate": "2026-11-15T00:00:00Z",
+   "category": "sports",
+   "startDate": "2026-10-19T19:30:13Z",
+   "description": "This market will settle to the winner of the LA Tech vs South Alabama college football game scheduled for October 31, 2026 at 3:00PM ET (as of the listing of the event's first instrument). Overtime is included if played. If the game is delayed, postponed, suspended or otherwise rescheduled to a date and time not within two days of the originally scheduled date and time, the market will settle to the last fair market price. Outcome sourced from the relevant governing body.",
+   "active": true,
+   "marketType": "moneyline",
+   "closed": false,
+   "createdAt": "2026-10-19T19:30:13Z",
+   "updatedAt": "2026-10-28T14:40:58Z",
+   "archived": false,
+   "orderPriceMinTickSize": 0.005,
+   "gameStartTime": "2026-10-31T19:00:00Z",
+   "manualActivation": false,
+   "sportsMarketType": "football_team_full_game_winner",
+   "marketSides": [
+    {
+     "id": "3193716",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "aec-cfb-loutch-sala-2026-10-31",
+     "createdAt": "2026-10-19T19:30:13Z",
+     "updatedAt": "2026-10-19T19:30:13Z",
+     "description": "Bulldogs",
+     "price": "0.6700",
+     "marketId": 1597121,
+     "long": true,
+     "teamId": 1160,
+     "team": {
+      "id": 1160,
+      "name": "LA Tech",
+      "abbreviation": "loutch",
+      "league": "cfb",
+      "record": "5-2",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/team_logos/football/cfb/_loutch_50000137.png",
+      "alias": "Bulldogs",
+      "safeName": "LA Tech",
+      "homeIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Louisiana+Tech+Bulldogs_R%40160x160.png",
+      "awayIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Louisiana+Tech+Bulldogs_L%40160x160.png",
+      "colorPrimary": "#002F8B",
+      "providerId": 137,
+      "ordering": "away",
+      "longIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Louisiana-Tech-Bulldogs_L@320x320.png",
+      "shortIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Louisiana-Tech-Bulldogs_R@320x320.png",
+      "displayAbbreviation": "LT",
+      "ranking": "0",
+      "conference": "Sun Belt - West",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "137"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "5bf6e8b8-2a02-4906-8253-08f967dd3c2c"
+       }
+      ],
+      "longIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Louisiana-Tech-Bulldogs_L@320x320.png",
+      "shortIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Louisiana-Tech-Bulldogs_R@320x320.png",
+      "color": {
+       "light": "#002F8B",
+       "dark": "#002F8B"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "quote": {
+      "value": "0.6700",
+      "currency": "USD"
+     },
+     "tradable": true
+    },
+    {
+     "id": "3193717",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "aec-cfb-loutch-sala-2026-10-31",
+     "createdAt": "2026-10-19T19:30:13Z",
+     "updatedAt": "2026-10-19T19:30:13Z",
+     "description": "Jaguars",
+     "price": "0.35",
+     "marketId": 1597121,
+     "long": false,
+     "teamId": 1304,
+     "team": {
+      "id": 1304,
+      "name": "South Alabama",
+      "abbreviation": "sala",
+      "league": "cfb",
+      "record": "4-3",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/team_logos/football/cfb/_sala_50000330.png",
+      "alias": "Jaguars",
+      "safeName": "South Alabama",
+      "homeIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_South+Alabama+Jaguars_R%40160x160%40160x160.png",
+      "awayIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_South+Alabama+Jaguars_L%40160x160%40160x160.png",
+      "colorPrimary": "#00205B",
+      "providerId": 330,
+      "ordering": "home",
+      "longIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_South-Alabama-Jaguars_L@320x320.png",
+      "shortIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_South-Alabama-Jaguars_R@320x320.png",
+      "displayAbbreviation": "USA",
+      "ranking": "0",
+      "conference": "Sun Belt - West",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "330"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "b6fa0a24-da86-4c1d-aed7-7aad175cd249"
+       }
+      ],
+      "longIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_South-Alabama-Jaguars_L@320x320.png",
+      "shortIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_South-Alabama-Jaguars_R@320x320.png",
+      "color": {
+       "light": "#00205B",
+       "dark": "#00205B"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "quote": {
+      "value": "0.35",
+      "currency": "USD"
+     },
+     "tradable": true
+    }
+   ],
+   "outcomes": "[\"Bulldogs\",\"Jaguars\"]",
+   "outcomePrices": "[\"0.6700\",\"0.35\"]",
+   "ep3Status": "OPEN",
+   "status": "MARKET_STATUS_OPEN",
+   "assetPriceTerms": null,
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_MONEYLINE",
+   "hidden": false,
+   "tags": [],
+   "feeCoefficient": 0.0695,
+   "bestBidQuote": {
+    "value": "0.6500",
+    "currency": "USD"
+   },
+   "bestAskQuote": {
+    "value": "0.6700",
+    "currency": "USD"
+   },
+   "ep3SyncedAt": "2026-10-22T11:51:15Z",
+   "minimumTradeQty": 0.01,
+   "comboEnabled": true,
+   "politics": null
+  },
+  "asc-cfb-loutch-sala-2026-10-31-neg-10pt5": {
+   "id": "1803333",
+   "question": "Will the LA Tech cover -10.5 vs the South Alabama in LA Tech vs. South Alabama?",
+   "slug": "asc-cfb-loutch-sala-2026-10-31-neg-10pt5",
+   "endDate": "2026-11-15T00:00:00Z",
+   "category": "sports",
+   "startDate": "2026-10-25T16:32:38Z",
+   "description": "This market will settle to Yes if LA Tech covers a -10.5 point spread in the LA Tech vs South Alabama college football game scheduled for October 31, 2026 at 3:00PM ET (as of the listing of the event's first instrument). Overtime is included if played. If the game is delayed, postponed, suspended or otherwise rescheduled to a date and time not within two days of the originally scheduled date and time, the market will settle to the last fair market price. Outcome sourced from the relevant governing body.",
+   "active": true,
+   "marketType": "spreads",
+   "closed": false,
+   "createdAt": "2026-10-25T16:32:38Z",
+   "updatedAt": "2026-10-25T16:59:05Z",
+   "archived": false,
+   "orderPriceMinTickSize": 0.005,
+   "gameStartTime": "2026-10-31T19:00:00Z",
+   "manualActivation": false,
+   "sportsMarketType": "football_team_full_game_spread",
+   "line": -10.5,
+   "marketSides": [
+    {
+     "id": "3606132",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "asc-cfb-loutch-sala-2026-10-31-neg-10pt5",
+     "createdAt": "2026-10-25T16:32:38Z",
+     "updatedAt": "2026-10-25T16:32:38Z",
+     "description": "-10.50",
+     "price": "0.3600",
+     "marketId": 1803333,
+     "long": true,
+     "teamId": 1160,
+     "team": {
+      "id": 1160,
+      "name": "LA Tech",
+      "abbreviation": "loutch",
+      "league": "cfb",
+      "record": "5-2",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/team_logos/football/cfb/_loutch_50000137.png",
+      "alias": "Bulldogs",
+      "safeName": "LA Tech",
+      "homeIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Louisiana+Tech+Bulldogs_R%40160x160.png",
+      "awayIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_Louisiana+Tech+Bulldogs_L%40160x160.png",
+      "colorPrimary": "#002F8B",
+      "providerId": 137,
+      "ordering": "away",
+      "longIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Louisiana-Tech-Bulldogs_L@320x320.png",
+      "shortIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Louisiana-Tech-Bulldogs_R@320x320.png",
+      "displayAbbreviation": "LT",
+      "ranking": "0",
+      "conference": "Sun Belt - West",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "137"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "5bf6e8b8-2a02-4906-8253-08f967dd3c2c"
+       }
+      ],
+      "longIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Louisiana-Tech-Bulldogs_L@320x320.png",
+      "shortIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_Louisiana-Tech-Bulldogs_R@320x320.png",
+      "color": {
+       "light": "#002F8B",
+       "dark": "#002F8B"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "quote": {
+      "value": "0.3600",
+      "currency": "USD"
+     },
+     "tradable": true
+    },
+    {
+     "id": "3606133",
+     "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+     "identifier": "asc-cfb-loutch-sala-2026-10-31-neg-10pt5",
+     "createdAt": "2026-10-25T16:32:38Z",
+     "updatedAt": "2026-10-25T16:32:38Z",
+     "description": "+10.50",
+     "price": "0.655",
+     "marketId": 1803333,
+     "long": false,
+     "teamId": 1304,
+     "team": {
+      "id": 1304,
+      "name": "South Alabama",
+      "abbreviation": "sala",
+      "league": "cfb",
+      "record": "4-3",
+      "logo": "https://polymarket-upload.s3.us-east-2.amazonaws.com/team_logos/football/cfb/_sala_50000330.png",
+      "alias": "Jaguars",
+      "safeName": "South Alabama",
+      "homeIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_South+Alabama+Jaguars_R%40160x160%40160x160.png",
+      "awayIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us/ncaa/Polymarket_South+Alabama+Jaguars_L%40160x160%40160x160.png",
+      "colorPrimary": "#00205B",
+      "providerId": 330,
+      "ordering": "home",
+      "longIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_South-Alabama-Jaguars_L@320x320.png",
+      "shortIcon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_South-Alabama-Jaguars_R@320x320.png",
+      "displayAbbreviation": "USA",
+      "ranking": "0",
+      "conference": "Sun Belt - West",
+      "providerIds": [
+       {
+        "provider": "PROVIDER_SPORTSDATAIO",
+        "providerId": "330"
+       },
+       {
+        "provider": "PROVIDER_SPORTRADAR",
+        "providerId": "b6fa0a24-da86-4c1d-aed7-7aad175cd249"
+       }
+      ],
+      "longIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_South-Alabama-Jaguars_L@320x320.png",
+      "shortIconDark": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us-logos/CFB/Polymarket_CFB_South-Alabama-Jaguars_R@320x320.png",
+      "color": {
+       "light": "#00205B",
+       "dark": "#00205B"
+      },
+      "imageDisplayType": "IMAGE_DISPLAY_TYPE_LOGO"
+     },
+     "quote": {
+      "value": "0.655",
+      "currency": "USD"
+     },
+     "tradable": true
+    }
+   ],
+   "outcomes": "[\"-10.50\",\"+10.50\"]",
+   "outcomePrices": "[\"0.3600\",\"0.655\"]",
+   "ep3Status": "OPEN",
+   "status": "MARKET_STATUS_OPEN",
+   "assetPriceTerms": null,
+   "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_SPREAD",
+   "hidden": false,
+   "tags": [],
+   "feeCoefficient": 0.0695,
+   "spreadTotalSuffix": "points",
+   "bestBidQuote": {
+    "value": "0.3450",
+    "currency": "USD"
+   },
+   "bestAskQuote": {
+    "value": "0.3600",
+    "currency": "USD"
+   },
+   "ep3SyncedAt": "2026-10-25T16:32:38Z",
+   "minimumTradeQty": 0.01,
+   "comboEnabled": true,
+   "politics": null
+  }
+ },
+ "locks": [
+  {
+   "id": "873e2f25-3774-47ce-9a03-90f4c97d4424",
+   "label": "New Orleans Pelicans ML + San Antonio Spurs ML",
+   "starts_at": "2026-10-21T01:30:00+00:00",
+   "leg_keys": [
+    "KXNBAGAME-26OCT20OKCSAS-SAS:yes",
+    "KXNBAGAME-26OCT21INDNOP-NOP:yes"
+   ],
+   "legs": [
+    {
+     "ticker": "KXNBAGAME-26OCT21INDNOP-NOP",
+     "side": "yes",
+     "label": "New Orleans",
+     "game": "Indiana vs New Orleans",
+     "starts_at": "2026-10-22T00:00:00.000Z"
+    },
+    {
+     "ticker": "KXNBAGAME-26OCT20OKCSAS-SAS",
+     "side": "yes",
+     "label": "San Antonio",
+     "game": "Oklahoma City vs San Antonio",
+     "starts_at": "2026-10-21T01:30:00.000Z"
+    }
+   ]
+  },
+  {
+   "id": "8fe618e1-822d-42d4-bdd5-827fd1d241d5",
+   "label": "Oklahoma City Thunder ML + Boston Celtics ML + Philadelphia 76ers ML",
+   "starts_at": "2026-10-20T19:00:00+00:00",
+   "leg_keys": [
+    "KXNBAGAME-26OCT20BOSDET-BOS:yes",
+    "KXNBAGAME-26OCT20OKCSAS-OKC:yes",
+    "KXNBAGAME-26OCT20PHINYK-PHI:yes"
+   ],
+   "legs": [
+    {
+     "ticker": "KXNBAGAME-26OCT20OKCSAS-OKC",
+     "side": "yes",
+     "label": "Oklahoma City",
+     "game": "Oklahoma City vs San Antonio",
+     "starts_at": "2026-10-21T01:30:00.000Z"
+    },
+    {
+     "ticker": "KXNBAGAME-26OCT20BOSDET-BOS",
+     "side": "yes",
+     "label": "Boston",
+     "game": "Boston vs Detroit",
+     "starts_at": "2026-10-20T19:00:00.000Z"
+    },
+    {
+     "ticker": "KXNBAGAME-26OCT20PHINYK-PHI",
+     "side": "yes",
+     "label": "Philadelphia",
+     "game": "Philadelphia vs New York",
+     "starts_at": "2026-10-20T23:00:00.000Z"
+    }
+   ]
+  },
+  {
+   "id": "699f11f4-c9fd-44b2-b3bc-09432ec0071f",
+   "label": "Wisconsin Badgers ML + California Golden Bears +18.5 + North Texas Mean Green ML + Miami (OH) RedHawks ML + Utah State Aggies/Texas State Bobcats u60.5 + Houston Cougars/Utah Utes u57.5 + New Mexico Lobos ML + Oklahoma Sooners ML + Kansas State Wildcats/Arizona State Sun Devils u51.5 + Georgia State Panthers ML",
+   "starts_at": "2026-10-24T16:00:00+00:00",
+   "leg_keys": [
+    "KXNCAAFGAME-26OCT23MOHCMU-MOH:yes",
+    "KXNCAAFGAME-26OCT23OKLAMSST-OKLA:yes",
+    "KXNCAAFGAME-26OCT23USCWIS-WIS:yes",
+    "KXNCAAFGAME-26OCT24GASTARST-GAST:yes",
+    "KXNCAAFGAME-26OCT24NDSUUNM-UNM:yes",
+    "KXNCAAFGAME-26OCT24UNTNAVY-UNT:yes",
+    "KXNCAAFSPREAD-26OCT24CALSMU-SMU18:no",
+    "KXNCAAFTOTAL-26OCT24HOUUTAH-58:no",
+    "KXNCAAFTOTAL-26OCT24KSUASU-52:no",
+    "KXNCAAFTOTAL-26OCT24USUTXST-61:no"
+   ],
+   "legs": [
+    {
+     "ticker": "KXNCAAFGAME-26OCT23USCWIS-WIS",
+     "side": "yes",
+     "label": "Wisconsin",
+     "game": "USC vs Wisconsin",
+     "starts_at": "2026-10-24T23:30:00.000Z"
+    },
+    {
+     "ticker": "KXNCAAFSPREAD-26OCT24CALSMU-SMU18",
+     "side": "no",
+     "label": "California +17.5",
+     "game": "California vs SMU",
+     "starts_at": "2026-10-24T16:00:00.000Z"
+    },
+    {
+     "ticker": "KXNCAAFGAME-26OCT24UNTNAVY-UNT",
+     "side": "yes",
+     "label": "North Texas",
+     "game": "North Texas vs Navy",
+     "starts_at": "2026-10-24T19:30:00.000Z"
+    },
+    {
+     "ticker": "KXNCAAFGAME-26OCT23MOHCMU-MOH",
+     "side": "yes",
+     "label": "Miami (OH)",
+     "game": "Miami (OH) vs Central Michigan",
+     "starts_at": "2026-10-24T17:00:00.000Z"
+    },
+    {
+     "ticker": "KXNCAAFTOTAL-26OCT24USUTXST-61",
+     "side": "no",
+     "label": "Under 60.5",
+     "game": "Utah St. vs Texas St.",
+     "starts_at": "2026-10-24T23:30:00.000Z"
+    },
+    {
+     "ticker": "KXNCAAFTOTAL-26OCT24HOUUTAH-58",
+     "side": "no",
+     "label": "Under 57.5",
+     "game": "Houston vs Utah",
+     "starts_at": "2026-10-25T02:15:00.000Z"
+    },
+    {
+     "ticker": "KXNCAAFGAME-26OCT24NDSUUNM-UNM",
+     "side": "yes",
+     "label": "New Mexico",
+     "game": "North Dakota St. vs New Mexico",
+     "starts_at": "2026-10-25T02:00:00.000Z"
+    },
+    {
+     "ticker": "KXNCAAFGAME-26OCT23OKLAMSST-OKLA",
+     "side": "yes",
+     "label": "Oklahoma",
+     "game": "Oklahoma vs Mississippi St.",
+     "starts_at": "2026-10-24T19:30:00.000Z"
+    },
+    {
+     "ticker": "KXNCAAFTOTAL-26OCT24KSUASU-52",
+     "side": "no",
+     "label": "Under 51.5",
+     "game": "Kansas St. vs Arizona St.",
+     "starts_at": "2026-10-24T19:45:00.000Z"
+    },
+    {
+     "ticker": "KXNCAAFGAME-26OCT24GASTARST-GAST",
+     "side": "yes",
+     "label": "Georgia St.",
+     "game": "Georgia St. vs Arkansas St.",
+     "starts_at": "2026-10-24T23:00:00.000Z"
+    }
+   ]
+  },
+  {
+   "id": "8438abf8-0de5-44fd-a2b9-05597bffcf57",
+   "label": "Arizona State Sun Devils +1.5 + Ole Miss Rebels ML",
+   "starts_at": "2026-10-24T19:45:00+00:00",
+   "leg_keys": [
+    "KXNCAAFGAME-26OCT24MISSTEX-MISS:yes",
+    "KXNCAAFSPREAD-26OCT24KSUASU-KSU2:no"
+   ],
+   "legs": [
+    {
+     "ticker": "KXNCAAFSPREAD-26OCT24KSUASU-KSU2",
+     "side": "no",
+     "label": "Arizona St. +1.5",
+     "game": "Kansas St. vs Arizona St.",
+     "starts_at": "2026-10-24T19:45:00.000Z"
+    },
+    {
+     "ticker": "KXNCAAFGAME-26OCT24MISSTEX-MISS",
+     "side": "yes",
+     "label": "Ole Miss",
+     "game": "Ole Miss vs Texas",
+     "starts_at": "2026-10-24T23:30:00.000Z"
+    }
+   ]
+  },
+  {
+   "id": "f155d66e-b38e-44dd-80b2-5c06a4065868",
+   "label": "Arizona State Sun Devils ML + UTSA Roadrunners ML + Ole Miss Rebels ML",
+   "starts_at": "2026-10-24T19:45:00+00:00",
+   "leg_keys": [
+    "KXNCAAFGAME-26OCT23KSUASU-ASU:yes",
+    "KXNCAAFGAME-26OCT23UTSATULN-UTSA:yes",
+    "KXNCAAFGAME-26OCT24MISSTEX-MISS:yes"
+   ],
+   "legs": [
+    {
+     "ticker": "KXNCAAFGAME-26OCT23KSUASU-ASU",
+     "side": "yes",
+     "label": "Arizona St.",
+     "game": "Kansas St. vs Arizona St.",
+     "starts_at": "2026-10-24T19:45:00.000Z"
+    },
+    {
+     "ticker": "KXNCAAFGAME-26OCT23UTSATULN-UTSA",
+     "side": "yes",
+     "label": "UTSA",
+     "game": "UTSA vs Tulane",
+     "starts_at": "2026-10-25T00:00:00.000Z"
+    },
+    {
+     "ticker": "KXNCAAFGAME-26OCT24MISSTEX-MISS",
+     "side": "yes",
+     "label": "Ole Miss",
+     "game": "Ole Miss vs Texas",
+     "starts_at": "2026-10-24T23:30:00.000Z"
+    }
+   ]
+  },
+  {
+   "id": "6fcec435-552b-4620-bed3-c28b2ee90957",
+   "label": "New York Knicks ML + Los Angeles Lakers ML + Sacramento Kings/San Antonio Spurs u232.5",
+   "starts_at": "2026-10-28T00:00:00+00:00",
+   "leg_keys": [
+    "KXNBAGAME-26OCT27DETNYK-NYK:yes",
+    "KXNBAGAME-26OCT27PORLAL-LAL:yes",
+    "KXNBATOTAL-26OCT27SACSAS-233:no"
+   ],
+   "legs": [
+    {
+     "ticker": "KXNBAGAME-26OCT27DETNYK-NYK",
+     "side": "yes",
+     "label": "New York",
+     "game": "Detroit vs New York",
+     "starts_at": "2026-10-28T00:00:00.000Z"
+    },
+    {
+     "ticker": "KXNBAGAME-26OCT27PORLAL-LAL",
+     "side": "yes",
+     "label": "Los Angeles L",
+     "game": "Portland vs Los Angeles L",
+     "starts_at": "2026-10-28T03:00:00.000Z"
+    },
+    {
+     "ticker": "KXNBATOTAL-26OCT27SACSAS-233",
+     "side": "no",
+     "label": "Under 232.5",
+     "game": "Sacramento vs San Antonio",
+     "starts_at": "2026-10-28T00:00:00.000Z"
+    }
+   ]
+  },
+  {
+   "id": "e1a486d4-22b8-4f72-a5ec-4b841002cc3f",
+   "label": "Boston Celtics -12.5 + San Antonio Spurs -18.5 + Detroit Pistons ML",
+   "starts_at": "2026-10-27T23:30:00+00:00",
+   "leg_keys": [
+    "KXNBAGAME-26OCT27DETNYK-DET:yes",
+    "KXNBASPREAD-26OCT27BKNBOS-BOS13:yes",
+    "KXNBASPREAD-26OCT27SACSAS-SAS19:yes"
+   ],
+   "legs": [
+    {
+     "ticker": "KXNBASPREAD-26OCT27BKNBOS-BOS13",
+     "side": "yes",
+     "label": "Boston −12.5",
+     "game": "Brooklyn vs Boston",
+     "starts_at": "2026-10-27T23:30:00.000Z"
+    },
+    {
+     "ticker": "KXNBASPREAD-26OCT27SACSAS-SAS19",
+     "side": "yes",
+     "label": "San Antonio −18.5",
+     "game": "Sacramento vs San Antonio",
+     "starts_at": "2026-10-28T00:00:00.000Z"
+    },
+    {
+     "ticker": "KXNBAGAME-26OCT27DETNYK-DET",
+     "side": "yes",
+     "label": "Detroit",
+     "game": "Detroit vs New York",
+     "starts_at": "2026-10-28T00:00:00.000Z"
+    }
+   ]
+  }
+ ]
+}
