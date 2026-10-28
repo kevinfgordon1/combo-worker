@@ -18,7 +18,7 @@ const { createLimiter } = require('./limiter');
   // shipped sniper.toml stays inside the split
   const toml = fs.readFileSync(path.join(__dirname, '..', 'fly', 'sniper.toml'), 'utf8');
   const env = {}; for (const m of toml.matchAll(/^\s*([A-Z0-9_]+)\s*=\s*"([^"]*)"/gm)) env[m[1]] = m[2];
-  x = b(env); assert.strictEqual(x.rps, 6); assert.strictEqual(x.clamped, false); assert.ok(x.rps + x.reserved <= 15);
+  x = b(env); assert.strictEqual(x.rps, 45); assert.strictEqual(x.on429, 20); assert.strictEqual(x.clamped, false); assert.ok(x.rps + x.reserved <= x.account);
   // limiter steps down after a 429 and keeps urgent-cancel priority
   let t = 0; const lim = createLimiter({ name: 'k', ratePerSec: 6, ratePerSecOn429: 4, burst: 1, now: () => t, sleep: async (ms) => { t += ms; } });
   await assert.rejects(lim.run(async () => ({ status: 429 })), /429/);
