@@ -25,7 +25,7 @@ function createLiveSniper({
   config, trader, store, coord, caps, reprice, alert = () => {}, log = console.log,
   now = () => Date.now(), ttlMs = RESERVE_TTL_MS, fillRetries = 4, fillRetryMs = 1500,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)), onHalt = () => {},
-  onHold = () => {}, startedReason = () => null, kickoffOf = () => null, onFilled = () => {}, pullConcurrency = 4, pullGuard = true, // onFilled: book-arb check (alert-only) // kickoffOf: ticker -> kickoff ms (fill alert); startedReason: (rfq) -> 'game_started' | 'no_kickoff' | null (rule 9)
+  onHold = () => {}, startedReason = () => null, kickoffOf = () => null, onFilled = () => {}, pullConcurrency = 4, pullGuard = true, requoteMemo = null, // requoteMemo: sniper/send-window createRequoteMemo (same-price re-quote skip) // onFilled: book-arb check (alert-only) // kickoffOf: ticker -> kickoff ms (fill alert); startedReason: (rfq) -> 'game_started' | 'no_kickoff' | null (rule 9)
 } = {}) {
   const pending = new Map(); // quoteId -> { d, rfq, accepted, timer }
   const byRfq = new Map(); // rfqId -> quoteId
@@ -42,7 +42,10 @@ function createLiveSniper({
     if (closed.size > CLOSED_MAX) { for (const [k, v] of closed) { if (closed.size <= CLOSED_MAX && t - v < CLOSED_KEEP_MS) break; closed.delete(k); } }
   };
   const isClosed = (rfqId) => { const t = closed.get(rfqId); if (t == null) return false; if (now() - t > CLOSED_KEEP_MS) { closed.delete(rfqId); return false; } return true; };
-  const stats = { cancelSkipped: 0, posted: 0, postFail: 0, staleDrop: 0, postFailBy: {}, postMs: [], preMs: [], cwMs: [], accepted: 0, confirmed: 0, declined: {}, fills: 0, cancelled: 0, settled: 0, aborted: {} };
+  const stats = { cancelSkipped: 0, posted: 0, postFail: 0, staleDrop: 0, postFailBy: {}, postMs: [], preMs: [], cwMs: [], sendMs: [], accepted: 0, confirmed: 0, declined: {}, fills: 0, cancelled: 0, settled: 0, aborted: {}, droppedExpired: 0, droppedLowPriority: 0 };
+  // Send latency = RFQ age (Kalshi created_ts, via the receive-time age) when our POST returned.
+  const sendAgeMs = (rfq) => (rfq && rfq.recvAt ? now() - rfq.recvAt + (Number(rfq.recvAge) || 0) : null);
+  const pushSend = (ms) => { if (Number.isFinite(ms)) { stats.sendMs.push(ms); if (stats.sendMs.length > 500) stats.sendMs.shift(); } };
   let halted = false;
   let haltReason = null; let haltDay = null;
   const etDayKey = (ms) => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
@@ -85,13 +88,17 @@ function createLiveSniper({
       bg(store.release(d.rfqId, 'failed', {}));
       const k = postFailKey(err); bump(stats.postFailBy, k);
       if (k.startsWith('stale_drop')) stats.staleDrop += 1; else stats.postFail += 1;
-      log(`[SNIPER] quote POST failed rfq=${rfq.rfqId} kind=${k} ms=${postMs} pre=${tPost - tSend}: ${String(err.message || err).slice(0, 400)}`);
+      if (k === 'stale_drop:expired') stats.droppedExpired += 1;
+      else if (k === 'stale_drop:low_priority') stats.droppedLowPriority += 1;
+      // Deadline drops are routine under load (counted + summarized each minute); log the rest.
+      if (k !== 'stale_drop:expired' && k !== 'stale_drop:low_priority') log(`[SNIPER] quote POST failed rfq=${rfq.rfqId} kind=${k} ms=${postMs} pre=${tPost - tSend}: ${String(err.message || err).slice(0, 400)}`);
       return { sent: false, reason: k.startsWith('stale_drop') ? 'post_stale_drop' : 'post_failed' };
     }
     inflight.delete(rfq.rfqId);
     stats.postMs.push(now() - tPost); if (stats.postMs.length > 200) stats.postMs.shift();
     if (!res.quoteId) { await store.release(d.rfqId, 'failed', {}); return { sent: false, reason: 'no_quote_id' }; }
-    stats.posted += 1;
+    stats.posted += 1; pushSend(sendAgeMs(rfq));
+    if (requoteMemo) requoteMemo.note(d, res.noBid);
     await store.update(d.rfqId, { phase: 'quoted', quote_id: res.quoteId, no_bid: res.noBid });
     if (isClosed(rfq.rfqId)) {
       // RFQ closed while our POST was in flight: the quote died with it. No TTL timer, no cancel.
@@ -278,7 +285,8 @@ function createLiveSniper({
     await mapLimit(todo, 8, ([qid]) => dropQuote(qid, 'cancelled', 'shutdown'));
     return todo.length;
   }
-  return { shutdown, stopping: () => stopping, send, abortRfq, hasRfqId: (id) => byRfq.has(id) || inflight.has(id) || ttlCancelling.has(id), forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); for (const id of inflight) cb(id); for (const id of ttlCancelling) cb(id); }, isClosed, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, postMs: undefined, preMs: undefined, cwMs: undefined, cwP50: (() => { const b = [...stats.cwMs].sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : null; })(), preP50: (() => { const b = [...stats.preMs].sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : null; })(), postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
+  const pct = (arr, q) => { if (!arr.length) return null; const b = [...arr].sort((x, y) => x - y); return Math.round(b[Math.min(b.length - 1, Math.floor(b.length * q))]); };
+  return { sendLatency: () => ({ n: stats.sendMs.length, p50: pct(stats.sendMs, 0.5), p90: pct(stats.sendMs, 0.9) }), shutdown, stopping: () => stopping, send, abortRfq, hasRfqId: (id) => byRfq.has(id) || inflight.has(id) || ttlCancelling.has(id), forEachRfqId: (cb) => { for (const id of byRfq.keys()) cb(id); for (const id of inflight) cb(id); for (const id of ttlCancelling) cb(id); }, isClosed, onAccepted, onExecuted, onRfqClosed, settleOnce, halt, resumeIfNewDay, pullStarted, haltReason: () => haltReason, halted: () => halted, pending, stats: () => { const a = [...stats.postMs].sort((x, y) => x - y); return { ...stats, postFailBy: { ...stats.postFailBy }, postMs: undefined, preMs: undefined, cwMs: undefined, sendMs: undefined, sendP50: pct(stats.sendMs, 0.5), sendP90: pct(stats.sendMs, 0.9), cwP50: (() => { const b = [...stats.cwMs].sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : null; })(), preP50: (() => { const b = [...stats.preMs].sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : null; })(), postP50: a.length ? a[Math.floor(a.length / 2)] : null, postP90: a.length ? a[Math.floor(a.length * 0.9)] : null, pending: pending.size }; }, _minQuotePrice: minQuotePrice };
 }
 
 module.exports = { createLiveSniper, postFailKey };

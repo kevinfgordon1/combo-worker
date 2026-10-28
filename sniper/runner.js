@@ -26,6 +26,8 @@ const { createSeriesFeeCache, seriesOfTicker } = require('../series-fee');
 const { sniperConfig, createSniperLedger, formatDecision, createTelegramNotifier } = require('../auto-sniper');
 const { createLimiter, createRateBreaker } = require('./limiter');
 const { sniperKalshiTradeBudget } = require('./kalshi-budget');
+const { sendWindowConfig, lowValueWhenBusy, createRequoteMemo } = require('./send-window');
+const { noBidFor } = require('./trader');
 const { fetchWithTimeout } = require('./fetch-timeout');
 const { createStaleAlert } = require('./stale-alert');
 const { createLedgerStore } = require('./ledger-store');
@@ -459,10 +461,17 @@ async function main(env = process.env) {
   }
   const coord = createLockCoord({ supabase, log });
   coord.start();
+  // Send-queue deadline (sniper/send-window.js): SNIPER_QUOTE_WINDOW_MS (default 3000),
+  // SNIPER_QUOTE_SAFETY_MS (250), SNIPER_SEND_DEADLINE=0 turns the new queue behaviour off.
+  const sendWin = sendWindowConfig(env);
+  log(`[SNIPER] send deadline ${sendWin.enabled ? 'on' : 'off'} window=${sendWin.windowMs}ms safety=${sendWin.safetyMs}ms busyFrac=${sendWin.busyFrac} busyMaxLegs=${sendWin.busyMaxLegs} busyMinEv=$${sendWin.busyMinEv} requote=${sendWin.requoteMs}ms`);
+  const requoteMemo = sendWin.enabled && sendWin.requoteMs > 0 ? createRequoteMemo({ windowMs: sendWin.requoteMs }) : null;
+  const sendq = { droppedExpired: 0, droppedLowPriority: 0, requoteSkipped: 0 }; // cumulative, pre-reserve
   const trader = createSniperTrader({
     gate, keyId: env.SNIPER_KALSHI_KEY_ID, pem: normalizePem(env.SNIPER_KALSHI_PRIVATE_KEY || ''),
     subaccount: sniperSubaccount(env), limiter: lim.kalshiTrade, readLimiter: lim.kalshiTradeRead, log,
-    maxConcurrent: num(env.SNIPER_QUOTE_CONCURRENCY, 8), maxQueued: num(env.SNIPER_QUOTE_MAX_QUEUED, 24),
+    maxConcurrent: num(env.SNIPER_QUOTE_CONCURRENCY, 8), maxQueued: num(env.SNIPER_QUOTE_MAX_QUEUED, sendWin.enabled ? 200 : 24),
+    sendWindow: sendWin.enabled ? sendWin : null,
   });
   // Kevin Oct 26: parlays settling within soonHours may use the sniper's live cash as total cap.
   const soonCap = createSoonCap({ totalCap: config.totalExposureCap, hours: config.soonHours, enabled: !!config.soonCap && sniperSubaccount(env) >= 1, fetchBalanceUsd: () => trader.subBalanceUsd(), log });
@@ -488,7 +497,7 @@ async function main(env = process.env) {
   });
   if (bookArb && gate.live) loop(() => bookArb.recheckOpen(), 'book_arb', num(env.SNIPER_BOOK_ARB_POLL_MS, 300000));
   const liveSniper = createLiveSniper({
-    config, trader, store: liveStore, coord, caps, log, onHold, ttlMs: quoteTtlMs,
+    config, trader, store: liveStore, coord, caps, log, onHold, ttlMs: quoteTtlMs, requoteMemo,
     pullConcurrency: Math.max(1, num(env.SNIPER_PULL_CONCURRENCY, 4)), pullGuard: String(env.SNIPER_PULL_GUARD || '1') !== '0',
     reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook, ncaaf: !!ncaafBook }),
     alert,
@@ -543,7 +552,7 @@ async function main(env = process.env) {
   const lat = createLatencyStats();
   createLoopLagSampler((ms) => lat.loopLag(ms));
   // Recent DB-reserve time (EWMA, ms) for the expiry gate; deadline = quote-sender's rfq_age drop.
-  const postDeadlineMs = num(env.SNIPER_POST_DEADLINE_MS, 3000);
+  const postDeadlineMs = sendWin.enabled ? sendWin.windowMs - sendWin.safetyMs : num(env.SNIPER_POST_DEADLINE_MS, 3000);
   // Decays back toward the 250ms baseline (half-life 5s) when no reserves are happening, so a slow
   // burst can never block every RFQ forever (the estimate only updates on reserves that ran).
   const reserveEst = (() => { const base = 250; let v = base; let at = Date.now();
@@ -618,9 +627,31 @@ async function main(env = process.env) {
         counts.skips.cant_make_expiry = (counts.skips.cant_make_expiry || 0) + 1; return;
       }
     }
+    // Send-queue deadline (Oct 27 2026): admit only RFQs whose POST can land inside the window given
+    // their EV-priority position in the send queue at quote sends/s; drop the rest now (no DB lock,
+    // no queue slot). Per RFQ, not a lockout: as the queue drains, fresh RFQs are admitted again.
+    if (gate.live && !config.dryRun && sendWin.enabled) {
+      const prio = Number.isFinite(d.ev) ? d.ev : 0;
+      const noBid = noBidFor(d.quoteYes, config.tick);
+      if (requoteMemo && requoteMemo.isRepeat(d, noBid)) {
+        ledger.positions.delete(d.rfqId); ledger.hour.pop(); sendq.requoteSkipped += 1;
+        counts.skips.requote_same_price = (counts.skips.requote_same_price || 0) + 1; return;
+      }
+      const qs = trader.queueState();
+      if (lowValueWhenBusy(d, qs, sendWin)) {
+        ledger.positions.delete(d.rfqId); ledger.hour.pop(); sendq.droppedLowPriority += 1;
+        counts.skips.dropped_low_priority = (counts.skips.dropped_low_priority || 0) + 1; return;
+      }
+      const adm = trader.admission(rfq, prio);
+      // + the DB reserve that still runs before the POST.
+      if (!adm.ok || (adm.projectedMs != null && adm.projectedMs + reserveEst.get() + sendWin.safetyMs > sendWin.windowMs)) {
+        ledger.positions.delete(d.rfqId); ledger.hour.pop(); sendq.droppedExpired += 1;
+        counts.skips.dropped_expired = (counts.skips.dropped_expired || 0) + 1; return;
+      }
+    }
     // Back-pressure (v49 regression): with the reserve off the hot path nothing throttled intake, so
     // the background reserve queue and the quote-sender queue grew until every POST aged out.
-    if (gate.live && !config.dryRun) {
+    if (gate.live && !config.dryRun && !sendWin.enabled) {
       if (wbStore && wbStore.backlog() > wbMaxBacklog) { ledger.positions.delete(d.rfqId); ledger.hour.pop(); counts.skips.wb_backlog = (counts.skips.wb_backlog || 0) + 1; return; }
       const age = rfqAgeMs(rfq.createdTs, signedNow());
       const ts = trader.stats();
@@ -773,8 +804,10 @@ async function main(env = process.env) {
     const latency = lat.snapshot();
     if (wsWorker) wsWorker.takeThroughputAsync().then((v) => { wsThroughputLast = v ? { ...v, worker: wsWorker.stats() } : null; }).catch(() => {});
     const wsThroughput = () => { if (wsWorker) return wsThroughputLast; try { if (!ws || typeof ws.takeThroughput !== 'function') return null; const t = summarizeThroughput(ws.takeThroughput()); delete t.perShard; return t; } catch (_) { return null; } };
+    { const ls = liveSniper.stats(); const ss = trader.senderStats(); const qs = trader.queueState();
+      log(`[SNIPER] sendq window=${sendWin.windowMs}ms dropped_expired=${sendq.droppedExpired + (ls.droppedExpired || 0)} (pre_reserve=${sendq.droppedExpired} queue=${ls.droppedExpired || 0}) dropped_low_priority=${sendq.droppedLowPriority + (ls.droppedLowPriority || 0)} requote_skipped=${sendq.requoteSkipped} send_p50=${ls.sendP50 == null ? 'n/a' : ls.sendP50}ms send_p90=${ls.sendP90 == null ? 'n/a' : ls.sendP90}ms post_est=${Math.round(trader.postEstMs())}ms rps=${trader.quoteRps()} queued=${qs.queued}/${qs.capacity} active=${qs.active} sender=${JSON.stringify(ss)}`); }
     log(`[SNIPER] latency ${JSON.stringify(latency)} wb=${wbStore ? JSON.stringify(wbStore.wbStats()) : "off"} batch=${batchStore ? JSON.stringify(batchStore.batchStats()) : "off"} dbb=${JSON.stringify(dbBreaker.stats())} ws=${JSON.stringify(wsThroughput())}`);
-    decisionStore.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts: JSON.parse(JSON.stringify(counts)), live: liveSniper.stats(), reserveEstMs: Math.round(reserveEst.get()), caps: effectiveCaps, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
+    decisionStore.decision({ rfq_id: null, action: 'summary', reason: null, details: { latency, mode: gate.live ? 'live' : 'dry', halted: liveSniper.halted(), haltReason: liveSniper.haltReason(), kickoffs: kickoffs.stats(), disabled, counts: JSON.parse(JSON.stringify(counts)), sendq: { ...sendq, windowMs: sendWin.windowMs, enabled: sendWin.enabled, postEstMs: Math.round(trader.postEstMs()), ...trader.queueState(), sender: trader.senderStats() }, live: liveSniper.stats(), reserveEstMs: Math.round(reserveEst.get()), caps: effectiveCaps, open: t.total, load: Object.values(lim).map((l) => l.stats()) } });
     counts.rfqs = 0; counts.quotes = 0; counts.skips = {};
   }, 60000);
   setInterval(() => {

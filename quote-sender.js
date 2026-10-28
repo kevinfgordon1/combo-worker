@@ -47,16 +47,54 @@ function createQuoteSender({
   // Optional: bound the queue. When full, the lowest-priority waiting send is dropped right away
   // (reason=queue_full) instead of aging out after maxQueueMs and wasting the wait.
   maxQueued = Infinity,
+  // Opt-in hard per-RFQ deadline (sniper, Oct 27 2026; combo-worker leaves this off):
+  //   { windowMs, safetyMs, rps: () => quote sends/s, postEstMs: () => ms, aheadExtra: () => n }
+  // A send is admitted only if  age + (ahead / rps) + postEst + safety <= windowMs, where `ahead`
+  // is its position in the priority queue + sends already in flight + higher-lane limiter waiters.
+  // Otherwise it is rejected at arrival (reason=expired) instead of queued. The same test runs
+  // again at dequeue, and fn() gets ctx.abortIf so the token wait can give up too. The queue is
+  // bounded to what rps can clear inside the window; past that the lowest-EV send is dropped
+  // (reason=low_priority). Admission is per send, so capacity frees up as the queue drains.
+  deadline = null,
 } = {}) {
   let active = 0;
   const queue = [];
   const inflightRfqs = new Set();
-  const stats = { sent: 0, staleAge: 0, staleQueue: 0, dup: 0, queueFull: 0 };
+  const stats = { sent: 0, staleAge: 0, staleQueue: 0, dup: 0, queueFull: 0, expired: 0, expiredAtArrival: 0, expiredAtDequeue: 0, lowPriority: 0 };
+  const dl = deadline && Number(deadline.windowMs) > 0 ? deadline : null;
+  const fnum = (f, d) => { const v = typeof f === 'function' ? f() : f; return Number.isFinite(Number(v)) && v != null ? Number(v) : d; };
+  const dlRps = () => Math.max(0.1, fnum(dl.rps, 1));
+  const dlPost = () => Math.max(0, fnum(dl.postEstMs, 150));
+  const dlSafety = () => Math.max(0, fnum(dl.safetyMs, 0));
+  const dlExtra = () => Math.max(0, fnum(dl.aheadExtra, 0));
+  // Max queued sends that rps can still put on the wire inside the window.
+  function capacity() {
+    if (!dl) return maxQueued;
+    const budget = dl.windowMs - dlSafety() - dlPost();
+    const cap = Math.max(1, Math.floor((dlRps() * Math.max(0, budget)) / 1000));
+    return Math.min(maxQueued, cap);
+  }
+  // Projected RFQ age when this send's POST lands, given `ahead` sends in front of it.
+  function projectedMs(createdTs, ahead) {
+    const age = rfqAgeMs(createdTs, serverNow());
+    if (age == null) return null;
+    return age + (Math.max(0, ahead) / dlRps()) * 1000 + dlPost();
+  }
+  const late = (p) => p != null && p + dlSafety() > dl.windowMs;
+  function admission(createdTs, priority = 0) {
+    let i = queue.length;
+    while (i > 0 && queue[i - 1].priority < priority) i -= 1;
+    const ahead = i + active + (dl ? dlExtra() : 0);
+    const projected = dl ? projectedMs(createdTs, ahead) : null;
+    return { ok: !dl || !late(projected), projectedMs: projected, ahead, position: i, capacity: capacity() };
+  }
 
   function drop(item, reason, extra) {
     if (reason === 'rfq_age') stats.staleAge += 1;
     else if (reason === 'queue_wait') stats.staleQueue += 1;
     else if (reason === 'queue_full') stats.queueFull += 1;
+    else if (reason === 'low_priority') stats.lowPriority += 1;
+    else if (reason === 'expired') stats.expired += 1;
     log(`STALE_DROP reason=${reason} rfq=${item.rfqId}${extra ? ' ' + extra : ''}`);
     item.reject(staleError(reason, extra));
   }
@@ -71,7 +109,14 @@ function createQuoteSender({
         continue;
       }
       const age = rfqAgeMs(item.createdTs, serverNow());
-      if (age != null && age > maxRfqAgeMs) {
+      if (dl) {
+        const p = age == null ? null : age + dlPost();
+        if (late(p)) {
+          inflightRfqs.delete(item.rfqId); stats.expiredAtDequeue += 1;
+          drop(item, 'expired', `age=${Math.round(age)}ms at=dequeue`);
+          continue;
+        }
+      } else if (age != null && age > maxRfqAgeMs) {
         inflightRfqs.delete(item.rfqId);
         drop(item, 'rfq_age', `age=${Math.round(age)}ms`);
         continue;
@@ -79,7 +124,12 @@ function createQuoteSender({
       active += 1;
       stats.sent += 1;
       Promise.resolve()
-        .then(() => item.fn({ queueMs: waited, rfqAgeMs: age }))
+        .then(() => item.fn({
+          queueMs: waited, rfqAgeMs: age,
+          // Deadline mode: true once the POST could no longer land inside the window (checked
+          // while it waits for a rate-limit token). Never true without a deadline.
+          abortIf: dl ? () => { const a = rfqAgeMs(item.createdTs, serverNow()); return a != null && late(a + dlPost()); } : null,
+        }))
         .then(item.resolve, item.reject)
         .finally(() => {
           active -= 1;
@@ -100,14 +150,23 @@ function createQuoteSender({
         reject(staleError('duplicate'));
         return;
       }
+      if (dl) {
+        const a = admission(createdTs, priority);
+        if (!a.ok) {
+          stats.expiredAtArrival += 1;
+          drop(item, 'expired', `projected=${Math.round(a.projectedMs)}ms ahead=${a.ahead} at=arrival`);
+          return;
+        }
+      }
       if (rfqId) inflightRfqs.add(rfqId);
       let i = queue.length;
       while (i > 0 && queue[i - 1].priority < priority) i -= 1;
       queue.splice(i, 0, item);
-      if (queue.length > maxQueued) {
+      const cap = capacity();
+      if (queue.length > cap) {
         const victim = queue.pop(); // lowest priority, newest among equals
         inflightRfqs.delete(victim.rfqId);
-        drop(victim, 'queue_full', `queued=${queue.length + 1}`);
+        drop(victim, dl ? 'low_priority' : 'queue_full', `queued=${queue.length + 1} cap=${cap}`);
       }
       pump();
     });
@@ -115,9 +174,11 @@ function createQuoteSender({
 
   return {
     send,
+    admission,
+    capacity,
     get active() { return active; },
     get queued() { return queue.length; },
-    stats() { return { ...stats, active, queued: queue.length }; },
+    stats() { return { ...stats, active, queued: queue.length, capacity: capacity() }; },
   };
 }
 

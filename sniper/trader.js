@@ -12,6 +12,7 @@ const { parseSubBalanceUsd } = require('./soon-cap');
 const { signedRequest, signedNow } = require('../kalshi-auth');
 const { createKalshiRestPair, QUOTE_TIMEOUT_MS } = require('../kalshi-http');
 const { createQuoteSender, rfqAgeMs, DEFAULT_MAX_RFQ_AGE_MS } = require('../quote-sender');
+const { createPostEstimator } = require('./send-window');
 const { buildQuoteBody, quoteYesBid, YES_DECLINE } = require('../engine');
 const { fillsQuery, fillReferencesOrder, bookFromQuoteExecution } = require('../kalshi-fill-confirm');
 
@@ -31,14 +32,29 @@ const sizeSource = (rfq) => (Number(rfq && rfq.contracts) > 0 ? 'contracts' : 'd
 
 class LiveGateClosed extends Error { constructor(op) { super(`LIVE_GATE_CLOSED ${op}`); this.liveGateClosed = true; } }
 
-function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = null, readLimiter = null, request = null, log = console.log, maxConcurrent = 8, maxQueued = 24 } = {}) {
+// sendWindow (sniper/send-window.js sendWindowConfig): hard per-RFQ deadline on the quote queue.
+// Quote sends/s for the estimate = the trade limiter's rate minus the routine-cancel share; sends
+// waiting in the urgent lane (risk-reducing cancels) count as ahead of every quote.
+function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = null, readLimiter = null, request = null, log = console.log, maxConcurrent = 8, maxQueued = 24, sendWindow = null, now = () => Date.now(), serverNow = () => signedNow() } = {}) {
   const live = !!(gate && gate.live);
   let pair = null;
   const pools = () => { if (!pair) pair = createKalshiRestPair(); return pair; };
-  const sender = createQuoteSender({ maxConcurrent, maxQueued, serverNow: () => signedNow(), log: (m) => log(`[SNIPER] ${m}`) });
+  const win = sendWindow && sendWindow.enabled !== false && sendWindow.windowMs > 0 ? sendWindow : null;
+  const postEst = createPostEstimator({ minMs: win ? win.postEstMinMs : 60, maxMs: win ? win.postEstMaxMs : 1000 });
+  const quoteRps = () => {
+    if (!limiter || typeof limiter.rate !== 'function') return 6;
+    const share = typeof limiter.lowShareRps === 'function' ? limiter.lowShareRps() : 0;
+    return Math.max(0.5, limiter.rate() - share);
+  };
+  const deadline = win ? {
+    windowMs: win.windowMs, safetyMs: win.safetyMs, rps: quoteRps, postEstMs: () => postEst.get(),
+    aheadExtra: () => (limiter && typeof limiter.waitingAt === 'function' ? limiter.waitingAt(2) : 0),
+  } : null;
+  const sender = createQuoteSender({ maxConcurrent, maxQueued, serverNow, now, deadline, log: (m) => log(`[SNIPER] ${m}`) });
+  const maxAge = win ? win.windowMs : DEFAULT_MAX_RFQ_AGE_MS;
   const stats = { posts: 0, confirms: 0, cancels: 0, cancelsSkipped: 0, fillReads: 0, refused: 0 };
 
-  async function raw(method, signPath, { path, body, quote = false, timeoutMs, shouldRetryExpired, low = false, priority, abortIf = null, lim = limiter } = {}) {
+  async function raw(method, signPath, { path, body, quote = false, timeoutMs, shouldRetryExpired, low = false, priority, abortIf = null, lim = limiter, onWireMs = null } = {}) {
     const doReq = request || (async ({ method: m, path: p, headers, body: b }) => {
       const http = quote ? pools().quote : pools().rest;
       const req = { method: m, path: p, headers };
@@ -51,7 +67,8 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
       keyId, pem, method, signPath, path, body, shouldRetryExpired,
       headers: body != null ? { 'Content-Type': 'application/json' } : undefined,
     });
-    const res = lim ? await lim.run(async () => { const r = await go(); return { ...r, ok: r.statusCode !== 429, status: r.statusCode }; }, { low, priority, abortIf }) : await go();
+    const timed = async () => { const t0 = now(); try { return await go(); } finally { if (onWireMs) onWireMs(now() - t0); } };
+    const res = lim ? await lim.run(async () => { const r = await timed(); return { ...r, ok: r.statusCode !== 429, status: r.statusCode }; }, { low, priority, abortIf }) : await timed();
     return res;
   }
   function mustBeLive(op) { if (!live) { stats.refused += 1; throw new LiveGateClosed(op); } }
@@ -62,10 +79,20 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
     const noBid = noBidFor(quoteYes, tick);
     const yesBid = quoteYesBid(sizeSource(rfq), noBid);
     const body = JSON.stringify({ ...buildQuoteBody(rfq.rfqId, noBid, yesBid, false), subaccount });
-    const { statusCode, text } = await sender.send(rfq.rfqId, rfq.createdTs, () => raw('POST', QUOTE_PATH, {
+    const r = await sender.send(rfq.rfqId, rfq.createdTs, (ctx) => raw('POST', QUOTE_PATH, {
       body, quote: true, timeoutMs: QUOTE_TIMEOUT_MS,
-      shouldRetryExpired: () => { const a = rfqAgeMs(rfq.createdTs, signedNow()); return a == null || a <= DEFAULT_MAX_RFQ_AGE_MS; },
+      shouldRetryExpired: () => { const a = rfqAgeMs(rfq.createdTs, serverNow()); return a == null || a <= maxAge; },
+      // Deadline mode: give up the token wait once the POST can't land inside the window.
+      abortIf: ctx && ctx.abortIf ? ctx.abortIf : null,
+      onWireMs: (ms) => postEst.add(ms),
     }), { priority });
+    if (r && r.aborted) {
+      stats.expiredAtToken = (stats.expiredAtToken || 0) + 1;
+      const a = rfqAgeMs(rfq.createdTs, serverNow());
+      log(`[SNIPER] STALE_DROP reason=expired rfq=${rfq.rfqId} age=${a == null ? '?' : Math.round(a)}ms at=token`);
+      const e = new Error(`STALE_DROP expired at=token`); e.staleDrop = true; e.staleReason = 'expired'; throw e;
+    }
+    const { statusCode, text } = r;
     stats.posts += 1;
     if (statusCode < 200 || statusCode >= 300) throw new Error(`Kalshi quote failed ${statusCode}: ${text}`);
     const j = JSON.parse(text || '{}');
@@ -114,7 +141,18 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
     if (!res || res.statusCode !== 200) throw new Error(`subaccount balance read ${res && res.statusCode}`);
     return parseSubBalanceUsd(JSON.parse(res.text || '{}'), subaccount);
   }
-  return { live, postQuote, confirm, cancel, fillsForOrder, subBalanceUsd, stats: () => ({ ...stats, queued: sender.queued, active: sender.active }) };
+  // Pre-reserve admission (runner): would a quote with this priority land inside the window?
+  function admission(rfq, priority = 0) {
+    if (!win) return { ok: true, projectedMs: null, ahead: 0, capacity: Infinity };
+    return sender.admission(rfq && rfq.createdTs, priority);
+  }
+  const queueState = () => ({ queued: sender.queued, active: sender.active, capacity: typeof sender.capacity === 'function' ? sender.capacity() : Infinity });
+  return {
+    live, postQuote, confirm, cancel, fillsForOrder, subBalanceUsd, admission, queueState,
+    postEstMs: () => postEst.get(), quoteRps, sendWindow: win,
+    senderStats: () => (typeof sender.stats === 'function' ? sender.stats() : {}),
+    stats: () => ({ ...stats, queued: sender.queued, active: sender.active }),
+  };
 }
 
 module.exports = { createSniperTrader, noBidFor, sizeSource, LiveGateClosed, YES_DECLINE };
