@@ -53,14 +53,14 @@ assert.strictEqual(ev({ id: 'c2', qtyDecimal: '100' }, { outstanding: 30 }).reas
 // exactly equal to remaining still quotes
 assert.strictEqual(ev({ id: 'c3', qtyDecimal: '86' }, { filledSoFar: 30 }).action, 'quoteable');
 
-// cash RFQ edge: $200 at 0.222 -> floor(200/0.222)=900 contracts > cap -> declined, never clipped
+// cash RFQ edge: $200 at 0.222 -> ~837 contracts after the taker fee (floor said 900) > cap -> declined, never clipped
 const cashBig = ev({ id: 'd', cashOrderQty: '200' });
 assert.strictEqual(cashBig.action, 'skip');
 assert.strictEqual(cashBig.reason, 'rfq_too_large');
 // small cash RFQ fits
 const cashOk = ev({ id: 'e', cashOrderQty: '10' });
 assert.strictEqual(cashOk.action, 'quoteable');
-assert.strictEqual(cashOk.decision.contracts, 45);
+assert.strictEqual(cashOk.decision.contracts, 41.84); // venue size: 41.84 × 0.222 + $0.71 taker fee ≤ $10
 
 // per-fill hedge cap (not just remaining) also declines
 const lowCap = { ...lock, max_contracts: 100000 };
@@ -119,7 +119,8 @@ assert.strictEqual(acceptedVenueQty({ quote: {} }, 'SIDE_BUY'), 0);
     const out2 = await loop.handleQuoteAccepted({ quote: { id: 'q-cash-big', rfqId: 'r2', acceptedSide: 'SIDE_BUY' } });
     assert.strictEqual(out2.confirmed, false);
     assert.strictEqual(out2.reason, 'cap_exceeded');
-    assert.strictEqual(maxPolymarketFillSize({ contracts: 100, cashOrderQty: 100, buyPrice: '0.2220' }, null) > 450, true);
+    // $100 cash at 0.222: the venue creates 418.6 (C·p + taker fee ≤ $100), still far over the 116 cap
+    assert.strictEqual(maxPolymarketFillSize({ contracts: 100, cashOrderQty: 100, buyPrice: '0.2220' }, null), 418.6);
 
     // a quote that fits (venue size == ours <= remaining) confirms
     pending.set('q-fits', { parlayId: 'lk', contracts: 100, maxContracts: 116, rfqId: 'r3', label: lock.label, rfqQty: 100 });
