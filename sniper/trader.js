@@ -155,6 +155,32 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
     }
     return out;
   }
+  // Read-only (read lane): COMPLETE snapshot of this subaccount's OPEN quotes (Oct 28 2026, fix for the
+  // quote-status poll). Kalshi's list only keeps cancelled quotes that were ACCEPTED first ("expired after
+  // acceptance"); a quote that dies with its RFQ un-accepted drops out of the list entirely, so polling
+  // status=cancelled saw ~4 quotes a run and saved no DELETEs. A quote absent from a complete open
+  // snapshot is not open. complete=false (cursor left after maxPages) => callers must not infer anything.
+  async function openQuotesSnapshot({ maxPages = 6 } = {}) {
+    const out = []; let cursor = ''; let complete = false; let newestCreatedMs = null;
+    for (let page = 0; page < maxPages; page += 1) {
+      const qs = new URLSearchParams({ user_filter: 'self', limit: '500', status: 'open' });
+      if (subaccount >= 1) qs.set('subaccount', String(subaccount));
+      if (cursor) qs.set('cursor', cursor);
+      const res = await raw('GET', QUOTE_PATH, { path: `${QUOTE_PATH}?${qs.toString()}`, lim: readLimiter || limiter, low: true });
+      stats.quoteReads = (stats.quoteReads || 0) + 1;
+      if (!res || res.statusCode !== 200) throw new Error(`open quotes read ${res && res.statusCode}`);
+      const j = JSON.parse(res.text || '{}');
+      const list = Array.isArray(j.quotes) ? j.quotes : [];
+      for (const q of list) {
+        if (String(q.status || 'open').toLowerCase() !== 'open') continue;
+        out.push(q);
+        const c = Date.parse(q.created_ts || ''); if (Number.isFinite(c) && (newestCreatedMs == null || c > newestCreatedMs)) newestCreatedMs = c;
+      }
+      if (!j.cursor || !list.length) { complete = true; break; }
+      cursor = j.cursor;
+    }
+    return { ids: new Set(out.map((q) => q.id).filter(Boolean)), count: out.length, complete, newestCreatedMs };
+  }
   // Read-only: this sniper subaccount's cash ($) for the soon-cap tier (sniper/soon-cap.js).
   async function subBalanceUsd() {
     const p = '/trade-api/v2/portfolio/subaccounts/balances';
@@ -169,7 +195,7 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
   }
   const queueState = () => ({ queued: sender.queued, active: sender.active, capacity: typeof sender.capacity === 'function' ? sender.capacity() : Infinity });
   return {
-    live, postQuote, confirm, cancel, fillsForOrder, subBalanceUsd, listQuotes, admission, queueState,
+    live, postQuote, confirm, cancel, fillsForOrder, subBalanceUsd, listQuotes, openQuotesSnapshot, admission, queueState,
     postEstMs: () => postEst.get(), quoteRps, sendWindow: win,
     senderStats: () => (typeof sender.stats === 'function' ? sender.stats() : {}),
     stats: () => ({ ...stats, queued: sender.queued, active: sender.active }),

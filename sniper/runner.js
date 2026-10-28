@@ -522,12 +522,36 @@ async function main(env = process.env) {
   const replaceMinAgeMs = Math.max(0, num(env.SNIPER_REPLACE_MIN_AGE_MS, 3000));
   ledger.canReplace = (ids, o = {}) => !!(gate.live && !config.dryRun) && ids.every((id) => liveSniper.canSupersede(id, { ev: o.ev, minAgeMs: replaceMinAgeMs }));
   // Quote-status poll (Oct 28 2026; SNIPER_QUOTE_STATUS_POLL_MS, default 1000; 0 = off). One read on
-  // the READ lane per tick, only while quotes are pending: quotes Kalshi already cancelled (their RFQ
-  // expired / executed elsewhere / deleted) are released without a DELETE, and any routine DELETE
-  // still waiting for a write token is skipped. Fails safe: if the read fails, cancels go out as before.
+  // the READ lane per tick, only while we have quotes pending or routine DELETEs queued.
+  // SNIPER_QUOTE_STATUS_MODE=open (default): complete snapshot of our OPEN quotes; a quote missing from
+  // it (posted > SNIPER_QUOTE_STATUS_GRACE_MS before the read, listing caught up past it) is already dead
+  // on Kalshi, so its routine DELETE is skipped (now or while queued). Fixes #300's status=cancelled poll:
+  // Kalshi only lists cancelled quotes that were accepted first, so it saw ~4 quotes/run and saved 0.
+  // SNIPER_QUOTE_STATUS_MODE=cancelled = the #300 behaviour. Fails safe: a failed / partial read infers
+  // nothing and every DELETE goes out as before; urgent cancels never consult it.
   const quotePollMs = num(env.SNIPER_QUOTE_STATUS_POLL_MS, 1000);
-  const quotePoll = { ticks: 0, ok: 0, errors: 0, seen: 0, released: 0, lastOkAt: null };
-  if (gate.live && quotePollMs > 0) {
+  const quotePollMode = String(env.SNIPER_QUOTE_STATUS_MODE || 'open').toLowerCase() === 'cancelled' ? 'cancelled' : 'open';
+  const quoteGraceMs = Math.max(500, num(env.SNIPER_QUOTE_STATUS_GRACE_MS, 2000));
+  const quotePoll = { mode: quotePollMode, ticks: 0, ok: 0, errors: 0, seen: 0, released: 0, marked: 0, partial: 0, lastOpen: null, lastOkAt: null };
+  if (gate.live && quotePollMs > 0 && quotePollMode === 'open') {
+    loop(async () => {
+      if (!liveSniper.pending.size && !liveSniper.queuedCancelCount()) return;
+      const startedAt = Date.now();
+      quotePoll.ticks += 1;
+      try {
+        const snap = await trader.openQuotesSnapshot({ maxPages: num(env.SNIPER_QUOTE_STATUS_MAX_PAGES, 6) });
+        quotePoll.ok += 1; quotePoll.seen += snap.count; quotePoll.lastOpen = snap.count; quotePoll.lastOkAt = Date.now();
+        if (!snap.complete) { quotePoll.partial += 1; return; }
+        // Kalshi created_ts is server time; compare in local ms (signedNow carries the measured offset).
+        const off = signedNow() - Date.now();
+        const newestCreatedLocalMs = snap.newestCreatedMs != null ? snap.newestCreatedMs - off : null;
+        quotePoll.marked += liveSniper.onOpenSnapshot({ ids: snap.ids, complete: true, startedAt, newestCreatedLocalMs }, { graceMs: quoteGraceMs });
+      } catch (e) {
+        quotePoll.errors += 1;
+        if (quotePoll.errors <= 5 || quotePoll.errors % 100 === 0) log(`[SNIPER] quote status poll failed (${quotePoll.errors}): ${String(e.message || e).slice(0, 200)}`);
+      }
+    }, 'quote_status', quotePollMs);
+  } else if (gate.live && quotePollMs > 0) {
     let since = null;
     loop(async () => {
       if (!liveSniper.pending.size) { since = null; return; }
