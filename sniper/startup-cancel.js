@@ -25,7 +25,7 @@ function selectStartupCancels(quotes, { subaccount, cutoffMs }) {
   return { ids: out, skipped, refused: null };
 }
 
-async function startupCancelOpen({ trader, subaccount, cutoffMs, rps = 8, urgent = true, maxPages = 10, log = console.log, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), snapshot = null }) {
+async function startupCancelOpen({ trader, subaccount, cutoffMs, rps = 8, urgent = true, maxPages = 10, log = console.log, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), snapshot = null, onTargets = () => {} }) {
   const res = { listed: 0, targets: 0, cancelled: 0, gone: 0, failed: 0, skipped: null, refused: null, complete: null };
   if (!(Number(subaccount) >= 1)) { res.refused = 'no_subaccount'; log('[SNIPER] startup open-quote cancel refused: no sniper subaccount'); return res; }
   const snap = snapshot || await trader.openQuotesSnapshot({ maxPages });
@@ -33,6 +33,7 @@ async function startupCancelOpen({ trader, subaccount, cutoffMs, rps = 8, urgent
   if (!snap.complete) { res.refused = 'partial_snapshot'; log(`[SNIPER] startup open-quote cancel skipped: partial snapshot (${res.listed} listed)`); return res; }
   const sel = selectStartupCancels(snap.quotes || [], { subaccount, cutoffMs });
   res.skipped = sel.skipped; res.targets = sel.ids.length;
+  try { onTargets(sel.ids); } catch (_) { /* untracked sweep dedupe only */ }
   const gap = rps > 0 ? 1000 / rps : 0;
   for (const id of sel.ids) {
     try { const r = await trader.cancel(id, { urgent }); if (r && r.statusCode === 404) res.gone += 1; else res.cancelled += 1; } catch (e) { res.failed += 1; if (res.failed <= 5) log(`[SNIPER] startup cancel ${id} failed: ${String(e.message || e).slice(0, 160)}`); }

@@ -199,3 +199,53 @@ test('trader.openQuotesSnapshot returns light quote objects with creator_subacco
   const s = await tr.openQuotesSnapshot();
   assert.deepStrictEqual(s.quotes, [{ id: 'q1', status: 'open', created_ts: '2026-10-28T16:00:00Z', creator_subaccount: 1, rfq_id: 'r1' }]);
 });
+
+// ── Untracked-quote sweep ──
+const { createUntrackedSweep } = require('./untracked-sweep');
+test('untracked sweep: cancels only open, sniper-subaccount, untracked quotes older than 30s; once per resend window', async () => {
+  let t = 1000000; const cancels = [];
+  const trader = { cancel: async (id, o) => { cancels.push(`${id}:${o && o.urgent ? 'urgent' : 'routine'}`); return { statusCode: id === 'gone' ? 404 : 204 }; } };
+  const tracked = new Set(['mine']);
+  const sw = createUntrackedSweep({ trader, subaccount: 1, isTracked: (id) => tracked.has(id), now: () => t, log: () => {} });
+  const server = Date.parse('2026-10-28T18:40:00Z');
+  const old = '2026-10-28T18:39:00Z'; const young = '2026-10-28T18:39:45Z';
+  const quotes = [
+    { id: 'orphan', status: 'open', creator_subaccount: 1, created_ts: old },
+    { id: 'gone', status: 'open', creator_subaccount: 1, created_ts: old },
+    { id: 'mine', status: 'open', creator_subaccount: 1, created_ts: old },
+    { id: 'young', status: 'open', creator_subaccount: 1, created_ts: young },
+    { id: 'combo', status: 'open', creator_subaccount: 0, created_ts: old },
+    { id: 'nosub', status: 'open', created_ts: old },
+    { id: 'acc', status: 'accepted', creator_subaccount: 1, created_ts: old },
+  ];
+  assert.deepStrictEqual(sw.onSnapshot({ complete: true, quotes }, server), ['orphan', 'gone']);
+  await wait(5);
+  assert.deepStrictEqual(cancels, ['orphan:routine', 'gone:routine']);
+  assert.strictEqual(sw.stats().sent, 1); assert.strictEqual(sw.stats().gone, 1); assert.strictEqual(sw.stats().skippedTracked, 1);
+  assert.deepStrictEqual(sw.onSnapshot({ complete: true, quotes }, server), [], 'no repeat inside resend window');
+  t += 30001; assert.deepStrictEqual(sw.onSnapshot({ complete: true, quotes }, server), ['orphan', 'gone'], 'retried if still listed open');
+  assert.deepStrictEqual(sw.onSnapshot({ complete: false, quotes }, server + 60000), [], 'partial snapshot => nothing');
+  assert.strictEqual(sw.stats().partial, 1);
+});
+test('untracked sweep: refuses without a sniper subaccount, off switch, maxPerTick, startup targets deduped', async () => {
+  const cancels = []; const trader = { cancel: async (id) => { cancels.push(id); return { statusCode: 204 }; } };
+  const q = (id) => ({ id, status: 'open', creator_subaccount: 0, created_ts: '2026-10-28T17:00:00Z' });
+  const z = createUntrackedSweep({ trader, subaccount: 0, isTracked: () => false, log: () => {} });
+  assert.deepStrictEqual(z.onSnapshot({ complete: true, quotes: [q('a')] }, Date.now()), []); assert.strictEqual(z.stats().refused, 'no_subaccount');
+  const off = createUntrackedSweep({ enabled: false, trader, subaccount: 1, isTracked: () => false, log: () => {} });
+  assert.deepStrictEqual(off.onSnapshot({ complete: true, quotes: [{ ...q('b'), creator_subaccount: 1 }] }, Date.now()), []);
+  const many = Array.from({ length: 40 }, (_, i) => ({ id: `m${i}`, status: 'open', creator_subaccount: 1, created_ts: '2026-10-28T17:00:00Z' }));
+  const sw = createUntrackedSweep({ trader, subaccount: 1, isTracked: () => false, maxPerTick: 10, log: () => {} });
+  sw.mark(['m0', 'm1']);
+  const first = sw.onSnapshot({ complete: true, quotes: many }, Date.now());
+  assert.strictEqual(first.length, 10); assert.ok(!first.includes('m0') && !first.includes('m1'), 'startup cancel targets not re-sent');
+  await wait(5); assert.strictEqual(cancels.length, 10);
+});
+test('live.isTrackedQuote: pending and queued routine DELETEs are tracked', async () => {
+  let open; const gate = new Promise((r) => { open = r; });
+  const trader = { live: true, postQuote: async (r) => ({ quoteId: `Q${r.rfqId}`, noBid: '0.600', yesBid: '0.00' }), cancel: async () => { await gate; return { statusCode: 204 }; }, confirm: async () => {} };
+  const L = createLiveSniper({ config, trader, store: { release: async () => true, update: async () => true }, coord: { blockReason: () => null, comboWorkerQuoting: async () => null }, caps: () => ({}), reprice: () => 0.3, log: () => {}, ttlMs: 5, defer: () => {}, cancelFifo: true });
+  await L.send(rfq('T'), dd('T')); assert.strictEqual(L.isTrackedQuote('QT'), true, 'pending');
+  await wait(20); assert.strictEqual(L.pending.size, 0); assert.strictEqual(L.isTrackedQuote('QT'), true, 'queued DELETE');
+  open(); await wait(10); assert.strictEqual(L.isTrackedQuote('QT'), false); assert.strictEqual(L.isTrackedQuote('nope'), false);
+});
