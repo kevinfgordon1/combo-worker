@@ -2486,6 +2486,8 @@ function startPolymarketRfqLoop(ctx = {}) {
       seenFillIds: ctx.seenFillIds,
       bookedFills: bookedPrior,
       maxPerTick: ctx.fillReconcileMax != null ? ctx.fillReconcileMax : 15,
+      loadSubmissionsForQuoteIds: typeof ctx.loadPolySubmissionsForQuoteIds === 'function'
+        ? ctx.loadPolySubmissionsForQuoteIds : undefined,
     });
     for (const evt of events) {
       const pending = evt.pending || (evt.quoteId ? pendingQuotes.get(evt.quoteId) : null);
