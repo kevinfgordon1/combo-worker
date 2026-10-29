@@ -11,6 +11,10 @@ function createPolySniperStore({ supabase, log = console.log, retries = 3, retry
   const chains = new Map(); // quote_id -> promise (writes for one quote stay in order)
   const stats = { writes: 0, failed: 0, retried: 0 };
   let warned = 0;
+  // quoted_risk needs migrations/20261029c_poly_sniper_quoted_risk.sql. Until it is applied, drop the field
+  // (once, then for the life of the process) instead of losing the whole ledger row.
+  let quotedRiskColumn = true;
+  const missingQuotedRisk = (error) => /quoted_risk/i.test(String((error && (error.message || error.details || error.hint)) || ''));
   async function attempt(fn, what) {
     for (let i = 0; i <= retries; i += 1) {
       try {
@@ -37,9 +41,20 @@ function createPolySniperStore({ supabase, log = console.log, retries = 3, retry
     return next;
   }
   return {
-    stats: () => ({ ...stats, pending: chains.size }),
+    stats: () => ({ ...stats, pending: chains.size, quotedRiskColumn }),
     insertQuote(row) {
-      return enqueue(row.quote_id, () => supabase.from('poly_sniper_ledger').upsert({ ...row, updated_at: new Date().toISOString() }, { onConflict: 'quote_id' }), 'insert');
+      return enqueue(row.quote_id, async () => {
+        const write = (r) => supabase.from('poly_sniper_ledger').upsert({ ...r, updated_at: new Date().toISOString() }, { onConflict: 'quote_id' });
+        if (!quotedRiskColumn || !('quoted_risk' in row)) { const { quoted_risk: _q, ...rest } = row; return write(quotedRiskColumn ? row : rest); }
+        const res = await write(row);
+        if (res && res.error && missingQuotedRisk(res.error)) {
+          quotedRiskColumn = false;
+          log('[POLY-SNIPER] ledger quoted_risk column missing: writing rows without it (run migrations/20261029c_poly_sniper_quoted_risk.sql)');
+          const { quoted_risk: _q, ...rest } = row;
+          return write(rest);
+        }
+        return res;
+      }, 'insert');
     },
     patch(quoteId, patch) {
       return enqueue(quoteId, () => supabase.from('poly_sniper_ledger').update({ ...patch, updated_at: new Date().toISOString() }).eq('quote_id', quoteId), 'update');

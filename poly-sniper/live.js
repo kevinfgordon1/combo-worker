@@ -273,7 +273,7 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
     };
     quotes.set(quoteId, rec); byRfq.set(rfq.rfqId, quoteId);
     hourPosts.push(t); stats.posted += 1;
-    if (store) store.insertQuote({ quote_id: quoteId, rfq_id: rfq.rfqId, symbol: rec.symbol, combo_key: rec.combo, games: rec.games, legs: rec.legs, leg_detail: rec.legDetail, phase: 'quoted', buy_price: rec.buyPrice, fair: rec.fair, edge: rec.roi, min_edge: rec.minRoi, contracts: rec.contracts, settle_at: new Date(settleAt).toISOString() });
+    if (store) store.insertQuote({ quote_id: quoteId, rfq_id: rfq.rfqId, symbol: rec.symbol, combo_key: rec.combo, games: rec.games, legs: rec.legs, leg_detail: rec.legDetail, phase: 'quoted', buy_price: rec.buyPrice, fair: rec.fair, edge: rec.roi, min_edge: rec.minRoi, contracts: rec.contracts, quoted_risk: Math.round(rec.quotedRisk * 1e6) / 1e6, settle_at: new Date(settleAt).toISOString() });
     if (stats.posted <= 20 || stats.posted % 50 === 0) say(`QUOTED rfq=${rfq.rfqId} quote_id=${quoteId} buy=${rec.buyPrice} fair=${rec.fair.toFixed(4)} edge=${(rec.roi * 100).toFixed(1)}% risk=$${rec.quotedRisk.toFixed(2)} n=${stats.posted}`);
     for (const ev of buffered) ev.release(true);
     return { posted: true, quoteId };

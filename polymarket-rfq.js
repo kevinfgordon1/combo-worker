@@ -2471,6 +2471,21 @@ function startPolymarketRfqLoop(ctx = {}) {
         console.error(`[${MODE}] fill reconcile load quotes`, e && e.message);
       }
     }
+    // Quotes we confirmed (order_id stamped) but never booked as filled. The newest-300 list above is
+    // all resting quotes at ~2,000+/day, so a missed fill falls out of it within hours, and Polymarket's
+    // GetQuotes(status=EXECUTED, SELF) first page comes back empty (filter applied after paging), so
+    // the #308 by-id rescue never saw it (Oct 26 Jazz + Rays + Cavs, 61.87 @ +575).
+    if (typeof ctx.loadOrderedUnfilledPolyQuotes === 'function') {
+      try {
+        const ordered = (await ctx.loadOrderedUnfilledPolyQuotes()) || [];
+        if (ordered.length) {
+          const have = new Set(submissions.map((r) => r && r.quote_id).filter(Boolean));
+          for (const r of ordered) if (r && r.quote_id && !have.has(r.quote_id)) { have.add(r.quote_id); submissions.push(r); }
+        }
+      } catch (e) {
+        console.error(`[${MODE}] fill reconcile load ordered quotes`, e && e.message);
+      }
+    }
     let slugRecords = [];
     if (typeof ctx.loadPolySlugRecords === 'function') {
       try { slugRecords = (await ctx.loadPolySlugRecords()) || []; } catch (e) {

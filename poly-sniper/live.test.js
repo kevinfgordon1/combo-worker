@@ -374,6 +374,17 @@ t('createPolySniper DRY_RUN=0 with switch on posts through observe and logs dry_
   assert.strictEqual(http.calls.del.length, 1);
 });
 
+t('ledger row keeps the quoted risk (quoted_risk) while counted risk stays $0 until a fill', async () => {
+  const S = await setup();
+  const a = await S.post(rfq(ML2, '100', S.clock));
+  assert.ok(a.posted);
+  const row = S.store.inserts.find((r) => r.quote_id === a.quoteId);
+  assert.ok(row, 'insert row');
+  assert.ok(row.quoted_risk > 0, 'quoted_risk persisted');
+  assert.ok(Math.abs(row.quoted_risk - row.contracts * (1 - row.buy_price)) < 0.01, 'quoted_risk = contracts * (1 - buy)');
+  assert.ok(!('risk' in row) || row.risk === 0, 'counted risk is not set on a resting quote');
+});
+
 (async () => {
   for (const [name, fn] of tests) {
     await fn(); n += 1; console.log(`ok ${name}`);
