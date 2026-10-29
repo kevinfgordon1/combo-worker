@@ -1,8 +1,15 @@
-// Polymarket combo sniper — Phase 1 DRY RUN inside poly-worker. Posts NOTHING.
+// Polymarket combo sniper inside poly-worker.
 // poly-worker calls observe(raw, src) for every RFQ it already received (WS or crawl).
-// We price it, decide what we WOULD quote, and log to Supabase poly_sniper_decisions.
+// We price it and log to Supabase poly_sniper_decisions.
+//   POLY_SNIPER_DRY_RUN=1: Phase 1 dry run. Posts NOTHING, never sees a Polymarket client (hard fallback).
+//   POLY_SNIPER_DRY_RUN=0: live-capable (Kevin Oct 29, preview). Posts only while the runtime switch
+//     poly_sniper_control.live is on (default off); otherwise behaves exactly like the dry run.
+//     The trading client is attached by poly-worker after its RFQ loop starts (attachTrading) and lives
+//     only in this process. See poly-sniper/live.js for caps, confirms, cancels and fills.
 'use strict';
-const { dryRunOn, enabled, assertNoTradingClient } = require('./guard');
+const { enabled, assertValidMode, assertNoTradingClient } = require('./guard');
+const { createPolySniperLive } = require('./live');
+const { createPolySniperStore } = require('./store');
 const { createPolySniperFeed } = require('./feed');
 const { decidePoly, polySniperConfig, createVenueLedger } = require('./engine');
 
@@ -107,16 +114,19 @@ function legRows(rfq, d) {
   });
 }
 
-function createPolySniper({ env = process.env, supabase = null, log = console.log, feed = null, now = () => Date.now() } = {}) {
+function createPolySniper({ env = process.env, supabase = null, log = console.log, feed = null, now = () => Date.now(), alert = null, store = null, liveTimers = true } = {}) {
   if (!enabled(env)) return null;
-  if (!dryRunOn(env)) throw new Error('POLY_SNIPER_DRY_RUN must be exactly 1: Phase 1 is dry run only (no live mode exists yet)');
+  const mode = assertValidMode(env); // throws unless POLY_SNIPER_DRY_RUN is exactly '1' or '0'
   assertNoTradingClient({ feed });
   const config = polySniperConfig(env);
   const f = feed || createPolySniperFeed({ env, log });
   const ledger = createVenueLedger('polymarket');
   const logger = createDecisionLogger({ supabase, log, logSkips: String(env.POLY_SNIPER_LOG_SKIPS || '1') !== '0', skipSample: skipSampleFrom(env) });
   const seen = new Set();
-  const counts = { seen: 0, quote: 0, skip: {} };
+  const counts = { seen: 0, quote: 0, skip: {}, livePosted: 0, liveSkipped: 0 };
+  const live = mode === 'live_capable'
+    ? createPolySniperLive({ env, engineConfig: config, feed: f, store: store || (supabase ? createPolySniperStore({ supabase, log }) : null), log, alert, now, timers: liveTimers })
+    : null;
   function observe(raw, src) {
     const t0 = now();
     let rfq;
@@ -124,14 +134,16 @@ function createPolySniper({ env = process.env, supabase = null, log = console.lo
     if (!rfq || !rfq.rfqId || seen.has(rfq.rfqId)) return null;
     seen.add(rfq.rfqId); if (seen.size > 100000) seen.clear();
     counts.seen += 1;
+    // Live only while the switch is on; otherwise the dry run (hypothetical ledger) exactly as before.
+    const goLive = !!(live && live.isActive());
     let d;
-    try { d = decidePoly(rfq, { feed: f, config, ledger, nowMs: t0 }); } catch (e) { d = { rfqId: rfq.rfqId, action: 'skip', reason: `error:${String(e.message).slice(0, 60)}` }; }
+    try { d = decidePoly(rfq, { feed: f, config, ledger, nowMs: t0, skipLedger: goLive }); } catch (e) { d = { rfqId: rfq.rfqId, action: 'skip', reason: `error:${String(e.message).slice(0, 60)}` }; }
     const t1 = now();
     const created = Date.parse(rfq.createdTime || '');
     const ageMs = Number.isFinite(created) ? t1 - created : null;
     if (d.action === 'quote') counts.quote += 1; else counts.skip[d.reason] = (counts.skip[d.reason] || 0) + 1;
-    logger.push({
-      rfq_id: rfq.rfqId, venue: 'polymarket', dry_run: true, source: src || null, symbol: rfq.symbol || null,
+    const row = (_d, extra = {}) => ({
+      rfq_id: rfq.rfqId, venue: 'polymarket', dry_run: !goLive, source: src || null, symbol: rfq.symbol || null,
       action: d.action, reason: d.reason || null,
       leg_count: Array.isArray(rfq.comboLegs) ? rfq.comboLegs.length : null,
       legs: legRows(rfq, d),
@@ -141,14 +153,40 @@ function createPolySniper({ env = process.env, supabase = null, log = console.lo
       qty_decimal: rfq.qtyDecimal != null ? Number(rfq.qtyDecimal) : null, cash_order_qty: rfq.cashOrderQty != null ? Number(rfq.cashOrderQty) : null,
       games: d.games || null, rfq_created_at: Number.isFinite(created) ? new Date(created).toISOString() : null,
       decide_ms: t1 - t0, rfq_age_ms: ageMs, within_target: ageMs != null ? ageMs <= config.latencyTargetMs : null,
+      ...extra,
     });
+    if (goLive && d.action === 'quote') {
+      live.onDecision(rfq, d, { ageMs }).then((r) => {
+        if (r && r.posted) { counts.livePosted += 1; logger.push(row(d)); }
+        else { counts.liveSkipped += 1; logger.push(row(d, { action: 'skip', reason: `live_${(r && r.reason) || 'unknown'}` })); }
+      }).catch((e) => log(`[POLY-SNIPER] live post error ${e && e.message}`));
+    } else {
+      logger.push(row(d));
+    }
     return d;
   }
   const hb = setInterval(() => {
     const top = Object.entries(counts.skip).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => `${k}=${v}`).join(' ');
-    log(`[POLY-SNIPER] DRY RUN seen=${counts.seen} would_quote=${counts.quote} index=${f.index.size()} td_index=${f.index.tdStats ? `${f.index.tdStats().indexed}/${f.index.tdStats().seen}` : '?'} tape=${logger.stats.written}w/${logger.stats.dropped}d line_index=${f.index.lineStats ? f.index.lineStats().indexed : '?'} line_meta=${f.lineMeta ? f.lineMeta.stats().cached : '-'} healthy=${f.pricesHealthy()} venues=${f.venues.join('+')} ${top}`);
+    const mtag = live ? `LIVE-CAPABLE state=${live.state()}` : 'DRY RUN';
+    if (live) { try { const ls = live.stats(); log(`[POLY-SNIPER] LIVE stats ${JSON.stringify({ ...ls, posted_from_observe: counts.livePosted, live_skipped: counts.liveSkipped })}`); } catch (_) { /* observability only */ } }
+    log(`[POLY-SNIPER] ${mtag} seen=${counts.seen} would_quote=${counts.quote} index=${f.index.size()} td_index=${f.index.tdStats ? `${f.index.tdStats().indexed}/${f.index.tdStats().seen}` : '?'} tape=${logger.stats.written}w/${logger.stats.dropped}d line_index=${f.index.lineStats ? f.index.lineStats().indexed : '?'} line_meta=${f.lineMeta ? f.lineMeta.stats().cached : '-'} healthy=${f.pricesHealthy()} venues=${f.venues.join('+')} ${top}`);
   }, 60000);
   if (hb.unref) hb.unref();
-  return { start: () => { if (!feed) f.start(); log(`[POLY-SNIPER] DRY RUN started (posts nothing). fair venues=${f.venues.join('+')} depth game=$${f.depths ? f.depths.game : '?'} td=$${f.depths ? f.depths.td : '?'} minEdge=ml:${(config.minRoiNflMl * 100).toFixed(1)}%,nfl:${(config.minRoiNfl * 100).toFixed(1)}%,ncaaf:${(config.minRoiNcaaf * 100).toFixed(1)}%,td:${(config.minRoiTd * 100).toFixed(1)}%,nba:${(config.minRoiNba * 100).toFixed(1)}% nba=${config.nba && !!f.nbaBook ? 'on' : 'off'} lines=${config.lines && !!f.linesBook ? 'on' : 'off'}`); }, observe, counts, ledger, flush: logger.flush };
+  const router = live ? {
+    onWsEvent: (evt) => live.onWsEvent(evt),
+    ownsExecution: (ex) => live.ownsExecution(ex),
+    onOrderExecution: (ex) => live.onOrderExecution(ex),
+    isSniperFill: (evt) => live.isSniperFill(evt),
+    onWsStall: () => live.onWsStall(),
+    onWsRecovered: () => live.onWsRecovered(),
+    onComboAcceptOutcome: (ok) => live.onComboAcceptOutcome(ok),
+  } : null;
+  // Only poly-worker calls this, with its own Polymarket client, after its RFQ loop starts.
+  async function attachTrading(deps) {
+    if (!live) throw new Error('poly-sniper: POLY_SNIPER_DRY_RUN=1 (dry run) never takes a trading client');
+    return live.attach(deps);
+  }
+  async function shutdown(reason) { if (live) await live.shutdown(reason || 'shutdown'); await logger.flush(); }
+  return { mode, live, router, attachTrading, shutdown, start: () => { if (!feed) f.start(); log(`[POLY-SNIPER] ${live ? 'LIVE-CAPABLE (POLY_SNIPER_DRY_RUN=0) started; posts only while poly_sniper_control.live is on' : 'DRY RUN started (posts nothing)'}. fair venues=${f.venues.join('+')} depth game=$${f.depths ? f.depths.game : '?'} td=$${f.depths ? f.depths.td : '?'} minEdge=ml:${(config.minRoiNflMl * 100).toFixed(1)}%,nfl:${(config.minRoiNfl * 100).toFixed(1)}%,ncaaf:${(config.minRoiNcaaf * 100).toFixed(1)}%,td:${(config.minRoiTd * 100).toFixed(1)}%,nba:${(config.minRoiNba * 100).toFixed(1)}% nba=${config.nba && !!f.nbaBook ? 'on' : 'off'} lines=${config.lines && !!f.linesBook ? 'on' : 'off'}`); }, observe, counts, ledger, flush: logger.flush };
 }
 module.exports = { createPolySniper, normalizePolymarketRfq, createDecisionLogger, legRows, skipSampleFrom };

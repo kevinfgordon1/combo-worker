@@ -28,11 +28,13 @@ function polySniperConfig(env = process.env) {
     maxLegs: num(env.POLY_SNIPER_MAX_LEGS, 10),
     bufferMs: num(env.POLY_SNIPER_KICKOFF_BUFFER_MS, 30 * 60 * 1000), // same as sniper: stop 30 min pre-kick
     // Caps are PER VENUE (Polymarket has its own; Kalshi sniper caps untouched). Kevin: Polymarket doubles capacity.
-    maxRisk: num(env.POLY_SNIPER_MAX_RISK, 200),
+    // Kevin Oct 29: same caps as the Kalshi sniper (its live values: $400/quote, $1,500/game, $750/leg,
+    // $10,000 open, $10,000/day). The live layer (poly-sniper/live.js) adds the rest of the Kalshi set.
+    maxRisk: num(env.POLY_SNIPER_MAX_RISK, 400),
     perGameCap: num(env.POLY_SNIPER_PER_GAME_CAP, 1500),
     perLegCap: num(env.POLY_SNIPER_PER_LEG_CAP, 750),
     totalExposureCap: num(env.POLY_SNIPER_TOTAL_EXPOSURE_CAP, 10000),
-    dailyRiskCap: num(env.POLY_SNIPER_DAILY_RISK_CAP, 5000),
+    dailyRiskCap: num(env.POLY_SNIPER_DAILY_RISK_CAP, 10000),
     latencyTargetMs: num(env.POLY_SNIPER_LATENCY_TARGET_MS, 200),
     ncaaf: String(env.POLY_SNIPER_NCAAF == null ? '1' : env.POLY_SNIPER_NCAAF) !== '0',
     // Dry run scope (Kevin Oct 28): NBA (ML + spreads/totals) and main spreads/totals (NFL, FBS, NBA).
@@ -86,7 +88,9 @@ function tickOf(rfq) { const t = Number(rfq.tickSize); return t > 0 && t < 0.1 ?
 const roundTick = (x, tick) => Math.round(Math.round(x / tick) * tick * 1e6) / 1e6;
 
 // rfq = normalizePolymarketRfq output. -> { action:'quote'|'skip', reason, ... }
-function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now() }) {
+// skipLedger: price only (no hypothetical ledger caps, nothing added). The LIVE sniper uses this and
+// applies its own fills-only caps (poly-sniper/live.js), and to re-price at confirm / stale sweeps.
+function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now(), skipLedger = false }) {
   const base = { rfqId: rfq && rfq.rfqId, symbol: rfq && rfq.symbol };
   const skip = (reason, extra) => ({ ...base, action: 'skip', reason, ...(extra || {}) });
   if (!rfq || !rfq.rfqId) return skip('bad_rfq');
@@ -131,6 +135,7 @@ function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now() }) {
   const combo = comboKey(ll); const games = [...new Set(ll.map(gameKey))]; const lkeys = ll.map(legKey);
   const econ = { fair, buyPrice, sellPrice: '0', contracts: px.n, risk: px.risk, ev: px.ev, roi: px.roi, fee: px.fee, minRoi, tick };
   if (px.risk > config.maxRisk + 1e-9) return skip('risk_over_cap', { legs, ...econ });
+  if (skipLedger) return { ...base, action: 'quote', legs, combo, games, legKeys: lkeys, ...econ };
   ledger.prune(nowMs);
   const t = ledger.totals();
   if (t.combos.has(combo)) return skip('already_hold_combo', { legs, ...econ });

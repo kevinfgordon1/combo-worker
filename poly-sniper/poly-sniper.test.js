@@ -69,7 +69,11 @@ t('per-venue game cap uses the Polymarket ledger only', () => {
 t('dry-run gate enforced in code', () => {
   assert.strictEqual(createPolySniper({ env: {} }), null);
   assert.throws(() => createPolySniper({ env: { POLY_SNIPER_ENABLED: '1' } }), /DRY_RUN must be exactly 1/);
-  assert.throws(() => createPolySniper({ env: { POLY_SNIPER_ENABLED: '1', POLY_SNIPER_DRY_RUN: '0' } }), /DRY_RUN/);
+  assert.throws(() => createPolySniper({ env: { POLY_SNIPER_ENABLED: '1', POLY_SNIPER_DRY_RUN: 'false' } }), /DRY_RUN must be exactly 1/);
+  // DRY_RUN=1: no live layer, no router, attachTrading refuses a client (hard fallback).
+  const dry = createPolySniper({ env: { POLY_SNIPER_ENABLED: '1', POLY_SNIPER_DRY_RUN: '1' }, feed: fakeFeed(), log: () => {} });
+  assert.strictEqual(dry.mode, 'dry'); assert.strictEqual(dry.live, null); assert.strictEqual(dry.router, null);
+  return dry.attachTrading({ http: { createQuote() {} } }).then(() => assert.fail('attached'), (e) => assert.ok(/never takes a trading client/.test(e.message)));
   assert.throws(() => assertNoTradingClient({ http: { createQuote() {} } }), /trading clients are not allowed/);
   assert.throws(() => createPolySniper({ env: { POLY_SNIPER_ENABLED: '1', POLY_SNIPER_DRY_RUN: '1' }, feed: { ...fakeFeed(), confirmQuote() {} } }), /confirmQuote/);
 });
@@ -88,10 +92,13 @@ t('observe logs a hypothetical decision with latency', () => {
 });
 
 t('poly-sniper source never references quote/confirm/delete endpoints or the Polymarket client', () => {
-  for (const f of fs.readdirSync(__dirname).filter((x) => x.endsWith('.js') && !x.endsWith('.test.js'))) {
+  // live.js is the only module that trades, and only with the client poly-worker attaches (DRY_RUN=0).
+  for (const f of fs.readdirSync(__dirname).filter((x) => x.endsWith('.js') && !x.endsWith('.test.js') && x !== 'live.js')) {
     const src = fs.readFileSync(path.join(__dirname, f), 'utf8');
     assert.ok(!/\/v1\/rfqs\/quotes|\/confirm|\.createQuote\(|\.confirmQuote\(|\.deleteQuote\(|polymarket-client|POLYMARKET_SECRET|POLYMARKET_KEY_ID/.test(src), `${f} references trading`);
   }
+  const liveSrc = fs.readFileSync(path.join(__dirname, 'live.js'), 'utf8');
+  assert.ok(!/polymarket-client|POLYMARKET_SECRET|POLYMARKET_KEY_ID|createPolymarketHttp/.test(liveSrc), 'live.js must never build its own client or read keys');
 });
 
 t('RFQ crawl pages at <= 1 req/s by default', () => { assert.ok(DEFAULT_PAGE_DELAY_MS >= 1000); });

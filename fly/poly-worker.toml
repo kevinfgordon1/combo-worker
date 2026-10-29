@@ -19,6 +19,26 @@ kill_timeout = "30s"
   # Poly sniper fair = full 4-venue inverse method incl. Polymarket (Kevin Oct 23). Sniper stays DRY (secrets).
   POLY_SNIPER_FAIR_INCLUDE_POLY = "1"
   POLY_SNIPER_MIN_ROI_TD = "0.06"   # Kevin Oct 23: NFL player-TD parlays need 6% (highest rule wins)
+  # Poly sniper LIVE (Kevin Oct 29, preview): same caps as the Kalshi sniper (its live values Oct 29).
+  # Going live needs BOTH: secret POLY_SNIPER_DRY_RUN=0 (today 1 = hard dry run) AND the DB switch
+  # public.poly_sniper_control.live = true (default false; polled every 5s, no restart; off deletes all
+  # open sniper quotes). Resting quotes count $0; only accepted/confirmed/filled risk counts.
+  POLY_SNIPER_MAX_RISK = "400"                # $ worst-case loss per quote
+  POLY_SNIPER_MAX_PAYOUT = "100000"           # $ payout (contracts) per quote
+  POLY_SNIPER_PER_GAME_CAP = "1500"
+  POLY_SNIPER_PER_LEG_CAP = "750"
+  POLY_SNIPER_TOTAL_EXPOSURE_CAP = "10000"
+  POLY_SNIPER_LONG_EXPOSURE_CAP = "5000"      # parlays settling > 48h after the quote
+  POLY_SNIPER_SHORT_SETTLE_HOURS = "48"
+  POLY_SNIPER_DAILY_RISK_CAP = "10000"        # new filled risk per ET day
+  POLY_SNIPER_DAILY_LOSS_CAP = "10000"        # realized loss per ET day -> auto-off until midnight ET
+  POLY_SNIPER_SOON_CAP = "1"                  # settles <= 24h: total cap = cash above the floor (never below $10,000)
+  POLY_SNIPER_SOON_HOURS = "24"
+  POLY_SNIPER_MAX_LEG_DAYS = "7"
+  POLY_SNIPER_CASH_FLOOR_USD = "5000"         # never post/confirm if Poly buying power - risk < this (Combo Locks funding)
+  POLY_SNIPER_POST_RPS = "20"                 # sniper quote posts/s (Polymarket US regular tier: 100/s per account)
+  POLY_SNIPER_CANCEL_RPS = "20"
+  POLY_SNIPER_DECLINE_PAUSE_RATIO = "0.10"    # pause if declines > 10% of accepts in the last hour (Polymarket pauses at 15%)
 
 [processes]
   app = "npm run start:poly"

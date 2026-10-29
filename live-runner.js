@@ -3077,8 +3077,10 @@ async function main() {
   const polyAppAlerts = createAppAlerts({ client: SCOPE.isTester ? null : supabase });
   const polyStallAlerts = createPolyStallAlerts({ appAlerts: polyAppAlerts, log: console.log });
   { const t = setInterval(() => { polyStallAlerts.tick().catch(() => {}); }, 30000); if (t.unref) t.unref(); }
-  // Polymarket combo sniper — Phase 1 DRY RUN (poly-sniper/). Off unless POLY_SNIPER_ENABLED=1, and refuses
-  // to start unless POLY_SNIPER_DRY_RUN=1. Gets RFQ payloads only — never the Polymarket client or keys.
+  // Polymarket combo sniper (poly-sniper/). Off unless POLY_SNIPER_ENABLED=1; refuses to start unless
+  // POLY_SNIPER_DRY_RUN is exactly 1 (dry run: RFQ payloads only, never the Polymarket client or keys) or
+  // 0 (live-capable: this process attaches its own client below; quotes only while
+  // poly_sniper_control.live is on, default off). Keys never leave poly-worker.
   let polySniper = null;
   // Combo Locks NFL TD legs: refresh the verified player crosswalk from public Kalshi/Poly US data
   // (the checked-in file is a Week 5 snapshot). Same matching rules; pricing/caps untouched.
@@ -3092,7 +3094,7 @@ async function main() {
   }
   if (SPLIT.runPoly && process.env.COMBO_ROLE === 'poly') {
     try {
-      polySniper = createPolySniper({ env: process.env, supabase: SCOPE.isTester ? null : supabase, log: console.log });
+      polySniper = createPolySniper({ env: process.env, supabase: SCOPE.isTester ? null : supabase, log: console.log, alert: sendAlert });
       if (polySniper) polySniper.start();
     } catch (e) { console.error(`[${MODE}] poly-sniper not started: ${e.message}`); polySniper = null; }
   }
@@ -3115,7 +3117,8 @@ async function main() {
   }
   const poly = !SPLIT.runPoly ? null : startPolymarketRfqLoop({
     lossTape: polyLossTape,
-    onRfqObserved: polySniper ? (raw, src) => { setImmediate(() => { try { polySniper.observe(raw, src); } catch (_) { /* dry run only */ } }); } : null,
+    onRfqObserved: polySniper ? (raw, src) => { setImmediate(() => { try { polySniper.observe(raw, src); } catch (_) { /* never into the Combo Locks path */ } }); } : null,
+    sniperRouter: polySniper && polySniper.router ? polySniper.router : null,
     pendingQuotes: polyPendingQuotes,
     kalshiPendingQuotes: pendingQuotes,
     capBook,
@@ -3162,6 +3165,15 @@ async function main() {
     }).catch((e) => console.error('onQuoteExecuted', e)),
   });
   polyLoop = poly;
+  if (poly && polySniper && polySniper.live && poly.http && poly.live) {
+    polySniper.attachTrading({
+      http: poly.http,
+      comboConfirming: () => (poly.confirmingQuotes ? poly.confirmingQuotes.size : 0),
+      onComboFallback: (evt) => poly.onWsEvent(evt),
+    }).catch((e) => console.error(`[${MODE}] poly-sniper live attach failed (sniper stays off): ${e.message}`));
+  } else if (polySniper && polySniper.live) {
+    console.log(`[${MODE}] poly-sniper LIVE-CAPABLE but Combo Locks Polymarket loop is not live: sniper stays off`);
+  }
   if (!poly) console.log(`[${MODE}] Polymarket RFQ loop OFF (COMBO_POLY_ENABLED=0) — runs in the combo-poly service`);
   // Single-leg + desk-fill alerts stay in combo-worker. With the RFQ loop moved
   // out they get a REST-only Polymarket client (no RFQ stream).
@@ -3214,7 +3226,9 @@ async function main() {
         if (t.unref) t.unref();
       }
     }
-    process.on('SIGINT', () => {
+    process.on('SIGINT', async () => {
+      // Live sniper first: delete its open quotes while the Polymarket client is still open.
+      if (polySniper && polySniper.shutdown) { try { await polySniper.shutdown('sigterm'); } catch (_) {} }
       try { poly && poly.stop && poly.stop(); } catch (_) {}
       Promise.resolve(venueCoord && venueCoord.stop()).finally(() => {
         console.log(`[${MODE}] final`, counts);

@@ -142,8 +142,9 @@ t('min edge: NBA 6% (highest rule wins); existing NFL / college / TD rules uncha
   assert.strictEqual(polySniperConfig({ POLY_SNIPER_MIN_ROI_NBA: '0.08' }).minRoiNba, 0.08);
 });
 
-t('still dry run only: no live mode, no trading client', () => {
-  assert.throws(() => createPolySniper({ env: { POLY_SNIPER_ENABLED: '1', POLY_SNIPER_DRY_RUN: '0' } }), /DRY_RUN/);
+t('DRY_RUN=1 stays dry; DRY_RUN=0 is live-capable but the switch starts off', () => {
+  const lc = createPolySniper({ env: { POLY_SNIPER_ENABLED: '1', POLY_SNIPER_DRY_RUN: '0' }, feed: fakeFeed(), log: () => {}, liveTimers: false });
+  assert.strictEqual(lc.mode, 'live_capable'); assert.strictEqual(lc.live.isActive(), false); assert.strictEqual(lc.live.state(), 'no_client');
   assert.throws(() => createPolySniper({ env: { POLY_SNIPER_ENABLED: '1', POLY_SNIPER_DRY_RUN: '1' }, feed: { ...fakeFeed(), createQuote() {} } }), /createQuote/);
 });
 
