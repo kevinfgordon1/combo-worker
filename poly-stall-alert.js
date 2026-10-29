@@ -31,7 +31,7 @@ function fmtCause(info) {
 function restNote(info) {
   return info && info.restFailing
     ? 'REST also failing - no RFQ intake until Polymarket recovers'
-    : 'REST crawl is covering intake meanwhile';
+    : 'REST polling covers part of intake until the socket is back';
 }
 
 function createPolyStallAlerts({ appAlerts, now = () => Date.now(), log = () => {}, ...opts } = {}) {
