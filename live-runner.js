@@ -1878,6 +1878,35 @@ async function loadUnfilledPolyQuotes() {
   }
 }
 
+// Confirmed-but-unbooked Polymarket quotes: order_id is stamped on confirm, status stays unfilled until a
+// fill books. Small set (a few hundred over 21 days, mostly rejected/expired orders the reconcile marks
+// seen after one GET). Index: migrations/20261029b_poly_ordered_unfilled_idx.sql.
+async function loadOrderedUnfilledPolyQuotes() {
+  const cutoff = new Date(Date.now() - POLY_FILL_LOOKBACK_MS).toISOString();
+  try {
+    const { data, error } = await supabase
+      .from('combo_submissions')
+      .select('id,quote_id,order_id,rfq_id,parlay_id,label,contracts,user_id,status,created_at,market_ticker')
+      .in('user_id', SCOPE.userIds)
+      .eq('venue', 'polymarket')
+      .not('quote_id', 'is', null)
+      .not('order_id', 'is', null)
+      .neq('status', 'filled')
+      .neq('status', 'shadow')
+      .gte('created_at', cutoff)
+      .order('created_at', { ascending: false })
+      .limit(500);
+    if (error) {
+      console.error(`[${MODE}] load ordered unfilled poly quotes`, error.message);
+      return [];
+    }
+    return data || [];
+  } catch (e) {
+    console.error(`[${MODE}] load ordered unfilled poly quotes`, e && e.message);
+    return [];
+  }
+}
+
 // Exact lookup for executed quote ids that fell outside loadUnfilledPolyQuotes' newest-300 window.
 async function loadPolySubmissionsForQuoteIds(quoteIds) {
   const ids = [...new Set((quoteIds || []).filter(Boolean))].slice(0, 100);
@@ -3136,6 +3165,7 @@ async function main() {
     persistQuoteOrder,
     loadUnfilledPolyQuotes,
     loadPolySubmissionsForQuoteIds,
+    loadOrderedUnfilledPolyQuotes,
     getFilledForQuote,
     loadRecentLocks,
     loadPolySlugRecords,

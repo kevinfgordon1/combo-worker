@@ -58,6 +58,47 @@ const unrelated = { quote_id: 'q-old', rfq_id: 'rfq-old', parlay_id: 'lock-old',
   const soft = await reconcilePolymarketLockFills(http, { pendingQuotes: new Map(), submissions: [unrelated], hydrate: false, loadSubmissionsForQuoteIds: async () => { throw new Error('db down'); } });
   assert.strictEqual(soft.length, 0);
 
+  // Real Polymarket behaviour (probed Oct 29): GetQuotes(status=EXECUTED, SELF) first page is EMPTY while
+  // our newest 100 quotes are resting, so the by-id rescue above never fires. The order-stamped
+  // submission row (order_id set on confirm) is the durable handle: hydrate the quote by id, read the order.
+  const realApi = {
+    hydrated: 0, orders: 0,
+    async listQuotes(query) {
+      if (query && query.rfqId === 'rfq-jazz' && query.quoteId === 'q-jazz') { realApi.hydrated += 1; return { quotes: [{ id: 'q-jazz', rfqId: 'rfq-jazz', status: 'QUOTE_STATUS_EXECUTED', creatorOrderId: 'DBCZV2R051N6', buyQtyDecimal: '61.87', symbol: 'crossd-20a23b816da19144' }] }; }
+      if (query && query.rfqId === 'rfq-dead') return { quotes: [{ id: 'q-dead', rfqId: 'rfq-dead', status: 'QUOTE_STATUS_CANCELLED', creatorOrderId: 'o-dead', buyQtyDecimal: '10' }] };
+      return { quotes: [], cursor: 'next' };
+    },
+    async getOrder(id) {
+      realApi.orders += 1;
+      if (id === 'DBCZV2R051N6') return { id, cumQuantity: 61.87, quantity: 61.87, state: 'ORDER_STATE_FILLED', price: { value: '0.1482' }, marketSlug: 'crossd-20a23b816da19144' };
+      if (id === 'o-dead') return { id, cumQuantity: 0, state: 'ORDER_STATE_REJECTED' };
+      return null;
+    },
+  };
+  const ordered = { ...row, order_id: 'DBCZV2R051N6' };
+  const dead = { quote_id: 'q-dead', rfq_id: 'rfq-dead', parlay_id: 'lock-dead', label: 'dead', contracts: 10, user_id: 'u1', status: 'unfilled', order_id: 'o-dead' };
+  const seen = new Set();
+  const viaOrder = await reconcilePolymarketLockFills(realApi, { pendingQuotes: new Map(), submissions: [unrelated, ordered, dead], seenQuoteIds: seen });
+  assert.strictEqual(viaOrder.length, 1, 'order-stamped row books even though the EXECUTED list is empty');
+  assert.strictEqual(viaOrder[0].quoteId, 'q-jazz');
+  assert.strictEqual(viaOrder[0].contracts, 61.87, 'venue size (61.87), not our 67 estimate');
+  assert.strictEqual(viaOrder[0].fillId, 'poly-recon:q-jazz:61.87', 'same fill_id as the SQL backfill -> a backfilled row is a replay');
+  assert.strictEqual(viaOrder[0].yesPrice, 0.1482);
+  assert.ok(seen.has('q-dead'), 'rejected order with nothing filled is not re-fetched every tick');
+  const ordersBefore = realApi.orders;
+  await reconcilePolymarketLockFills(realApi, { pendingQuotes: new Map(), submissions: [dead], seenQuoteIds: seen });
+  assert.strictEqual(realApi.orders, ordersBefore, 'seen dead order: no GET');
+  // Already booked (same lock + size, e.g. by the activity path) -> not booked again.
+  const booked = [{ fill_id: 'poly-act:T1', parlay_id: LOCK.id, ticker: 'crossd-20a23b816da19144', count: 61.87, raw: { venue: 'polymarket', source: 'poly-activity' } }];
+  const twin = await reconcilePolymarketLockFills(realApi, { pendingQuotes: new Map(), submissions: [ordered], bookedFills: booked, seenQuoteIds: new Set() });
+  assert.strictEqual(twin.length, 0, 'activity-booked fill of the same size is not re-booked');
+  const rfqSrc2 = fs.readFileSync(path.join(__dirname, 'polymarket-rfq.js'), 'utf8');
+  assert.ok(/ctx\.loadOrderedUnfilledPolyQuotes/.test(rfqSrc2), 'reconcile loads order-stamped rows');
+  const lr = fs.readFileSync(path.join(__dirname, 'live-runner.js'), 'utf8');
+  const ol = lr.slice(lr.indexOf('async function loadOrderedUnfilledPolyQuotes'), lr.indexOf('async function loadPolySubmissionsForQuoteIds'));
+  assert.ok(/\.not\('order_id', 'is', null\)/.test(ol) && /\.in\('user_id', SCOPE\.userIds\)/.test(ol));
+  assert.ok(/loadOrderedUnfilledPolyQuotes,/.test(lr), 'ordered loader passed to the Polymarket loop');
+
   // live-runner loaders: newest-first, scoped, and wired.
   const src = fs.readFileSync(path.join(__dirname, 'live-runner.js'), 'utf8');
   const unfilled = src.slice(src.indexOf('async function loadUnfilledPolyQuotes'), src.indexOf('async function loadPolySubmissionsForQuoteIds'));

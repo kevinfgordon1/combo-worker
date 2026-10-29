@@ -1079,6 +1079,7 @@ async function resolveQuoteFill(http, {
   pendingId,
   alreadyFilled = 0,
   allowExecutedWithoutOrder = false,
+  out = null,
 } = {}) {
   if (!quote && !pending) return null;
   const q = quote || {};
@@ -1086,6 +1087,7 @@ async function resolveQuoteFill(http, {
     || (pending && (pending.creatorOrderId || pending.orderId || pending.order_id))
     || null;
   const order = orderId ? await fetchOrder(http, orderId) : null;
+  if (out && typeof out === 'object') out.order = order;
   if (order && !(cumQuantityOf(order) > 0) && !isFilledOrderState(order.state)) {
     return null;
   }
@@ -1163,13 +1165,16 @@ const HYDRATE_PER_TICK = Number(process.env.POLY_HYDRATE_PER_TICK) > 0
 function hydratePriority(c) {
   const p = c && c.pending;
   if (p && (p.accepted || p.confirmed || p.executed || p.creatorOrderId || p.orderId)) return 0;
+  // combo_submissions.order_id is stamped when we confirm: the quote was accepted and an order exists.
+  if (c && orderIdOfQuote(c.quote)) return 0;
   return 1;
 }
 
-async function hydrateMissingQuotes(http, candidates, maxHydrate) {
+async function hydrateMissingQuotes(http, candidates, maxHydrate, seenQuoteIds) {
   const limit = Math.min(Number.isFinite(maxHydrate) ? maxHydrate : HYDRATE_PER_TICK, HYDRATE_PER_TICK);
+  const seen = seenQuoteIds && typeof seenQuoteIds.has === 'function' ? seenQuoteIds : null;
   let n = 0;
-  const ordered = (candidates || []).map((c, i) => ({ c, i }))
+  const ordered = (candidates || []).filter((c) => !(seen && c && seen.has(c.id))).map((c, i) => ({ c, i }))
     .sort((a, b) => hydratePriority(a.c) - hydratePriority(b.c) || a.i - b.i)
     .map((x) => x.c);
   for (const c of ordered) {
@@ -1245,7 +1250,7 @@ async function reconcilePolymarketLockFills(http, {
     mergeQuoteCandidates(executed, submissions, pendingQuotes),
     { submissions, pendingQuotes }
   );
-  if (hydrate) await hydrateMissingQuotes(http, candidates, maxPerTick);
+  if (hydrate) await hydrateMissingQuotes(http, candidates, maxPerTick, seenQuoteIds);
   const picked = pickReconcileCandidates(candidates, { maxPerTick, seenQuoteIds });
   const quoteIds = quoteIdLockMap(submissions, pendingQuotes);
   const slugs = slugsByLockId(submissions, null, pendingQuotes);
@@ -1256,13 +1261,22 @@ async function reconcilePolymarketLockFills(http, {
     if (!(already > 0) && typeof getFilledForQuote === 'function') {
       try { already = parsePositive(await getFilledForQuote(quoteId)); } catch (_) { already = 0; }
     }
+    const seenOrder = {};
     const evt = await resolveQuoteFill(http, {
       quote: c.quote,
       pending: c.pending,
       pendingId: quoteId,
       alreadyFilled: already,
       allowExecutedWithoutOrder,
+      out: seenOrder,
     });
+    // Order finished with nothing filled (rejected / expired / cancelled after the accept): nothing will
+    // ever book, so stop re-fetching it every tick. Order-stamped submission rows stay in the loader for
+    // 21 days; without this each dead one would cost a GET /v1/order per tick.
+    if (seenQuoteIds && quoteId && seenOrder.order && isDeadOrderState(orderStateOf(seenOrder.order))
+      && !(cumQuantityOf(seenOrder.order) > 0)) {
+      seenQuoteIds.add(quoteId);
+    }
     if (evt && evt.contracts > 0) {
       const lockId = (c.pending && c.pending.parlayId) || quoteIds.get(quoteId);
       const lock = lockId && lockId !== false ? { id: lockId } : { id: evt.parlayId };
