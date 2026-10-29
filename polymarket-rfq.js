@@ -2478,7 +2478,8 @@ function startPolymarketRfqLoop(ctx = {}) {
       }
     }
     const bookedPrior = (Array.isArray(ctx.bookedPolyFills) ? ctx.bookedPolyFills : []).concat(slugRecords);
-    const events = await reconcilePolymarketLockFills(http, {
+    const notSniper = (e) => !(sniperRouter && sniperSafe(() => sniperRouter.isSniperFill(e), false));
+    const events = (await reconcilePolymarketLockFills(http, {
       pendingQuotes,
       submissions,
       getFilledForQuote: ctx.getFilledForQuote,
@@ -2488,7 +2489,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       maxPerTick: ctx.fillReconcileMax != null ? ctx.fillReconcileMax : 15,
       loadSubmissionsForQuoteIds: typeof ctx.loadPolySubmissionsForQuoteIds === 'function'
         ? ctx.loadPolySubmissionsForQuoteIds : undefined,
-    });
+    })).filter(notSniper);
     for (const evt of events) {
       const pending = evt.pending || (evt.quoteId ? pendingQuotes.get(evt.quoteId) : null);
       if (pending && evt.contracts > 0) {
@@ -2511,14 +2512,14 @@ function startPolymarketRfqLoop(ctx = {}) {
       try { locks = (await ctx.loadRecentLocks()) || []; } catch (_) { locks = []; }
       if (locks.length) {
         try {
-          extra = await reconcileLockActivityEvents(http, {
+          extra = (await reconcileLockActivityEvents(http, {
             locks,
             seenFillIds: ctx.seenFillIds,
             submissions,
             slugRecords,
             pendingQuotes,
             bookedFills: events.concat(bookedPrior),
-          });
+          })).filter(notSniper);
         } catch (e) {
           console.error(`[${MODE}] fill reconcile activities`, e && e.message);
         }
@@ -2822,8 +2823,33 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
   }
 
+  // Live Polymarket sniper (poly-sniper/live.js) shares this socket and account. Its own quotes,
+  // orders and fills are handed to it here and never reach Combo Locks' accept/confirm/fill code.
+  const sniperRouter = ctx.sniperRouter || null;
+  function sniperSafe(fn, dflt) { try { return fn(); } catch (e) { console.error(`[${MODE}] sniper router`, e && e.message); return dflt; } }
+  function comboKnowsQuote(id) { return !!(id && (pendingQuotes.has(id) || closedContext.get(id))); }
+  const NOT_AN_OUTCOME = new Set(['missing_context', 'missing_ids', 'in_flight', 'live_off']);
+
   function onWsEvent(evt) {
     if (!evt || stopped) return;
+    if (sniperRouter) {
+      if (evt.type === 'quoteAccepted' || evt.type === 'quoteConfirmed' || evt.type === 'quoteExecuted' || evt.type === 'quoteDeleted') {
+        const sq = evt.quote || {};
+        const sid = sq.id || sq.quoteId || sq.quote_id || null;
+        if (!comboKnowsQuote(sid) && sniperSafe(() => sniperRouter.onWsEvent(evt), false)) return;
+      } else if (evt.type === 'rfqClosed') {
+        sniperSafe(() => sniperRouter.onWsEvent(evt), false);
+      } else if (evt.type === 'orderExecution') {
+        const all = Array.isArray(evt.executions) && evt.executions.length ? evt.executions : (evt.execution ? [evt.execution] : []);
+        const mine = all.filter((ex) => sniperSafe(() => sniperRouter.ownsExecution(ex), false));
+        if (mine.length) {
+          for (const ex of mine) sniperSafe(() => sniperRouter.onOrderExecution(ex));
+          const rest = all.filter((ex) => !mine.includes(ex));
+          if (!rest.length) return;
+          evt = { ...evt, executions: rest, execution: undefined };
+        }
+      }
+    }
     // Anonymous RFQ trade prints (rfqEvent.rfqTrade) arrive on the existing RFQ subscription as type 'other'.
     if (lossTape && evt.type === 'other') {
       const rt = evt.raw && evt.raw.rfqEvent && evt.raw.rfqEvent.rfqTrade;
@@ -2839,7 +2865,10 @@ function startPolymarketRfqLoop(ctx = {}) {
       handleRfqClosed(evt);
     } else if (evt.type === 'quoteAccepted') {
       if (lossTape) { const a = acceptedFromEvent(evt); tape('onOurs', { quoteId: a.quoteId, rfqId: a.rfqId }); }
-      handleQuoteAccepted(evt).catch((e) => console.error(`[${MODE}] onAccept`, e.message));
+      handleQuoteAccepted(evt).then((r) => {
+        // Account-wide decline rate (Polymarket pauses makers over 15%): the sniper pauses itself first.
+        if (sniperRouter && r && !NOT_AN_OUTCOME.has(r.reason)) sniperSafe(() => sniperRouter.onComboAcceptOutcome(!!r.confirmed));
+      }).catch((e) => console.error(`[${MODE}] onAccept`, e.message));
       noteUnhedgedFillEvent(evt);
     } else if (evt.type === 'quoteConfirmed') {
       noteUnhedgedFillEvent(evt);
@@ -2893,6 +2922,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       subscribePositions: live && polyRole,
       onStall: (info) => {
         lastWsStallAt = Date.now();
+        if (sniperRouter) sniperSafe(() => sniperRouter.onWsStall(info));
         console.error(
           `[${MODE}] WS STALL no message for ${Math.round(info.silentMs / 1000)}s ` +
           `(stalls=${info.stalls}) - terminating socket and reconnecting | cause: ` +
@@ -2912,6 +2942,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       },
       onRecovered: (info) => {
         console.log(`[${MODE}] WS recovered after stall (stalls=${info.stalls})`);
+        if (sniperRouter) sniperSafe(() => sniperRouter.onWsRecovered(info));
         if (polyRole) fillScheduler.trigger('ws-recovered');
         if (typeof ctx.onWsRecovered === 'function') {
           try { Promise.resolve(ctx.onWsRecovered(info)).catch(() => {}); } catch (_) { /* observability only */ }
@@ -3143,6 +3174,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     strayDeletes,
     deleteStats,
     pendingQuotes,
+    confirmingQuotes,
     seenRfqs,
     missTape,
     live,
