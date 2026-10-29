@@ -2618,7 +2618,7 @@ function startPolymarketRfqLoop(ctx = {}) {
   // arrive on the WS) but together made ~130 req/min and tripped Cloudflare
   // 1015 (HTTP 429). While healthy we poll slowly and crawl shallow; the
   // moment the WS goes quiet/stalls we go back to full-rate coverage.
-  const wsHealthyMaxSilentMs = envIntLocal('POLY_WS_HEALTHY_SILENT_MS', 15000);
+  const wsHealthyMaxSilentMs = envIntLocal('POLY_WS_HEALTHY_SILENT_MS', 5000);
   const reconcileHealthyMs = envIntLocal('POLY_RECONCILE_HEALTHY_MS', polyRole ? 60000 : 30000);
   const crawlHealthyPages = envIntLocal('POLY_CRAWL_HEALTHY_PAGES', 5);
   const stallRecoveryMs = envIntLocal('POLY_WS_STALL_RECOVERY_MS', 10 * 60 * 1000);

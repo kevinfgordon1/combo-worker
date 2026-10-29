@@ -500,10 +500,13 @@ function executionsFromOrderUpdate(update) {
   return [];
 }
 
-// RFQ flow never drops below ~55 msg/s, so 30s of silence is already a dead
-// socket (was 60s). Override with POLY_WS_STALL_MS (0 disables).
-const DEFAULT_WS_STALL_MS = 30000;
-const DEFAULT_WS_STALL_CHECK_MS = 5000;
+// RFQ flow never drops below ~55 msg/s (~220 msg/s even at 12:30 AM ET), so
+// 10s of silence is already a dead socket. Polymarket's silent freezes
+// (pongs still answered, zero data, a fresh socket gets data within ~1s) were
+// costing ~31-36s of WS intake each at the old 30s window; 10s + a 2s check
+// cuts that to ~10-12s. Override with POLY_WS_STALL_MS (0 disables).
+const DEFAULT_WS_STALL_MS = 10000;
+const DEFAULT_WS_STALL_CHECK_MS = 2000;
 function envStallMs() {
   const raw = process.env.POLY_WS_STALL_MS;
   if (raw == null || raw === '') return DEFAULT_WS_STALL_MS;

@@ -77,7 +77,7 @@ class FakeSock extends EventEmitter {
 }
 
 function testClientDiagnostics() {
-  assert.strictEqual(DEFAULT_WS_STALL_MS, 30000, 'default stall window is 30s');
+  assert.strictEqual(DEFAULT_WS_STALL_MS, 10000, 'default stall window is 10s');
   let t = 1_000_000;
   const socks = []; const stalls = [];
   const ws = createPolymarketRfqWs({
@@ -130,7 +130,7 @@ function testClientDiagnostics() {
 }
 
 async function testRestNote() {
-  assert.ok(/REST crawl is covering/.test(restNote({})));
+  assert.ok(/REST polling covers part of intake/.test(restNote({})));
   assert.ok(/REST also failing/.test(restNote({ restFailing: true })));
   const a = fakeAlerts(); let t = 1e7;
   const s = createPolyStallAlerts({ appAlerts: a, now: () => t });
