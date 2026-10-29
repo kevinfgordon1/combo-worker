@@ -151,6 +151,13 @@ function sizeKey(n) {
 function quotedContractsForReconcile(quote, pending) {
   const pendingQty = pending ? parsePositive(pending.contracts) : 0;
   const quoteQty = contractsFromQuote(quote);
+  // The venue's own EXECUTED quote (same quote id) is authoritative for its size. On cash RFQs our
+  // submission row only holds our pre-trade estimate (Oct 26: we logged 67, venue sized 61.87 after the
+  // taker fee), and the mismatch made reconcile drop a real fill. The order's cum qty is still checked
+  // against this size below, so a wrong-size order is still refused.
+  if (quoteQty > 0 && quoteIdOf(quote) && isExecutedQuoteStatus(quote && quote.status)) {
+    return { quoted: quoteQty, mismatch: false, pendingQty, quoteQty };
+  }
   if (pendingQty > 0 && quoteQty > 0 && !sizesEqual(pendingQty, quoteQty)) {
     return { quoted: 0, mismatch: true, pendingQty, quoteQty };
   }
@@ -1210,6 +1217,10 @@ async function reconcilePolymarketLockFills(http, {
   seenFillIds,
   bookedFills,
   hydrate = true,
+  // Optional async (quoteIds[]) -> combo_submissions rows. Executed quotes are only booked when their
+  // submission row is in scope; with ~2,000 quotes/day the caller's bounded "recent unfilled" list can
+  // miss them (Oct 26 6:51 PM ET: 61.87 @ +575 executed, never booked). Look the missing ones up by id.
+  loadSubmissionsForQuoteIds,
 } = {}) {
   let executed = [];
   try {
@@ -1217,6 +1228,18 @@ async function reconcilePolymarketLockFills(http, {
     executed = listed.quotes || [];
   } catch (_) {
     executed = [];
+  }
+  if (typeof loadSubmissionsForQuoteIds === 'function' && executed.length) {
+    const have = new Set();
+    for (const row of submissions || []) { const id = row && (row.quote_id || row.quoteId); if (id) have.add(id); }
+    if (pendingQuotes && typeof pendingQuotes.forEach === 'function') pendingQuotes.forEach((_, id) => have.add(id));
+    const missing = [...new Set(executed.map(quoteIdOf).filter((id) => id && !have.has(id)))];
+    if (missing.length) {
+      try {
+        const extra = await loadSubmissionsForQuoteIds(missing);
+        if (Array.isArray(extra) && extra.length) submissions = (submissions || []).concat(extra);
+      } catch (_) { /* fail soft: same as before the lookup existed */ }
+    }
   }
   const candidates = scopeQuoteCandidates(
     mergeQuoteCandidates(executed, submissions, pendingQuotes),

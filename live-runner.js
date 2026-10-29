@@ -1863,6 +1863,9 @@ async function loadUnfilledPolyQuotes() {
       .neq('status', 'filled')
       .neq('status', 'shadow')
       .gte('created_at', cutoff)
+      // Newest first: ~40k quote rows sit in the 21-day window, so an unordered limit returned
+      // arbitrary (oldest) rows and recent quotes were never reconciled.
+      .order('created_at', { ascending: false })
       .limit(300);
     if (error) {
       console.error(`[${MODE}] load unfilled poly quotes`, error.message);
@@ -1871,6 +1874,29 @@ async function loadUnfilledPolyQuotes() {
     return data || [];
   } catch (e) {
     console.error(`[${MODE}] load unfilled poly quotes`, e && e.message);
+    return [];
+  }
+}
+
+// Exact lookup for executed quote ids that fell outside loadUnfilledPolyQuotes' newest-300 window.
+async function loadPolySubmissionsForQuoteIds(quoteIds) {
+  const ids = [...new Set((quoteIds || []).filter(Boolean))].slice(0, 100);
+  if (!ids.length) return [];
+  try {
+    const { data, error } = await supabase
+      .from('combo_submissions')
+      .select('id,quote_id,order_id,rfq_id,parlay_id,label,contracts,user_id,status,created_at,market_ticker')
+      .in('user_id', SCOPE.userIds)
+      .eq('venue', 'polymarket')
+      .in('quote_id', ids)
+      .limit(500);
+    if (error) {
+      console.error(`[${MODE}] load poly quotes by id`, error.message);
+      return [];
+    }
+    return data || [];
+  } catch (e) {
+    console.error(`[${MODE}] load poly quotes by id`, e && e.message);
     return [];
   }
 }
@@ -1910,8 +1936,12 @@ async function loadRecentLocks() {
       supabase
         .from('combo_parlays')
         .select('id,label,user_id,max_contracts,active,created_at,archived_at')
+        .in('user_id', SCOPE.userIds)
         .gte('created_at', cutoff)
-        .limit(200),
+        // Newest first and scoped to this worker's users: 570+ locks (all users) sit in 21 days, so the
+        // unordered limit(200) dropped new locks and their fills were never matched to activity trades.
+        .order('created_at', { ascending: false })
+        .limit(1000),
       supabase
         .from('combo_submissions')
         .select('parlay_id')
@@ -1919,6 +1949,7 @@ async function loadRecentLocks() {
         .eq('venue', 'polymarket')
         .not('quote_id', 'is', null)
         .gte('created_at', cutoff)
+        .order('created_at', { ascending: false })
         .limit(2000),
     ]);
     if (locksQ.error) {
@@ -3101,6 +3132,7 @@ async function main() {
       persistQuoteSkip(quoteId, skipReason, fallback, 'polymarket'),
     persistQuoteOrder,
     loadUnfilledPolyQuotes,
+    loadPolySubmissionsForQuoteIds,
     getFilledForQuote,
     loadRecentLocks,
     loadPolySlugRecords,
