@@ -15,9 +15,16 @@
 //     Polymarket's last-look window, together with a fresh fair price (engine.decidePoly).
 //   * Cash floor: never post or confirm if Polymarket buying power minus the new risk would fall below
 //     POLY_SNIPER_CASH_FLOOR_USD, so Combo Locks stays funded. Unknown / stale balance = no trading.
-//   * Rate limits: sniper posts <= POLY_SNIPER_POST_RPS (20/s) and cancels <= POLY_SNIPER_CANCEL_RPS,
-//     on their own buckets (Polymarket US: 100 quote writes/s per account on the regular tier). A sniper
-//     confirm waits (briefly) for any Combo Locks confirm in flight: Combo Locks always goes first.
+//   * Rate limits: sniper posts <= POLY_SNIPER_POST_RPS (20/s) and cancels <= POLY_SNIPER_CANCEL_RPS
+//     (50/s, POLY_SNIPER_CANCEL_CONCURRENCY in flight), on their own buckets (Polymarket US: quote create
+//     and quote delete each have their own 100 req/s venue bucket). A sniper confirm waits (briefly) for
+//     any Combo Locks confirm in flight: Combo Locks always goes first.
+//   * Max quote life (Kevin Oct 30: "no quote alive more than 20 seconds"): POLY_SNIPER_MAX_QUOTE_LIFE_MS
+//     (20s). Polymarket US CreateQuote has no expiry field, so we enforce it ourselves: every quote is
+//     deleted at POLY_SNIPER_QUOTE_TTL_MS (15s, never more than max life - 5s) by a 1s sweeper. Deletes
+//     have strict priority: no new quote is posted while the delete lane is backed up (> 20 pending or
+//     oldest pending > 2s) or while any open quote is near the max life. Before Oct 30 the delete lane
+//     sent one DELETE at a time, so it fell 100-285s behind ~20 posts/s.
 //   * Declines: if sniper declines exceed 10% of sniper accepts over the last hour — or the whole
 //     account's (sniper + Combo Locks) do — the sniper pauses (Polymarket pauses makers over 15%,
 //     which would also stop Combo Locks). Resumes when the hour window is back under 10%.
@@ -38,6 +45,7 @@ const flag = (v, d) => (v == null || v === '' ? d : !/^(0|false|no|off)$/i.test(
 // soon-cap (settles <= 24h: total cap = cash, never below normal), legs <= 7 days out.
 // Every value can be overridden with the POLY_SNIPER_* env of the same name.
 function liveConfig(env = process.env) {
+  const maxLife = Math.max(6000, num(env.POLY_SNIPER_MAX_QUOTE_LIFE_MS, 20000));
   return {
     maxRisk: num(env.POLY_SNIPER_MAX_RISK, 500),
     maxPayout: num(env.POLY_SNIPER_MAX_PAYOUT, 100000),
@@ -57,11 +65,27 @@ function liveConfig(env = process.env) {
     balancePollMs: num(env.POLY_SNIPER_BALANCE_POLL_MS, 30000),
     balanceMaxAgeMs: num(env.POLY_SNIPER_BALANCE_MAX_AGE_MS, 120000),
     postRps: num(env.POLY_SNIPER_POST_RPS, 20),
-    cancelRps: num(env.POLY_SNIPER_CANCEL_RPS, 20),
+    cancelRps: num(env.POLY_SNIPER_CANCEL_RPS, 50),
+    cancelConcurrency: Math.max(1, Math.floor(num(env.POLY_SNIPER_CANCEL_CONCURRENCY, 10))),
     maxRfqAgeMs: num(env.POLY_SNIPER_MAX_RFQ_AGE_MS, 3000),
-    quoteTtlMs: num(env.POLY_SNIPER_QUOTE_TTL_MS, 60000),
+    // Kevin Oct 30: no quote may stay alive on Polymarket more than 20s. TTL (when the sweeper deletes it)
+    // is clamped to max life - 5s, leaving room for sweep granularity, the delete lane and the DELETE itself.
+    maxQuoteLifeMs: maxLife,
+    quoteTtlMs: Math.max(1000, Math.min(num(env.POLY_SNIPER_QUOTE_TTL_MS, 15000), maxLife - 5000)),
+    // Post gate: no new quote while the delete lane has more than this many pending (queued + in flight),
+    // or its oldest pending delete has waited longer than cancelBacklogMs, or any open quote is within
+    // ageGuardMs of the max life.
+    cancelBacklogMax: num(env.POLY_SNIPER_CANCEL_BACKLOG_MAX, 20),
+    cancelBacklogMs: num(env.POLY_SNIPER_CANCEL_BACKLOG_MS, 2000),
+    ageGuardMs: num(env.POLY_SNIPER_AGE_GUARD_MS, 2000),
+    // DELETE 4xx (Polymarket "400 unable to process"): verify with one GetQuotes read (shares the 1 req/s
+    // RFQ budget, so at most one per verifyGapMs); a quote still live is re-deleted up to rejectRetries.
+    verifyGapMs: num(env.POLY_SNIPER_DELETE_VERIFY_GAP_MS, 3000),
+    rejectRetries: num(env.POLY_SNIPER_DELETE_REJECT_RETRIES, 3),
+    // Post a little above the minimum edge (min + this); last look / sweeps still use the plain minimum.
+    postEdgeCushion: num(env.POLY_SNIPER_POST_EDGE_CUSHION, 0.005),
     closedGraceMs: num(env.POLY_SNIPER_CLOSED_GRACE_MS, 30000),
-    sweepMs: num(env.POLY_SNIPER_SWEEP_MS, 2000),
+    sweepMs: num(env.POLY_SNIPER_SWEEP_MS, 1000),
     declinePauseRatio: num(env.POLY_SNIPER_DECLINE_PAUSE_RATIO, 0.10),
     declineWindowMs: num(env.POLY_SNIPER_DECLINE_WINDOW_MS, 3600000),
     confirmSafetyMs: num(env.POLY_SNIPER_CONFIRM_SAFETY_MS, 300),
@@ -170,8 +194,9 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
   const comboOutcomes = [];   // { at, declined }
   const postBucket = createBucket(config.postRps, config.postRps, now);
   const cancelBucket = createBucket(config.cancelRps, config.cancelRps, now);
-  const cancelQueue = [];     // { quoteId, rfqId, reason, tries }
-  const stats = { posted: 0, postFailed: 0, postRate: 0, accepted: 0, confirmed: 0, declined: 0, cancelled: 0, cancelFailed: 0, filled: 0, fillContracts: 0, settled: 0, skips: {} };
+  const cancelQueue = [];     // { quoteId, rfqId, reason, tries, queuedAt }
+  const inflightCancels = new Map(); // quoteId -> job
+  const stats = { posted: 0, postFailed: 0, postRate: 0, accepted: 0, confirmed: 0, declined: 0, cancelled: 0, cancelFailed: 0, cancelGone: 0, cancelRejected: 0, cancelVerified: 0, cancelStillLive: 0, cancelClosed: 0, maxCancelLagMs: 0, maxQuoteAgeMs: 0, filled: 0, fillContracts: 0, settled: 0, skips: {} };
   const day = { key: null, risk: 0, loss: 0, startIso: null };
   const hourPosts = [];
   let http = null; let comboConfirming = () => 0;
@@ -183,6 +208,8 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
   let confirmChain = Promise.resolve();
   let started = false; let stopped = false; const handles = [];
   let backoffUntil = 0;
+  let lastVerifyAt = 0;
+  let ageAlertAt = 0;
 
   const say = (m) => log(`[POLY-SNIPER] LIVE ${m}`);
   const notify = (m) => { if (typeof alert === 'function') { try { Promise.resolve(alert(`🎯 POLY SNIPER (not Combo Locks) ${m}`)).catch(() => {}); } catch (_) { /* best effort */ } } };
@@ -249,6 +276,8 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
     if (!isActive()) return { posted: false, reason: skipNote(state()) };
     if (!d || d.action !== 'quote') return { posted: false, reason: 'not_quote' };
     if (t < backoffUntil) return { posted: false, reason: skipNote('post_backoff') };
+    const gate = postGate(t);
+    if (gate) return { posted: false, reason: skipNote(gate) };
     if (byRfq.has(rfq.rfqId) || posting.has(rfq.rfqId)) return { posted: false, reason: skipNote('already_quoted') };
     if (ageMs != null && ageMs > config.maxRfqAgeMs) return { posted: false, reason: skipNote('stale_rfq') };
     const { settleAt, kicks } = settleAtOf(d.legKeys, t);
@@ -285,39 +314,106 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
     return { posted: true, quoteId };
   }
 
-  // ── cancels (never dropped; rate limited; retried) ──────────────────────
+  // ── cancels (never dropped; strict priority over posts; parallel; rate limited) ──
+  // Up to cancelConcurrency DELETEs in flight at cancelRps. Outcomes:
+  //   2xx / 404            -> gone (404 = already gone on the venue)
+  //   network/5xx/429/408  -> retried fast (<= 2s backoff, up to 8 tries; 429 also pauses posts 2s)
+  //   other 4xx (400 "unable to process") -> RFQ closed = gone; else verified with GetQuotes (rate
+  //                           limited, off the delete lane): already gone / executed -> recorded as such;
+  //                           still live -> re-deleted (rejectRetries) then alert; unverifiable ->
+  //                           recorded as delete_rejected_<code>. Never retried forever.
   function queueCancel(rec, reason) {
     if (!rec || rec.cancelQueued) return;
     rec.cancelQueued = true; rec.cancelReason = reason;
-    cancelQueue.push({ quoteId: rec.quoteId, rfqId: rec.rfqId, reason, tries: 0 });
+    cancelQueue.push({ quoteId: rec.quoteId, rfqId: rec.rfqId, reason, tries: 0, rejects: 0, queuedAt: now() });
     drainCancels();
   }
-  let draining = false;
-  async function drainCancels() {
-    if (draining || !http) return; draining = true;
-    try {
-      while (cancelQueue.length) {
-        const w = cancelBucket.waitMs();
-        if (w > 0) { await new Promise((r) => setTimeout(r, w)); }
-        if (!cancelBucket.take()) continue;
-        const job = cancelQueue.shift();
-        const rec = quotes.get(job.quoteId);
-        try {
-          await http.deleteQuote(job.rfqId, job.quoteId);
-          stats.cancelled += 1;
-          finishCancel(rec, job);
-        } catch (e) {
-          const sc = e && e.statusCode;
-          const transient = sc == null || sc >= 500 || sc === 429 || sc === 408;
-          if (transient && job.tries < 6) { job.tries += 1; setTimeout(() => { cancelQueue.push(job); drainCancels(); }, 250 * (2 ** job.tries)).unref?.(); }
-          else { stats.cancelFailed += 1; say(`cancel ${transient ? 'GAVE UP' : `terminal ${sc}`} quote_id=${job.quoteId} rfq=${job.rfqId}: ${e && e.message}`); finishCancel(rec, job, true); }
-        }
-      }
-    } finally { draining = false; }
+  function cancelBacklog(t = now()) {
+    let oldest = null;
+    for (const j of cancelQueue) if (oldest == null || j.queuedAt < oldest) oldest = j.queuedAt;
+    for (const j of inflightCancels.values()) if (oldest == null || j.queuedAt < oldest) oldest = j.queuedAt;
+    return { pending: cancelQueue.length + inflightCancels.size, oldestMs: oldest == null ? 0 : t - oldest };
   }
-  function finishCancel(rec, job, failed = false) {
+  // Oldest quote that may still be resting on the venue (phase quoted; not one whose DELETE the venue
+  // already refused and is being verified, and not one on a closed RFQ, which can no longer be accepted).
+  function oldestOpenAgeMs(t = now()) {
+    let max = 0;
+    for (const r of quotes.values()) {
+      if (r.phase !== 'quoted' || r.closedAt || r.cancelVerifying) continue;
+      const a = t - (r.postedAt || t); if (a > max) max = a;
+    }
+    return max;
+  }
+  // Reason to hold new posts, or null. Deletes always go first.
+  function postGate(t = now()) {
+    const b = cancelBacklog(t);
+    if (b.pending > config.cancelBacklogMax) return 'cancel_backlog';
+    if (b.pending > 0 && b.oldestMs > config.cancelBacklogMs) return 'cancel_lag';
+    if (oldestOpenAgeMs(t) >= config.maxQuoteLifeMs - config.ageGuardMs) return 'quote_age_guard';
+    return null;
+  }
+  let draining = false;
+  function drainCancels() {
+    if (!http) return;
+    while (cancelQueue.length && inflightCancels.size < config.cancelConcurrency) {
+      if (!cancelBucket.take()) {
+        if (!draining) { draining = true; setTimeout(() => { draining = false; drainCancels(); }, Math.max(5, cancelBucket.waitMs())); }
+        return;
+      }
+      const job = cancelQueue.shift();
+      inflightCancels.set(job.quoteId, job);
+      runCancel(job).catch((e) => say(`cancel worker error ${e && e.message}`)).finally(() => { inflightCancels.delete(job.quoteId); drainCancels(); });
+    }
+  }
+  async function runCancel(job) {
+    const rec = quotes.get(job.quoteId);
+    if (!rec || rec.phase !== 'quoted') return; // accepted / declined / dropped meanwhile: nothing to delete
+    if (rec.closedAt) { stats.cancelClosed += 1; finishCancel(rec, job, ':rfq_closed'); return; }
+    const lag = now() - job.queuedAt; if (lag > stats.maxCancelLagMs) stats.maxCancelLagMs = lag;
+    try {
+      const res = await http.deleteQuote(job.rfqId, job.quoteId);
+      if (res && res.statusCode === 404) { stats.cancelGone += 1; finishCancel(rec, job, ':already_gone'); return; }
+      stats.cancelled += 1;
+      finishCancel(rec, job);
+    } catch (e) {
+      const sc = e && e.statusCode;
+      const transient = sc == null || sc >= 500 || sc === 429 || sc === 408;
+      if (sc === 429) backoffUntil = Math.max(backoffUntil, now() + 2000); // deletes first: hold posts
+      if (transient) {
+        if (job.tries < 8) { job.tries += 1; const h = setTimeout(() => { cancelQueue.unshift(job); drainCancels(); }, Math.min(2000, 100 * (2 ** job.tries))); if (h.unref) h.unref(); return; }
+        stats.cancelFailed += 1; say(`cancel GAVE UP after ${job.tries} tries quote_id=${job.quoteId} rfq=${job.rfqId}: ${e && e.message}`);
+        notify(`⚠️ could not delete quote ${job.quoteId} (rfq ${job.rfqId}) after ${job.tries} tries: ${e && e.message}`);
+        finishCancel(rec, job, ':delete_failed');
+        return;
+      }
+      onDeleteRejected(rec, job, sc, e);
+    }
+  }
+  function onDeleteRejected(rec, job, sc, e) {
+    stats.cancelRejected += 1;
+    if (stats.cancelRejected <= 20 || stats.cancelRejected % 100 === 0) say(`cancel rejected ${sc} quote_id=${job.quoteId} rfq=${job.rfqId} (${stats.cancelRejected} so far): ${String((e && e.message) || '').slice(0, 120)}`);
+    if (rec && rec.closedAt) { stats.cancelClosed += 1; finishCancel(rec, job, ':rfq_closed'); return; }
+    const t = now();
+    if (!rec || typeof http.listQuotes !== 'function' || t - lastVerifyAt < config.verifyGapMs) { finishCancel(rec, job, `:delete_rejected_${sc}`); return; }
+    lastVerifyAt = t; rec.cancelVerifying = true;
+    const timeout = new Promise((r) => { const h = setTimeout(() => r(undefined), 6000); if (h.unref) h.unref(); });
+    Promise.race([fetchQuoteByIds(http, { rfqId: job.rfqId, quoteId: job.quoteId }), timeout]).then((cur) => {
+      rec.cancelVerifying = false;
+      if (rec.phase !== 'quoted') return; // accepted / gone meanwhile
+      const st = String((cur && (cur.status || cur.state)) || '').toUpperCase();
+      if (cur === undefined || !cur || !st) { finishCancel(rec, job, `:delete_rejected_${sc}`); return; }
+      stats.cancelVerified += 1;
+      if (/DELET|EXPIR|CANCEL|EXECUT|REJECT|CLOSED|FILLED|DONE/.test(st)) { stats.cancelGone += 1; finishCancel(rec, job, `:already_gone_${st.replace(/^QUOTE_STATUS_/, '').toLowerCase()}`); return; }
+      stats.cancelStillLive += 1;
+      if (job.rejects < config.rejectRetries) { job.rejects += 1; cancelQueue.unshift(job); drainCancels(); return; }
+      say(`QUOTE STILL LIVE after ${job.rejects + 1} rejected deletes quote_id=${job.quoteId} rfq=${job.rfqId} status=${st}`);
+      notify(`⚠️ quote ${job.quoteId} (rfq ${job.rfqId}) still ${st} on Polymarket after ${job.rejects + 1} rejected deletes. Check it.`);
+      finishCancel(rec, job, ':delete_rejected_still_live');
+    }).catch(() => { rec.cancelVerifying = false; finishCancel(rec, job, `:delete_rejected_${sc}`); });
+  }
+  function finishCancel(rec, job, suffix = '') {
     if (!rec) return;
-    if (rec.phase === 'quoted') { dropRec(rec, 'cancelled', { cancel_reason: job.reason + (failed ? ':delete_failed' : '') }); }
+    if (rec.phase === 'quoted') { dropRec(rec, 'cancelled', { cancel_reason: job.reason + (suffix || '') }); }
   }
   function dropRec(rec, phase, patch = {}) {
     rec.phase = phase;
@@ -500,19 +596,60 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
     }
   }
 
+  // Decline pause survives restarts (Oct 30): rebuild the last hour's sniper accepts / declines from
+  // poly_sniper_ledger.accepted_at before trading. If it cannot be read, stay paused
+  // (decline_history_unknown) and retry on every control poll.
+  async function loadDeclineHistory() {
+    if (!store || typeof store.recentOutcomes !== 'function') return null;
+    const t = now();
+    try {
+      const rows = await store.recentOutcomes(new Date(t - config.declineWindowMs).toISOString());
+      const a = []; const d = [];
+      for (const r of rows || []) {
+        if (quotes.has(r.quote_id) && quotes.get(r.quote_id).acceptedAt) continue; // already counted live
+        const at = Date.parse(r.accepted_at || '');
+        if (!Number.isFinite(at) || at < t - config.declineWindowMs) continue;
+        a.push(at); if (r.phase === 'declined') d.push(at);
+      }
+      const merge = (arr, add) => { arr.push(...add); arr.sort((x, y) => x - y); };
+      merge(accepts, a); merge(declines, d);
+      if (paused && paused.reason === 'decline_history_unknown') { paused = null; say('decline history loaded: pause cleared'); }
+      say(`decline history: ${a.length} accept(s), ${d.length} decline(s) in the last ${Math.round(config.declineWindowMs / 60000)}m loaded from the ledger`);
+      checkDeclinePause(t);
+      return { accepts: a.length, declines: d.length };
+    } catch (e) {
+      if (!paused) { paused = { reason: 'decline_history_unknown', at: t }; cancelAllResting('decline_history_unknown'); }
+      say(`decline history read failed: ${e.message} — sniper paused until it loads`);
+      return null;
+    }
+  }
+
   // ── stale sweep (stale prices, feed stall, fair moved past edge, near game start, TTL, closed) ──
   function sweep() {
     const t = now(); rollDay(t); prune(t);
     checkDeclinePause(t);
     if (!isActive()) { cancelAllResting(state()); return; }
     const healthy = feed && typeof feed.pricesHealthy === 'function' ? feed.pricesHealthy(t) : true;
+    let oldest = 0;
     for (const rec of quotes.values()) {
-      if (rec.phase !== 'quoted' || rec.cancelQueued) continue;
+      if (rec.phase !== 'quoted') continue;
+      // A closed RFQ can no longer be accepted: its quotes are dead on the venue (a DELETE would only get
+      // "400 unable to process"). Kept in memory for the grace period so late WS events still route here.
+      if (rec.closedAt) { if (t - rec.closedAt > config.closedGraceMs) dropRec(rec, 'expired', { cancel_reason: 'rfq_closed' }); continue; }
+      const age = t - rec.postedAt;
+      if (!rec.cancelVerifying && age > oldest) oldest = age;
+      if (rec.cancelQueued) continue;
       if (!healthy) { queueCancel(rec, 'prices_stale'); continue; }
-      if (rec.closedAt && t - rec.closedAt > config.closedGraceMs) { dropRec(rec, 'expired', { cancel_reason: 'rfq_closed' }); continue; }
-      if (t - rec.postedAt > config.quoteTtlMs) { queueCancel(rec, 'ttl'); continue; }
+      if (age >= config.quoteTtlMs) { queueCancel(rec, 'ttl'); continue; }
       const rp = reprice(rec, t);
       if (!rp.ok) queueCancel(rec, rp.reason === 'game_started' ? 'near_game_start' : rp.reason);
+    }
+    if (oldest > stats.maxQuoteAgeMs) stats.maxQuoteAgeMs = oldest;
+    if (oldest > config.maxQuoteLifeMs && t - ageAlertAt > 60000) {
+      ageAlertAt = t;
+      const b = cancelBacklog(t);
+      say(`MAX QUOTE LIFE EXCEEDED: oldest open quote ${(oldest / 1000).toFixed(1)}s > ${config.maxQuoteLifeMs / 1000}s (delete lane pending=${b.pending} oldest=${b.oldestMs}ms). Posting held until it clears.`);
+      notify(`⚠️ a quote has been open ${(oldest / 1000).toFixed(1)}s (> ${config.maxQuoteLifeMs / 1000}s max). New quotes held until deletes catch up.`);
     }
   }
 
@@ -534,7 +671,7 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
   }
   async function drainStaleDeletes(max = 1) {
     let n = 0;
-    while (http && n < max && staleDeletes.length && !cancelQueue.length && !draining && cancelBucket.take()) {
+    while (http && n < max && staleDeletes.length && !cancelQueue.length && !inflightCancels.size && cancelBucket.take()) {
       const job = staleDeletes.shift(); n += 1;
       try { await http.deleteQuote(job.rfqId, job.quoteId); stats.staleDeleted = (stats.staleDeleted || 0) + 1; } catch (_) { stats.staleDeleteGone = (stats.staleDeleteGone || 0) + 1; }
     }
@@ -674,9 +811,11 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
     if (started) return;
     started = true;
     await hydrate();
+    await loadDeclineHistory();
     await Promise.all([pollControl(), pollBalance(), refreshDay()]);
     try { await staleQuotedSweep(); } catch (e) { say(`stale sweep failed: ${e.message}`); }
     every(config.controlPollMs, pollControl);
+    every(config.controlPollMs, async function declineHistoryRetry() { if (paused && paused.reason === 'decline_history_unknown') await loadDeclineHistory(); });
     every(config.balancePollMs, pollBalance);
     every(config.sweepMs, sweep);
     every(config.fillCheckMs, fillBackstop);
@@ -684,7 +823,7 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
     every(config.dayRefreshMs, refreshDay);
     every(config.staleSweepMs, staleQuotedSweep);
     every(config.sweepMs, drainStaleDeletes);
-    say(`attached. switch=${switchOn ? 'ON' : 'OFF'} cash=${cash != null ? `$${cash.toFixed(2)}` : 'unknown'} floor=$${config.cashFloorUsd} posts<=${config.postRps}/s cancels<=${config.cancelRps}/s`);
+    say(`attached. switch=${switchOn ? 'ON' : 'OFF'} cash=${cash != null ? `$${cash.toFixed(2)}` : 'unknown'} floor=$${config.cashFloorUsd} posts<=${config.postRps}/s cancels<=${config.cancelRps}/s x${config.cancelConcurrency} quote_ttl=${config.quoteTtlMs / 1000}s max_life=${config.maxQuoteLifeMs / 1000}s post_cushion=+${(config.postEdgeCushion * 100).toFixed(1)}%`);
   }
   async function shutdown(reason = 'shutdown', budgetMs = 10000) {
     stopped = true;
@@ -692,7 +831,7 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
     for (const rec of quotes.values()) if (rec.phase === 'accepted') decline(rec, reason, now());
     cancelAllResting(reason);
     const until = now() + budgetMs;
-    while ((cancelQueue.length || draining) && now() < until) await new Promise((r) => setTimeout(r, 50));
+    while ((cancelQueue.length || inflightCancels.size) && now() < until) await new Promise((r) => setTimeout(r, 50));
     if (store) { try { await Promise.race([store.flush(), new Promise((r) => setTimeout(r, Math.max(0, until - now())))]); } catch (_) {} }
   }
   return {
@@ -701,9 +840,9 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
     onWsRecovered() { wsStalled = false; },
     onComboAcceptOutcome(confirmed) { comboOutcomes.push({ at: now(), declined: !confirmed }); checkDeclinePause(); },
     isActive, state,
-    stats: () => ({ state: state(), open: [...quotes.values()].filter((r) => r.phase === 'quoted').length, positions: countedPositions().length, openRisk: countedPositions().reduce((a, r) => a + r.risk, 0), dayRisk: day.risk, dayPnl: day.loss, cash, ...declineRatios(), ...stats, skips: { ...stats.skips } }),
+    stats: () => ({ state: state(), open: [...quotes.values()].filter((r) => r.phase === 'quoted').length, cancelPending: cancelBacklog().pending, cancelOldestMs: cancelBacklog().oldestMs, oldestQuoteMs: oldestOpenAgeMs(), positions: countedPositions().length, openRisk: countedPositions().reduce((a, r) => a + r.risk, 0), dayRisk: day.risk, dayPnl: day.loss, cash, ...declineRatios(), ...stats, skips: { ...stats.skips } }),
     confirmIdle: () => confirmChain,
-    _internal: { quotes, byRfq, byOrder, posting, cancelQueue, sweep, pollControl, pollBalance, fillBackstop, settleTick, hydrate, bookFill, staleQuotedSweep, drainStaleDeletes, staleDeletes, setCash: (v, at) => { cash = v; cashAt = at; }, day },
+    _internal: { quotes, byRfq, byOrder, posting, cancelQueue, inflightCancels, postGate, cancelBacklog, oldestOpenAgeMs, loadDeclineHistory, sweep, pollControl, pollBalance, fillBackstop, settleTick, hydrate, bookFill, staleQuotedSweep, drainStaleDeletes, staleDeletes, setCash: (v, at) => { cash = v; cashAt = at; }, day },
   };
 }
 
