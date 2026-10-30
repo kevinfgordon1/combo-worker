@@ -31,6 +31,8 @@ const { noBidFor } = require('./trader');
 const { fetchWithTimeout } = require('./fetch-timeout');
 const { createStaleAlert } = require('./stale-alert');
 const { createLedgerStore } = require('./ledger-store');
+const { createUnbookedReconcile } = require('./unbooked-reconcile');
+const { createBalanceSnapshot } = require('./balance-snapshot');
 const { createBookArbWatch } = require('./book-arb-watch');
 const { loadBookData } = require('./book-arb');
 const { venuesFromEnv } = require('./fair');
@@ -901,7 +903,35 @@ async function main(env = process.env) {
   // Leak sweep: 'accepted' rows with no fill after SNIPER_STALE_ACCEPTED_MIN (default 60, 0 = off) still
   // count at full risk forever (one $74 row from Oct 24 was holding cap). Release them.
   const staleAcceptedMin = num(env.SNIPER_STALE_ACCEPTED_MIN, 60);
-  if (gate.live && staleAcceptedMin > 0) {
+  // Oct 30: confirmed-but-unbooked reconcile asks Kalshi (quote status + fills by order id) before it
+  // books or releases an 'accepted' row (sniper/unbooked-reconcile.js). While it is on, the blind
+  // stale-accepted release below is off (it could drop a real, unbooked position).
+  // SNIPER_UNBOOKED_RECONCILE=0 restores the old blind sweep.
+  const unbookedOn = gate.live && String(env.SNIPER_UNBOOKED_RECONCILE || '1') !== '0';
+  if (unbookedOn) {
+    const unbooked = createUnbookedReconcile({
+      supabase, trader, store: liveStore, liveSniper, log, alert,
+      decision: (rec) => decisionStore.decision(rec),
+      minAgeMs: Math.max(60000, num(env.SNIPER_UNBOOKED_MIN_AGE_MS, 10 * 60000)),
+      noFillGraceMs: Math.max(5 * 60000, num(env.SNIPER_UNBOOKED_NO_FILL_GRACE_MS, 30 * 60000)),
+      maxPerCycle: Math.max(1, num(env.SNIPER_UNBOOKED_MAX_PER_CYCLE, 15)),
+    });
+    const runUnbooked = () => unbooked.tick().catch((e) => log(`[SNIPER] unbooked reconcile error: ${e.message}`));
+    setInterval(runUnbooked, Math.max(60000, num(env.SNIPER_UNBOOKED_RECONCILE_MS, 300000))).unref?.();
+    setTimeout(runUnbooked, 30000).unref?.();
+    log('[SNIPER] unbooked reconcile on (accepted rows > 10m with no fill: checked against Kalshi every 5m)');
+  }
+  // Oct 30: sniper subaccount balance -> kalshi_account_snapshots every 5 min (SNIPER_BALANCE_SNAPSHOT_MS, 0 = off).
+  const balanceSnapMs = num(env.SNIPER_BALANCE_SNAPSHOT_MS, 300000);
+  if (gate.live && balanceSnapMs > 0 && sniperSubaccount(env) >= 1) {
+    const balSnap = createBalanceSnapshot({
+      supabase, fetchBalanceUsd: () => trader.subBalanceUsd(), subaccount: sniperSubaccount(env), log,
+      totals: () => ledger.totals(), positions: () => ledger.positions.size,
+    });
+    setInterval(() => { balSnap.tick().catch(() => {}); }, Math.max(60000, balanceSnapMs)).unref?.();
+    setTimeout(() => { balSnap.tick().catch(() => {}); }, 20000).unref?.();
+  }
+  if (gate.live && staleAcceptedMin > 0 && !unbookedOn) {
     const sweepAccepted = async () => {
       const rows = await store.staleAccepted(staleAcceptedMin);
       for (const r of rows) {

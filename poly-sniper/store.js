@@ -5,6 +5,7 @@
 'use strict';
 
 const OPEN_PHASES = ['quoted', 'accepted', 'confirmed', 'filled'];
+const EXPOSURE_PHASES = ['accepted', 'confirmed', 'filled'];
 
 function createPolySniperStore({ supabase, log = console.log, retries = 3, retryMs = 1000, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
   if (!supabase) throw new Error('poly-sniper store needs supabase');
@@ -67,12 +68,52 @@ function createPolySniperStore({ supabase, log = console.log, retries = 3, retry
       const r = data && data[0];
       return { live: !!(r && r.live === true), updatedAt: r ? r.updated_at : null, updatedBy: r ? r.updated_by : null };
     },
-    async hydrateOpen() {
-      const { data, error } = await supabase.from('poly_sniper_ledger')
-        .select('quote_id,rfq_id,symbol,combo_key,games,legs,leg_detail,phase,buy_price,fair,contracts,accepted_contracts,filled_contracts,filled_cost,risk,order_id,fill_ids,settle_at,created_at,filled_at')
-        .in('phase', OPEN_PHASES).limit(5000);
-      if (error) throw new Error(`hydrate: ${error.message}`);
-      return data || [];
+    // Startup load (Oct 30 fix): every EXPOSURE row (accepted / confirmed / filled), ordered and paged so a
+    // pile of stale 'quoted' rows can never push a real position past a row limit (was one unordered
+    // .limit(5000) over all open phases). 'quoted' rows are loaded only when younger than
+    // staleQuotedMs (still possibly resting on the venue -> startup DELETE); older ones are left to
+    // expireStaleQuoted. Throws on any page error (caller fails closed: sniper stays off).
+    async hydrateOpen({ staleQuotedMs = 15 * 60000, nowMs = Date.now(), pageSize = 1000, maxPages = 200 } = {}) {
+      const cols = 'quote_id,rfq_id,symbol,combo_key,games,legs,leg_detail,phase,buy_price,fair,contracts,accepted_contracts,filled_contracts,filled_cost,risk,order_id,fill_ids,settle_at,created_at,filled_at';
+      const paged = async (build, what) => {
+        const out = [];
+        for (let page = 0; page < maxPages; page += 1) {
+          const from = page * pageSize;
+          const { data, error } = await build().order('created_at', { ascending: true }).order('quote_id', { ascending: true }).range(from, from + pageSize - 1);
+          if (error) throw new Error(`hydrate ${what}: ${error.message}`);
+          const rows = data || [];
+          out.push(...rows);
+          if (rows.length < pageSize) return out;
+        }
+        throw new Error(`hydrate ${what}: more than ${maxPages * pageSize} rows (refusing a partial load)`);
+      };
+      const exposure = await paged(() => supabase.from('poly_sniper_ledger').select(cols).in('phase', EXPOSURE_PHASES), 'exposure');
+      const sinceIso = new Date(nowMs - staleQuotedMs).toISOString();
+      const quoted = await paged(() => supabase.from('poly_sniper_ledger').select(cols).eq('phase', 'quoted').gte('created_at', sinceIso), 'quoted');
+      return [...exposure, ...quoted];
+    },
+    // Stale 'quoted' rows (older than staleQuotedMs: past every TTL / cancel retry, so not live in this
+    // process) -> phase 'expired'. These are rows a previous process left behind (e.g. quotes inserted
+    // during a deploy after the new process had already loaded). Returns the expired rows' ids so the
+    // caller can best-effort DELETE them on the venue. Ids in keepIds (live in memory) are never touched.
+    async expireStaleQuoted({ staleQuotedMs = 15 * 60000, nowMs = Date.now(), keepIds = new Set(), batch = 500 } = {}) {
+      const beforeIso = new Date(nowMs - staleQuotedMs).toISOString();
+      const { data, error } = await supabase.from('poly_sniper_ledger').select('quote_id,rfq_id,created_at')
+        .eq('phase', 'quoted').lt('created_at', beforeIso).order('created_at', { ascending: true }).limit(batch);
+      if (error) throw new Error(`stale quoted read: ${error.message}`);
+      const rows = (data || []).filter((r) => r.quote_id && !keepIds.has(r.quote_id));
+      if (!rows.length) return [];
+      const ids = rows.map((r) => r.quote_id);
+      const done = [];
+      for (let i = 0; i < ids.length; i += 100) {
+        const chunk = ids.slice(i, i + 100);
+        // phase guard: a row that moved on (accepted / filled) between the read and this write is left alone.
+        const res = await supabase.from('poly_sniper_ledger').update({ phase: 'expired', cancel_reason: 'stale_quoted_sweep', updated_at: new Date(nowMs).toISOString() })
+          .in('quote_id', chunk).eq('phase', 'quoted');
+        if (res && res.error) throw new Error(`stale quoted expire: ${res.error.message}`);
+        done.push(...rows.filter((r) => chunk.includes(r.quote_id)));
+      }
+      return done;
     },
     // Today's (ET) realized P&L and new filled risk, for the daily loss stop and the daily risk cap.
     async dayTotals(dayStartIso) {
@@ -88,4 +129,4 @@ function createPolySniperStore({ supabase, log = console.log, retries = 3, retry
   };
 }
 
-module.exports = { createPolySniperStore, OPEN_PHASES };
+module.exports = { createPolySniperStore, OPEN_PHASES, EXPOSURE_PHASES };
