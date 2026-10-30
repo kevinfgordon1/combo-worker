@@ -19,6 +19,8 @@ kill_timeout = "30s"
   # Poly sniper fair = full 4-venue inverse method incl. Polymarket (Kevin Oct 23). Sniper stays DRY (secrets).
   POLY_SNIPER_FAIR_INCLUDE_POLY = "1"
   POLY_SNIPER_MIN_ROI_TD = "0.06"   # Kevin Oct 23: NFL player-TD parlays need 6% (highest rule wins)
+  POLY_SNIPER_MIN_ROI_NFL_ML = "0.05"  # Kevin Oct 30: all-NFL-ML parlays 5% (was 3%); nothing below 5%
+  POLY_SNIPER_MIN_ROI_NFL = "0.05"     # Kevin Oct 30: other NFL 5% (was 4%); NCAAF 5%, NBA 6% unchanged
   # Poly sniper LIVE (Kevin Oct 29, preview): same caps as the Kalshi sniper (its live values Oct 29).
   # Going live needs BOTH: secret POLY_SNIPER_DRY_RUN=0 (today 1 = hard dry run) AND the DB switch
   # public.poly_sniper_control.live = true (default false; polled every 5s, no restart; off deletes all

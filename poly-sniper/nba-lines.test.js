@@ -133,11 +133,11 @@ t('NBA horizon, kickoff buffer, and scope switches', () => {
 
 t('min edge: NBA 6% (highest rule wins); existing NFL / college / TD rules unchanged', () => {
   const c = polySniperConfig({});
-  assert.strictEqual(c.minRoiNflMl, 0.03); assert.strictEqual(c.minRoiNfl, 0.04);
+  assert.strictEqual(c.minRoiNflMl, 0.05); assert.strictEqual(c.minRoiNfl, 0.05);
   assert.strictEqual(c.minRoiNcaaf, 0.05); assert.strictEqual(c.minRoiTd, 0.06); assert.strictEqual(c.minRoiNba, 0.06);
   assert.strictEqual(polyMinRoi([{ kind: 'ml' }, { kind: 'nba' }], c), 0.06);
   assert.strictEqual(polyMinRoi([{ kind: 'ml' }, { kind: 'line', league: 'nba' }], c), 0.06);
-  assert.strictEqual(polyMinRoi([{ kind: 'ml' }, { kind: 'line', league: 'nfl' }], c), 0.04);
+  assert.strictEqual(polyMinRoi([{ kind: 'ml' }, { kind: 'line', league: 'nfl' }], c), 0.05);
   assert.strictEqual(polyMinRoi([{ kind: 'ml' }, { kind: 'line', league: 'ncaaf' }], c), 0.05);
   assert.strictEqual(polySniperConfig({ POLY_SNIPER_MIN_ROI_NBA: '0.08' }).minRoiNba, 0.08);
 });
