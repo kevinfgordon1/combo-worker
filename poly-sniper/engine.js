@@ -14,8 +14,8 @@ const POLY_COMBO_MAKER_RATE = 0;
 
 function polySniperConfig(env = process.env) {
   return {
-    minRoiNflMl: num(env.POLY_SNIPER_MIN_ROI_NFL_ML, 0.03), // all legs NFL moneyline
-    minRoiNfl: num(env.POLY_SNIPER_MIN_ROI_NFL, 0.04),      // any other NFL (spreads/totals)
+    minRoiNflMl: num(env.POLY_SNIPER_MIN_ROI_NFL_ML, 0.05), // all legs NFL moneyline (Kevin Oct 30: 5%, was 3%)
+    minRoiNfl: num(env.POLY_SNIPER_MIN_ROI_NFL, 0.05),      // any other NFL (spreads/totals) (Kevin Oct 30: 5%, was 4%)
     minRoiTd: num(env.POLY_SNIPER_MIN_ROI_TD, 0.06),        // any NFL player-TD leg (Kevin Oct 23: 6%)
     minRoiNcaaf: num(env.POLY_SNIPER_MIN_ROI_NCAAF, 0.05),  // any college (FBS only) leg
     // Any NBA leg (moneyline, spread or total). New with NBA (Oct 28): 6%, the Kalshi sniper's NBA rule.

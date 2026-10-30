@@ -81,8 +81,8 @@ t('caps default to the Kalshi sniper values', () => {
     [400, 100000, 1500, 750, 10000, 5000, 48, 10000, 10000, true, 24, 7]);
   const e = polySniperConfig({});
   assert.deepStrictEqual([e.maxRisk, e.perGameCap, e.perLegCap, e.totalExposureCap, e.dailyRiskCap], [400, 1500, 750, 10000, 10000]);
-  // min edges unchanged
-  assert.deepStrictEqual([e.minRoiNflMl, e.minRoiNfl, e.minRoiTd, e.minRoiNcaaf, e.minRoiNba], [0.03, 0.04, 0.06, 0.05, 0.06]);
+  // min edges: nothing below 5% (Kevin Oct 30: NFL ML 3%->5%, other NFL 4%->5%)
+  assert.deepStrictEqual([e.minRoiNflMl, e.minRoiNfl, e.minRoiTd, e.minRoiNcaaf, e.minRoiNba], [0.05, 0.05, 0.06, 0.05, 0.06]);
   assert.strictEqual(c.postRps, 20); assert.strictEqual(c.declinePauseRatio, 0.10);
 });
 
@@ -129,7 +129,8 @@ t('switch on: posts buy side only, resting quotes count $0, post bucket caps bur
 });
 
 t('confirm re-checks caps with real exposure: second accept on the same game is declined', async () => {
-  const S = await setup();
+  // Fixture sized for a ~$399 fill at the old 3% NFL ML floor; pinned so this stays a cap test, not an edge test.
+  const S = await setup({ env: { POLY_SNIPER_MIN_ROI_NFL_ML: '0.03' } });
   const a = await S.post(rfq(ML2, '580')); const b = await S.post(rfq(ML2b, '580'));
   const qa = S.L._internal.quotes.get(a.quoteId); const qb = S.L._internal.quotes.get(b.quoteId);
   await S.accept(a.quoteId, qa.rfqId, 580);

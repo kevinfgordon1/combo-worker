@@ -25,13 +25,13 @@ function fakeFeed({ cost = 0.45, kickoffMs = Date.parse('2026-10-25T17:00:00Z'),
 const rfq = (legs, extra = {}) => ({ rfqId: `rfq_${Math.random()}`, symbol: 'crossd-x', qtyDecimal: '100', tickSize: 0.001, createdTime: new Date(NOW - 50).toISOString(), comboLegs: legs, ...extra });
 const ML2 = [{ symbol: 'aec-nfl-phi-was-2026-10-25', side: 'SIDE_BUY' }, { symbol: 'aec-nfl-nyg-den-2026-10-25', side: 'SIDE_SELL' }];
 
-t('NFL ML combo: quotes at >= 3% edge, sell side off, Polymarket book excluded from fair', () => {
+t('NFL ML combo: quotes at >= 5% edge, sell side off, Polymarket book excluded from fair', () => {
   const d = decidePoly(rfq(ML2), { feed: fakeFeed(), config: polySniperConfig({}), ledger: createVenueLedger(), nowMs: NOW });
   assert.strictEqual(d.action, 'quote', d.reason);
   assert.strictEqual(d.sellPrice, '0');
   assert.ok(Math.abs(d.fair - 0.55 * 0.55) < 1e-9, `fair ${d.fair}`); // novig 0.45 cost, not polymarket 0.30
-  assert.ok(d.roi >= 0.03 - 1e-9 && d.buyPrice > d.fair);
-  assert.strictEqual(d.minRoi, 0.03);
+  assert.ok(d.roi >= 0.05 - 1e-9 && d.buyPrice > d.fair);
+  assert.strictEqual(d.minRoi, 0.05);
   assert.deepStrictEqual(d.legs.map((l) => l.venue), ['novig', 'novig']);
 });
 
@@ -105,15 +105,16 @@ t('RFQ crawl pages at <= 1 req/s by default', () => { assert.ok(DEFAULT_PAGE_DEL
 
 console.log(`poly-sniper: ${n} tests passed`);
 
-{ // min edge: highest applicable rule wins (ML 3%, other NFL 4%, college 5%, TD 6%)
+{ // min edge: highest applicable rule wins (ML 5%, other NFL 5%, college 5%, TD 6%; nothing below 5%)
   const { polyMinRoi } = require('./engine');
   const c = polySniperConfig({});
   assert.strictEqual(c.minRoiTd, 0.06);
   assert.strictEqual(polySniperConfig({ POLY_SNIPER_MIN_ROI_TD: '0.07' }).minRoiTd, 0.07);
   const ml = { kind: 'ml' }; const td = { kind: 'td' }; const nfl = { kind: 'line', league: 'nfl' };
   const cfb = { kind: 'ncaaf' }; const cfbLine = { kind: 'line', league: 'ncaaf' };
-  assert.strictEqual(polyMinRoi([ml, ml], c), 0.03);
-  assert.strictEqual(polyMinRoi([ml, nfl], c), 0.04);
+  assert.strictEqual(polyMinRoi([ml, ml], c), 0.05);
+  assert.strictEqual(polyMinRoi([ml, nfl], c), 0.05);
+  assert.strictEqual(polySniperConfig({ POLY_SNIPER_MIN_ROI_NFL_ML: '0.03' }).minRoiNflMl, 0.03); // env override still works
   assert.strictEqual(polyMinRoi([ml, cfb], c), 0.05);
   assert.strictEqual(polyMinRoi([ml, cfbLine], c), 0.05);
   assert.strictEqual(polyMinRoi([ml, td], c), 0.06);
