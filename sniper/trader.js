@@ -194,6 +194,18 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
     }
     return { ids: new Set(out.map((q) => q.id).filter(Boolean)), count: out.length, complete, newestCreatedMs, quotes: out };
   }
+  // Read-only (read lane): one of our quotes by id -> Kalshi's quote object (status, executed_ts,
+  // creator_order_id, ...). null on 404. Used by the confirmed-but-unbooked reconcile (sniper/unbooked-reconcile.js).
+  async function getQuote(quoteId) {
+    if (!quoteId) return null;
+    const p = `${QUOTE_PATH}/${encodeURIComponent(quoteId)}`;
+    const res = await raw('GET', p, { path: p, lim: readLimiter || limiter, low: true });
+    stats.quoteReads = (stats.quoteReads || 0) + 1;
+    if (res && res.statusCode === 404) return null;
+    if (!res || res.statusCode !== 200) throw new Error(`quote read ${res && res.statusCode}`);
+    const j = JSON.parse(res.text || '{}');
+    return j.quote || j || null;
+  }
   // Read-only: this sniper subaccount's cash ($) for the soon-cap tier (sniper/soon-cap.js).
   async function subBalanceUsd() {
     const p = '/trade-api/v2/portfolio/subaccounts/balances';
@@ -208,7 +220,7 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
   }
   const queueState = () => ({ queued: sender.queued, active: sender.active, capacity: typeof sender.capacity === 'function' ? sender.capacity() : Infinity });
   return {
-    live, postQuote, confirm, cancel, fillsForOrder, subBalanceUsd, listQuotes, openQuotesSnapshot, admission, queueState,
+    live, postQuote, confirm, cancel, fillsForOrder, getQuote, subBalanceUsd, listQuotes, openQuotesSnapshot, admission, queueState,
     postEstMs: () => postEst.get(), quoteRps, sendWindow: win,
     senderStats: () => (typeof sender.stats === 'function' ? sender.stats() : {}),
     stats: () => ({ ...stats, queued: sender.queued, active: sender.active }),

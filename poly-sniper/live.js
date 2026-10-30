@@ -72,6 +72,11 @@ function liveConfig(env = process.env) {
     unfilledReleaseMs: num(env.POLY_SNIPER_UNFILLED_RELEASE_MS, 15 * 60000),
     settleMs: num(env.POLY_SNIPER_SETTLE_MS, 5 * 60000),
     dayRefreshMs: num(env.POLY_SNIPER_DAY_REFRESH_MS, 5 * 60000),
+    // 'quoted' ledger rows older than this are past every TTL (60s) + cancel retry, so not live here:
+    // expired at startup and by the stale sweep (Oct 30: 2,608 rows left 'quoted' by two deploys).
+    staleQuotedMs: num(env.POLY_SNIPER_STALE_QUOTED_MS, 15 * 60000),
+    staleSweepMs: num(env.POLY_SNIPER_STALE_SWEEP_MS, 5 * 60000),
+    staleDeleteMaxAgeMs: num(env.POLY_SNIPER_STALE_DELETE_MAX_AGE_MS, 24 * 3600e3), // venue DELETE only for rows younger than this
   };
 }
 
@@ -510,6 +515,31 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
     }
   }
 
+  // ── stale 'quoted' ledger rows (left by a previous process) ──────────────
+  // DB: phase -> 'expired' (cancel_reason stale_quoted_sweep). Venue: best-effort DELETE, one at a time
+  // and only while the real cancel lane is idle, so live cancels never wait behind cleanup.
+  const staleDeletes = [];
+  async function staleQuotedSweep() {
+    if (!store || typeof store.expireStaleQuoted !== 'function') return 0;
+    const t = now();
+    const rows = await store.expireStaleQuoted({ staleQuotedMs: config.staleQuotedMs, nowMs: t, keepIds: new Set(quotes.keys()) });
+    for (const r of rows) {
+      const age = t - (Date.parse(r.created_at) || t);
+      if (age <= config.staleDeleteMaxAgeMs && staleDeletes.length < 10000) staleDeletes.push({ rfqId: r.rfq_id, quoteId: r.quote_id });
+    }
+    stats.staleExpired = (stats.staleExpired || 0) + rows.length;
+    if (rows.length) say(`stale sweep: expired ${rows.length} leftover 'quoted' row(s) older than ${Math.round(config.staleQuotedMs / 60000)}m (${staleDeletes.length} venue delete(s) queued)`);
+    return rows.length;
+  }
+  async function drainStaleDeletes(max = 1) {
+    let n = 0;
+    while (http && n < max && staleDeletes.length && !cancelQueue.length && !draining && cancelBucket.take()) {
+      const job = staleDeletes.shift(); n += 1;
+      try { await http.deleteQuote(job.rfqId, job.quoteId); stats.staleDeleted = (stats.staleDeleted || 0) + 1; } catch (_) { stats.staleDeleteGone = (stats.staleDeleteGone || 0) + 1; }
+    }
+    return n;
+  }
+
   // ── control switch ──────────────────────────────────────────────────────
   async function pollControl() {
     if (!store) return;
@@ -549,7 +579,7 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
   async function hydrate() {
     if (!store) return { cleaned: 0, loaded: 0 };
     let rows = [];
-    try { rows = await store.hydrateOpen(); } catch (e) { say(`hydrate failed: ${e.message} — sniper stays off until it loads`); throw e; }
+    try { rows = await store.hydrateOpen({ staleQuotedMs: config.staleQuotedMs, nowMs: now() }); } catch (e) { say(`hydrate failed: ${e.message} — sniper stays off until it loads`); throw e; }
     let cleaned = 0; let loaded = 0;
     for (const r of rows) {
       const rec = {
@@ -644,12 +674,15 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
     started = true;
     await hydrate();
     await Promise.all([pollControl(), pollBalance(), refreshDay()]);
+    try { await staleQuotedSweep(); } catch (e) { say(`stale sweep failed: ${e.message}`); }
     every(config.controlPollMs, pollControl);
     every(config.balancePollMs, pollBalance);
     every(config.sweepMs, sweep);
     every(config.fillCheckMs, fillBackstop);
     every(config.settleMs, settleTick);
     every(config.dayRefreshMs, refreshDay);
+    every(config.staleSweepMs, staleQuotedSweep);
+    every(config.sweepMs, drainStaleDeletes);
     say(`attached. switch=${switchOn ? 'ON' : 'OFF'} cash=${cash != null ? `$${cash.toFixed(2)}` : 'unknown'} floor=$${config.cashFloorUsd} posts<=${config.postRps}/s cancels<=${config.cancelRps}/s`);
   }
   async function shutdown(reason = 'shutdown', budgetMs = 10000) {
@@ -669,7 +702,7 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
     isActive, state,
     stats: () => ({ state: state(), open: [...quotes.values()].filter((r) => r.phase === 'quoted').length, positions: countedPositions().length, openRisk: countedPositions().reduce((a, r) => a + r.risk, 0), dayRisk: day.risk, dayPnl: day.loss, cash, ...declineRatios(), ...stats, skips: { ...stats.skips } }),
     confirmIdle: () => confirmChain,
-    _internal: { quotes, byRfq, byOrder, posting, cancelQueue, sweep, pollControl, pollBalance, fillBackstop, settleTick, hydrate, bookFill, setCash: (v, at) => { cash = v; cashAt = at; }, day },
+    _internal: { quotes, byRfq, byOrder, posting, cancelQueue, sweep, pollControl, pollBalance, fillBackstop, settleTick, hydrate, bookFill, staleQuotedSweep, drainStaleDeletes, staleDeletes, setCash: (v, at) => { cash = v; cashAt = at; }, day },
   };
 }
 
