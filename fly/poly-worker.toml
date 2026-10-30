@@ -39,7 +39,10 @@ kill_timeout = "30s"
   POLY_SNIPER_MAX_LEG_DAYS = "7"
   POLY_SNIPER_CASH_FLOOR_USD = "5000"         # never post/confirm if Poly buying power - risk < this (Combo Locks funding)
   POLY_SNIPER_POST_RPS = "20"                 # sniper quote posts/s (Polymarket US regular tier: 100/s per account)
-  POLY_SNIPER_CANCEL_RPS = "20"
+  POLY_SNIPER_CANCEL_RPS = "50"               # Oct 30: was 20 (one DELETE at a time); now up to 10 in flight (venue: 100 deletes/s)
+  POLY_SNIPER_MAX_QUOTE_LIFE_MS = "20000"     # Kevin Oct 30: no quote alive on Polymarket more than 20s
+  POLY_SNIPER_QUOTE_TTL_MS = "15000"          # sweeper deletes at 15s (clamped to max life - 5s); posts held while deletes lag
+  POLY_SNIPER_POST_EDGE_CUSHION = "0.005"     # post at min edge + 0.5%; last look still at the plain min
   POLY_SNIPER_DECLINE_PAUSE_RATIO = "0.10"    # pause if declines > 10% of accepts in the last hour (Polymarket pauses at 15%)
 
 [processes]

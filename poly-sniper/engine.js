@@ -90,7 +90,9 @@ const roundTick = (x, tick) => Math.round(Math.round(x / tick) * tick * 1e6) / 1
 // rfq = normalizePolymarketRfq output. -> { action:'quote'|'skip', reason, ... }
 // skipLedger: price only (no hypothetical ledger caps, nothing added). The LIVE sniper uses this and
 // applies its own fills-only caps (poly-sniper/live.js), and to re-price at confirm / stale sweeps.
-function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now(), skipLedger = false }) {
+// edgeCushion: LIVE posts price at min edge + cushion (Oct 30, POLY_SNIPER_POST_EDGE_CUSHION) so a small
+// fair tick does not turn an accept into a decline; minRoi reported (and last look) stays the plain min.
+function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now(), skipLedger = false, edgeCushion = 0 }) {
   const base = { rfqId: rfq && rfq.rfqId, symbol: rfq && rfq.symbol };
   const skip = (reason, extra) => ({ ...base, action: 'skip', reason, ...(extra || {}) });
   if (!rfq || !rfq.rfqId) return skip('bad_rfq');
@@ -127,13 +129,14 @@ function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now(), skipLedger 
   const { contracts, cash } = sizeOf(rfq);
   if (contracts == null && cash == null) return skip('no_size', { legs, fair });
   const tick = tickOf(rfq);
-  const px = minQuotePrice({ fair, contracts, cash, makerRate: POLY_COMBO_MAKER_RATE, minRoi, tick });
+  const postMinRoi = minRoi + (edgeCushion > 0 ? edgeCushion : 0);
+  const px = minQuotePrice({ fair, contracts, cash, makerRate: POLY_COMBO_MAKER_RATE, minRoi: postMinRoi, tick });
   if (!px) return skip('roi_below_min', { legs, fair, minRoi });
   if (px.roi > config.maxRoi) return skip('roi_suspicious', { legs, fair, minRoi });
   const buyPrice = roundTick(px.q, tick);
   const ll = legs.map((l) => ({ ticker: l.ticker, side: l.side }));
   const combo = comboKey(ll); const games = [...new Set(ll.map(gameKey))]; const lkeys = ll.map(legKey);
-  const econ = { fair, buyPrice, sellPrice: '0', contracts: px.n, risk: px.risk, ev: px.ev, roi: px.roi, fee: px.fee, minRoi, tick };
+  const econ = { fair, buyPrice, sellPrice: '0', contracts: px.n, risk: px.risk, ev: px.ev, roi: px.roi, fee: px.fee, minRoi, tick, ...(edgeCushion > 0 ? { postMinRoi } : {}) };
   if (px.risk > config.maxRisk + 1e-9) return skip('risk_over_cap', { legs, ...econ });
   if (skipLedger) return { ...base, action: 'quote', legs, combo, games, legKeys: lkeys, ...econ };
   ledger.prune(nowMs);

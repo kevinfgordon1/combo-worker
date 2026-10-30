@@ -137,7 +137,7 @@ function createPolySniper({ env = process.env, supabase = null, log = console.lo
     // Live only while the switch is on; otherwise the dry run (hypothetical ledger) exactly as before.
     const goLive = !!(live && live.isActive());
     let d;
-    try { d = decidePoly(rfq, { feed: f, config, ledger, nowMs: t0, skipLedger: goLive }); } catch (e) { d = { rfqId: rfq.rfqId, action: 'skip', reason: `error:${String(e.message).slice(0, 60)}` }; }
+    try { d = decidePoly(rfq, { feed: f, config, ledger, nowMs: t0, skipLedger: goLive, edgeCushion: goLive ? live.config.postEdgeCushion : 0 }); } catch (e) { d = { rfqId: rfq.rfqId, action: 'skip', reason: `error:${String(e.message).slice(0, 60)}` }; }
     const t1 = now();
     const created = Date.parse(rfq.createdTime || '');
     const ageMs = Number.isFinite(created) ? t1 - created : null;

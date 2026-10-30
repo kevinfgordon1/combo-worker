@@ -115,6 +115,21 @@ function createPolySniperStore({ supabase, log = console.log, retries = 3, retry
       }
       return done;
     },
+    // Sniper accepts in the decline window (for the decline-rate pause after a restart). Every accept
+    // sets accepted_at; a declined one ends in phase 'declined'. Throws on error (caller stays paused).
+    async recentOutcomes(sinceIso, { pageSize = 1000, maxPages = 20 } = {}) {
+      const out = [];
+      for (let page = 0; page < maxPages; page += 1) {
+        const from = page * pageSize;
+        const { data, error } = await supabase.from('poly_sniper_ledger').select('quote_id,phase,accepted_at')
+          .gte('accepted_at', sinceIso).order('accepted_at', { ascending: true }).range(from, from + pageSize - 1);
+        if (error) throw new Error(`decline history: ${error.message}`);
+        const rows = data || [];
+        out.push(...rows);
+        if (rows.length < pageSize) return out;
+      }
+      return out;
+    },
     // Today's (ET) realized P&L and new filled risk, for the daily loss stop and the daily risk cap.
     async dayTotals(dayStartIso) {
       const out = { realized: 0, filledRisk: 0 };
