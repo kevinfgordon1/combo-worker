@@ -32,16 +32,17 @@ const num = (v, d) => (v == null || v === '' || !Number.isFinite(Number(v)) ? d 
 const flag = (v, d) => (v == null || v === '' ? d : !/^(0|false|no|off)$/i.test(String(v).trim()));
 
 // Kalshi sniper caps, as live on kaygo-sniper Oct 29 (summary row caps + fly/sniper.toml):
-// per quote $400 risk / $100,000 payout, per game $1,500, per leg $750, total open $10,000,
+// per quote $400 risk / $100,000 payout, per game $1,500, per leg $750, (Kevin Oct 30: Poly + Kalshi now $500/quote, $1,000/leg)
+// total open $10,000,
 // long-dated open $5,000 (settles > 48h after quote), daily new risk $10,000, daily loss stop $10,000,
 // soon-cap (settles <= 24h: total cap = cash, never below normal), legs <= 7 days out.
 // Every value can be overridden with the POLY_SNIPER_* env of the same name.
 function liveConfig(env = process.env) {
   return {
-    maxRisk: num(env.POLY_SNIPER_MAX_RISK, 400),
+    maxRisk: num(env.POLY_SNIPER_MAX_RISK, 500),
     maxPayout: num(env.POLY_SNIPER_MAX_PAYOUT, 100000),
     perGameCap: num(env.POLY_SNIPER_PER_GAME_CAP, 1500),
-    perLegCap: num(env.POLY_SNIPER_PER_LEG_CAP, 750),
+    perLegCap: num(env.POLY_SNIPER_PER_LEG_CAP, 1000),
     totalExposureCap: num(env.POLY_SNIPER_TOTAL_EXPOSURE_CAP, 10000),
     longExposureCap: num(env.POLY_SNIPER_LONG_EXPOSURE_CAP, 5000),
     shortSettleHours: num(env.POLY_SNIPER_SHORT_SETTLE_HOURS, 48),
