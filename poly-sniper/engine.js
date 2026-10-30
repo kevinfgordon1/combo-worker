@@ -30,9 +30,9 @@ function polySniperConfig(env = process.env) {
     // Caps are PER VENUE (Polymarket has its own; Kalshi sniper caps untouched). Kevin: Polymarket doubles capacity.
     // Kevin Oct 29: same caps as the Kalshi sniper (its live values: $400/quote, $1,500/game, $750/leg,
     // $10,000 open, $10,000/day). The live layer (poly-sniper/live.js) adds the rest of the Kalshi set.
-    maxRisk: num(env.POLY_SNIPER_MAX_RISK, 400),
+    maxRisk: num(env.POLY_SNIPER_MAX_RISK, 500),
     perGameCap: num(env.POLY_SNIPER_PER_GAME_CAP, 1500),
-    perLegCap: num(env.POLY_SNIPER_PER_LEG_CAP, 750),
+    perLegCap: num(env.POLY_SNIPER_PER_LEG_CAP, 1000),
     totalExposureCap: num(env.POLY_SNIPER_TOTAL_EXPOSURE_CAP, 10000),
     dailyRiskCap: num(env.POLY_SNIPER_DAILY_RISK_CAP, 10000),
     latencyTargetMs: num(env.POLY_SNIPER_LATENCY_TARGET_MS, 200),

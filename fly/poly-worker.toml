@@ -25,10 +25,10 @@ kill_timeout = "30s"
   # Going live needs BOTH: secret POLY_SNIPER_DRY_RUN=0 (today 1 = hard dry run) AND the DB switch
   # public.poly_sniper_control.live = true (default false; polled every 5s, no restart; off deletes all
   # open sniper quotes). Resting quotes count $0; only accepted/confirmed/filled risk counts.
-  POLY_SNIPER_MAX_RISK = "400"                # $ worst-case loss per quote
+  POLY_SNIPER_MAX_RISK = "500"                # $ worst-case loss per quote (Kevin Oct 30: $400 -> $500)
   POLY_SNIPER_MAX_PAYOUT = "100000"           # $ payout (contracts) per quote
   POLY_SNIPER_PER_GAME_CAP = "1500"
-  POLY_SNIPER_PER_LEG_CAP = "750"
+  POLY_SNIPER_PER_LEG_CAP = "1000"   # Kevin Oct 30: $750 -> $1,000
   POLY_SNIPER_TOTAL_EXPOSURE_CAP = "10000"
   POLY_SNIPER_LONG_EXPOSURE_CAP = "5000"      # parlays settling > 48h after the quote
   POLY_SNIPER_SHORT_SETTLE_HOURS = "48"

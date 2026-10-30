@@ -78,9 +78,9 @@ t('caps default to the Kalshi sniper values', () => {
   const c = liveConfig({});
   assert.deepStrictEqual(
     [c.maxRisk, c.maxPayout, c.perGameCap, c.perLegCap, c.totalExposureCap, c.longExposureCap, c.shortSettleHours, c.dailyRiskCap, c.dailyLossCap, c.soonCap, c.soonHours, c.maxLegDays],
-    [400, 100000, 1500, 750, 10000, 5000, 48, 10000, 10000, true, 24, 7]);
+    [500, 100000, 1500, 1000, 10000, 5000, 48, 10000, 10000, true, 24, 7]);
   const e = polySniperConfig({});
-  assert.deepStrictEqual([e.maxRisk, e.perGameCap, e.perLegCap, e.totalExposureCap, e.dailyRiskCap], [400, 1500, 750, 10000, 10000]);
+  assert.deepStrictEqual([e.maxRisk, e.perGameCap, e.perLegCap, e.totalExposureCap, e.dailyRiskCap], [500, 1500, 1000, 10000, 10000]);
   // min edges: nothing below 5% (Kevin Oct 30: NFL ML 3%->5%, other NFL 4%->5%)
   assert.deepStrictEqual([e.minRoiNflMl, e.minRoiNfl, e.minRoiTd, e.minRoiNcaaf, e.minRoiNba], [0.05, 0.05, 0.06, 0.05, 0.06]);
   assert.strictEqual(c.postRps, 20); assert.strictEqual(c.declinePauseRatio, 0.10);
@@ -91,7 +91,7 @@ t('capReason: every Kalshi rule, plus cash floor', () => {
   const pos = (x = {}) => ({ risk: 100, contracts: 150, games: ['G1'], legs: ['L1:yes'], combo: 'C', settleAt: now + 30 * 3600e3, legKickoffs: [now + 26 * 3600e3], ...x });
   const bk = (positions = [], x = {}) => ({ positions, dayRisk: 0, dayLoss: 0, ...x });
   assert.strictEqual(capReason(pos(), bk(), c, ok), null);
-  assert.strictEqual(capReason(pos({ risk: 401 }), bk(), c, ok), 'risk_over_cap');
+  assert.strictEqual(capReason(pos({ risk: 501 }), bk(), c, ok), 'risk_over_cap');
   assert.strictEqual(capReason(pos({ contracts: 100001 }), bk(), c, ok), 'payout_over_cap');
   assert.strictEqual(capReason(pos(), bk([], { dayLoss: -10000 }), c, ok), 'daily_loss_halt');
   assert.strictEqual(capReason(pos({ legKickoffs: [now + 8 * 864e5] }), bk(), c, ok), 'leg_too_far');
@@ -105,7 +105,7 @@ t('capReason: every Kalshi rule, plus cash floor', () => {
   assert.strictEqual(capReason(pos({ settleAt: now + 10 * 3600e3 }), bk([{ risk: 9950, games: ['X'] }]), c, { ...ok, cashUsd: 12000 }), 'total_cap');
   assert.strictEqual(capReason(pos({ settleAt: now + 60 * 3600e3, legKickoffs: [] }), bk([{ risk: 4950, long: true, games: ['X'] }]), c, ok), 'cap_total_long');
   assert.strictEqual(capReason(pos(), bk([{ risk: 1450, games: ['G1'] }]), c, ok), 'game_cap');
-  assert.strictEqual(capReason(pos(), bk([{ risk: 700, games: ['X'], legs: ['L1:yes'] }]), c, ok), 'leg_cap');
+  assert.strictEqual(capReason(pos(), bk([{ risk: 950, games: ['X'], legs: ['L1:yes'] }]), c, ok), 'leg_cap');
   assert.strictEqual(capReason(pos(), bk([], { dayRisk: 9950 }), c, ok), 'daily_risk_cap');
 });
 
