@@ -20,7 +20,9 @@
     "cleanup:combo-fills": "node scripts/cleanup-combo-fill-twins.js",
     "reconcile:kalshi-fills": "node scripts/reconcile-kalshi-phantom-fills.js",
     "test": "node scripts/run-tests.js",
-    "start:testers": "node start-testers.js"
+    "start:testers": "node start-testers.js",
+    "ncaab:teams": "node scripts/gen-ncaab-teams.js --write-fixture",
+    "ncaab:check": "node scripts/check-ncaab-teams.js"
   },
   "engines": {
     "node": ">=18"

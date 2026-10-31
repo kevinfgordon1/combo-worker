@@ -589,7 +589,7 @@ function parseKalshiNcaabMlTicker(text, sideOverride, label) {
   if (!parsed || parsed.startMs != null) return null;
   const selDash = parsed.teamsBlob.lastIndexOf('-');
   if (selDash <= 0) return null;
-  const sp = NCAAB.splitBlob(parsed.teamsBlob.slice(0, selDash));
+  const sp = NCAAB.splitBlob(parsed.teamsBlob.slice(0, selDash), { date: parsed.date });
   if (!sp) return null;
   const kc = parsed.teamsBlob.slice(selDash + 1).toUpperCase();
   if (!sp.codes.includes(kc)) return null;

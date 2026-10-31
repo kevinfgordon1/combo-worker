@@ -6,6 +6,8 @@
 // with scripts/gen-ncaab-crosswalk.js). Unknown names fail closed: the game is dropped, never guessed.
 
 let D1 = require('./ncaab-d1-teams.json');
+// Canonical NCAAB team table (ESPN id = identity, every venue's names as aliases): ncaab-teams.js / ncaab-teams.json.
+const CANON = require('./ncaab-teams');
 
 function normName(value) {
   return String(value || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
@@ -113,8 +115,14 @@ function index() {
   if (!INDEX) INDEX = buildIndex(D1.teams);
   return INDEX;
 }
-// The generator swaps in a freshly fetched list before building the crosswalk.
-function useTeams(teams) { D1 = { teams }; INDEX = null; }
+// The generator swaps in a freshly fetched list before building the crosswalk (and then skips the canonical
+// table, so the old generator's output depends on its own inputs only).
+let useCanon = true;
+function useTeams(teams) { D1 = { teams }; INDEX = null; useCanon = false; }
+function canonTeam(id) {
+  const t = CANON.team(id); if (!t) return null;
+  return { espnId: t.espnId, abbr: t.abbr, location: t.location, short: t.short, display: t.display, name: t.mascot };
+}
 
 // The D1 team for a display name ("Grambling St.", "Miami (FL)", "Villanova Wildcats"), or null.
 function d1Team(name) {
@@ -123,7 +131,12 @@ function d1Team(name) {
   if (!n) return null;
   const direct = names.get(n) || names.get(ALIAS_N.get(n) || '');
   if (direct) return direct;
-  // "Villanova Wildcats" style full names are covered by display; nothing fuzzier (fail closed).
+  // Canonical table: any venue's known spelling of a D1 school (exact alias, never fuzzy). A name two schools
+  // share, or a non-D1 school's name, stays null (fail closed).
+  if (useCanon) {
+    const r = CANON.resolveTeam('any', { name });
+    if (r.espnId) return index().ids.get(r.espnId) || canonTeam(r.espnId);
+  }
   return null;
 }
 

@@ -1,0 +1,47 @@
+{
+ "note": "Manual NCAAB team aliases for scripts/gen-ncaab-teams.js. names[alias] = ESPN team id (any source). aliases[source][raw venue name or code] = ESPN team id or \"NON_D1\" (source \"*\" = every source). extraD1 / notD1 = ESPN ids to add to / remove from ESPN's D1 list. Add a line here when scripts/check-ncaab-teams.js reports a new unmatched name, then regenerate.",
+ "names": {
+  "GW": "45",
+  "GW Revolutionaries": "45",
+  "Loyola (Chi)": "2350",
+  "Cal Baptist": "2856",
+  "SE Missouri St": "2546",
+  "CSU Fullerton": "2239",
+  "CSU Bakersfield": "2934",
+  "Long Beach St 49ers": "299",
+  "Army Knights": "349",
+  "Florida Int'l": "2229",
+  "Tenn-Martin": "2630",
+  "UMKC": "140",
+  "UMKC Kangaroos": "140",
+  "Dixie State": "3101",
+  "Dixie State Trailblazers": "3101"
+ },
+ "aliases": {
+  "*": {
+   "Baldwin Wallace Yellow Jackets": "NON_D1",
+   "Brescia Bearcats": "NON_D1",
+   "Cincinnati Clermont": "NON_D1",
+   "Clinton Bears": "NON_D1",
+   "Defiance College Yellow Jackets": "NON_D1",
+   "Gallaudet Bison": "NON_D1",
+   "Georgia Southwestern State Hurricanes": "NON_D1",
+   "Hartford Hawks": "NON_D1",
+   "Immaculata Mighty Macs": "NON_D1",
+   "John Jay College Bloodhounds": "NON_D1",
+   "Johnson And Wales (NC) Wildcats": "NON_D1",
+   "Kansas Christian Falcons": "NON_D1",
+   "North American Stallions": "NON_D1",
+   "Pfeiffer Falcons": "NON_D1",
+   "Regent University Royals": "NON_D1",
+   "Savannah St Tigers": "NON_D1",
+   "Sonoma State Seawolves": "NON_D1",
+   "Spalding Golden Eagles": "NON_D1",
+   "St. Francis (PA) Red Flash": "NON_D1",
+   "St. Francis BKN Terriers": "NON_D1",
+   "Western State Colorado Mountaineers": "NON_D1"
+  }
+ },
+ "extraD1": [],
+ "notD1": []
+}
