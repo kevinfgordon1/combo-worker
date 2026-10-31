@@ -10,6 +10,7 @@
 'use strict';
 const data = require('./ncaab-crosswalk.json');
 const D1 = require('./ncaab-d1');
+const CANON = require('./ncaab-teams');
 
 const byCode = new Map(); // KALSHI CODE -> { code, espnId, name, espn, p, pname }
 const byPoly = new Map(); // poly abbr -> team
@@ -24,6 +25,26 @@ for (const [code, t] of Object.entries(data.teams || {})) {
   byEspn.set(id, team);
 }
 for (const [id, v] of [...byEspn]) if (v === null) byEspn.delete(id);
+// Canonical table (ncaab-teams.json): every D1 team with a Kalshi game code that the old crosswalk lacks, plus
+// codes some other (non-D1) school also uses (Kalshi OAK = Oakland + Oakwood). Those AMBIGUOUS codes only ever
+// pass splitBlob() with opponent + date context (ESPN schedule / learned Kalshi games), never on the code alone.
+const AMBIGUOUS = new Set();
+for (const t of CANON.teams()) {
+  const k = (t.aliases && t.aliases.kalshi) || {};
+  if (byEspn.has(t.espnId)) continue;
+  const code = (k.codes || [])[0];
+  const pc = ((t.aliases.polymarket && t.aliases.polymarket.codes) || [])[0] || null;
+  const team = { code: null, espnId: t.espnId, name: (k.names || [])[0] || t.location, espn: t.display, p: pc && /^[a-z0-9]+$/.test(pc) ? pc : null, pname: pc ? t.location : null };
+  if (code && !byCode.has(code)) { team.code = code; byCode.set(code, team); byEspn.set(t.espnId, team); }
+}
+for (const [code, a] of Object.entries((require('./ncaab-teams.json').ambiguous || {}).kalshi || {})) {
+  AMBIGUOUS.add(code);
+  if (byCode.has(code) || (a.d1 || []).length !== 1) continue;
+  const t = CANON.team(a.d1[0]); if (!t || byEspn.has(t.espnId)) continue;
+  const pc = ((t.aliases.polymarket && t.aliases.polymarket.codes) || [])[0] || null;
+  const team = { code, espnId: t.espnId, name: t.location, espn: t.display, p: pc, pname: pc ? t.location : null, ambiguous: true };
+  byCode.set(code, team); byEspn.set(t.espnId, team);
+}
 for (const t of byCode.values()) {
   if (!t.p) continue;
   if (byPoly.has(t.p)) { byPoly.get(t.p).p = null; t.p = null; continue; }
@@ -32,7 +53,10 @@ for (const t of byCode.values()) {
 const CODES = [...byCode.keys()].sort((a, b) => b.length - a.length);
 
 // "NDVILL" -> { codes: ['ND','VILL'] } ONLY when exactly one reading uses two distinct known codes.
-function splitBlob(blob) {
+// ctx = { date: 'YYYY-MM-DD' } or { dateBlob: '26NOV02' }: needed when a code is AMBIGUOUS (another, non-D1 school
+// uses it too): the reading must then be confirmed by the canonical resolver (learned Kalshi game, or the ESPN
+// schedule shows the D1 team playing that opponent on that date). No context -> null (fail closed).
+function splitBlob(blob, ctx = null) {
   const s = String(blob || '').toUpperCase();
   if (!/^[A-Z]+$/.test(s)) return null;
   const hits = [];
@@ -41,7 +65,14 @@ function splitBlob(blob) {
     const r = s.slice(a.length);
     if (r !== a && byCode.has(r)) hits.push([a, r]);
   }
-  return hits.length === 1 ? { codes: hits[0] } : null;
+  if (hits.length !== 1) return null;
+  if (hits[0].some((c) => AMBIGUOUS.has(c))) {
+    if (!ctx || (!ctx.date && !ctx.dateBlob)) return null;
+    const c = CANON.splitKalshiBlob(s, ctx);
+    if (!c || c.codes.join() !== hits[0].join()) return null;
+    if (c.espnIds.join() !== hits[0].map((x) => byCode.get(x).espnId).join()) return null;
+  }
+  return { codes: hits[0] };
 }
 
 const teamByCode = (code) => byCode.get(String(code || '').toUpperCase()) || null;
@@ -57,7 +88,7 @@ const codeForPoly = (abbr) => { const t = teamByPoly(abbr); return t ? t.code : 
 const codeForEspnId = (id) => { const t = teamByEspn(id); return t ? t.code : null; };
 
 module.exports = {
-  splitBlob, teamByCode, teamByPoly, teamByEspn, codeForName, codeForPoly, codeForEspnId,
+  splitBlob, teamByCode, isAmbiguousCode: (c) => AMBIGUOUS.has(String(c || '').toUpperCase()), teamByPoly, teamByEspn, codeForName, codeForPoly, codeForEspnId,
   generatedAt: data.generatedAt || null,
   teamCount: byCode.size,
   unmatchedKalshi: data.unmatchedKalshi || [],

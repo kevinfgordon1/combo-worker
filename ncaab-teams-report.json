@@ -1,0 +1,156 @@
+{
+ "capturedAt": "2026-10-31T03:29:16.425Z",
+ "teamCount": 365,
+ "coverage": {
+  "books:betmgm": {
+   "kind": "names",
+   "total": 159,
+   "matched": 159,
+   "nonD1": 0,
+   "unmatched": 0,
+   "coveragePct": 100
+  },
+  "books:betrivers": {
+   "kind": "names",
+   "total": 204,
+   "matched": 203,
+   "nonD1": 1,
+   "unmatched": 0,
+   "coveragePct": 100
+  },
+  "books:espnbet": {
+   "kind": "names",
+   "total": 93,
+   "matched": 93,
+   "nonD1": 0,
+   "unmatched": 0,
+   "coveragePct": 100
+  },
+  "books:fanduel": {
+   "kind": "names",
+   "total": 92,
+   "matched": 92,
+   "nonD1": 0,
+   "unmatched": 0,
+   "coveragePct": 100
+  },
+  "kalshi": {
+   "kind": "games",
+   "total": 155,
+   "matched": 140,
+   "nonD1": 15,
+   "unmatched": 0,
+   "scheduleConfirmed": 140,
+   "scheduleMissing": 0,
+   "coveragePct": 100
+  },
+  "kalshiFutures": {
+   "kind": "names",
+   "total": 73,
+   "matched": 73,
+   "nonD1": 0,
+   "unmatched": 0,
+   "coveragePct": 100
+  },
+  "novig": {
+   "kind": "games",
+   "total": 7,
+   "matched": 7,
+   "nonD1": 0,
+   "unmatched": 0,
+   "scheduleConfirmed": 7,
+   "scheduleMissing": 0,
+   "coveragePct": 100
+  },
+  "oddsapi": {
+   "kind": "games",
+   "total": 7,
+   "matched": 7,
+   "nonD1": 0,
+   "unmatched": 0,
+   "scheduleConfirmed": 7,
+   "scheduleMissing": 0,
+   "coveragePct": 100
+  },
+  "oddsapiParticipants": {
+   "kind": "names",
+   "total": 386,
+   "matched": 365,
+   "nonD1": 21,
+   "unmatched": 0,
+   "coveragePct": 100
+  },
+  "polymarket": {
+   "kind": "games",
+   "total": 543,
+   "matched": 543,
+   "nonD1": 0,
+   "unmatched": 0,
+   "scheduleConfirmed": 542,
+   "scheduleMissing": 1,
+   "coveragePct": 100
+  },
+  "polymarketFutures": {
+   "kind": "names",
+   "total": 73,
+   "matched": 73,
+   "nonD1": 0,
+   "unmatched": 0,
+   "coveragePct": 100
+  },
+  "prophetx": {
+   "kind": "games",
+   "total": 0,
+   "matched": 0,
+   "nonD1": 0,
+   "unmatched": 0,
+   "note": "no snapshot within timeout",
+   "coveragePct": null
+  },
+  "underdog": {
+   "kind": "games",
+   "total": 132,
+   "matched": 132,
+   "nonD1": 0,
+   "unmatched": 0,
+   "scheduleConfirmed": 132,
+   "scheduleMissing": 0,
+   "coveragePct": 100
+  }
+ },
+ "unmatched": {},
+ "scheduleMissing": {
+  "polymarket": [
+   {
+    "game": "cbb-pitt-pennst-2026-11-08",
+    "espnIds": [
+     "221",
+     "213"
+    ],
+    "names": [
+     "Pittsburgh Panthers",
+     "Penn State Nittany Lions"
+    ]
+   }
+  ]
+ },
+ "learnedFromContext": [],
+ "ambiguous": {
+  "kalshi": {
+   "OAK": {
+    "d1": [
+     "2473"
+    ],
+    "nonD1": [
+     "Oakwood"
+    ]
+   }
+  }
+ },
+ "teamsWithoutAlias": {
+  "kalshi": 1,
+  "oddsapi": 1,
+  "polymarket": 1,
+  "underdog": 103
+ }
+}

@@ -23,7 +23,12 @@ assert.ok(X.teamCount >= 250, `crosswalk teams ${X.teamCount}`);
 assert.strictEqual(X.teamByCode('VILL').espnId, '222'); assert.strictEqual(X.teamByCode('ND').espnId, '87');
 assert.strictEqual(X.codeForPoly('vill'), 'VILL'); assert.strictEqual(X.codeForPoly('nd'), 'ND');
 assert.strictEqual(X.codeForName('Villanova Wildcats'), 'VILL'); assert.strictEqual(X.codeForName('Fisk'), null);
-assert.strictEqual(X.teamByCode('OAK'), null, 'Kalshi OAK = Oakland AND Oakwood => dropped (fail closed)');
+// Kalshi OAK = Oakland AND Oakwood (non-D1): resolved with opponent + date context (canonical table), not dropped
+assert.ok(X.isAmbiguousCode('OAK'), 'OAK is ambiguous');
+require('../ncaab-teams').setSchedule([{ homeId: '130', awayId: '2473', date: '2026-11-02T23:00Z' }, { homeId: '2010', awayId: '99999', date: '2026-11-02T23:00Z' }]);
+assert.strictEqual(X.splitBlob('OAKMICH'), null, 'ambiguous code without a date => fail closed');
+assert.deepStrictEqual(X.splitBlob('OAKMICH', { date: '2026-11-02' }), { codes: ['OAK', 'MICH'] }, 'Oakland @ Michigan (learned Kalshi game)');
+assert.strictEqual(X.splitBlob('OAKAAMU', { date: '2026-11-02' }), null, 'Oakwood (non-D1) vs Alabama A&M stays out');
 assert.deepStrictEqual(X.splitBlob('NDVILL').codes, ['ND', 'VILL']);
 const xw = require('../ncaab-crosswalk.json');
 assert.ok(xw.nonD1.includes('Fisk') && Object.values(xw.teams).every((t) => t.espnId), 'non-D1 schools never in the table');

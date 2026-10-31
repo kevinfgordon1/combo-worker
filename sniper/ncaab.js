@@ -16,6 +16,7 @@
 //   fair(T) = 1 − min_v cost_v, 15s staleness, real depth only.
 'use strict';
 const X = require('../ncaab-crosswalk');
+const CANON = require('../ncaab-teams'); // ESPN schedule -> opponent/tip context for ambiguous Kalshi codes
 const { walk, american, FEES, pxEffective } = require('../noboost/pm-live');
 const { etDate } = require('../mm-paper-odds');
 
@@ -33,8 +34,8 @@ const isNcaabAny = (t) => /^KXNCAAMB/.test(String(t || '').split(':')[0].toUpper
 function gameOfBlob(blob) {
   const m = /^(\d\d)([A-Z]{3})(\d\d)(?:\d{4})?([A-Z]+)$/.exec(String(blob || '').toUpperCase());
   if (!m || !MON[m[2]]) return null;
-  const sp = X.splitBlob(m[4]); if (!sp) return null;
   const date = `20${m[1]}-${MON[m[2]]}-${m[3]}`;
+  const sp = X.splitBlob(m[4], { date, dateBlob: `${m[1]}${m[2]}${m[3]}` }); if (!sp) return null;
   return { date, teams: sp.codes.slice(), gameId: `ncaab|${date}|${[...sp.codes].sort().join('+')}` };
 }
 
@@ -149,6 +150,7 @@ function createNcaabBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 1
 // Teams are matched by ESPN id (exact), so a non-D1 or unmapped team simply yields no entry.
 function espnNcaabKickoffs(j) {
   const out = [];
+  try { CANON.addSchedule(j); } catch (_) { /* schedule context is best effort */ }
   for (const e of (j && j.events) || []) {
     const c = e.competitions && e.competitions[0];
     const codes = ((c && c.competitors) || []).map((x) => X.codeForEspnId(x && (x.id || (x.team && x.team.id))));
