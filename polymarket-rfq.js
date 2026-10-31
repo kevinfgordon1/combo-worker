@@ -225,6 +225,7 @@ const LEAGUE_SLUG_TOKENS = {
   nba: ['nba', 'basketball'],
   nhl: ['nhl', 'hockey'],
   ncaaf: ['ncaaf', 'cfb', 'football'],
+  ncaab: ['cbb'], // men's college basketball (aec-cbb-…); identities only from ncaab-crosswalk
 };
 
 function normalizePolymarketSide(side) {

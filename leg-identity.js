@@ -19,6 +19,11 @@
 // NCAAF identity is the Polymarket abbreviation. Unknown team / ambiguous blob =>
 // no identity. NCAAF is Poly-only (opts.lines): the Kalshi matcher never sees it.
 //
+// NCAAB (men's college basketball, Kevin Oct 30 2026): moneylines only, D1 vs D1 only. Kalshi
+// KXNCAAMBGAME codes and Poly cbb abbreviations are translated through ncaab-crosswalk.json (ESPN id
+// bridge); the canonical team is the Polymarket abbreviation (same as NCAAF). Poly-sniper only: never in
+// SERIES and never read from Combo Locks lock legs, so the Kalshi matcher and Combo Locks are unchanged.
+//
 // LINE LEGS (spread / total; NFL, MLB, NHL, NCAAF full game only). Both venues are
 // canonicalized to ONE exact space and compared by exact string equality:
 //   spread  canonical (first team alphabetically, line from ITS side, yes|no); the
@@ -38,6 +43,7 @@
 'use strict';
 const { parseKalshiTickerStart, parseTs } = require('./started');
 const NCAAF = require('./ncaaf-crosswalk');
+const NCAAB = require('./ncaab-crosswalk');
 const PROPX = require('./player-prop-crosswalk');
 
 const MONTHS = {
@@ -555,6 +561,48 @@ function parseKalshiNcaafMlTicker(text, sideOverride, label, opts) {
     marketType: 'moneyline',
     period: 'full',
     selection: team.p,
+    side: 'yes',
+  });
+}
+
+// NCAAB moneyline (KXNCAAMBGAME-26NOV01NDVILL-VILL:yes). Poly-sniper only (never in SERIES, never read
+// from lock legs). Teams ONLY via the verified D1 crosswalk, and both teams must be listed on Polymarket US
+// (canonical = Poly abbreviation). A label, when given, must name the picked team. :no is not mapped.
+const NCAAB_ML_SERIES = 'KXNCAAMBGAME';
+function parseKalshiNcaabMlTicker(text, sideOverride, label) {
+  if (text == null || text === '') return null;
+  let raw = String(text).trim();
+  let side = sideOverride ? String(sideOverride).toLowerCase() : '';
+  const sideAt = raw.lastIndexOf(':');
+  if (sideAt > 0) {
+    const maybe = raw.slice(sideAt + 1).toLowerCase();
+    if (maybe === 'yes' || maybe === 'no') {
+      if (!side) side = maybe;
+      raw = raw.slice(0, sideAt);
+    }
+  }
+  if (!side) side = 'yes';
+  if (side !== 'yes') return null;
+  const dash = raw.indexOf('-');
+  if (dash <= 0 || raw.slice(0, dash).toUpperCase() !== NCAAB_ML_SERIES) return null;
+  const parsed = parseKalshiDateRest(raw.slice(dash + 1));
+  if (!parsed || parsed.startMs != null) return null;
+  const selDash = parsed.teamsBlob.lastIndexOf('-');
+  if (selDash <= 0) return null;
+  const sp = NCAAB.splitBlob(parsed.teamsBlob.slice(0, selDash));
+  if (!sp) return null;
+  const kc = parsed.teamsBlob.slice(selDash + 1).toUpperCase();
+  if (!sp.codes.includes(kc)) return null;
+  const teams = sp.codes.map((c) => NCAAB.teamByCode(c));
+  if (teams.some((t) => !t || !t.p)) return null;
+  if (label != null && label !== '' && NCAAB.codeForName(label) !== kc) return null;
+  return makeIdentity({
+    league: 'ncaab',
+    date: parsed.date,
+    teams: teams.map((t) => t.p),
+    marketType: 'moneyline',
+    period: 'full',
+    selection: NCAAB.teamByCode(kc).p,
     side: 'yes',
   });
 }
@@ -1096,6 +1144,7 @@ const SLUG_LEAGUE = {
   hockey: 'nhl',
   ncaaf: 'ncaaf',
   cfb: 'ncaaf',
+  cbb: 'ncaab', // men's college basketball (aec-cbb-…): crosswalk-only, see below
 };
 
 function polymarketYesNo(sideRaw) {
@@ -1153,6 +1202,12 @@ function identityFromPolymarketSlug(symbol, rfqSide) {
     if (teamTokens.length !== 2 || teamTokens[0] === teamTokens[1]
       || !teamTokens.every((t) => NCAAF.teamByPoly(t))) return null;
     if (tokens[leagueIdx] !== 'cfb' || tokens.length !== dateIdx + 3 || afterDate.length) return null;
+  }
+  if (league === 'ncaab') {
+    // D1 college basketball teams are only trusted through the verified crosswalk.
+    if (teamTokens.length !== 2 || teamTokens[0] === teamTokens[1]
+      || !teamTokens.every((t) => NCAAB.teamByPoly(t))) return null;
+    if (tokens[leagueIdx] !== 'cbb' || tokens.length !== dateIdx + 3 || afterDate.length) return null;
   }
 
   return makeIdentity({
@@ -1281,6 +1336,7 @@ module.exports = {
   POLY_LINE_SPORT,
   parseKalshiLineTicker,
   parseKalshiNcaafMlTicker,
+  parseKalshiNcaabMlTicker,
   PROP_SERIES,
   parseKalshiPropTicker,
   identityFromPolymarketProp,

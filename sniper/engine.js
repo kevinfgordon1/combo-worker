@@ -6,19 +6,22 @@ const { legFairDepth, MID_GUARD_REASONS } = require('./fair');
 const { isNcaafTicker, classifyNcaafLeg } = require('./ncaaf');
 const { isLineTicker, classifyLineLeg } = require('./lines');
 const { isNbaTicker, isNbaAny, classifyNbaLeg } = require('./nba');
+const { isNcaabTicker, isNcaabAny, classifyNcaabLeg, clampHours: clampNcaabHours } = require('./ncaab');
 
 const MON = { JAN: '01', FEB: '02', MAR: '03', APR: '04', MAY: '05', JUN: '06', JUL: '07', AUG: '08', SEP: '09', OCT: '10', NOV: '11', DEC: '12' };
 const legDate = (t) => { const m = /-(\d\d)([A-Z]{3})(\d\d)/.exec(t || ''); return m ? `20${m[1]}-${MON[m[2]]}-${m[3]}` : null; };
 
 // kickoffFor(ticker) -> ms | null. Unknown kickoff => cannot prove pregame => skip.
 // Full settle = latest leg kickoff + game length (default 4h). null if any kickoff unknown (DB treats as long).
-// NBA legs (KXNBA*) use nbaGameHours (default 3h: tip + ~2.5h game + buffer) instead.
-function settleAtMs(keys, kickoffFor, gameHours = 4, nbaGameHours = 3) {
+// NBA legs (KXNBA*) use nbaGameHours (default 3h: tip + ~2.5h game + buffer) instead; men's college
+// basketball legs (KXNCAAMB*) use ncaabGameHours (default 3h: 40 min halves, ~2h game + buffer).
+function settleAtMs(keys, kickoffFor, gameHours = 4, nbaGameHours = 3, ncaabGameHours = 3) {
   let last = -Infinity;
   const gh = Number.isFinite(gameHours) ? gameHours : 4; const nh = Number.isFinite(nbaGameHours) ? nbaGameHours : 3;
+  const ch = Number.isFinite(ncaabGameHours) ? ncaabGameHours : 3;
   for (const k of keys) {
     const t = String(k).split(':')[0]; const ko = kickoffFor(t); if (!Number.isFinite(ko) || ko <= 0) return null;
-    const end = ko + (isNbaAny(t) ? nh : gh) * 3600e3; if (end > last) last = end;
+    const end = ko + (isNbaAny(t) ? nh : isNcaabAny(t) ? ch : gh) * 3600e3; if (end > last) last = end;
   }
   return Number.isFinite(last) ? last : null;
 }
@@ -29,6 +32,17 @@ function nbaHorizonCheck(keys, kickoffFor, nowMs, hours) {
   for (const k of keys) {
     const t = String(k).split(':')[0]; if (!isNbaAny(t)) continue;
     const ko = kickoffFor(t); if (Number.isFinite(ko) && ko > 0 && ko - nowMs > hours * 3600e3) return 'nba_beyond_horizon';
+  }
+  return null;
+}
+
+// NCAAB (Kevin Oct 30): every college-basketball leg must tip within `hours` (default 24, capped at 36).
+// Unknown kickoff is caught by pregameCheck (no_kickoff) before this.
+function ncaabHorizonCheck(keys, kickoffFor, nowMs, hours) {
+  const h = clampNcaabHours(hours);
+  for (const k of keys) {
+    const t = String(k).split(':')[0]; if (!isNcaabAny(t)) continue;
+    const ko = kickoffFor(t); if (Number.isFinite(ko) && ko > 0 && ko - nowMs > h * 3600e3) return 'ncaab_beyond_horizon';
   }
   return null;
 }
@@ -67,12 +81,17 @@ function pregameCheck(keys, kickoffFor, nowMs, bufferMs) {
 const NFL_SENTINEL = 'KXNFLGAME-20JAN01BUFKC-BUF:yes';
 // Main spread / total legs (lines) go through sniper/lines.js the same way (config.lines).
 // NBA legs (config.nba): moneylines via sniper/nba.js, spreads / totals via sniper/lines.js.
-function classifyLegs(rfq, { td, ncaaf, lines = false, nba = false }) {
+// NCAAB legs (config.ncaab, default off): MONEYLINES ONLY via sniper/ncaab.js; any other KXNCAAMB* leg
+// (spread / total / props) rejects the whole RFQ.
+function classifyLegs(rfq, { td, ncaaf, lines = false, nba = false, ncaab = false }) {
   const keys = (rfq && rfq.legKeys) || [];
   const isL = keys.map((k) => isLineTicker(String(k).split(':')[0]));
   const isB = keys.map((k) => isNbaTicker(String(k).split(':')[0]));
-  const isN = keys.map((k, i) => isL[i] || isB[i] || isNcaafTicker(String(k).split(':')[0]));
+  const isC = keys.map((k) => isNcaabAny(String(k).split(':')[0]));
+  const isN = keys.map((k, i) => isL[i] || isB[i] || isC[i] || isNcaafTicker(String(k).split(':')[0]));
   if (!isN.some(Boolean)) return classifyNfl(rfq, 'kalshi', { td });
+  if (isC.some(Boolean) && !ncaab) return { ok: false, reason: 'ncaab_off' };
+  if (keys.some((k, i) => isC[i] && !isNcaabTicker(String(k).split(':')[0]))) return { ok: false, reason: 'ncaab_lines_off' };
   if (keys.some((k) => isNbaAny(String(k).split(':')[0])) && !nba) return { ok: false, reason: 'nba_off' };
   if (isL.some(Boolean) && !lines) return { ok: false, reason: 'lines_off' };
   if (keys.some((k, i) => !isL[i] && isNcaafTicker(String(k).split(':')[0])) && !ncaaf) return { ok: false, reason: 'ncaaf_off' };
@@ -87,7 +106,7 @@ function classifyLegs(rfq, { td, ncaaf, lines = false, nba = false }) {
   }
   const legs = []; const games = new Set(); let j = 0;
   for (let i = 0; i < keys.length; i += 1) {
-    const leg = isL[i] ? classifyLineLeg(keys[i]) : isB[i] ? classifyNbaLeg(keys[i]) : isN[i] ? classifyNcaafLeg(keys[i]) : nflLegs[j++];
+    const leg = isL[i] ? classifyLineLeg(keys[i]) : isB[i] ? classifyNbaLeg(keys[i]) : isC[i] ? classifyNcaabLeg(keys[i]) : isN[i] ? classifyNcaafLeg(keys[i]) : nflLegs[j++];
     if (!leg || (isN[i] && !leg.kind)) return { ok: false, reason: (leg && leg.reason) || 'leg_parse' };
     if (games.has(leg.gameId)) return { ok: false, reason: 'correlated_same_game' };
     games.add(leg.gameId); legs.push(leg);
@@ -96,12 +115,12 @@ function classifyLegs(rfq, { td, ncaaf, lines = false, nba = false }) {
 }
 
 // -> { decision, row } ; decision.action 'quote' | 'skip'
-function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBook = null, nbaBook = null, venues, kickoffFor, makerRate, nowMs, bufferMs = 30 * 60 * 1000, pricesHealthy = true, totalCapFor = null }) {
+function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBook = null, nbaBook = null, ncaabBook = null, venues, kickoffFor, makerRate, nowMs, bufferMs = 30 * 60 * 1000, pricesHealthy = true, totalCapFor = null }) {
   const skip = (reason) => ({ decision: { action: 'skip', reason } });
   if (!config.enabled) return skip('kill_switch');
   if (!rfq || !rfq.rfqId || !Array.isArray(rfq.legKeys)) return skip('bad_rfq');
   if (!pricesHealthy) return skip('prices_stale');
-  const cls = classifyLegs(rfq, { td: !!tdBook, ncaaf: config.ncaaf !== false, lines: !!linesBook, nba: !!nbaBook && !!config.nba });
+  const cls = classifyLegs(rfq, { td: !!tdBook, ncaaf: config.ncaaf !== false, lines: !!linesBook, nba: !!nbaBook && !!config.nba, ncaab: !!ncaabBook && !!config.ncaab });
   if (!cls.ok) return skip(`scope_${cls.reason}`);
   const keys = rfq.legKeys;
   if (keys.length !== cls.legs.length) return skip('leg_mismatch');
@@ -111,11 +130,13 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
   if (pg) return skip(pg);
   const hz = nbaHorizonCheck(keys, kickoffFor, nowMs, config.nbaHours != null ? config.nbaHours : 36);
   if (hz) return skip(hz);
+  const hzc = ncaabHorizonCheck(keys, kickoffFor, nowMs, config.ncaabHours);
+  if (hzc) return skip(hzc);
   const guardHits = []; // thin-book guard (sniper/mid-guard.js)
   const rogue = []; // rogue-line guard events (sniper/rogue.js), logged by the runner
   const legs = keys.map((k, i) => {
     const [ticker, side] = String(k).split(':');
-    const f = legFairDepth(cls.legs[i], { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook });
+    const f = legFairDepth(cls.legs[i], { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook, ncaabBook });
     if (f.rogue && f.rogue.length) rogue.push(...f.rogue.map((e) => ({ ...e, ticker, side: side || 'yes' })));
     if (f.p == null && MID_GUARD_REASONS.has(f.reason)) guardHits.push({ ...(f.guard || { kind: f.reason }), ticker, side: side || 'yes' });
     else if (f.guardShadow) guardHits.push({ ...f.guardShadow, ticker, side: side || 'yes', shadow: true });
@@ -145,11 +166,16 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
   // Any NBA leg (moneyline, spread or total): SNIPER_MIN_ROI_NBA (Kevin Oct 24: 6%).
   const hasNba = cls.legs.some((l) => l && (l.kind === 'nba' || (l.kind === 'line' && l.league === 'nba')));
   if (hasNba) minRoi = Math.max(minRoi, config.minRoiNba != null ? config.minRoiNba : 0.06);
+  // Any men's college basketball leg: SNIPER_MIN_ROI_NCAAB (Kevin Oct 30 proposal: 7%). NCAAB-only rule;
+  // every other minimum is unchanged and the highest applicable one still wins.
+  const hasNcaab = cls.legs.some((l) => l && l.kind === 'ncaab');
+  if (hasNcaab) minRoi = Math.max(minRoi, config.minRoiNcaab != null ? config.minRoiNcaab : 0.07);
   // Per-parlay total cap (sniper/soon-cap.js): <= soonHours to settle may use the sniper's cash.
-  const settleAt0 = settleAtMs(keys, kickoffFor, config.gameHours, config.nbaGameHours);
+  const settleAt0 = settleAtMs(keys, kickoffFor, config.gameHours, config.nbaGameHours, config.ncaabGameHours);
   const totalCap = totalCapFor ? totalCapFor(settleAt0, nowMs) : config.totalExposureCap;
   const d = evaluateSnipe(row, { config: { ...config, minRoi, totalExposureCap: totalCap }, ledger, nowMs, makerRate });
-  if (d.action === 'skip' && d.reason === 'roi_below_min' && hasNba) d.reason = 'roi_below_min_nba';
+  if (d.action === 'skip' && d.reason === 'roi_below_min' && hasNcaab) d.reason = 'roi_below_min_ncaab';
+  else if (d.action === 'skip' && d.reason === 'roi_below_min' && hasNba) d.reason = 'roi_below_min_nba';
   else if (d.action === 'skip' && d.reason === 'roi_below_min' && hasNcaaf) d.reason = 'roi_below_min_ncaaf';
   else if (d.action === 'skip' && d.reason === 'roi_below_min' && hasTd) d.reason = 'roi_below_min_td';
   else if (d.action === 'skip' && d.reason === 'roi_below_min' && hasLine) d.reason = 'roi_below_min_lines';
@@ -159,7 +185,7 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
     d.releaseAt = releaseAtMs(legs, nowMs);
     d.settleAt = settleAt0;
     if (totalCap > config.totalExposureCap) d.totalCap = totalCap;
-    d.minRoi = minRoi; d.hasTd = hasTd; d.hasLine = hasLine; d.hasNcaaf = hasNcaaf; d.hasNba = hasNba;
+    d.minRoi = minRoi; d.hasTd = hasTd; d.hasLine = hasLine; d.hasNcaaf = hasNcaaf; d.hasNba = hasNba; d.hasNcaab = hasNcaab;
     // Per-leg detail for the fill alert + audit (sniper_decisions.details.legDetail).
     d.legDetail = legs.map((l) => ({ ticker: l.ticker, side: l.side, fair: l.fair_yes, venue: l.venue, depthUsd: l.depth_usd, name: l.name, ref: l.ref }));
   }
@@ -167,16 +193,16 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
 }
 
 // Fresh combo fair (product of per-leg best-of-venues $depth fairs) for send/confirm-time re-pricing.
-function repriceFair(rfq, { pmLive, tdBook, venues, ncaafBook = null, linesBook = null, nbaBook = null, ncaaf = true }) {
-  const cls = classifyLegs(rfq, { td: !!tdBook, ncaaf, lines: !!linesBook, nba: !!nbaBook });
+function repriceFair(rfq, { pmLive, tdBook, venues, ncaafBook = null, linesBook = null, nbaBook = null, ncaabBook = null, ncaaf = true }) {
+  const cls = classifyLegs(rfq, { td: !!tdBook, ncaaf, lines: !!linesBook, nba: !!nbaBook, ncaab: !!ncaabBook });
   if (!cls.ok || cls.legs.length !== (rfq.legKeys || []).length) return null;
   let fair = 1;
   for (const leg of cls.legs) {
-    const f = legFairDepth(leg, { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook });
+    const f = legFairDepth(leg, { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook, ncaabBook });
     if (!(f.p > 0 && f.p < 1)) return null;
     fair *= f.p;
   }
   return fair;
 }
 
-module.exports = { decide, settleAtMs, pregameCheck, nbaHorizonCheck, maxLegDaysCheck, legDate, repriceFair, classifyLegs };
+module.exports = { decide, settleAtMs, pregameCheck, nbaHorizonCheck, ncaabHorizonCheck, maxLegDaysCheck, legDate, repriceFair, classifyLegs };

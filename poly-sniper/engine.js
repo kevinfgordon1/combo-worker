@@ -4,7 +4,7 @@
 // Polymarket combo maker fee = 0 and no maker rebate (docs.polymarket.us/fees).
 // We SELL the parlay: quote buyPrice (requester buys the combo) and sellPrice "0".
 'use strict';
-const { classifyLegs, pregameCheck, nbaHorizonCheck, legDate } = require('../sniper/engine');
+const { classifyLegs, pregameCheck, nbaHorizonCheck, ncaabHorizonCheck, legDate } = require('../sniper/engine');
 const { legFairDepth } = require('../sniper/fair');
 const { minQuotePrice, comboKey, gameKey, legKey, releaseAtMs } = require('../auto-sniper');
 const { mapPolyLegs } = require('./map');
@@ -21,6 +21,10 @@ function polySniperConfig(env = process.env) {
     // Any NBA leg (moneyline, spread or total). New with NBA (Oct 28): 6%, the Kalshi sniper's NBA rule.
     minRoiNba: num(env.POLY_SNIPER_MIN_ROI_NBA, 0.06),
     nbaHours: num(env.POLY_SNIPER_NBA_HOURS, 36),           // NBA legs must tip within this many hours (sniper rule)
+    // Men's college basketball MONEYLINES (Kevin Oct 30: built with the switch OFF; POLY_SNIPER_NCAAB=1 turns it on).
+    ncaab: String(env.POLY_SNIPER_NCAAB || '0') === '1',
+    minRoiNcaab: num(env.POLY_SNIPER_MIN_ROI_NCAAB, 0.06),  // any NCAAB leg: 6% (NCAAB-only; other minimums unchanged)
+    ncaabHours: Math.min(num(env.POLY_SNIPER_NCAAB_HOURS, 24), 36), // NCAAB legs must tip within 24h (never > 36h)
     maxRoi: num(env.POLY_SNIPER_MAX_ROI, 0.5),
     minLegFair: num(env.POLY_SNIPER_MIN_LEG_FAIR, 0.05),
     maxLegFair: num(env.POLY_SNIPER_MAX_LEG_FAIR, 0.95),
@@ -51,7 +55,8 @@ function polyMinRoi(legs, config) {
   for (const l of legs || []) {
     const college = l.kind === 'ncaaf' || (l.kind === 'line' && l.league === 'ncaaf');
     const nba = l.kind === 'nba' || (l.kind === 'line' && l.league === 'nba');
-    if (nba) m = Math.max(m, config.minRoiNba != null ? config.minRoiNba : 0.06);
+    if (l.kind === 'ncaab') m = Math.max(m, config.minRoiNcaab != null ? config.minRoiNcaab : 0.06);
+    else if (nba) m = Math.max(m, config.minRoiNba != null ? config.minRoiNba : 0.06);
     else if (college) m = Math.max(m, config.minRoiNcaaf);
     else if (l.kind === 'td') m = Math.max(m, config.minRoiTd != null ? config.minRoiTd : config.minRoiNfl);
     else if (l.kind !== 'ml') m = Math.max(m, config.minRoiNfl);
@@ -102,20 +107,22 @@ function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now(), skipLedger 
   if (!feed.pricesHealthy(nowMs)) return skip('prices_stale');
   const linesOn = config.lines !== false && !!feed.linesBook;
   const nbaOn = config.nba !== false && !!feed.nbaBook;
-  const leagues = ['nfl', 'ncaaf', ...(nbaOn ? ['nba'] : [])];
+  const ncaabOn = config.ncaab === true && !!feed.ncaabBook;
+  const leagues = ['nfl', 'ncaaf', ...(nbaOn ? ['nba'] : []), ...(ncaabOn ? ['ncaab'] : [])];
   const m = mapPolyLegs(comboLegs, feed.index, { leagues, lineMeta: linesOn ? feed.lineMeta : null });
   if (!m.ok) return skip(m.reason, { unmapped: m.unmapped || null, matched: m.matched || null });
   const kRfq = { rfqId: rfq.rfqId, legKeys: m.legKeys };
-  const cls = classifyLegs(kRfq, { td: !!feed.tdBook, ncaaf: config.ncaaf && !!feed.ncaafBook, lines: linesOn, nba: nbaOn });
+  const cls = classifyLegs(kRfq, { td: !!feed.tdBook, ncaaf: config.ncaaf && !!feed.ncaafBook, lines: linesOn, nba: nbaOn, ncaab: ncaabOn });
   if (!cls.ok) return skip(`scope_${cls.reason}`);
   const pg = pregameCheck(m.legKeys, (t) => feed.kickoffs.kickoffFor(t), nowMs, config.bufferMs);
   if (pg) return skip(pg);
   const hz = nbaHorizonCheck(m.legKeys, (t) => feed.kickoffs.kickoffFor(t), nowMs, config.nbaHours != null ? config.nbaHours : 36);
   if (hz) return skip(hz);
+  if (ncaabOn) { const hc = ncaabHorizonCheck(m.legKeys, (t) => feed.kickoffs.kickoffFor(t), nowMs, config.ncaabHours); if (hc) return skip(hc); }
   const legs = []; let fair = 1;
   for (let i = 0; i < m.legKeys.length; i += 1) {
     const [ticker, side] = m.legKeys[i].split(':');
-    const f = legFairDepth(cls.legs[i], { pmLive: feed.pmLive, tdBook: feed.tdBook, ncaafBook: feed.ncaafBook, linesBook: linesOn ? feed.linesBook : null, nbaBook: nbaOn ? feed.nbaBook : null, venues: feed.venues });
+    const f = legFairDepth(cls.legs[i], { pmLive: feed.pmLive, tdBook: feed.tdBook, ncaafBook: feed.ncaafBook, linesBook: linesOn ? feed.linesBook : null, nbaBook: nbaOn ? feed.nbaBook : null, ncaabBook: ncaabOn ? feed.ncaabBook : null, venues: feed.venues });
     const leg = { polySymbol: comboLegs[i].symbol, polySide: comboLegs[i].side, ticker, side, kind: cls.legs[i].kind || 'ml', league: cls.legs[i].league || null, fair: f.p, venue: f.venue || null, best: f.best || null, depthUsd: f.depthUsd != null ? Math.round(f.depthUsd) : null, reason: f.reason || null, date: legDate(ticker) };
     legs.push(leg);
     if (!(f.p > 0 && f.p < 1)) return skip(f.reason || 'leg_no_fair', { legs });

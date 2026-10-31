@@ -50,6 +50,11 @@ function sniperConfig(env = process.env) {
     minRoiNba: num(env.SNIPER_MIN_ROI_NBA, 0.06),               // any NBA leg: 6% (highest rule wins)
     nbaHours: num(env.SNIPER_NBA_HOURS, 36),                    // NBA legs must tip within this many hours
     nbaGameHours: num(env.SNIPER_NBA_GAME_HOURS, 3),            // NBA settle = last tip + this
+    // Men's college basketball MONEYLINES (Kevin Oct 30: built with the switch OFF). Off unless SNIPER_NCAAB=1.
+    ncaab: String(env.SNIPER_NCAAB || '0') === '1',
+    minRoiNcaab: num(env.SNIPER_MIN_ROI_NCAAB, 0.07),           // any NCAAB leg: 7% (NCAAB-only; highest rule wins)
+    ncaabHours: Math.min(num(env.SNIPER_NCAAB_HOURS, 24), 36),  // NCAAB legs must tip within this (24h, never > 36h)
+    ncaabGameHours: num(env.SNIPER_NCAAB_GAME_HOURS, 3),        // NCAAB settle = last tip + this
     maxLegDays: num(env.SNIPER_MAX_LEG_DAYS, 7),
     soonCap: String(env.SNIPER_SOON_CAP == null ? '1' : env.SNIPER_SOON_CAP) !== '0', // Kevin Oct 26: <=soonHours parlays cap = sniper cash
     soonHours: num(env.SNIPER_SOON_HOURS, 24),                // Kevin Oct 26: reject any leg whose game is > this many days out (0 = off)

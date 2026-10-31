@@ -25,7 +25,7 @@ function closeRows(due, books) {
   for (const d of due) {
     let f = { p: null };
     try {
-      const cls = classifyLegs({ legKeys: d.legKeys }, { td: !!books.tdBook, ncaaf: !!books.ncaafBook, lines: !!books.linesBook, nba: !!books.nbaBook });
+      const cls = classifyLegs({ legKeys: d.legKeys }, { td: !!books.tdBook, ncaaf: !!books.ncaafBook, lines: !!books.linesBook, nba: !!books.nbaBook, ncaab: !!books.ncaabBook });
       if (cls.ok && cls.legs[d.i]) f = legFairDepth(cls.legs[d.i], books) || { p: null };
     } catch (_) { /* no price */ }
     const [ticker, side] = d.key.split(':');

@@ -38,7 +38,13 @@ function guarded(sources, venues, rogue, noVenueReason, mid, own) {
   if (m.skip && mcfg.mode === 'enforce') return { p: null, reason: m.skip, guard: m.ev, rogue: rogueEv.length ? rogueEv : undefined };
   return { p: 1 - b.cost, ref: m.ref != null ? m.ref : null, guardShadow: m.ev || undefined, best: `${b.venue}${b.via && b.via !== 'td_opposite' ? ':' + b.via : ''}`, venue: b.venue, depthUsd: b.availUsd != null ? b.availUsd : null, rogue: rogueEv.length ? rogueEv : undefined };
 }
-function legFairDepth(leg, { pmLive, tdBook, venues, ncaafBook, linesBook = null, nbaBook = null, rogue, mid }) {
+function legFairDepth(leg, { pmLive, tdBook, venues, ncaafBook, linesBook = null, nbaBook = null, ncaabBook = null, rogue, mid }) {
+  if (leg.kind === 'ncaab') { // men's college basketball moneyline (sniper/ncaab.js); no NCAAB lines
+    if (!ncaabBook) return { p: null, reason: 'no_ncaab_book' };
+    const f = ncaabBook.legFair(leg.gameId, leg.team);
+    if (!f) return { p: null, reason: 'no_game' };
+    return guarded(f.sources, venues, rogue, 'no_venue_depth', mid, f.own);
+  }
   if (leg.kind === 'nba') { // NBA moneyline (sniper/nba.js); NBA spreads/totals are kind 'line'
     if (!nbaBook) return { p: null, reason: 'no_nba_book' };
     const f = nbaBook.legFair(leg.gameId, leg.team);
