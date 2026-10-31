@@ -61,4 +61,8 @@ kill_timeout = "60s"   # Oct 25: room to cancel every open quote on SIGTERM
   SNIPER_MIN_ROI_NBA = "0.06"     # Kevin Oct 24: any NBA leg needs 6% (highest rule wins)
   SNIPER_NBA_HOURS = "36"         # NBA legs must tip within 36h of the quote
   SNIPER_NBA_GAME_HOURS = "3"     # NBA settle_at = last tip + 3h
+  SNIPER_NCAAB = "0"              # Kevin Oct 30: college basketball MONEYLINES built with the switch OFF ("1" turns it on)
+  SNIPER_MIN_ROI_NCAAB = "0.07"   # NCAAB-only minimum edge (proposed 7%); other minimums unchanged
+  SNIPER_NCAAB_HOURS = "24"       # NCAAB legs must tip within 24h (code caps this at 36h)
+  SNIPER_NCAAB_GAME_HOURS = "3"   # NCAAB settle_at = last tip + 3h
   SNIPER_ODDS_RELAY_URL = "http://kaygo-odds-relay.internal:8787"

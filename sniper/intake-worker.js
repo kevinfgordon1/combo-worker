@@ -35,7 +35,7 @@ const ws = createKalshiFirehose({
   shardFactor: cfg.shardFactor,
   keyId: env.SNIPER_KALSHI_KEY_ID,
   pem: normalizePem(env.SNIPER_KALSHI_PRIVATE_KEY),
-  shouldDropCreated: cfg.fastDrop ? createSniperFrameFilter({ ncaaf: !cfg.scope || cfg.scope.ncaaf !== false, nba: cfg.scope ? !!cfg.scope.nba : !!cfg.nba, all: cfg.needleAll !== false }) : undefined,
+  shouldDropCreated: cfg.fastDrop ? createSniperFrameFilter({ ncaaf: !cfg.scope || cfg.scope.ncaaf !== false, nba: cfg.scope ? !!cfg.scope.nba : !!cfg.nba, ncaab: cfg.scope ? !!cfg.scope.ncaab : !!cfg.ncaab, all: cfg.needleAll !== false }) : undefined,
   shouldDropDeleted: cfg.fastDrop ? createDeletedIdFilter((id) => open.has(id)) : undefined,
   onRfqCreated: (rfq) => { const c = candidate(rfq); if (c) post({ t: 'rfq', rfq: c }); },
   onRfqDeleted: (evt) => post({ t: 'deleted', evt }),

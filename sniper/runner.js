@@ -58,6 +58,7 @@ const { espnKickoffs, oddsKickoffs } = require('../noboost/kickoffs');
 const { createNcaafBook, espnNcaafKickoffs, oddsNcaafKickoffs, ESPN_NCAAF, isFbsGame } = require('./ncaaf');
 const { createLinesBook } = require('./lines');
 const { createNbaBook, espnNbaKickoffs, espnNbaUrls } = require('./nba');
+const { createNcaabBook, espnNcaabKickoffs, espnNcaabUrls, isD1Game: isNcaabD1Game } = require('./ncaab');
 
 const ORIGIN = 'https://api.elections.kalshi.com';
 const P = '/trade-api/v2';
@@ -100,7 +101,7 @@ async function main(env = process.env) {
   const gate = liveGate(env);
   config.dryRun = !gate.live;
   if (String(env.SNIPER_DRY_RUN) === '0' && !gate.live) alert(`[SNIPER] SNIPER_DRY_RUN=0 but live gate closed (${gate.why.join(', ')}) — staying DRY RUN.`);
-  log(`[SNIPER] boot enabled=${config.enabled} mode=${gate.live ? 'LIVE' : 'DRY_RUN'} depth=game:$${gameDepth},td:$${depth} venues=${venues.join('+')} prophetx=${hasProphetXCreds(env) ? 'on' : 'off'} minEdge=ml:${(config.minRoi * 100).toFixed(1)}%,lines:${(config.minRoiLines * 100).toFixed(1)}%,td:${(config.minRoiTd * 100).toFixed(1)}% ncaaf=${config.ncaaf ? `on(min ${(config.minRoiNcaaf * 100).toFixed(1)}%)` : 'off'} lines=${String(env.SNIPER_LINES || '0') === '1' ? 'on' : 'off'} nba=${config.nba ? `on(min ${(config.minRoiNba * 100).toFixed(1)}%, ${config.nbaHours}h)` : 'off'} caps=total:$${config.totalExposureCap},long:$${config.longExposureCap}(>${config.shortSettleHours}h),game:$${config.perGameCap},leg:$${config.perLegCap},quote:$${config.maxRisk},dailyRisk:$${config.dailyRiskCap},dailyLoss:$${config.dailyLossCap}`);
+  log(`[SNIPER] boot enabled=${config.enabled} mode=${gate.live ? 'LIVE' : 'DRY_RUN'} depth=game:$${gameDepth},td:$${depth} venues=${venues.join('+')} prophetx=${hasProphetXCreds(env) ? 'on' : 'off'} minEdge=ml:${(config.minRoi * 100).toFixed(1)}%,lines:${(config.minRoiLines * 100).toFixed(1)}%,td:${(config.minRoiTd * 100).toFixed(1)}% ncaaf=${config.ncaaf ? `on(min ${(config.minRoiNcaaf * 100).toFixed(1)}%)` : 'off'} lines=${String(env.SNIPER_LINES || '0') === '1' ? 'on' : 'off'} nba=${config.nba ? `on(min ${(config.minRoiNba * 100).toFixed(1)}%, ${config.nbaHours}h)` : 'off'} ncaab=${config.ncaab ? `on(ML only, min ${(config.minRoiNcaab * 100).toFixed(1)}%, ${config.ncaabHours}h)` : 'off'} caps=total:$${config.totalExposureCap},long:$${config.longExposureCap}(>${config.shortSettleHours}h),game:$${config.perGameCap},leg:$${config.perLegCap},quote:$${config.maxRisk},dailyRisk:$${config.dailyRiskCap},dailyLoss:$${config.dailyLossCap}`);
   // Effective caps after env overrides, published on every summary heartbeat so the dashboard
   // header can't drift from what the sniper actually enforces (audit Oct 24).
   const effectiveCaps = { totalOpen: config.totalExposureCap, longDatedOpen: config.longExposureCap, perGame: config.perGameCap, perLeg: config.perLegCap, dailyLoss: config.dailyLossCap, dailyNewRisk: config.dailyRiskCap, perQuoteRisk: config.maxRisk, minEdge: config.minRoi, minEdgeLines: config.minRoiLines, minEdgeNcaaf: config.minRoiNcaaf, minEdgeNba: config.minRoiNba, minEdgeTd: config.minRoiTd, depthGame: gameDepth, depthTd: depth };
@@ -151,6 +152,9 @@ async function main(env = process.env) {
   const linesBook = linesOn ? createLinesBook({ staleMs: 15000, depthUsd: gameDepth }) : null;
   // NBA moneylines (spreads / totals ride linesBook), same $gameDepth per leg. SNIPER_NBA=1 to enable.
   const nbaBook = config.nba ? createNbaBook({ staleMs: 15000, depthUsd: gameDepth }) : null;
+  // Men's college basketball MONEYLINES (D1 vs D1 via ncaab-crosswalk), same $gameDepth per leg.
+  // SNIPER_NCAAB=1 to enable (Kevin Oct 30: built with the switch OFF). No NCAAB spreads / totals.
+  const ncaabBook = config.ncaab ? createNcaabBook({ staleMs: 15000, depthUsd: gameDepth }) : null;
   // Real kickoffs (ESPN > odds_cache > Kalshi occurrence−3h fallback, logged). `kick` keeps the
   // Kalshi estimate per ticker for the td-book's own staleness use.
   const kick = new Map();
@@ -185,7 +189,7 @@ async function main(env = process.env) {
     }
     return out;
   }
-  let mlTickers = []; let tdTickers = []; let ncaafTickers = []; let lineTickers = []; let nbaTickers = []; let listedAt = 0;
+  let mlTickers = []; let tdTickers = []; let ncaafTickers = []; let lineTickers = []; let nbaTickers = []; let ncaabTickers = []; let listedAt = 0;
   async function refreshLists() {
     const ml = await listMarkets('KXNFLGAME'); mlTickers = ml.map((m) => String(m.ticker).toUpperCase());
     if (venues.length) {
@@ -216,6 +220,15 @@ async function main(env = process.env) {
       const nbaHorizon = Date.now() + (config.nbaHours + 3) * 3600e3;
       nbaTickers = (await listMarkets('KXNBAGAME')).filter((m) => { const o = Date.parse(m.occurrence_datetime || ''); return !Number.isFinite(o) || o <= nbaHorizon; }).map((m) => String(m.ticker).toUpperCase());
     }
+    if (ncaabBook) {
+      // NCAAB: occurrence = tip + 3h. Only D1-vs-D1 games (crosswalk) inside the quoting window (+3h slack),
+      // soonest first, capped (SNIPER_NCAAB_MAX_TICKERS, default 200) so a 300-game slate can't crowd the
+      // NFL / NBA order-book budget.
+      const ncaabHorizon = Date.now() + (config.ncaabHours + 3) * 3600e3;
+      const occ = (m) => { const o = Date.parse(m.occurrence_datetime || ''); return Number.isFinite(o) ? o : Infinity; };
+      ncaabTickers = (await listMarkets('KXNCAAMBGAME')).filter((m) => isNcaabD1Game(m.ticker)).filter((m) => occ(m) <= ncaabHorizon)
+        .sort((a, b) => occ(a) - occ(b)).slice(0, num(env.SNIPER_NCAAB_MAX_TICKERS, 200)).map((m) => String(m.ticker).toUpperCase());
+    }
     listedAt = Date.now();
   }
   async function books(tickers, sink) {
@@ -237,6 +250,7 @@ async function main(env = process.env) {
     ...(ncaafBook ? { ncaaf: { tickers: () => ncaafTickers, sink: (o) => ncaafBook.ingestKalshiOrderbooks(o) } } : {}),
     ...(nbaBook ? { nba: { tickers: () => nbaTickers, sink: (o) => nbaBook.ingestKalshiOrderbooks(o) } } : {}),
     ...(linesBook ? { lines: { tickers: () => linesBook.mainTickers(lineTickers), sink: (o) => linesBook.ingestKalshiOrderbooks(o) } } : {}),
+    ...(ncaabBook ? { ncaab: { tickers: () => ncaabTickers, sink: (o) => ncaabBook.ingestKalshiOrderbooks(o) } } : {}), // last: never ahead of NFL / NBA
   };
   const bookWsOn = String(env.SNIPER_KALSHI_BOOK_WS || '1') !== '0' && !!env.SNIPER_KALSHI_KEY_ID && !!env.SNIPER_KALSHI_PRIVATE_KEY;
   const bookFeed = bookWsOn ? createKalshiBookFeed({
@@ -256,6 +270,7 @@ async function main(env = process.env) {
     if (!listedAt) return;
     if (ncaafBook && bookRouter.restNeeded('ncaaf')) await books(ncaafTickers, (o) => ncaafBook.ingestKalshiOrderbooks(o));
     if (nbaBook && bookRouter.restNeeded('nba')) await books(nbaTickers, (o) => nbaBook.ingestKalshiOrderbooks(o));
+    if (ncaabBook && bookRouter.restNeeded('ncaab')) await books(ncaabTickers, (o) => ncaabBook.ingestKalshiOrderbooks(o));
     if (linesBook && bookRouter.restNeeded('lines')) await books(linesBook.mainTickers(lineTickers), (o) => linesBook.ingestKalshiOrderbooks(o)); // main-line strikes only
     if (bookRouter.restNeeded('td')) { await books(tdTickers, (o) => tdBook.ingest(o, tdMeta())); health.td = Date.now(); }
   }
@@ -284,6 +299,10 @@ async function main(env = process.env) {
           const b = await getJson(lim.relay, `${relayBase}/board?venue=${venue}&league=NBA`);
           nbaBook.ingestRelay(venue, b.quotes || [], { feedLive: venue === 'novig' ? novigLive : false, polledAt });
           if (linesBook) linesBook.ingestRelay(venue, 'nba', b.quotes || [], { feedLive: venue === 'novig' ? novigLive : false, polledAt });
+        }
+        if (ncaabBook) { // moneylines only (sniper/ncaab.js ignores everything else)
+          const cb = await getJson(lim.relay, `${relayBase}/board?venue=${venue}&league=NCAAB`);
+          ncaabBook.ingestRelay(venue, cb.quotes || [], { feedLive: venue === 'novig' ? novigLive : false, polledAt });
         }
       } catch (e) { if (/disabled/.test(e.message)) throw e; relayErr[`${venue}_board`] = (relayErr[`${venue}_board`] || 0) + 1; }
       if (tdOff.has(venue) && Date.now() - tdOff.get(venue) < 10 * 60 * 1000) continue; // relay says td_off: re-check every 10 min
@@ -366,6 +385,13 @@ async function main(env = process.env) {
         const c = await fetch(u, { headers: { accept: 'application/json' } });
         if (!c.ok) throw new Error(`espn nba scoreboard ${c.status}`);
         kickoffs.setKickoffs(espnNbaKickoffs(await c.json()));
+      }
+    }
+    if (ncaabBook) {
+      for (const u of espnNcaabUrls(Date.now(), 2)) { // D1 scoreboard, today + tomorrow ET (<=36h window)
+        const c = await fetch(u, { headers: { accept: 'application/json' } });
+        if (!c.ok) throw new Error(`espn ncaab scoreboard ${c.status}`);
+        kickoffs.setKickoffs(espnNcaabKickoffs(await c.json()));
       }
     }
     if (ncaafBook) {
@@ -460,7 +486,7 @@ async function main(env = process.env) {
   loop(() => store.refreshHedges(ledger, { live: gate.live }), 'hedges', num(env.SNIPER_HEDGE_POLL_MS, 60000));
   // Closing-line snapshot per open live fill leg (EV drift tracker). SNIPER_CLOSE_SNAPSHOT=0 turns it off.
   if (String(env.SNIPER_CLOSE_SNAPSHOT || '1') !== '0') {
-    const closeSnap = createCloseSnapshot({ supabase, kickoffFor, books: { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook }, live: gate.live, log });
+    const closeSnap = createCloseSnapshot({ supabase, kickoffFor, books: { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook, ncaabBook }, live: gate.live, log });
     loop(() => closeSnap.tick(), 'close_snapshot', num(env.SNIPER_CLOSE_POLL_MS, 60000));
   }
   // d.totalCap (soon-cap tier) raises only that parlay's DB total cap; everything else unchanged.
@@ -537,7 +563,7 @@ async function main(env = process.env) {
     // Accept-race fix: SNIPER_EARLY_REGISTER=0 restores the old order (ledger write, then track).
     earlyRegister: String(env.SNIPER_EARLY_REGISTER || '1') !== '0',
     pullConcurrency: Math.max(1, num(env.SNIPER_PULL_CONCURRENCY, 4)), pullGuard: String(env.SNIPER_PULL_GUARD || '1') !== '0',
-    reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook, ncaaf: !!ncaafBook }),
+    reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook, ncaabBook, ncaaf: !!ncaafBook }),
     alert,
     onFilled: (f) => (bookArb ? bookArb.check(f, 'fill') : null),
     // Rule 9 at commence time (no buffer here; decide() already stops new quotes 30 min early).
@@ -719,7 +745,7 @@ async function main(env = process.env) {
     let makerRate = null;
     try { const e = await fees.prefetch(seriesOfTicker(rfq.marketTicker)); makerRate = e ? e.rate : null; } catch (_) { makerRate = null; }
     const nowMs = Date.now();
-    const { decision: d } = decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook, linesBook, nbaBook, venues, kickoffFor, makerRate, nowMs, pricesHealthy: pricesHealthy(), totalCapFor: soonCap.capFor });
+    const { decision: d } = decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook, linesBook, nbaBook, ncaabBook, venues, kickoffFor, makerRate, nowMs, pricesHealthy: pricesHealthy(), totalCapFor: soonCap.capFor });
     lat.stage('handlerToDecided', Date.now() - tH);
     staleAlert.record(d.reason === 'prices_stale');
     if (d.rogue && d.rogue.length) logRogue(d);
@@ -873,7 +899,7 @@ async function main(env = process.env) {
     wsWorker = createIntakeWorker({
       workerData: {
         shardFactor: readShardFactor(env.SNIPER_WS_SHARD_FACTOR, env, DEFAULT_LIVE_SHARD_FACTOR), fastDrop, nba: !!nbaBook, maxAgeMs,
-        scope: { td: !!tdBook, ncaaf: config.ncaaf !== false, lines: !!linesBook, nba: !!nbaBook && !!config.nba },
+        scope: { td: !!tdBook, ncaaf: config.ncaaf !== false, lines: !!linesBook, nba: !!nbaBook && !!config.nba, ncaab: !!ncaabBook && !!config.ncaab },
         earlyFilter, maxLegDays: config.maxLegDays, maxLegs: config.maxLegs, needleAll: !needleAllDisabled(env),
       },
       startedAll: () => [...startedTickers],
@@ -891,7 +917,7 @@ async function main(env = process.env) {
     pem: normalizePem(env.SNIPER_KALSHI_PRIVATE_KEY),
     // ~97% of rfq_created frames have no NFL leg: drop them before JSON.parse. rfq_deleted for
     // RFQs we hold no quote on are dropped too (we only act on closes of our own quotes).
-    shouldDropCreated: String(env.SNIPER_WS_FAST_DROP) === '0' ? undefined : createSniperFrameFilter({ ncaaf: !!ncaafBook, nba: !!nbaBook && !!config.nba, all: !needleAllDisabled(env) }),
+    shouldDropCreated: String(env.SNIPER_WS_FAST_DROP) === '0' ? undefined : createSniperFrameFilter({ ncaaf: !!ncaafBook, nba: !!nbaBook && !!config.nba, ncaab: !!ncaabBook && !!config.ncaab, all: !needleAllDisabled(env) }),
     shouldDropDeleted: String(env.SNIPER_WS_FAST_DROP) === '0' ? undefined : createDeletedIdFilter((id) => liveSniper.hasRfqId(id)),
     // Stamp receive time in the ws message tick (before any await) for stage timing.
     ...wsCallbacks,

@@ -4,6 +4,7 @@
 const { parseNcaafMl, teamName } = require('./ncaaf');
 const { parseLineTicker } = require('./lines');
 const NBA = require('./nba');
+const NCAAB = require('./ncaab');
 const VENUE = { kalshi: 'Kalshi', polymarket: 'Polymarket', novig: 'Novig', prophetx: 'ProphetX' };
 function american(p) {
   const x = Number(p);
@@ -72,6 +73,10 @@ function legParts(ticker, side, name) {
   if (t.startsWith('KXNBAGAME-')) { // KXNBAGAME-26OCT23DALIND-IND:yes → "Pacers to win" · "DAL @ IND", opp "DAL"
     const g = NBA.parseNbaMl(t);
     if (g) { const other = g.codes.find((c) => c !== g.selection); return { bet: `${NBA.nickName(g.selection)} to win${no ? ' (No)' : ''}`, game: `${g.codes[0]} @ ${g.codes[1]}`, opp: no ? g.selection : other }; }
+  }
+  if (t.startsWith('KXNCAAMBGAME-')) { // KXNCAAMBGAME-26NOV01NDVILL-VILL:yes → "Villanova to win" · "Notre Dame @ Villanova" (blob order)
+    const g = NCAAB.parseNcaabMl(t);
+    if (g) { const other = g.codes.find((c) => c !== g.selection); return { bet: `${NCAAB.teamName(g.selection)} to win${no ? ' (No)' : ''}`, game: `${NCAAB.teamName(g.codes[0])} vs ${NCAAB.teamName(g.codes[1])}`, opp: no ? NCAAB.teamName(g.selection) : NCAAB.teamName(other) }; }
   }
   if (/^KX(NFL|NCAAF|NBA)(SPREAD|TOTAL)-/.test(t)) { const lp = lineParts(t, no); if (lp) return lp; }
   if (t.startsWith('KXNFLGAME')) {

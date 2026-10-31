@@ -1,6 +1,6 @@
 // Polymarket combo leg -> equivalent Kalshi leg key, so the sniper's own fair model
 // (sniper/engine classifyLegs + sniper/fair legFairDepth) prices it unchanged.
-// Index: every listed Kalshi NFL ML / NCAAF ML / NBA ML / NFL TD ticker -> leg-identity key,
+// Index: every listed Kalshi NFL ML / NCAAF ML / NBA ML / NCAAB ML (D1) / NFL TD ticker -> leg-identity key,
 // plus every Kalshi NFL / NCAAF / NBA spread and total strike (both Yes and No) -> key.
 // Poly leg identity (leg-identity.js, the same parser Combo Locks uses) -> key -> ticker.
 //
@@ -23,6 +23,7 @@ function kalshiIdentity(ticker, label, opts = {}) {
   if (/^KXNFLGAME-/.test(t)) return L.parseKalshiTicker(`${t}:yes`);
   if (/^KXNBAGAME-/.test(t)) return L.parseKalshiTicker(`${t}:yes`);
   if (/^KXNCAAFGAME-/.test(t)) return L.parseKalshiNcaafMlTicker(t, 'yes', label, {});
+  if (/^KXNCAAMBGAME-/.test(t)) return L.parseKalshiNcaabMlTicker(t, 'yes', label); // D1 college basketball ML only
   if (/^KXNFLTD-/.test(t)) return L.parseKalshiPropTicker(t, 'yes', label, { idx: opts.idx || undefined });
   return null;
 }

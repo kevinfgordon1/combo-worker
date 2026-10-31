@@ -15,6 +15,9 @@ const NFL_NEEDLES = [Buffer.from('KXNFLGAME'), Buffer.from('KXNFLTD'), Buffer.fr
 // NBA game legs (SNIPER_NBA=1 only; NBA props never match these needles). Kept separate so the
 // ~40% of the firehose that is NBA is only parsed when NBA quoting is on.
 const NBA_NEEDLES = [Buffer.from('KXNBAGAME'), Buffer.from('KXNBASPREAD'), Buffer.from('KXNBATOTAL')];
+// Men's college basketball MONEYLINES only (SNIPER_NCAAB=1 only). KXNCAAMBSPREAD / TOTAL are not needles,
+// so with the every-leg filter a combo carrying one is dropped before parse.
+const NCAAB_NEEDLES = [Buffer.from('KXNCAAMBGAME')];
 
 function frameHas(raw, needles) {
   if (Buffer.isBuffer(raw)) return needles.some((n) => raw.indexOf(n) !== -1);
@@ -60,13 +63,13 @@ function createAllLegsFrameFilter(needles) {
 }
 
 // Needles for the sports actually on: college football only when NCAAF is on, NBA only when NBA is on.
-function sniperNeedles({ ncaaf = true, nba = false } = {}) {
+function sniperNeedles({ ncaaf = true, nba = false, ncaab = false } = {}) {
   const base = NFL_NEEDLES.filter((n) => ncaaf || !n.toString().startsWith('KXNCAAF'));
-  return nba ? [...base, ...NBA_NEEDLES] : base;
+  return [...base, ...(nba ? NBA_NEEDLES : []), ...(ncaab ? NCAAB_NEEDLES : [])];
 }
 const needleAllDisabled = (env = process.env) => /^(0|false|no|off)$/i.test(String((env && env.SNIPER_WS_NEEDLE_ALL) || ''));
-function createSniperFrameFilter({ ncaaf = true, nba = false, all = true } = {}) {
-  const needles = sniperNeedles({ ncaaf, nba });
+function createSniperFrameFilter({ ncaaf = true, nba = false, ncaab = false, all = true } = {}) {
+  const needles = sniperNeedles({ ncaaf, nba, ncaab });
   return all ? createAllLegsFrameFilter(needles) : createNflFrameFilter(needles);
 }
 
@@ -143,4 +146,4 @@ function createLatencyStats() {
   };
 }
 
-module.exports = { createAllLegsFrameFilter, sniperNeedles, needleAllDisabled, createSniperFrameFilter, createDeletedIdFilter, createLoopLagSampler, staleBucket, STAGES, createNflFrameFilter, createDeletedFilter, tooOld, createLatencyStats, NFL_NEEDLES, NBA_NEEDLES };
+module.exports = { NCAAB_NEEDLES, createAllLegsFrameFilter, sniperNeedles, needleAllDisabled, createSniperFrameFilter, createDeletedIdFilter, createLoopLagSampler, staleBucket, STAGES, createNflFrameFilter, createDeletedFilter, tooOld, createLatencyStats, NFL_NEEDLES, NBA_NEEDLES };

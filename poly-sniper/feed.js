@@ -15,6 +15,7 @@ const { espnKickoffs, oddsKickoffs } = require('../noboost/kickoffs');
 const { createNcaafBook, espnNcaafKickoffs, oddsNcaafKickoffs, ESPN_NCAAF, isFbsGame } = require('../sniper/ncaaf');
 const { createLinesBook } = require('../sniper/lines');
 const { createNbaBook, espnNbaKickoffs, espnNbaUrls } = require('../sniper/nba');
+const { createNcaabBook, espnNcaabKickoffs, espnNcaabUrls, isD1Game: isNcaabD1Game, clampHours: clampNcaabHours } = require('../sniper/ncaab');
 const { createLimiter } = require('../sniper/limiter');
 const { ALL_VENUES } = require('../sniper/fair');
 const { createKalshiIndex } = require('./map');
@@ -77,6 +78,9 @@ function createPolySniperFeed({ env = process.env, log = console.log, fetchImpl 
   const linesOn = String(env.POLY_SNIPER_LINES == null ? '1' : env.POLY_SNIPER_LINES) !== '0';
   const nbaOn = String(env.POLY_SNIPER_NBA == null ? '1' : env.POLY_SNIPER_NBA) !== '0';
   const nbaHours = num(env.POLY_SNIPER_NBA_HOURS, 36);
+  // Men's college basketball MONEYLINES (Kevin Oct 30: built with the switch OFF). POLY_SNIPER_NCAAB=1 to enable.
+  const ncaabOn = String(env.POLY_SNIPER_NCAAB || '0') === '1';
+  const ncaabHours = clampNcaabHours(num(env.POLY_SNIPER_NCAAB_HOURS, 24));
   const lim = {
     kalshi: createLimiter({ name: 'poly_sniper_kalshi_public', ratePerSec: num(env.POLY_SNIPER_KALSHI_RPS, 2), burst: 3 }),
     relay: createLimiter({ name: 'poly_sniper_relay', ratePerSec: num(env.POLY_SNIPER_RELAY_RPS, 2), burst: 2 }),
@@ -93,6 +97,7 @@ function createPolySniperFeed({ env = process.env, log = console.log, fetchImpl 
   const ncaafBook = ncaafOn ? createNcaafBook({ staleMs, depthUsd: gameDepth }) : null;
   const linesBook = linesOn ? createLinesBook({ staleMs, depthUsd: gameDepth }) : null;
   const nbaBook = nbaOn ? createNbaBook({ staleMs, depthUsd: gameDepth }) : null;
+  const ncaabBook = ncaabOn ? createNcaabBook({ staleMs, depthUsd: gameDepth }) : null;
   const lineMeta = linesOn ? createLineMetaCache({
     log,
     fetchMarket: async (slug) => {
@@ -124,7 +129,7 @@ function createPolySniperFeed({ env = process.env, log = console.log, fetchImpl 
     }
     return out;
   }
-  let mlT = []; let tdT = []; let cfbT = []; let nbaT = []; let lineT = []; let listedAt = 0;
+  let mlT = []; let tdT = []; let cfbT = []; let nbaT = []; let ncaabT = []; let lineT = []; let listedAt = 0;
   async function refreshLists() {
     const ml = await listMarkets('KXNFLGAME'); mlT = ml.map((m) => String(m.ticker).toUpperCase()); index.ingestMarkets(ml);
     const td = await listMarkets('KXNFLTD'); tdBook.setNames(td); index.ingestMarkets(td);
@@ -139,6 +144,12 @@ function createPolySniperFeed({ env = process.env, log = console.log, fetchImpl 
     if (nbaBook) { // NBA: occurrence = tip + 3h; only games inside the quoting window (+3h slack)
       const n = (await listMarkets('KXNBAGAME')).filter(within(Date.now() + (nbaHours + 3) * 3600e3));
       index.ingestMarkets(n); nbaT = n.map((m) => String(m.ticker).toUpperCase());
+    }
+    if (ncaabBook) { // NCAAB: D1 vs D1 only (crosswalk), tip + 3h = occurrence; soonest first, capped
+      const occ = (m) => { const o = Date.parse(m.occurrence_datetime || ''); return Number.isFinite(o) ? o : Infinity; };
+      const c = (await listMarkets('KXNCAAMBGAME')).filter((m) => isNcaabD1Game(m.ticker)).filter((m) => occ(m) <= Date.now() + (ncaabHours + 3) * 3600e3)
+        .sort((a, b) => occ(a) - occ(b)).slice(0, num(env.POLY_SNIPER_NCAAB_MAX_TICKERS, 200));
+      index.ingestMarkets(c); ncaabT = c.map((m) => String(m.ticker).toUpperCase());
     }
     if (linesBook) {
       const horizon = Date.now() + num(env.POLY_SNIPER_NCAAF_DAYS, 8) * 864e5;
@@ -164,6 +175,7 @@ function createPolySniperFeed({ env = process.env, log = console.log, fetchImpl 
       await books(mlT, (o) => pmLive.ingestKalshiOrderbooks(o)); health.ml = Date.now();
       if (ncaafBook) await books(cfbT, (o) => ncaafBook.ingestKalshiOrderbooks(o));
       if (nbaBook) await books(nbaT, (o) => nbaBook.ingestKalshiOrderbooks(o));
+      if (ncaabBook) await books(ncaabT, (o) => ncaabBook.ingestKalshiOrderbooks(o));
       if (linesBook) await books(linesBook.mainTickers(lineT), (o) => linesBook.ingestKalshiOrderbooks(o)); // main-line strikes only
       await books(tdT, (o) => tdBook.ingest(o, Object.fromEntries([...kick].filter(([t]) => t.startsWith('KXNFLTD'))))); health.td = Date.now();
     }
@@ -193,6 +205,10 @@ function createPolySniperFeed({ env = process.env, log = console.log, fetchImpl 
           nbaBook.ingestRelay(venue, b.quotes || [], { feedLive, polledAt });
           if (linesBook) linesBook.ingestRelay(venue, 'nba', b.quotes || [], { feedLive, polledAt });
         }
+        if (ncaabBook && venue !== 'prophetx') { // moneylines only; the relay has no ProphetX college basketball
+          const cb = await getJson(lim.relay, `${relayBase}/board?venue=${venue}&league=NCAAB`);
+          ncaabBook.ingestRelay(venue, cb.quotes || [], { feedLive, polledAt });
+        }
       } catch (e) { log(`[POLY-SNIPER] relay ${venue} board: ${e.message}`); }
       if (tdOff.has(venue) && Date.now() - tdOff.get(venue) < 10 * 60 * 1000) continue;
       try {
@@ -221,6 +237,7 @@ function createPolySniperFeed({ env = process.env, log = console.log, fetchImpl 
     if (!r.ok) throw new Error(`espn ${r.status}`);
     kickoffs.setKickoffs(espnKickoffs(await r.json()));
     if (nbaBook) for (const u of espnNbaUrls(Date.now(), 2)) { const c = await fetchImpl(u, { headers: { accept: 'application/json' } }); if (c.ok) kickoffs.setKickoffs(espnNbaKickoffs(await c.json())); }
+    if (ncaabBook) for (const u of espnNcaabUrls(Date.now(), 2)) { const c = await fetchImpl(u, { headers: { accept: 'application/json' } }); if (c.ok) kickoffs.setKickoffs(espnNcaabKickoffs(await c.json())); }
     if (ncaafBook) for (const u of ESPN_NCAAF) { const c = await fetchImpl(u, { headers: { accept: 'application/json' } }); if (c.ok) kickoffs.setKickoffs(espnNcaafKickoffs(await c.json())); }
   }
   async function pollOddsKickoffs() {
@@ -254,6 +271,6 @@ function createPolySniperFeed({ env = process.env, log = console.log, fetchImpl 
     const fresh = (t) => t > 0 && nowMs - t < 30000;
     return (!venues.includes('kalshi') || fresh(health.ml)) && (!relayBase || fresh(health.relay));
   }
-  return { start, stop: () => { stopped = true; timers.forEach(clearTimeout); }, pmLive, tdBook, ncaafBook, linesBook, nbaBook, lineMeta, kickoffs, index, venues, pricesHealthy, health, xwalk, depths: { game: gameDepth, td: tdDepth } };
+  return { start, stop: () => { stopped = true; timers.forEach(clearTimeout); }, pmLive, tdBook, ncaafBook, linesBook, nbaBook, ncaabBook, lineMeta, kickoffs, index, venues, pricesHealthy, health, xwalk, depths: { game: gameDepth, td: tdDepth } };
 }
 module.exports = { createPolySniperFeed, fairVenues, createLineMetaCache };
