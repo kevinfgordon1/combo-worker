@@ -205,7 +205,7 @@ function createProphetXFeed(opts = {}) {
 
   const status = {
     rest: 'starting', ws: pushOn ? 'starting' : 'off', auth: 'starting',
-    restCalls: 0, rest429: 0, restErrors: 0, lastRestError: null, lastRestAt: 0,
+    restCalls: 0, rest429: 0, leagueErrors: {}, lastDiscoverAt: 0, restErrors: 0, lastRestError: null, lastRestAt: 0,
     wsMsgs: 0, wsUpdates: 0, wsIgnored: 0, wsConnects: 0, lastWsMsgAt: 0, lastWsUpdateAt: 0, lastWsError: null,
     channels: 0, channelLimit: null, rejected: 0, snapshotted: 0, lastCycleMs: null,
   };
@@ -260,13 +260,31 @@ function createProphetXFeed(opts = {}) {
     status.restCalls += 1;
     if (r.status === 429) { status.rest429 += 1; throw Object.assign(new Error(`429 ${path.split('?')[0]}`), { is429: true }); }
     if (r.status === 401) { token = null; }
-    if (!r.ok) throw new Error(`${r.status} ${path.split('?')[0]}`);
+    if (!r.ok) throw Object.assign(new Error(`${r.status} ${path.split('?')[0]}`), { httpStatus: r.status });
     return r.json();
   }
 
+  // One league failing must never block the others. ProphetX answers 404 data_not_found for a
+  // tournament with no listed events (MLB after the World Series, NBA/NFL off-season): that is an
+  // empty league, not an error. Before this, MLB's 404 (from Oct 29, after the World Series)
+  // threw out of the loop, so NBA was never discovered, no event was ever snapshotted, every
+  // push was ignored and ProphetX published nothing.
   async function discover() {
+    let ok = 0; let firstErr = null;
+    status.leagueErrors = status.leagueErrors || {};
     for (const league of leagues) {
-      const j = await api(`/mm/get_sport_events?tournament_id=${TOURNAMENTS[league]}`, {}, { rest: true });
+      let j;
+      try {
+        j = await api(`/mm/get_sport_events?tournament_id=${TOURNAMENTS[league]}`, {}, { rest: true });
+      } catch (e) {
+        if (e.httpStatus === 404) { j = { data: { sport_events: [] } }; } else {
+          status.leagueErrors[league] = e.message; firstErr = firstErr || e;
+          if (e.is429) throw e; // back off the whole cycle
+          continue; // keep this league's known events; try the next league
+        }
+      }
+      delete status.leagueErrors[league];
+      ok += 1;
       const list = (j.data && (j.data.sport_events || j.data)) || [];
       const seen = new Set();
       for (const e of Array.isArray(list) ? list : []) {
@@ -285,6 +303,9 @@ function createProphetXFeed(opts = {}) {
       }
       for (const [id, ev] of events) if (ev.league === league && !seen.has(id)) { events.delete(id); dirty.add(league); }
     }
+    if (!ok && firstErr) throw firstErr;
+    status.lastDiscoverAt = Date.now();
+    if (dirty.size) scheduleEmit(0);
     if (ws && socketId) await register().catch((e) => { status.lastWsError = e.message; });
   }
 
@@ -321,7 +342,7 @@ function createProphetXFeed(opts = {}) {
     while (!stopped) {
       const cycleStart = Date.now();
       try {
-        if (!lastDiscover || Date.now() - lastDiscover > discoverMs) { await discover(); lastDiscover = Date.now(); }
+        if (!lastDiscover || Date.now() - lastDiscover > discoverMs) { await discover(); lastDiscover = Date.now(); if (status.rest !== 'up') status.rest = 'ok'; }
         // never-snapshotted events first, then oldest.
         const order = [...events.values()].sort((a, b) => a.snapshotAt - b.snapshotAt);
         for (const ev of order) {

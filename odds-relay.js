@@ -5391,6 +5391,8 @@ function handleRequest(req, res, state) {
     }
     const novig = state.novigFeed ? state.novigFeed.health() : null;
     const prophetx = state.prophetxFeed ? state.prophetxFeed.health() : null;
+    // Live status (was only set when quotes were published, so a feed that never published sat at 'starting').
+    if (prophetx && state.prophetxFeed.status) state.status.prophetx = `rest:${state.prophetxFeed.status.rest} ws:${state.prophetxFeed.status.ws}`;
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     const dkfd = state.dkfd && state.dkfd.poller ? state.dkfd.poller.health() : null;
     const t = state.usTd;
