@@ -31,7 +31,7 @@ function createScheduleSync({ env = process.env, fetchFn = globalThis.fetch, log
 
   async function pullEspn(days) {
     const out = []; const today = G.etDate(now());
-    for (const lg of SYNC_LEAGUES) for (const d of days) {
+    for (const lg of require('./mlb-switch').withoutMlb(SYNC_LEAGUES, env)) for (const d of days) { // MLB only with MLB_ENABLED=1
       try { const rows = await G.fetchEspnDay(lg, G.addDays(today, d), fetchFn); for (const r of rows) out.push(r); } catch (e) { stats.espnErrors += 1; log(`[SCHEDULE] ESPN ${lg} ${d}: ${e.message}`); }
       await yieldLoop();
     }

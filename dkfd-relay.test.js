@@ -96,7 +96,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.strictEqual(dkfdEnabled({}), false);
   assert.strictEqual(dkfdEnabled({ DKFD_FEED: '1' }), true);
   assert.strictEqual(dkfdEnabled({ DKFD_FEED: 'on' }), true);
-  assert.deepStrictEqual(dkfdLeagues({}), ['NFL', 'NCAAF', 'MLB', 'NHL']);
+  assert.deepStrictEqual(dkfdLeagues({}), ['NFL', 'NCAAF', 'NHL']); // MLB off unless MLB_ENABLED=1 (Kevin Oct 30)
   assert.deepStrictEqual(dkfdLeagues({ DKFD_LEAGUES: 'nfl, ncaaf ,XFL' }), ['NFL', 'NCAAF']);
   assert.deepStrictEqual(dkfdBooks({}), ['draftkings', 'fanduel']);
   assert.deepStrictEqual(dkfdBooks({ DKFD_BOOKS: 'FanDuel' }), ['fanduel']);
