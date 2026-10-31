@@ -28,8 +28,16 @@ const KALSHI_WS_SIGN_PATH = '/trade-api/ws/v2';
 
 const BOOK_IDS = Object.freeze({ polymarket: 193, kalshi: 194, novig: 195 });
 const VENUES = ['polymarket', 'kalshi', 'novig', 'prophetx'];
-const LEAGUES = ['NFL', 'NCAAF', 'MLB', 'NBA'];
-const US_LEAGUE_PATH = Object.freeze({ NFL: 'nfl', MLB: 'mlb', NCAAF: 'cfb', NBA: 'nba' });
+// Men's college basketball (NCAAB, Kevin Oct 30 2026): moneylines only, D1 vs D1 only (ncaab-d1.js),
+// games inside RELAY_NCAAB_HOURS (default 48h) or live. Always LAST so it never runs ahead of NFL / NBA in
+// a shared loop, and on Polymarket US it rides its own subscription (cbb-*) so it can never take one of the
+// 100 main slugs. RELAY_NCAAB=0 turns it off entirely (league not served).
+const D1 = require('./ncaab-d1');
+const ncaabRelayOn = (env = process.env) => !/^(0|false|no|off)$/i.test(String((env && env.RELAY_NCAAB) || '').trim());
+const NCAAB_ON = ncaabRelayOn();
+const NCAAB_HOURS = Number(process.env.RELAY_NCAAB_HOURS) > 0 ? Number(process.env.RELAY_NCAAB_HOURS) : 48;
+const LEAGUES = ['NFL', 'NCAAF', 'MLB', 'NBA', ...(NCAAB_ON ? ['NCAAB'] : [])];
+const US_LEAGUE_PATH = Object.freeze({ NFL: 'nfl', MLB: 'mlb', NCAAF: 'cfb', NBA: 'nba', NCAAB: 'cbb' });
 const WINNER_TYPES = new Set([
   'football_team_full_game_winner',
   'baseball_team_full_game_winner',
@@ -42,6 +50,7 @@ const KALSHI_GAME_SERIES = Object.freeze({
   NCAAF: 'KXNCAAFGAME',
   MLB: 'KXMLBGAME',
   NBA: 'KXNBAGAME',
+  NCAAB: 'KXNCAAMBGAME', // occurrence_datetime = tip + 3h (ESPN tip time replaces it)
 });
 const ESPN_SCOREBOARD = Object.freeze({
   NFL: 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard',
@@ -53,7 +62,29 @@ const ESPN_SCOREBOARD = Object.freeze({
   ],
   MLB: 'https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard',
   NBA: 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard',
+  // D1 only (groups=50). The bare board is today only; espnBoardUrls adds tomorrow (ET) for NCAAB.
+  NCAAB: 'https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard?groups=50&limit=500',
 });
+
+function etYmd(ms) {
+  const p = {};
+  new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' })
+    .formatToParts(new Date(ms)).forEach((x) => { p[x.type] = x.value; });
+  return `${p.year}${p.month}${p.day}`;
+}
+function espnBoardUrls(league, nowMs = Date.now()) {
+  if (league !== 'NCAAB') return [].concat(ESPN_SCOREBOARD[league] || []);
+  const base = ESPN_SCOREBOARD.NCAAB;
+  return [0, 1, 2].map((d) => `${base}&dates=${etYmd(nowMs + d * 864e5)}`);
+}
+
+// NCAAB game in scope: both teams D1 (by name, fail closed) and live or tipping within NCAAB_HOURS.
+function ncaabInScope(away, home, startIso, live, nowMs = Date.now()) {
+  if (!D1.isD1Game(away, home)) return false;
+  if (live) return true;
+  const t = Date.parse(startIso || '');
+  return Number.isFinite(t) && t > nowMs - 8 * 3600 * 1000 && t <= nowMs + NCAAB_HOURS * 3600 * 1000;
+}
 const US_SLUG_CAP = 100;
 const US_FRESH_MS = 15_000;
 const US_DEAD_MS = 60_000;
@@ -114,7 +145,7 @@ function moneyValue(raw) {
 }
 
 function pairKeyFromSlug(slug) {
-  const m = String(slug || '').toLowerCase().match(/(?:nfl|mlb|cfb|ncaaf|nba)-([a-z0-9]+)-([a-z0-9]+)-\d{4}/);
+  const m = String(slug || '').toLowerCase().match(/(?:nfl|mlb|cfb|ncaaf|nba|cbb)-([a-z0-9]+)-([a-z0-9]+)-\d{4}/);
   if (!m) return '';
   return [m[1], m[2]].sort().join('|');
 }
@@ -629,6 +660,8 @@ function createState() {
     usLastFrameAt: 0,
     usLastAliveAt: 0,
     usSubscribed: new Set(),
+    usCbbSubscribed: new Set(), // NCAAB lane (own Polymarket US subscription, requestId cbb-*)
+    usCbbSubError: null,
     usSeedAt: new Map(),
     kalshiWsUp: false,
     status: { us: 'starting', clob: 'starting', kalshi: 'starting', novig: 'off', prophetx: 'off' },
@@ -964,17 +997,20 @@ function scheduleFromEspn(body) {
   for (const ev of (body && body.events) || []) {
     const comp = (ev.competitions && ev.competitions[0]) || {};
     const abbrs = [];
+    const ids = [];
     let away = '';
     let home = '';
     for (const side of comp.competitors || []) {
       const abbr = side && side.team && side.team.abbreviation;
       if (abbr) abbrs.push(String(abbr).toUpperCase());
+      const tid = side && ((side.team && side.team.id) || side.id);
+      if (tid) ids.push(String(tid));
       const name = side && side.team && (side.team.displayName || side.team.shortDisplayName || '');
       if (side && side.homeAway === 'home') home = name;
       if (side && side.homeAway === 'away') away = name;
     }
     const gameState = comp.status && comp.status.type && comp.status.type.state;
-    out.push({ abbrs, away, home, start: ev.date || null, live: gameState === 'in' });
+    out.push({ abbrs, ids, away, home, start: ev.date || null, live: gameState === 'in' });
   }
   return out;
 }
@@ -983,10 +1019,17 @@ function applyKalshiSchedule(quotes, schedule, nowMs) {
   const now = Number(nowMs) || Date.now();
   for (const quote of quotes || []) {
     if (!quote) continue;
-    const codes = pairFromTicker(quote.ticker);
-    const hit = codes.length === 2
-      ? (schedule || []).find((game) => game && codes.every((code) => (game.abbrs || []).includes(code)))
-      : null;
+    let hit = null;
+    if (quote.league === 'NCAAB') {
+      // College codes are not ESPN abbreviations: match on the two D1 teams (ESPN ids, by name).
+      const a = D1.d1Team(quote.away); const h = D1.d1Team(quote.home);
+      hit = a && h ? (schedule || []).find((game) => game && (game.ids || []).includes(a.espnId) && (game.ids || []).includes(h.espnId)) || null : null;
+    } else {
+      const codes = pairFromTicker(quote.ticker);
+      hit = codes.length === 2
+        ? (schedule || []).find((game) => game && codes.every((code) => (game.abbrs || []).includes(code)))
+        : null;
+    }
     if (hit && hit.start) quote.start = hit.start;
     if (hit && hit.away) quote.away = hit.away;
     if (hit && hit.home) quote.home = hit.home;
@@ -1300,6 +1343,7 @@ function startPolymarketUs(state, deps) {
   let backoff = 1000;
   let subscribedKey = '';
   let slugs = [];
+  let cbbSlugs = []; let cbbSubKey = ''; let cbbSubId = null; // NCAAB lane (own subscription)
   const tdOn = ['1', 'true', 'on', 'yes'].includes(String(env.RELAY_TD || '').toLowerCase());
   const td = { on: tdOn, catalog: new Map(), books: new Map(), subs: new Map(), subscribed: new Set(), eventSlugs: [], lastDiscoverAt: 0, discoverErrors: 0, subErrors: 0, lastSubError: null };
   state.usTd = td;
@@ -1420,11 +1464,15 @@ function startPolymarketUs(state, deps) {
   };
 
   const seed = (markets, mode) => {
-    const ranked = rankUsMarkets(markets);
-    const capped = ranked.slice(0, US_SLUG_CAP);
+    // NCAAB rides its own capped list + subscription (cbb-*): it never takes one of the 100 main slugs.
+    const ranked = rankUsMarkets(markets.filter((m) => m.league !== 'NCAAB'));
+    const cbbCapped = rankUsMarkets(markets.filter((m) => m.league === 'NCAAB')).slice(0, US_SLUG_CAP);
+    const mainCapped = ranked.slice(0, US_SLUG_CAP);
+    const capped = [...mainCapped, ...cbbCapped];
     catalog.clear();
     for (const meta of capped) catalog.set(meta.slug, meta);
-    slugs = capped.map((meta) => meta.slug);
+    slugs = mainCapped.map((meta) => meta.slug);
+    cbbSlugs = cbbCapped.map((meta) => meta.slug);
     // Drop US quotes for markets that left the catalog (settled / closed games).
     for (const league of Object.keys(state.books.polymarket || {})) {
       const book = state.books.polymarket[league];
@@ -1447,7 +1495,21 @@ function startPolymarketUs(state, deps) {
     }
   };
 
+  const sendCbbSub = () => {
+    if (!ws || ws.readyState !== 1) return;
+    const key = cbbSlugs.slice().sort().join(',');
+    if (key === cbbSubKey) return;
+    if (cbbSubId) { try { ws.send(JSON.stringify({ unsubscribe: { requestId: cbbSubId } })); } catch (_) { /* closing */ } }
+    cbbSubId = null;
+    if (cbbSlugs.length) {
+      cbbSubId = `cbb-${Date.now()}`;
+      ws.send(JSON.stringify(usSubscribeMessage(cbbSlugs, cbbSubId)));
+    }
+    cbbSubKey = key;
+    state.usCbbSubscribed = new Set(cbbSlugs);
+  };
   const sendSub = () => {
+    sendCbbSub();
     if (!ws || ws.readyState !== 1 || !slugs.length) return;
     const key = slugs.slice().sort().join(',');
     if (key === subscribedKey) return;
@@ -1471,7 +1533,9 @@ function startPolymarketUs(state, deps) {
         if (!res.ok || !res.body || !Array.isArray(res.body.events)) {
           throw new Error(`HTTP ${res.status}${res.body ? '' : ' (non-JSON body)'}`);
         }
-        lastGood.set(league, usMarketsFromEvents(res.body.events, league, Date.now()));
+        let got = usMarketsFromEvents(res.body.events, league, Date.now());
+        if (league === 'NCAAB') got = got.filter((m) => ncaabInScope(m.away, m.home, m.start, m.live));
+        lastGood.set(league, got);
         if (linesOn && (league === 'NFL' || league === 'NCAAF' || league === 'NBA')) {
           const nowMs = Date.now();
           lines.eventSlugs[league] = res.body.events.filter((ev) => ev && ev.slug && usLineInWindow(ev, nowMs, lines.days)).map((ev) => String(ev.slug));
@@ -1521,6 +1585,7 @@ function startPolymarketUs(state, deps) {
       state.usSocketUp = true;
       state.status.us = 'up';
       subscribedKey = '';
+      cbbSubKey = ''; cbbSubId = null;
       sendSub();
       td.subs.clear();
       sendTdSubs();
@@ -1576,6 +1641,17 @@ function startPolymarketUs(state, deps) {
           }
         }
       }
+      if (cbbSubId) {
+        for (const msg of Array.isArray(parsed) ? parsed : [parsed]) {
+          const rid = String((msg && (msg.requestId || msg.request_id)) || '');
+          if (msg && msg.error && rid.startsWith('cbb-')) {
+            // Rejected: never claim those prices are confirmed live; retried on the next discover.
+            state.usCbbSubError = String(msg.error).slice(0, 200);
+            state.usCbbSubscribed = new Set(); cbbSubKey = ''; cbbSubId = null;
+            console.error(`[odds-relay] polymarket us ncaab subscription ${rid} error: ${state.usCbbSubError}`);
+          }
+        }
+      }
       const quotes = usQuotesFromMessage(parsed, catalog, Date.now());
       if (!quotes.length) return;
       state.usLastFrameAt = Date.now();
@@ -1590,6 +1666,7 @@ function startPolymarketUs(state, deps) {
       ping = null;
       subscribedKey = '';
       state.usSubscribed = new Set();
+      cbbSubKey = ''; cbbSubId = null; state.usCbbSubscribed = new Set();
       td.subs.clear();
       td.subscribed = new Set();
       lines.subs.clear();
@@ -1786,7 +1863,7 @@ function startClob(state, deps) {
 const espnCache = new Map();
 
 async function espnSchedule(league, fetchFn) {
-  const boardUrls = [].concat(ESPN_SCOREBOARD[league] || []);
+  const boardUrls = espnBoardUrls(league);
   if (!boardUrls.length) return [];
   const hit = espnCache.get(league);
   const now = Date.now();
@@ -1842,10 +1919,15 @@ function startKalshi(state, deps) {
       cursor = (res.body && res.body.cursor) || '';
       if (!cursor) break;
     }
-    const quotes = quotesFromKalshiEvents(events, league, fetchedAt);
+    let quotes = quotesFromKalshiEvents(events, league, fetchedAt);
+    if (league === 'NCAAB') {
+      // No ESPN match => occurrence_datetime is tip + 3h; move it back so the start is never 3h late.
+      for (const q of quotes) { const t = Date.parse(q.start || ''); if (Number.isFinite(t)) q.start = new Date(t - 3 * 3600 * 1000).toISOString(); }
+    }
     try {
       applyKalshiSchedule(quotes, await scheduleP, fetchedAt);
     } catch (_) { /* identity stays on the market title */ }
+    if (league === 'NCAAB') quotes = quotes.filter((q) => ncaabInScope(q.away, q.home, q.start, q.is_live, fetchedAt));
     if (!state.kalshiWsUp) {
       const live = quotes.filter((quote) => {
         const start = Date.parse(quote.start || '');
@@ -1998,8 +2080,10 @@ const novigFeed = (() => {
 
   const NOVIG_BOOK_ID = 195;
   const DEFAULT_BASE = 'https://api.novig.com';
-  const LEAGUES = ['NFL', 'MLB', 'NCAAF', 'NBA'];
+  const LEAGUES = ['NFL', 'MLB', 'NCAAF', 'NBA', ...(NCAAB_ON ? ['NCAAB'] : [])]; // Novig's own league names
   const BOARD_TYPES = ['MONEY', 'SPREAD', 'TOTAL'];
+  // NCAAB: moneylines only (Kevin Oct 30), so no spread/total pull, no main-line searches, small watch set.
+  const boardTypesFor = (league) => (league === 'NCAAB' ? ['MONEY'] : BOARD_TYPES);
   const WINDOW_BACK_MS = 8 * 3600 * 1000;
   const WINDOW_AHEAD_MS = 8 * 24 * 3600 * 1000;
   const EMPTY_BODY_HASH = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
@@ -2390,6 +2474,9 @@ const novigFeed = (() => {
       if (!eventInWindow(ev, at)) continue;
       const teams = splitMatchup(ev.description);
       if (!teams) continue;
+      // NCAAB: D1 vs D1 only, live or tipping within RELAY_NCAAB_HOURS.
+      if (league === 'NCAAB' && !ncaabInScope(teams.away, teams.home, ev.startsTs ? new Date(Number(ev.startsTs)).toISOString() : null,
+        String(ev.status || '').toUpperCase() === 'OPEN_INGAME', at)) continue;
       events.set(String(ev.eventId), {
         id: String(ev.eventId),
         league,
@@ -2890,7 +2977,8 @@ const novigFeed = (() => {
     async function fetchMarketItems(league) {
       const items = [];
       const seen = new Set();
-      const groups = [BOARD_TYPES.filter((t) => t === 'MONEY'), BOARD_TYPES.filter((t) => t !== 'MONEY')];
+      const types0 = boardTypesFor(league);
+      const groups = [types0.filter((t) => t === 'MONEY'), types0.filter((t) => t !== 'MONEY')];
       for (const types of groups) {
         if (!types.length) continue;
         let after = '';
@@ -5208,7 +5296,8 @@ function usConfirmedAt(state, quote, now = Date.now()) {
   if (slug) {
     const seed = state.usSeedAt && state.usSeedAt.get(slug);
     if (seed > at) at = seed;
-    if (state.usSocketUp && state.usSubscribed && state.usSubscribed.has(slug)
+    const subscribed = (state.usSubscribed && state.usSubscribed.has(slug)) || (state.usCbbSubscribed && state.usCbbSubscribed.has(slug));
+    if (state.usSocketUp && subscribed
       && state.usLastAliveAt && now - state.usLastAliveAt < US_CONFIRM_MS) at = now;
   }
   return at ? new Date(at).toISOString() : null;
@@ -5477,4 +5566,8 @@ module.exports = {
   espnSchedule,
   scheduleFromEspn,
   applyKalshiSchedule,
+  startPolymarketUs,
+  ncaabInScope,
+  espnBoardUrls,
+  LEAGUES,
 };
