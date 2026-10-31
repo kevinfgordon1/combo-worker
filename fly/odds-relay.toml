@@ -23,6 +23,8 @@ kill_timeout = "30s"
   RELAY_POLY_LINES = "1"
   PORT = "8787"
   RELAY_TD = "1"   # NFL anytime-TD books: Polymarket US, Novig, ProphetX (read-only) on /td
+  RELAY_NCAAB = "1"        # Kevin Oct 30: college basketball moneylines (D1 vs D1), "0" = off
+  RELAY_NCAAB_HOURS = "48" # NCAAB games served when live or tipping within 48h
 
 [http_service]
   internal_port = 8787
