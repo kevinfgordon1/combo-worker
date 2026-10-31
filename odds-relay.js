@@ -36,7 +36,9 @@ const D1 = require('./ncaab-d1');
 const ncaabRelayOn = (env = process.env) => !/^(0|false|no|off)$/i.test(String((env && env.RELAY_NCAAB) || '').trim());
 const NCAAB_ON = ncaabRelayOn();
 const NCAAB_HOURS = Number(process.env.RELAY_NCAAB_HOURS) > 0 ? Number(process.env.RELAY_NCAAB_HOURS) : 48;
-const LEAGUES = ['NFL', 'NCAAF', 'MLB', 'NBA', ...(NCAAB_ON ? ['NCAAB'] : [])];
+// MLB off by default (Kevin Oct 30 2026, season over). MLB_ENABLED=1 brings it back (mlb-switch.js).
+const { withoutMlb } = require('./mlb-switch');
+const LEAGUES = withoutMlb(['NFL', 'NCAAF', 'MLB', 'NBA', ...(NCAAB_ON ? ['NCAAB'] : [])]);
 const US_LEAGUE_PATH = Object.freeze({ NFL: 'nfl', MLB: 'mlb', NCAAF: 'cfb', NBA: 'nba', NCAAB: 'cbb' });
 const WINNER_TYPES = new Set([
   'football_team_full_game_winner',
@@ -2080,7 +2082,7 @@ const novigFeed = (() => {
 
   const NOVIG_BOOK_ID = 195;
   const DEFAULT_BASE = 'https://api.novig.com';
-  const LEAGUES = ['NFL', 'MLB', 'NCAAF', 'NBA', ...(NCAAB_ON ? ['NCAAB'] : [])]; // Novig's own league names
+  const LEAGUES = withoutMlb(['NFL', 'MLB', 'NCAAF', 'NBA', ...(NCAAB_ON ? ['NCAAB'] : [])]); // Novig's own league names (MLB only with MLB_ENABLED=1)
   const BOARD_TYPES = ['MONEY', 'SPREAD', 'TOTAL'];
   // NCAAB: moneylines only (Kevin Oct 30), so no spread/total pull, no main-line searches, small watch set.
   const boardTypesFor = (league) => (league === 'NCAAB' ? ['MONEY'] : BOARD_TYPES);
@@ -4110,7 +4112,7 @@ const betstampRelay = (() => {
 // BETSTAMP_PROXY_URL (the app origin); neither set: /underdog answers 503 and
 // the board keeps its own poll.
 const underdogRelay = (() => {
-  const RELAY_LEAGUES = new Set(['NFL', 'NCAAF', 'MLB']);
+  const RELAY_LEAGUES = new Set(withoutMlb(['NFL', 'NCAAF', 'MLB']));
   const MAX_HUBS = 3;
   const MAX_CLIENTS = 150;
   const MAX_CLIENT_BACKLOG = 2 * 1024 * 1024;
@@ -4317,7 +4319,7 @@ const underdogRelay = (() => {
 
     function open(league) {
       if (upstream.mode === 'off') return { status: 503, error: 'underdog_upstream_not_configured' };
-      if (!RELAY_LEAGUES.has(league)) return { status: 400, error: 'league must be NFL, NCAAF or MLB' };
+      if (!RELAY_LEAGUES.has(league)) return { status: 400, error: `league must be ${[...RELAY_LEAGUES].join(', ')}` };
       if (clientCount >= MAX_CLIENTS) return { status: 503, error: 'too_many_clients' };
       let hub = hubs.get(league);
       if (!hub) {
@@ -5060,7 +5062,7 @@ const dkfdFeed = (() => {  const BOOKS = Object.freeze({
 // full-snapshot channel like Novig, plus an `event: feed` heartbeat after
 // every poll so the board can tell a quiet market from a dead feed.
 const DKFD_VENUES = Object.freeze(['draftkings', 'fanduel']);
-const DKFD_ALL_LEAGUES = Object.freeze(['NFL', 'NCAAF', 'MLB', 'NHL']);
+const DKFD_ALL_LEAGUES = Object.freeze(withoutMlb(['NFL', 'NCAAF', 'MLB', 'NHL']));
 
 function dkfdEnabled(env = process.env) {
   const raw = String((env && env.DKFD_FEED) || '').trim().toLowerCase();

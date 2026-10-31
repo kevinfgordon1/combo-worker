@@ -27,7 +27,7 @@ const px = require('./prophetx-feed');
   };
   class FakeWs extends EventEmitter { send() {} close() {} terminate() {} }
   const got = {};
-  const feed = px.createProphetXFeed({ env: { PROPHETX_ACCESS_KEY: 'a', PROPHETX_SECRET_KEY: 'b', PROPHETX_LEAGUES: 'NFL,MLB,NBA', PROPHETX_REST_RPS: '1', PROPHETX_PUSH: '0' }, fetchFn, WebSocket: FakeWs, log: () => {}, onQuotes: (league, quotes) => { got[league] = quotes; } });
+  const feed = px.createProphetXFeed({ env: { PROPHETX_ACCESS_KEY: 'a', PROPHETX_SECRET_KEY: 'b', PROPHETX_LEAGUES: 'NFL,MLB,NBA', MLB_ENABLED: '1', PROPHETX_REST_RPS: '1', PROPHETX_PUSH: '0' }, fetchFn, WebSocket: FakeWs, log: () => {}, onQuotes: (league, quotes) => { got[league] = quotes; } });
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   for (let i = 0; i < 80 && !(got.NFL && got.NFL.length && got.NBA && got.NBA.length); i += 1) await wait(100);
   const h = feed.health();
