@@ -1341,6 +1341,47 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
 
   loopOn.stop();
 
+  // Nov 1 2026: every Combo Locks Polymarket accept we do not confirm is written to
+  // combo_submissions (accept_declined:<reason>) and counted by the decline guard; a lock that
+  // keeps declining stops posting on Polymarket.
+  {
+    const { createDeclineGuard } = require('./poly-decline-guard');
+    const guardLogs = [];
+    const guard = createDeclineGuard({ lockMaxDeclines: 2, minDeclines: 99 }, { log: (m) => guardLogs.push(m) });
+    const persisted = [];
+    const gPending = new Map();
+    const loopG = startPolymarketRfqLoop({
+      env: { POLYMARKET_KEY_ID: 'key-id-fixture', POLYMARKET_SECRET_KEY: SEED_B64, POLYMARKET_RFQ_LIVE: 'true' },
+      http: fakeHttp,
+      startWs: false,
+      getParlays: () => [pmParlay],
+      filledSoFarFor: () => 0,
+      getOutstanding: () => 0,
+      pendingQuotes: gPending,
+      reconcileMs: 60 * 60 * 1000,
+      declineGuard: guard,
+      persistQuoteSkip: (quoteId, reason) => { persisted.push([quoteId, reason]); return Promise.resolve(null); },
+    });
+    const flush = async () => { for (let i = 0; i < 20; i += 1) await new Promise((r) => setImmediate(r)); };
+    for (let k = 1; k <= 2; k += 1) {
+      const out = await loopG.handleRfq({ ...pmRfq, id: `rfq_guard_${k}` });
+      assert.strictEqual(out.post, true, `post ${k}`);
+      const qid = [...gPending.keys()].pop();
+      loopG.onWsEvent({ type: 'quoteAccepted', quote: { id: qid, rfqId: `rfq_guard_${k}`, acceptedSide: 'SIDE_SELL' } });
+      await flush();
+      assert.deepStrictEqual(persisted[k - 1], [qid, 'accept_declined:side_not_buy']);
+    }
+    assert.ok(guardLogs.some((m) => /DECLINE GUARD lock=pm-parlay/.test(m)), guardLogs.join('\n'));
+    const held = await loopG.handleRfq({ ...pmRfq, id: 'rfq_guard_3' });
+    assert.strictEqual(held.post, false);
+    assert.strictEqual(held.reason, 'lock_declines');
+    const st = guard.stats();
+    assert.strictEqual(st.declines, 2);
+    assert.deepStrictEqual(st.byReason, { side_not_buy: 2 });
+    assert.strictEqual(st.skipped.lock_declines, 1);
+    loopG.stop();
+  }
+
   // Confirm-after-start: BUY accept must not confirm; quote is deleted.
   const startedDeletes = [];
   const startedConfirms = [];

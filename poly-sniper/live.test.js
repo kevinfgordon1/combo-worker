@@ -189,6 +189,31 @@ t('account-wide: Combo Locks declines count, sniper pauses only when it also dec
   assert.strictEqual(S.L.state(), 'live'); // sniper has no declines: pausing it would not help
 });
 
+t('Nov 1: one sniper decline among many Combo Locks accepts does not pause the sniper', async () => {
+  const S = await setup();
+  for (let i = 0; i < 70; i += 1) S.L.onComboAcceptOutcome(i < 2); // 68 of 70 Combo Locks declines
+  const a = await S.post(rfq());
+  S.feed.s.cost = 0.40;
+  await S.accept(a.quoteId, S.L._internal.quotes.get(a.quoteId).rfqId, 100); // sniper 1 decline / 1 accept
+  S.feed.s.cost = 0.45;
+  const st = S.L.stats();
+  assert.strictEqual(st.declines, 1);
+  assert.ok(st.sniperShare < 0.02, `share ${st.sniperShare}`);
+  assert.strictEqual(S.L.state(), 'live');
+});
+
+t('Nov 1: sniper still pauses on its own repeated declines even with many combo accepts', async () => {
+  const S = await setup();
+  for (let i = 0; i < 70; i += 1) S.L.onComboAcceptOutcome(true);
+  for (let k = 0; k < 2; k += 1) {
+    const a = await S.post(rfq(k ? ML2b : undefined));
+    S.feed.s.cost = 0.40;
+    await S.accept(a.quoteId, S.L._internal.quotes.get(a.quoteId).rfqId, 100);
+    S.feed.s.cost = 0.45;
+  }
+  assert.ok(/paused:decline_rate/.test(S.L.state()), S.L.state());
+});
+
 t('switch off deletes every open sniper quote and declines accepts; no restart needed', async () => {
   const S = await setup();
   const a = await S.post(rfq()); const b = await S.post(rfq(ML2b));

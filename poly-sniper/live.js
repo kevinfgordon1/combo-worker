@@ -87,6 +87,9 @@ function liveConfig(env = process.env) {
     closedGraceMs: num(env.POLY_SNIPER_CLOSED_GRACE_MS, 30000),
     sweepMs: num(env.POLY_SNIPER_SWEEP_MS, 1000),
     declinePauseRatio: num(env.POLY_SNIPER_DECLINE_PAUSE_RATIO, 0.10),
+    // Own-rate clause needs this many sniper declines in the window (Nov 1: one reprice decline of
+    // one accept paused the sniper 12:12-1:12 PM ET while it was 1 of 71 account accepts).
+    declinePauseMin: num(env.POLY_SNIPER_DECLINE_PAUSE_MIN, 2),
     declineWindowMs: num(env.POLY_SNIPER_DECLINE_WINDOW_MS, 3600000),
     confirmSafetyMs: num(env.POLY_SNIPER_CONFIRM_SAFETY_MS, 300),
     confirmDefaultBudgetMs: num(env.POLY_SNIPER_CONFIRM_BUDGET_MS, 2500),
@@ -580,16 +583,25 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
   // ── decline-rate pause ──────────────────────────────────────────────────
   function declineRatios() {
     const cA = comboOutcomes.length; const cD = comboOutcomes.filter((x) => x.declined).length;
-    return { sniper: accepts.length ? declines.length / accepts.length : 0, account: (accepts.length + cA) ? (declines.length + cD) / (accepts.length + cA) : 0, accepts: accepts.length, declines: declines.length, comboAccepts: cA, comboDeclines: cD };
+    const all = accepts.length + cA;
+    return { sniper: accepts.length ? declines.length / accepts.length : 0, account: all ? (declines.length + cD) / all : 0, sniperShare: all ? declines.length / all : 0, accepts: accepts.length, declines: declines.length, comboAccepts: cA, comboDeclines: cD };
+  }
+  // Pause on the sniper's OWN declines only (Nov 1): (a) its own rate, once it has declined at least
+  // declinePauseMin times, or (b) its own declines as a share of every account accept (what it adds
+  // to Polymarket's account-wide rate). Combo Locks declines never pause the sniper; Combo Locks
+  // stops its own Polymarket posting instead (poly-decline-guard.js).
+  function declineOver(r) {
+    if (!(r.declines > 0)) return false;
+    return (r.declines >= config.declinePauseMin && r.sniper > config.declinePauseRatio) || r.sniperShare > config.declinePauseRatio;
   }
   function checkDeclinePause(t = now()) {
     prune(t);
     const r = declineRatios();
-    const over = (r.declines > 0 && r.sniper > config.declinePauseRatio) || ((r.declines + r.comboDeclines) > 0 && r.account > config.declinePauseRatio && r.declines > 0);
+    const over = declineOver(r);
     if (over && !paused) {
       paused = { reason: 'decline_rate', at: t };
       cancelAllResting('decline_rate_pause');
-      say(`PAUSED decline rate sniper=${(r.sniper * 100).toFixed(0)}% (${r.declines}/${r.accepts}) account=${(r.account * 100).toFixed(0)}% last hour > ${(config.declinePauseRatio * 100).toFixed(0)}%`);
+      say(`PAUSED decline rate sniper=${(r.sniper * 100).toFixed(0)}% (${r.declines}/${r.accepts}) sniper_share=${(r.sniperShare * 100).toFixed(1)}% account=${(r.account * 100).toFixed(0)}% (combo ${r.comboDeclines}/${r.comboAccepts}) last hour > ${(config.declinePauseRatio * 100).toFixed(0)}%`);
       notify(`⏸ PAUSED: declined ${r.declines} of ${r.accepts} accepts in the last hour (account ${(r.account * 100).toFixed(0)}%). Polymarket pauses makers over 15%. Auto-resumes under ${(config.declinePauseRatio * 100).toFixed(0)}%.`);
     } else if (!over && paused && paused.reason === 'decline_rate') {
       paused = null; say('decline-rate pause cleared');

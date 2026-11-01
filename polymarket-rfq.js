@@ -47,6 +47,7 @@ const { matchParlay } = require('./rfq');
 const { decideAtFill, isFreeBetRow, quoteFailureSkipReason, isRfqClosedFailure } = require('./engine');
 const { createLatencyStats } = require('./latency-stats');
 const { findStartedEvent } = require('./started');
+const { createDeclineGuard, readDeclineGuardConfig } = require('./poly-decline-guard');
 const {
   RESERVE_TTL_MS,
   sumOutstanding,
@@ -1570,6 +1571,12 @@ function startPolymarketRfqLoop(ctx = {}) {
     ttlMs: ctx.quoteContextTtlMs > 0 ? ctx.quoteContextTtlMs : CLOSED_CONTEXT_TTL_MS,
     now: clock,
   });
+  // Nov 1: Combo Locks stops posting on Polymarket when it cannot honor accepts (poly-decline-guard.js).
+  const declineGuard = ctx.declineGuard || createDeclineGuard(readDeclineGuardConfig(env), {
+    now: clock,
+    log: (m) => console.warn(`[${MODE}] ${m}`),
+  });
+  const acceptCtx = new Map(); // quoteId -> { parlayId, label, rfqId } for the accept outcome log
   const seenRfqs = new Map();
   let reserveSeq = 0;
   let stopped = false;
@@ -1986,6 +1993,10 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
 
     const gate = shouldPostNow(evaluation, { live });
+    if (gate.post && evaluation.parlay) {
+      const held = declineGuard.check(evaluation.parlay.id);
+      if (held) return { ...evaluation, post: false, reason: held.reason };
+    }
     const p = evaluation.parlay;
     const q = evaluation.quote;
     const d = evaluation.decision;
@@ -2225,6 +2236,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
     if (pending) {
       pending.accepted = true;
+      if (quoteId) acceptCtx.set(quoteId, { parlayId: pending.parlayId, label: pending.label, rfqId: rfqId || pending.rfqId });
       if (acc.creatorOrderId) pending.creatorOrderId = acc.creatorOrderId;
       if (quoteId && pending.creatorOrderId && typeof ctx.persistQuoteOrder === 'function') {
         try { ctx.persistQuoteOrder(quoteId, pending.creatorOrderId); } catch (_) {}
@@ -2351,7 +2363,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       await deleteQuoteReliably(rfqId, quoteId, { label: 'confirm-failed delete' });
       forgetQuote(quoteId, pending);
       pendingQuotes.delete(quoteId);
-      return { confirmed: false, reason: skipReason || 'confirm_failed', error: e.message };
+      return { confirmed: false, reason: skipReason || 'confirm_failed', error: e.message, persisted: !!skipReason };
     } finally {
       confirmingQuotes.delete(quoteId);
     }
@@ -2846,6 +2858,40 @@ function startPolymarketRfqLoop(ctx = {}) {
   function comboKnowsQuote(id) { return !!(id && (pendingQuotes.has(id) || closedContext.get(id))); }
   const NOT_AN_OUTCOME = new Set(['missing_context', 'missing_ids', 'in_flight', 'live_off']);
 
+  // Every Combo Locks Polymarket accept we did not confirm: one log line with the reason, the
+  // combo_submissions row marked declined / accept_declined:<reason> (before Nov 1 only the
+  // confirm-failed path with a known skip reason was written; side_not_buy, game_started,
+  // cap_exceeded and unknown confirm failures were console-only), and the decline guard.
+  function noteComboAcceptOutcome(evt, r) {
+    const acc = acceptedFromEvent(evt);
+    const info = (acc.quoteId && acceptCtx.get(acc.quoteId)) || {};
+    if (acc.quoteId) acceptCtx.delete(acc.quoteId);
+    if (!r || NOT_AN_OUTCOME.has(r.reason)) return;
+    const reason = r.confirmed ? null : String(r.reason || 'unknown');
+    let res = { lockTripped: false, accountTripped: false };
+    try { res = declineGuard.record({ parlayId: info.parlayId, confirmed: !!r.confirmed, reason }); } catch (_) { /* metrics */ }
+    if (!r.confirmed) {
+      console.warn(
+        `[${MODE}] ACCEPT DECLINED reason=${reason} quote_id=${acc.quoteId || '?'} ` +
+        `rfq_id=${acc.rfqId || info.rfqId || '?'} lock=${info.parlayId || '?'} label=${info.label || '(unknown)'} ` +
+        `side=${acc.acceptedSide || '?'}${r.want != null ? ` want=${r.want}` : ''}` +
+        `${r.error ? ` error=${String(r.error).slice(0, 200)}` : ''}`
+      );
+      if (!r.persisted && acc.quoteId && typeof ctx.persistQuoteSkip === 'function') {
+        try { Promise.resolve(ctx.persistQuoteSkip(acc.quoteId, `accept_declined:${reason}`)).catch(() => {}); } catch (_) { /* best effort */ }
+      }
+    }
+    if (live && (res.lockTripped || res.accountTripped)) {
+      const ids = new Set();
+      if (res.accountTripped) { for (const q of pendingQuotes.values()) if (q && q.parlayId) ids.add(q.parlayId); }
+      else if (info.parlayId) ids.add(info.parlayId);
+      for (const [qid, q] of [...pendingQuotes]) {
+        if (!q || !ids.has(q.parlayId) || q.accepted || q.confirmed || confirmingQuotes.has(qid)) continue;
+        deleteQuoteAndDrop(qid, q, { kind: 'decline_guard' }).catch((e) => console.error(`[${MODE}] decline-guard cancel`, e.message));
+      }
+    }
+  }
+
   function onWsEvent(evt) {
     if (!evt || stopped) return;
     if (sniperRouter) {
@@ -2882,6 +2928,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     } else if (evt.type === 'quoteAccepted') {
       if (lossTape) { const a = acceptedFromEvent(evt); tape('onOurs', { quoteId: a.quoteId, rfqId: a.rfqId }); }
       handleQuoteAccepted(evt).then((r) => {
+        noteComboAcceptOutcome(evt, r);
         // Account-wide decline rate (Polymarket pauses makers over 15%): the sniper pauses itself first.
         if (sniperRouter && r && !NOT_AN_OUTCOME.has(r.reason)) sniperSafe(() => sniperRouter.onComboAcceptOutcome(!!r.confirmed));
       }).catch((e) => console.error(`[${MODE}] onAccept`, e.message));
@@ -3005,6 +3052,12 @@ function startPolymarketRfqLoop(ctx = {}) {
     snap.priceable_locks = countPriceableLocks(parlays());
     snap.priceable_line_locks = countPriceableLineLocks(parlays());
     snap.pending_quotes = pendingQuotes.size;
+    try {
+      const g = declineGuard.stats();
+      if (g.accepts || g.accountPaused || g.pausedLocks) {
+        console.log(`[${MODE}] decline-guard accepts=${g.accepts} declines=${g.declines} ratio=${(g.ratio * 100).toFixed(0)}% account_paused=${g.accountPaused} paused_locks=${g.pausedLocks} reasons=${JSON.stringify(g.byReason)} skipped=${JSON.stringify(g.skipped)}`);
+      }
+    } catch (_) { /* metrics only */ }
     if (ws && typeof ws.stats === 'function') {
       const st = ws.stats();
       snap.ws_silent_s = st.silentMs != null ? Math.round(st.silentMs / 1000) : -1;
@@ -3185,6 +3238,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     cancelOpenQuotesForParlay,
     cancelQuoteById,
     cancelUnaccepted,
+    declineGuard,
     deleteQuoteReliably,
     sweepStrayDeletes,
     strayDeletes,
