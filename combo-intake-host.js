@@ -18,6 +18,19 @@ function intEnv(raw, dflt, min, max) {
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
+// Combo Locks pre-parse age gate (Nov 1 2026). quote-sender.js STALE_DROPs any POST on an RFQ
+// older than 3s, so an rfq_created older than this can never be quoted. Drop it on the socket
+// before JSON.parse (kalshi-ws.js peekCreatedMs) so a backlogged intake drains instead of
+// parsing RFQs it will only fail. COMBO_PREPARSE_MAX_AGE_MS=0 turns it off (old behaviour).
+const DEFAULT_PREPARSE_MAX_AGE_MS = 3500;
+function readPreparseMaxAgeMs(env = process.env) {
+  const raw = env && env.COMBO_PREPARSE_MAX_AGE_MS;
+  if (raw == null || String(raw).trim() === '') return DEFAULT_PREPARSE_MAX_AGE_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.max(1000, Math.min(15000, Math.floor(n)));
+}
+
 function createdMs(createdTs) {
   if (createdTs == null || createdTs === '') return null;
   const t = typeof createdTs === 'number' ? (createdTs < 1e12 ? createdTs * 1000 : createdTs) : Date.parse(createdTs);
@@ -42,7 +55,7 @@ function mergeReconnects(acc, r) {
 }
 
 function createComboIntakeHost({
-  env = process.env, shardFactor, plan, maxAgeMs = 15000, dropDeleted = true,
+  env = process.env, shardFactor, plan, maxAgeMs = 15000, dropDeleted = true, preparseMaxAgeMs = 0,
   onRfqCreated, onRfqDeleted, onQuoteAccepted, onQuoteExecuted, onStatus = () => {},
   openIds = () => [], syncMs = 100, log = console.log, now = () => Date.now(),
   WorkerImpl, file = path.join(__dirname, 'combo-intake-worker.js'),
@@ -81,7 +94,7 @@ function createComboIntakeHost({
   }
 
   function spawn() {
-    w = new Worker(file, { workerData: { shardFactor, plan: curPlan, maxAgeMs, dropDeleted } });
+    w = new Worker(file, { workerData: { shardFactor, plan: curPlan, maxAgeMs, dropDeleted, preparseMaxAgeMs } });
     w.on('message', onMessage);
     w.on('error', (e) => log(`[intake] combo intake worker error: ${e && e.message}`));
     w.on('exit', (code) => {
@@ -109,4 +122,7 @@ function createComboIntakeHost({
   };
 }
 
-module.exports = { createComboIntakeHost, comboIntakeWorkerEnabled, intakeCandidate, mergeReconnects };
+module.exports = {
+  createComboIntakeHost, comboIntakeWorkerEnabled, intakeCandidate, mergeReconnects,
+  readPreparseMaxAgeMs, DEFAULT_PREPARSE_MAX_AGE_MS,
+};

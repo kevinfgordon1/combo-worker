@@ -35,6 +35,7 @@ const ws = createKalshiFirehose({
   keyId: env.KALSHI_KEY_ID,
   pem: normalizePem(env.Kalshi_combo_key || env.KALSHI_PRIVATE_KEY || ''),
   shouldDropCreated: (raw) => hot.shouldDropCreated(raw),
+  maxCreatedAgeMs: cfg.preparseMaxAgeMs || 0,
   shouldDropDeleted: cfg.dropDeleted ? createDeletedFilter((cb) => { open.forEach((id) => cb(id)); }) : undefined,
   onRfqCreated: (rfq, e) => {
     const c = intakeCandidate(rfq, { maxAgeMs: cfg.maxAgeMs, bump });
