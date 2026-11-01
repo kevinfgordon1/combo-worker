@@ -227,7 +227,7 @@ const MODE = SPLIT.mode;
 const { createTelegramGate } = require('./tg-gate');
 const { createPolyDeskFillWatcher } = require('./poly-desk-fills');
 const { comboLocksOnly } = require('./single-leg');
-const { createComboIntakeHost, comboIntakeWorkerEnabled } = require('./combo-intake-host');
+const { createComboIntakeHost, comboIntakeWorkerEnabled, readPreparseMaxAgeMs } = require('./combo-intake-host');
 // NEAR-MISS leg-key log for active locks (COMBO_NEAR_MISS_LOG=1, default off; rate-limited).
 const nearMiss = require('./near-miss').createNearMissLogger({ env: process.env, mode: MODE });
 const { createSingleLegRunner } = require('./single-leg-runner');
@@ -3309,11 +3309,14 @@ async function main() {
   // COMBO_INTAKE_WORKER=1: the Kalshi WS + pre-parse drops + 15s stale gate run on a
   // worker thread (combo-intake-host.js); matching/pricing/sends stay here. Default off.
   const useIntakeWorker = comboIntakeWorkerEnabled(process.env);
+  // Drop rfq_created frames already older than the post deadline before JSON.parse (Nov 1).
+  const preparseMaxAgeMs = readPreparseMaxAgeMs(process.env);
   const client = useIntakeWorker ? createComboIntakeHost({
     env: process.env,
     shardFactor,
     plan: null,
     maxAgeMs: STALE_RFQ_MS,
+    preparseMaxAgeMs,
     dropDeleted: !(runUnhedged || dropDeletedDisabled(process.env)),
     openIds: () => { const ids = []; pendingQuotes.forEach((q) => { if (q && q.rfqId) ids.push(q.rfqId); }); return ids; },
     onStatus: (s, info) => noteWsStatus(s, info),
@@ -3325,6 +3328,7 @@ async function main() {
     keyId: KEY_ID,
     pem: PEM,
     shardFactor,
+    maxCreatedAgeMs: preparseMaxAgeMs,
     onStatus: noteWsStatus,
     shouldDeferCreated: (raw) => quoteHot.shouldDeferCreated(raw),
     shouldDropCreated: (raw) => quoteHot.shouldDropCreated(raw),
@@ -3402,7 +3406,7 @@ async function main() {
   if (useIntakeWorker) {
     intakeHost = client;
     client.setPlan(lastHotPlan);
-    console.log(`[${MODE}] intake worker on (COMBO_INTAKE_WORKER=1) shard_factor=${shardFactor} stale_ms=${STALE_RFQ_MS}`);
+    console.log(`[${MODE}] intake worker on (COMBO_INTAKE_WORKER=1) shard_factor=${shardFactor} stale_ms=${STALE_RFQ_MS} preparse_max_age_ms=${preparseMaxAgeMs}`);
     setInterval(() => { console.log(`[${MODE}] intake-stats`, client.stats()); }, 60_000).unref();
   }
   client.start();

@@ -39,7 +39,7 @@
 // KALSHI_WS_OWNER=combo.
 'use strict';
 const WebSocket = require('ws');
-const { authHeaders, applyServerDate, applyServerDateSample, clockMidpointEnabled, isTimestampExpired } = require('./kalshi-auth');
+const { authHeaders, applyServerDate, applyServerDateSample, clockMidpointEnabled, isTimestampExpired, clockOffset } = require('./kalshi-auth');
 const { parseEnvelope, peekEnvelopeType, isRfqCreated, isRfqClosed, normalizeRfq, normalizeRfqClosed } = require('./rfq');
 const { captureRfq } = require('./rfq-debug');
 
@@ -98,6 +98,35 @@ function peekTypeFast(data) {
   return m ? m[1] : null;
 }
 
+// Pre-parse age gate (Nov 1 2026). Kalshi's created_ts read straight off the raw frame (Buffer
+// indexOf + a 48-byte slice, no JSON.parse). An rfq_created that is already older than the post
+// deadline can never be quoted, so a consumer that has fallen behind can drop it for the cost of
+// a substring scan instead of a full parse + match + post-fail. Unparseable -> null (never drop).
+const CREATED_KEY = '"created_ts"';
+const CREATED_KEY_BUF = Buffer.from(CREATED_KEY);
+function peekCreatedMs(data) {
+  let tail;
+  if (Buffer.isBuffer(data)) {
+    const i = data.lastIndexOf(CREATED_KEY_BUF);
+    if (i < 0) return null;
+    const from = i + CREATED_KEY_BUF.length;
+    tail = data.toString('utf8', from, Math.min(data.length, from + 48));
+  } else {
+    const str = typeof data === 'string' ? data
+      : (Array.isArray(data) ? Buffer.concat(data).toString() : String(data == null ? '' : data));
+    const i = str.lastIndexOf(CREATED_KEY);
+    if (i < 0) return null;
+    tail = str.slice(i + CREATED_KEY.length, i + CREATED_KEY.length + 48);
+  }
+  const m = /^\s*:\s*(?:"([^"]+)"|(-?\d+(?:\.\d+)?))/.exec(tail);
+  if (!m) return null;
+  let t;
+  if (m[1] != null) t = /^\d+(\.\d+)?$/.test(m[1]) ? Number(m[1]) : Date.parse(m[1]);
+  else t = Number(m[2]);
+  if (!Number.isFinite(t) || t <= 0) return null;
+  return t < 1e12 ? t * 1000 : t;
+}
+
 function toRawString(data) {
   if (typeof data === 'string') return data;
   if (Buffer.isBuffer(data)) return data.toString();
@@ -109,6 +138,7 @@ function createStats() {
   return {
     recv: 0,
     drop: 0,
+    dropStale: 0,
     parse: 0,
     quotes: 0,
     backlog: 0,
@@ -122,6 +152,7 @@ function createStats() {
     windowMaxGapMs: 0,
     windowRecv: 0,
     windowDrop: 0,
+    windowDropStale: 0,
     dropDeleted: 0,
     windowDropDeleted: 0,
     windowParse: 0,
@@ -208,8 +239,13 @@ function createKalshiWs({
   WebSocket: WsImpl,
   random,
   fastReconnectMs,
+  maxCreatedAgeMs,
+  now: nowFn,
 } = {}) {
   const Ws = WsImpl || WebSocket;
+  // Off unless the caller opts in (Combo Locks only; the sniper keeps its own gates).
+  const staleLimitMs = Number(maxCreatedAgeMs) > 0 ? Number(maxCreatedAgeMs) : 0;
+  const clockNow = typeof nowFn === 'function' ? nowFn : () => Date.now() + (clockOffset() || 0);
   const capture = captureFn || captureRfq;
   const stallAfter = readStallMs(stallMs);
   const shardN = shardFactor != null ? Number(shardFactor) : null;
@@ -518,6 +554,20 @@ function createKalshiWs({
       touchComm();
       let kind = null;
       try { kind = peekTypeFast(d); } catch (_) { kind = null; }
+      // Behind the feed: an rfq_created older than the post deadline is dead on arrival. Drop it
+      // before the needle scan / JSON.parse so a backlogged socket drains instead of spending
+      // its CPU parsing RFQs it can only STALE_DROP (Kevin Nov 1: 4-15s feed age, Kalshi
+      // 'Subscription buffer overflow' / 1008 'delivery exceeded 15 seconds').
+      if (kind === 'rfq_created' && staleLimitMs > 0) {
+        let t = null;
+        try { t = peekCreatedMs(d); } catch (_) { t = null; }
+        if (t != null && clockNow() - t > staleLimitMs) {
+          stats.dropStale++;
+          stats.windowDropStale++;
+          noteHandler(started);
+          return;
+        }
+      }
       // Only rfq_created is eligible to drop. quote_accepted / quote_executed
       // (confirm + PR #93 fill confirm) and rfq close frames always parse.
       if (kind === 'rfq_created' && shouldDropCreated) {
@@ -597,6 +647,7 @@ function createKalshiWs({
         backlog: stats.backlog,
         recv: stats.recv,
         drop: stats.drop,
+        dropStale: stats.dropStale,
         parse: stats.parse,
         quotes: stats.quotes,
         reconnects: stats.reconnects,
@@ -625,6 +676,7 @@ function createKalshiWs({
         windowMs,
         recv: stats.windowRecv,
         drop: stats.windowDrop,
+        dropStale: stats.windowDropStale || 0,
         dropDeleted: stats.windowDropDeleted,
         parse: stats.windowParse,
         quotes: stats.windowQuotes,
@@ -635,6 +687,7 @@ function createKalshiWs({
       };
       stats.windowRecv = 0;
       stats.windowDrop = 0;
+      stats.windowDropStale = 0;
       stats.windowDropDeleted = 0;
       stats.windowParse = 0;
       stats.windowQuotes = 0;
@@ -716,6 +769,8 @@ function createKalshiFirehose(opts = {}) {
       onQuoteExecuted,
       onEvent: opts.onEvent,
       captureRfq: opts.captureRfq,
+      maxCreatedAgeMs: opts.maxCreatedAgeMs,
+      now: opts.now,
       shardFactor: sharded ? factor : null,
       shardKey: sharded ? shardKey : null,
       onStatus: (s, info) => onShardStatus(s, info),
@@ -854,6 +909,7 @@ function createKalshiFirehose(opts = {}) {
       const sec = Math.max(0.001, windowMs / 1000);
       let recv = 0;
       let drop = 0;
+      let dropStale = 0;
       let dropDeleted = 0;
       let parse = 0;
       let quotes = 0;
@@ -863,6 +919,7 @@ function createKalshiFirehose(opts = {}) {
       for (const p of parts) {
         recv += p.recv;
         drop += p.drop;
+        dropStale += p.dropStale || 0;
         dropDeleted += p.dropDeleted || 0;
         parse += p.parse;
         quotes += p.quotes;
@@ -881,6 +938,7 @@ function createKalshiFirehose(opts = {}) {
         windowMs,
         recv,
         drop,
+        dropStale,
         dropDeleted,
         parse,
         quotes,
@@ -916,6 +974,8 @@ function summarizeThroughput(snap) {
     drop,
     dropPerSec: Math.round(drop / sec),
     dropDeleted: snap && snap.dropDeleted || 0,
+    dropStale: snap && snap.dropStale || 0,
+    dropStalePerSec: Math.round((snap && snap.dropStale || 0) / sec),
     parse,
     parsePerSec: Math.round(parse / sec),
     quotes: snap && snap.quotes || 0,
@@ -948,6 +1008,7 @@ module.exports = {
   readShardFactor,
   shardsLookUnsplit,
   peekTypeFast,
+  peekCreatedMs,
   summarizeThroughput,
   deadChannelReason,
   shouldOpenQuoteWatcherWs,
