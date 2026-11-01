@@ -16,8 +16,13 @@ kill_timeout = "30s"
   strategy = "immediate"
 
 [[vm]]
-  size = "performance-1x"
-  memory = "2gb"
+  # Nov 1 2026: was performance-1x (1 dedicated core shared by the main runner AND the intake
+  # worker thread). At NFL Sunday volume (~9.3k Kalshi frames/s over 8 shards, ~4k JSON.parse/s)
+  # the intake thread fell 4-15s behind and Kalshi closed sockets (1008 "delivery exceeded 15
+  # seconds", code 25 "Subscription buffer overflow"). 2 cores = one for each thread.
+  # Rollback: size = "performance-1x", memory = "2gb".
+  size = "performance-2x"
+  memory = "4gb"
 
 # EXACTLY ONE machine, ever. No [http_service], so Fly never auto-starts/stops it.
 # Never 'fly scale count' above 1; stop Railway combo-worker before the first start.
