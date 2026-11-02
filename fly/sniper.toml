@@ -50,20 +50,20 @@ kill_timeout = "60s"   # Oct 25: room to cancel every open quote on SIGTERM
   MLB_ENABLED = "0"              # Kevin Oct 30: no ESPN MLB schedule pulls (season over). "1" = back on
   SNIPER_FETCH_TIMEOUT_MS = "30000"   # Kevin Oct 24: 8s cut off Kalshi book pulls
   SNIPER_PER_GAME_CAP = "1500"
-  SNIPER_MIN_ROI = "0.05"         # Kevin Oct 27: all-NFL parlays 5% (was 4%); TD 7%, college/NBA 6% unchanged
-  SNIPER_MIN_ROI_TD = "0.07"      # Kevin Oct 24: any NFL player-TD leg needs 7% (highest rule wins)
-  SNIPER_MIN_ROI_NCAAF = "0.06"   # Kevin Oct 24: college 6% (4% all-NFL-ML, 5% other NFL)
+  SNIPER_MIN_ROI = "0.08"         # Kevin Nov 1: every sport 8% (was all-NFL 5%); Oct 27 5%, Oct 24 4%
+  SNIPER_MIN_ROI_TD = "0.08"      # Kevin Nov 1: 8% (was 7%); highest rule wins
+  SNIPER_MIN_ROI_NCAAF = "0.08"   # Kevin Nov 1: college 8% (was 6%)
   SNIPER_FAIR_DEPTH_USD = "1000"   # NFL player-TD legs ($ potential profit, not stake)
   SNIPER_GAME_DEPTH_USD = "2000"   # NFL + college moneylines (and spreads/totals) ($ potential profit, not stake)
   SNIPER_LINES = "1"              # main spreads/totals (preview)
   SNIPER_ROGUE_MODE = "shadow"     # weekend: log rogue_line rows only, never change the fair
-  SNIPER_MIN_ROI_LINES = "0.05"   # Kevin Oct 24: other NFL 5%
+  SNIPER_MIN_ROI_LINES = "0.08"   # Kevin Nov 1: other NFL 8% (was 5%)
   SNIPER_NBA = "1"                # Kevin Oct 23: NBA moneylines + main spreads/totals (no player props)
-  SNIPER_MIN_ROI_NBA = "0.06"     # Kevin Oct 24: any NBA leg needs 6% (highest rule wins)
+  SNIPER_MIN_ROI_NBA = "0.08"     # Kevin Nov 1: any NBA leg 8% (was 6%)
   SNIPER_NBA_HOURS = "36"         # NBA legs must tip within 36h of the quote
   SNIPER_NBA_GAME_HOURS = "3"     # NBA settle_at = last tip + 3h
   SNIPER_NCAAB = "0"              # Kevin Oct 30: college basketball MONEYLINES built with the switch OFF ("1" turns it on)
-  SNIPER_MIN_ROI_NCAAB = "0.07"   # NCAAB-only minimum edge (proposed 7%); other minimums unchanged
+  SNIPER_MIN_ROI_NCAAB = "0.08"   # Kevin Nov 1: 8% (was 7%); NCAAB switch still OFF
   SNIPER_NCAAB_HOURS = "24"       # NCAAB legs must tip within 24h (code caps this at 36h)
   SNIPER_NCAAB_GAME_HOURS = "3"   # NCAAB settle_at = last tip + 3h
   SNIPER_ODDS_RELAY_URL = "http://kaygo-odds-relay.internal:8787"
