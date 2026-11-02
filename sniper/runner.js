@@ -39,7 +39,7 @@ const { venuesFromEnv } = require('./fair');
 const { createCloseSnapshot } = require('./close-snapshot');
 const { RESERVE_TTL_MS } = require('../reserve');
 const { rogueConfig, americanOf } = require('./rogue');
-const { decide, repriceFair, pregameCheck } = require('./engine');
+const { decide, repriceFair, repriceHedge, pregameCheck } = require('./engine');
 const { liveGate, sniperSubaccount } = require('./gates');
 const { createSniperTrader } = require('./trader');
 const { createSoonCap } = require('./soon-cap');
@@ -564,6 +564,7 @@ async function main(env = process.env) {
     earlyRegister: String(env.SNIPER_EARLY_REGISTER || '1') !== '0',
     pullConcurrency: Math.max(1, num(env.SNIPER_PULL_CONCURRENCY, 4)), pullGuard: String(env.SNIPER_PULL_GUARD || '1') !== '0',
     reprice: (rfq) => repriceFair(rfq, { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook, ncaabBook, ncaaf: !!ncaafBook }),
+    rehedge: (rfq, d, n) => repriceHedge(rfq, { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook, ncaabBook, ncaaf: !!ncaafBook }, { q: d.quoteYes, n, makerRate: d.makerRate, fair: d.fairYes }),
     alert,
     onFilled: (f) => (bookArb ? bookArb.check(f, 'fill') : null),
     // Rule 9 at commence time (no buffer here; decide() already stops new quotes 30 min early).

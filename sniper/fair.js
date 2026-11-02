@@ -38,39 +38,41 @@ function guarded(sources, venues, rogue, noVenueReason, mid, own) {
   if (m.skip && mcfg.mode === 'enforce') return { p: null, reason: m.skip, guard: m.ev, rogue: rogueEv.length ? rogueEv : undefined };
   return { p: 1 - b.cost, ref: m.ref != null ? m.ref : null, guardShadow: m.ev || undefined, best: `${b.venue}${b.via && b.via !== 'td_opposite' ? ':' + b.via : ''}`, venue: b.venue, depthUsd: b.availUsd != null ? b.availUsd : null, rogue: rogueEv.length ? rogueEv : undefined };
 }
+// LOG-ONLY: carry the book's lazy own-side cost reader (hedgeSources) on the result; never used for the fair.
+function withHedge(r, f) { if (r && f && typeof f.hedgeSources === 'function') r.hedgeSources = f.hedgeSources; return r; }
 function legFairDepth(leg, { pmLive, tdBook, venues, ncaafBook, linesBook = null, nbaBook = null, ncaabBook = null, rogue, mid }) {
   if (leg.kind === 'ncaab') { // men's college basketball moneyline (sniper/ncaab.js); no NCAAB lines
     if (!ncaabBook) return { p: null, reason: 'no_ncaab_book' };
     const f = ncaabBook.legFair(leg.gameId, leg.team);
     if (!f) return { p: null, reason: 'no_game' };
-    return guarded(f.sources, venues, rogue, 'no_venue_depth', mid, f.own);
+    return withHedge(guarded(f.sources, venues, rogue, 'no_venue_depth', mid, f.own), f);
   }
   if (leg.kind === 'nba') { // NBA moneyline (sniper/nba.js); NBA spreads/totals are kind 'line'
     if (!nbaBook) return { p: null, reason: 'no_nba_book' };
     const f = nbaBook.legFair(leg.gameId, leg.team);
     if (!f) return { p: null, reason: 'no_game' };
-    return guarded(f.sources, venues, rogue, 'no_venue_depth', mid, f.own);
+    return withHedge(guarded(f.sources, venues, rogue, 'no_venue_depth', mid, f.own), f);
   }
   if (leg.kind === 'line') { // main spread / total (sniper/lines.js)
     if (!linesBook) return { p: null, reason: 'lines_off' };
     const f = linesBook.legFair(leg);
     if (f.p == null && f.reason) return { p: null, reason: f.reason };
-    return guarded(f.sources, venues, rogue, 'no_venue_depth', mid, f.own);
+    return withHedge(guarded(f.sources, venues, rogue, 'no_venue_depth', mid, f.own), f);
   }
   if (leg.kind === 'ncaaf') {
     if (!ncaafBook) return { p: null, reason: 'no_ncaaf_book' };
     const f = ncaafBook.legFair(leg.gameId, leg.team);
     if (!f) return { p: null, reason: 'no_game' };
-    return guarded(f.sources, venues, rogue, 'no_venue_depth', mid, f.own);
+    return withHedge(guarded(f.sources, venues, rogue, 'no_venue_depth', mid, f.own), f);
   }
   if (leg.kind === 'td') {
     if (!tdBook) return { p: null, reason: 'td_no_book' };
     const m = tdBook.legMulti({ id: leg.id, side: leg.side });
-    return guarded(m && m.sources, venues, rogue, 'td_no_venue_depth', mid);
+    return withHedge(guarded(m && m.sources, venues, rogue, 'td_no_venue_depth', mid), m);
   }
   if (!pmLive) return { p: null, reason: 'no_ml_book' };
   const f = pmLive.legFair(leg.gameId, leg.team);
   if (!f) return { p: null, reason: 'no_game' };
-  return guarded(f.sources, venues, rogue, 'no_venue_depth', mid, f.own);
+  return withHedge(guarded(f.sources, venues, rogue, 'no_venue_depth', mid, f.own), f);
 }
 module.exports = { MID_GUARD_REASONS, ALL_VENUES, venuesFromEnv, bestCost, legFairDepth };

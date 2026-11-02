@@ -3,6 +3,7 @@
 // and logged. The in-memory ledger (poly-sniper/live.js) is authoritative while the process runs and
 // is rebuilt from poly_sniper_ledger on boot. Reads that gate trading (control switch) fail CLOSED.
 'use strict';
+const { writeTolerant } = require('../sniper/hedge-cols');
 
 const OPEN_PHASES = ['quoted', 'accepted', 'confirmed', 'filled'];
 const EXPOSURE_PHASES = ['accepted', 'confirmed', 'filled'];
@@ -45,7 +46,8 @@ function createPolySniperStore({ supabase, log = console.log, retries = 3, retry
     stats: () => ({ ...stats, pending: chains.size, quotedRiskColumn }),
     insertQuote(row) {
       return enqueue(row.quote_id, async () => {
-        const write = (r) => supabase.from('poly_sniper_ledger').upsert({ ...r, updated_at: new Date().toISOString() }, { onConflict: 'quote_id' });
+        // Log-only hedge-cost columns are dropped if their migration has not been run yet (sniper/hedge-cols.js).
+        const write = (r) => writeTolerant('poly_sniper_ledger', r, (x) => supabase.from('poly_sniper_ledger').upsert({ ...x, updated_at: new Date().toISOString() }, { onConflict: 'quote_id' }), log);
         if (!quotedRiskColumn || !('quoted_risk' in row)) { const { quoted_risk: _q, ...rest } = row; return write(quotedRiskColumn ? row : rest); }
         const res = await write(row);
         if (res && res.error && missingQuotedRisk(res.error)) {
@@ -58,7 +60,7 @@ function createPolySniperStore({ supabase, log = console.log, retries = 3, retry
       }, 'insert');
     },
     patch(quoteId, patch) {
-      return enqueue(quoteId, () => supabase.from('poly_sniper_ledger').update({ ...patch, updated_at: new Date().toISOString() }).eq('quote_id', quoteId), 'update');
+      return enqueue(quoteId, () => writeTolerant('poly_sniper_ledger', patch, (p) => supabase.from('poly_sniper_ledger').update({ ...p, updated_at: new Date().toISOString() }).eq('quote_id', quoteId), log), 'update');
     },
     async flush() { await Promise.all([...chains.values()]); },
     // Throws on error (caller fails closed).

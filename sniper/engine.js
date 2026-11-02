@@ -2,7 +2,8 @@
 'use strict';
 const { evaluateSnipe, releaseAtMs } = require('../auto-sniper');
 const { classifyNfl } = require('../noboost/shadow');
-const { legFairDepth, MID_GUARD_REASONS } = require('./fair');
+const { legFairDepth, MID_GUARD_REASONS, ALL_VENUES } = require('./fair');
+const { legHedge, parlayHedge, safe, hedgeLogOn } = require('./hedge-cost');
 const { isNcaafTicker, classifyNcaafLeg } = require('./ncaaf');
 const { isLineTicker, classifyLineLeg } = require('./lines');
 const { isNbaTicker, isNbaAny, classifyNbaLeg } = require('./nba');
@@ -134,9 +135,11 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
   if (hzc) return skip(hzc);
   const guardHits = []; // thin-book guard (sniper/mid-guard.js)
   const rogue = []; // rogue-line guard events (sniper/rogue.js), logged by the runner
+  const hedgeReaders = []; // LOG-ONLY hedge cost (sniper/hedge-cost.js); read only when we quote
   const legs = keys.map((k, i) => {
     const [ticker, side] = String(k).split(':');
     const f = legFairDepth(cls.legs[i], { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook, ncaabBook });
+    hedgeReaders.push(f.hedgeSources || null);
     if (f.rogue && f.rogue.length) rogue.push(...f.rogue.map((e) => ({ ...e, ticker, side: side || 'yes' })));
     if (f.p == null && MID_GUARD_REASONS.has(f.reason)) guardHits.push({ ...(f.guard || { kind: f.reason }), ticker, side: side || 'yes' });
     else if (f.guardShadow) guardHits.push({ ...f.guardShadow, ticker, side: side || 'yes', shadow: true });
@@ -188,8 +191,33 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
     d.minRoi = minRoi; d.hasTd = hasTd; d.hasLine = hasLine; d.hasNcaaf = hasNcaaf; d.hasNba = hasNba; d.hasNcaab = hasNcaab;
     // Per-leg detail for the fill alert + audit (sniper_decisions.details.legDetail).
     d.legDetail = legs.map((l) => ({ ticker: l.ticker, side: l.side, fair: l.fair_yes, venue: l.venue, depthUsd: l.depth_usd, name: l.name, ref: l.ref }));
+    // LOG-ONLY hedge cost at the quote's own price / size / maker rate. Non-enumerable so it never rides
+    // into sniper_decisions details (it is written once, to the ledger row, when the quote is posted).
+    const h = hedgeFor(legs, hedgeReaders, venues, { q: d.quoteYes, n: d.contracts, makerRate: d.makerRate, fair: d.fairYes });
+    if (h) Object.defineProperty(d, 'hedge', { value: h, enumerable: false, writable: true, configurable: true });
   }
   return { decision: d, row };
+}
+
+// LOG-ONLY: parlay hedge cost from each leg's lazy own-side reader. Never throws (null on any problem).
+function hedgeFor(legs, readers, venues, econ) {
+  if (!hedgeLogOn()) return null;
+  return safe(() => parlayHedge(legs.map((l, i) => ({ ticker: l.ticker, side: l.side, hedge: legHedge(readers[i] ? readers[i]() : [], venues || ALL_VENUES) })), econ));
+}
+
+// LOG-ONLY: fresh hedge cost at fill / confirm time (same books as repriceFair; no API calls). Null if unpriceable.
+function repriceHedge(rfq, { pmLive, tdBook, venues, ncaafBook = null, linesBook = null, nbaBook = null, ncaabBook = null, ncaaf = true }, econ = {}) {
+  return safe(() => {
+    const cls = classifyLegs(rfq, { td: !!tdBook, ncaaf, lines: !!linesBook, nba: !!nbaBook, ncaab: !!ncaabBook });
+    if (!cls.ok || cls.legs.length !== (rfq.legKeys || []).length) return null;
+    const legs = []; const readers = [];
+    rfq.legKeys.forEach((k, i) => {
+      const [ticker, side] = String(k).split(':');
+      const f = legFairDepth(cls.legs[i], { pmLive, tdBook, venues, ncaafBook, linesBook, nbaBook, ncaabBook });
+      legs.push({ ticker, side: side || 'yes' }); readers.push(f.hedgeSources || null);
+    });
+    return hedgeFor(legs, readers, venues, econ);
+  });
 }
 
 // Fresh combo fair (product of per-leg best-of-venues $depth fairs) for send/confirm-time re-pricing.
@@ -205,4 +233,4 @@ function repriceFair(rfq, { pmLive, tdBook, venues, ncaafBook = null, linesBook 
   return fair;
 }
 
-module.exports = { decide, settleAtMs, pregameCheck, nbaHorizonCheck, ncaabHorizonCheck, maxLegDaysCheck, legDate, repriceFair, classifyLegs };
+module.exports = { decide, settleAtMs, pregameCheck, nbaHorizonCheck, ncaabHorizonCheck, maxLegDaysCheck, legDate, repriceFair, repriceHedge, hedgeFor, classifyLegs };

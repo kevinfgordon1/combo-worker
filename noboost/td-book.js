@@ -261,10 +261,28 @@ function createTdBook({ now = () => Date.now(), staleMs = 15000, depthUsd = DEPT
       if (r) sources.push(r);
     }
     const used = sources.filter((x) => x.used);
-    if (!used.length) return { p: null, best: null, sources };
+    // LOG-ONLY hedge cost (sniper/hedge-cost.js): cost to BUY the leg's own side (Yes for a Yes leg, No for
+    // a No leg) per venue, same entries / staleness / depth / overround rules. Lazy: posted quotes and fills only.
+    const hedgeSources = () => {
+      const hs = [];
+      const own = (venue, e) => {
+        if (!e) return;
+        const age = now() - e.at;
+        const side = e.y && e.n ? (isNo ? e.n : e.y) : null;
+        const out = { venue, via: 'td_own', key: venue === 'kalshi' ? t : (e.key || null), ageMs: Math.round(age) };
+        if (age > staleMs) hs.push({ ...out, used: false, reason: 'stale' });
+        else if (e.fail) hs.push({ ...out, used: false, reason: e.fail });
+        else if (!side) hs.push({ ...out, used: false, reason: 'no_ask' });
+        else hs.push({ ...out, used: true, reason: 'ok', cost: side.vwap, availUsd: side.availUsd });
+      };
+      own('kalshi', k);
+      for (const [venue, vb] of venueBooks) own(venue, vb.get(t));
+      return hs;
+    };
+    if (!used.length) return { p: null, best: null, sources, hedgeSources };
     const best = used.reduce((a, b) => (b.cost < a.cost ? b : a));
     const p = 1 - best.cost;
-    return { p: p > 0 && p < 1 ? p : null, best: best.venue, sources };
+    return { p: p > 0 && p < 1 ? p : null, best: best.venue, sources, hedgeSources };
   }
   function takeMatchStats() { const out = JSON.parse(JSON.stringify(matchStats)); for (const k of Object.keys(matchStats)) delete matchStats[k]; return out; }
   function venueSize(v) { const vb = venueBooks.get(v); return vb ? vb.size : 0; }

@@ -8,6 +8,7 @@ const { classifyLegs, pregameCheck, nbaHorizonCheck, ncaabHorizonCheck, legDate 
 const { legFairDepth } = require('../sniper/fair');
 const { minQuotePrice, comboKey, gameKey, legKey, releaseAtMs } = require('../auto-sniper');
 const { mapPolyLegs } = require('./map');
+const { hedgeFor } = require('../sniper/engine');
 
 const num = (v, d) => (v == null || v === '' || !Number.isFinite(Number(v)) ? d : Number(v));
 const POLY_COMBO_MAKER_RATE = 0;
@@ -119,12 +120,12 @@ function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now(), skipLedger 
   const hz = nbaHorizonCheck(m.legKeys, (t) => feed.kickoffs.kickoffFor(t), nowMs, config.nbaHours != null ? config.nbaHours : 36);
   if (hz) return skip(hz);
   if (ncaabOn) { const hc = ncaabHorizonCheck(m.legKeys, (t) => feed.kickoffs.kickoffFor(t), nowMs, config.ncaabHours); if (hc) return skip(hc); }
-  const legs = []; let fair = 1;
+  const legs = []; let fair = 1; const hedgeReaders = []; // hedgeReaders: LOG-ONLY hedge cost (sniper/hedge-cost.js)
   for (let i = 0; i < m.legKeys.length; i += 1) {
     const [ticker, side] = m.legKeys[i].split(':');
     const f = legFairDepth(cls.legs[i], { pmLive: feed.pmLive, tdBook: feed.tdBook, ncaafBook: feed.ncaafBook, linesBook: linesOn ? feed.linesBook : null, nbaBook: nbaOn ? feed.nbaBook : null, ncaabBook: ncaabOn ? feed.ncaabBook : null, venues: feed.venues });
     const leg = { polySymbol: comboLegs[i].symbol, polySide: comboLegs[i].side, ticker, side, kind: cls.legs[i].kind || 'ml', league: cls.legs[i].league || null, fair: f.p, venue: f.venue || null, best: f.best || null, depthUsd: f.depthUsd != null ? Math.round(f.depthUsd) : null, reason: f.reason || null, date: legDate(ticker) };
-    legs.push(leg);
+    legs.push(leg); hedgeReaders.push(f.hedgeSources || null);
     if (!(f.p > 0 && f.p < 1)) return skip(f.reason || 'leg_no_fair', { legs });
     if (f.p < config.minLegFair || f.p > config.maxLegFair) return skip('leg_fair_out_of_range', { legs });
     fair *= f.p;
@@ -145,7 +146,10 @@ function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now(), skipLedger 
   const combo = comboKey(ll); const games = [...new Set(ll.map(gameKey))]; const lkeys = ll.map(legKey);
   const econ = { fair, buyPrice, sellPrice: '0', contracts: px.n, risk: px.risk, ev: px.ev, roi: px.roi, fee: px.fee, minRoi, tick, ...(edgeCushion > 0 ? { postMinRoi } : {}) };
   if (px.risk > config.maxRisk + 1e-9) return skip('risk_over_cap', { legs, ...econ });
-  if (skipLedger) return { ...base, action: 'quote', legs, combo, games, legKeys: lkeys, ...econ };
+  // LOG-ONLY hedge cost at this quote's price / size (Polymarket combo maker fee 0). Non-enumerable: it is
+  // written once to poly_sniper_ledger when the quote is posted, never into the decision tape.
+  const withHedge = (d) => { const h = hedgeFor(ll, hedgeReaders, feed.venues, { q: buyPrice, n: px.n, makerRate: POLY_COMBO_MAKER_RATE, fair }); if (h) Object.defineProperty(d, 'hedge', { value: h, enumerable: false, writable: true, configurable: true }); return d; };
+  if (skipLedger) return withHedge({ ...base, action: 'quote', legs, combo, games, legKeys: lkeys, ...econ });
   ledger.prune(nowMs);
   const t = ledger.totals();
   if (t.combos.has(combo)) return skip('already_hold_combo', { legs, ...econ });
@@ -154,7 +158,7 @@ function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now(), skipLedger 
   for (const l of lkeys) if ((t.legs.get(l) || 0) + px.risk > config.perLegCap) return skip('leg_cap', { legs, ...econ, leg: l });
   if (ledger.day.risk + px.risk > config.dailyRiskCap) return skip('daily_risk_cap', { legs, ...econ });
   ledger.add(rfq.rfqId, { combo, games, legs: lkeys, risk: px.risk, releaseAt: releaseAtMs(legs, nowMs) });
-  return { ...base, action: 'quote', legs, combo, games, ...econ };
+  return withHedge({ ...base, action: 'quote', legs, combo, games, ...econ });
 }
 
 module.exports = { decidePoly, polySniperConfig, polyMinRoi, createVenueLedger, POLY_COMBO_MAKER_RATE };
