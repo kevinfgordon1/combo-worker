@@ -22,7 +22,9 @@
     "test": "node scripts/run-tests.js",
     "start:testers": "node start-testers.js",
     "ncaab:teams": "node scripts/gen-ncaab-teams.js --write-fixture",
-    "ncaab:check": "node scripts/check-ncaab-teams.js"
+    "ncaab:check": "node scripts/check-ncaab-teams.js",
+    "start:prophetx": "node start-prophetx.js",
+    "test:px": "node px/prophetx.test.js"
   },
   "engines": {
     "node": ">=18"

@@ -1,0 +1,43 @@
+# Fly app for the ProphetX SANDBOX parlay RFQ quoter (was Railway service prophetx-worker,
+# stopped Oct 21 2026 when Railway was removed). Sandbox only; never ProphetX production.
+# Deploy (Kevin approves first): flyctl deploy . -c fly/prophetx-sandbox.toml -a kaygo-prophetx-sandbox --local-only --ha=false
+# Secrets (fly secrets, never here), names only:
+#   PROPHETX_SANDBOX_API_KEY, PROPHETX_SANDBOX_SECRET_KEY  (the quoter's sandbox key pair)
+#   SUPABASE_URL, SUPABASE_SERVICE_KEY                     (logging to prophetx_sandbox_quotes)
+# NEVER set on this app: PROPHETX_API_KEY / PROPHETX_ACCESS_KEY / PROPHETX_SECRET_KEY (production,
+# relay only), any KALSHI_* / SNIPER_KALSHI_* key, any POLYMARKET_* / POLY_* key, any NOVIG_* key.
+# px/guard.js refuses to start if any of those names is present.
+app = "kaygo-prophetx-sandbox"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = "10s"
+
+[build]
+  dockerfile = "../Dockerfile"
+
+[processes]
+  app = "node start-prophetx.js"   # node gets SIGTERM directly
+
+[deploy]
+  # never rolling/bluegreen: no overlap of two quoters on one sandbox account
+  strategy = "immediate"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+
+# EXACTLY ONE machine. No [http_service] / [[services]]: the quoter only makes outbound
+# connections (ProphetX sandbox REST + websocket, public Kalshi/Polymarket/Novig books, Supabase).
+[env]
+  PX_SANDBOX = "1"
+  PX_API_BASE = "https://api.sandbox.prophetx.dev/partner"
+  PX_PARLAY_BASE = "https://api.sandbox.prophetx.dev/parlay/sp/v2"
+  # Vendored book-depth.js defaults its ProphetX venue to production; pin it to sandbox too
+  # (it is unused anyway: no production ProphetX key is ever on this app).
+  PROPHETX_API_BASE = "https://api.sandbox.prophetx.dev/partner"
+  # Polymarket US + ProphetX opposing ladders: odds relay read-only /board over Fly private network.
+  # The relay holds the production ProphetX key (read-only); this app never does.
+  PX_ODDS_RELAY_URL = "http://kaygo-odds-relay.internal:8787"
+  PX_MAX_RISK = "1000"        # Kevin Oct 20: $1,000 risk cap per order (partial fills still count as clean)
+  PX_OFFER_SIGN = "participant"
+  MLB_ENABLED = "0"           # Kevin Oct 30: MLB season over
