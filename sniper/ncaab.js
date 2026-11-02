@@ -139,9 +139,12 @@ function createNcaabBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 1
     if (rn) sources.push({ ...rn, via: 'no_own' });
     const used = sources.filter((s) => s.used);
     const own = []; { const m0 = asks.get(`${gameId}:${team}`) || {}; for (const v of ['kalshi', 'polymarket', 'novig', 'prophetx']) { const r = evalVenue(v, m0[v]); if (r && r.reason !== 'stale' && r.topAmerican != null) own.push({ venue: v, topAmerican: r.topAmerican }); } }
-    if (!used.length) return { p: null, american: null, sources, own };
+    // LOG-ONLY hedge cost (sniper/hedge-cost.js): what it costs to BUY this team's own side, per venue, from the
+    // same books (Kalshi: Yes on the team, or No on the opponent). Lazy: only evaluated for posted quotes / fills.
+    const hedgeSources = () => { const m0 = asks.get(`${gameId}:${team}`) || {}; const hs = []; for (const v of ['kalshi', 'polymarket', 'novig', 'prophetx']) { const r = evalVenue(v, m0[v]); if (r) hs.push(v === 'kalshi' ? { ...r, via: 'yes_own' } : r); } const rk = evalVenue('kalshi', (kalshiNo.get(`${gameId}:${opp}`) || {}).kalshi); if (rk) hs.push({ ...rk, via: 'no_opp' }); return hs; };
+    if (!used.length) return { p: null, american: null, sources, own, hedgeSources };
     const best = used.reduce((x, y) => (y.cost < x.cost ? y : x));
-    return { p: 1 - best.cost, american: american(1 - best.cost), best: `${best.venue}${best.via ? ':' + best.via : ''}`, sources, own };
+    return { p: 1 - best.cost, american: american(1 - best.cost), best: `${best.venue}${best.via ? ':' + best.via : ''}`, sources, own, hedgeSources };
   }
   return { ingestKalshiOrderbooks, ingestRelay, legFair, gameCount: () => games.size, _asks: asks };
 }

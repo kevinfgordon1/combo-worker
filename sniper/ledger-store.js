@@ -3,6 +3,7 @@
 // sniper_confirm_check (one advisory lock, so concurrent RFQs cannot both pass). Any DB error
 // fails closed (no quote / no confirm).
 'use strict';
+const { writeTolerant } = require('./hedge-cols');
 const { isLongPos } = require('./write-behind');
 const { netRiskOf, hedgePnl } = require('./hedge');
 
@@ -106,7 +107,8 @@ function createLedgerStore({ supabase, log = console.log, now = () => Date.now()
   }
   async function update(rfqId, patch) {
     try {
-      const { error } = await supabase.from('sniper_ledger').update({ ...patch, updated_at: new Date(now()).toISOString() }).eq('rfq_id', rfqId);
+      // Hedge-cost columns (log-only) are dropped if the migration has not been run yet (sniper/hedge-cols.js).
+      const { error } = await writeTolerant('sniper_ledger', patch, (p) => supabase.from('sniper_ledger').update({ ...p, updated_at: new Date(now()).toISOString() }).eq('rfq_id', rfqId), log);
       if (error) { log(`[SNIPER] ledger update ${rfqId} failed: ${error.message}`); return false; }
       return true;
     } catch (e) { log(`[SNIPER] ledger update ${rfqId} threw: ${e.message}`); return false; }

@@ -9,6 +9,7 @@
 // silently. Fill safety is unchanged: confirmCheck flushes first, then runs sniper_confirm_check
 // (DB, global lock, full caps) — a fill can never pass the real cap.
 'use strict';
+const { forTable, hasHedgeCols, stripHedgeCols, isMissingHedgeCol, disableHedgeCols } = require('./hedge-cols');
 
 function rowFor(d, { releaseAt, dryRun, marketTicker }) {
   return {
@@ -33,35 +34,50 @@ function createBatchedLedgerStore(store, { supabase, flushMs = 300, maxQueue = 2
   async function writeBatch(batch) {
     const inserts = []; const groups = new Map(); rejected.clear();
     for (const [id, e] of batch) {
-      if (e.row) inserts.push({ ...e.row, ...e.patch, updated_at: ts() });
+      // forTable: drops the log-only hedge-cost columns while they are known missing (sniper/hedge-cols.js).
+      if (e.row) inserts.push(forTable('sniper_ledger', { ...e.row, ...e.patch, updated_at: ts() }));
       else if (Object.keys(e.patch).length) {
-        const k = JSON.stringify(e.patch); if (!groups.has(k)) groups.set(k, { patch: e.patch, ids: [] }); groups.get(k).ids.push(id);
+        const patch = forTable('sniper_ledger', e.patch);
+        const k = JSON.stringify(patch); if (!groups.has(k)) groups.set(k, { patch, ids: [] }); groups.get(k).ids.push(id);
       }
     }
+    // Hedge columns missing (migration not run yet): turn them off and retry the same write without them.
+    const tolerant = async (rowsOrPatch, write) => {
+      let res = await write(rowsOrPatch);
+      const has = Array.isArray(rowsOrPatch) ? rowsOrPatch.some(hasHedgeCols) : hasHedgeCols(rowsOrPatch);
+      if (res && res.error && has && isMissingHedgeCol(res.error)) {
+        disableHedgeCols('sniper_ledger', log);
+        res = await write(Array.isArray(rowsOrPatch) ? rowsOrPatch.map(stripHedgeCols) : stripHedgeCols(rowsOrPatch));
+      }
+      return res;
+    };
     let ok = true;
     // Oct 28 2026: UPDATEs (releases) first, then inserts. A new quote that replaces our waiting quote on
     // the same parlay (fix 2) inserts an open row with the same combo_key in the same flush as the old
     // row's release; releasing first keeps sniper_ledger_open_combo_uq from rejecting the new row.
     // Safe: an UPDATE here only targets rows inserted by an earlier flush (same-batch rows merge into the insert).
     for (const g of groups.values()) {
-      const { error } = await supabase.from('sniper_ledger').update({ ...g.patch, updated_at: ts() }).in('rfq_id', g.ids);
+      const { error } = await tolerant(g.patch, (p) => supabase.from('sniper_ledger').update({ ...p, updated_at: ts() }).in('rfq_id', g.ids));
       if (error) { ok = false; log(`[SNIPER] ledger batch update (${g.ids.length}) failed: ${error.message}`); } else stats.updated += g.ids.length;
     }
     if (inserts.length) {
-      const { error } = await supabase.from('sniper_ledger').upsert(inserts, { onConflict: 'rfq_id' });
+      const { error } = await tolerant(inserts, (rows) => {
+        if (rows !== inserts) for (let i = 0; i < rows.length; i += 1) inserts[i] = rows[i]; // per-row retry below uses the stripped rows
+        return supabase.from('sniper_ledger').upsert(rows, { onConflict: 'rfq_id' });
+      });
       if (!error) stats.inserted += inserts.length;
       else {
         // One bad row (e.g. open-combo unique index) must not wedge the batch: retry row by row,
         // drop rows that are permanently rejected (logged), requeue the rest.
         log(`[SNIPER] ledger batch upsert (${inserts.length}) failed: ${error.message} — retrying per row`);
         for (const r of inserts) {
-          let one = await supabase.from('sniper_ledger').upsert([r], { onConflict: 'rfq_id' });
+          let one = await tolerant([r], (rows) => supabase.from('sniper_ledger').upsert(rows, { onConflict: 'rfq_id' }));
           if (!one.error) { stats.inserted += 1; continue; }
           // Oct 26 2026: a stale (past-hold, unfilled, no order) row on the same combo must not block
           // a fresh quote. Release it and retry once; live/filled rows still block (unchanged).
           if (/open_combo/i.test(one.error.message || '') && r.status === 'open' && !r.dry_run && store.releaseStaleCombo) {
             let n = 0; try { n = await store.releaseStaleCombo(r.combo_key); } catch (e) { log(`[SNIPER] ${e.message}`); }
-            if (n > 0) { stats.staleFreed = (stats.staleFreed || 0) + n; one = await supabase.from('sniper_ledger').upsert([r], { onConflict: 'rfq_id' }); if (!one.error) { stats.inserted += 1; continue; } }
+            if (n > 0) { stats.staleFreed = (stats.staleFreed || 0) + n; one = await supabase.from('sniper_ledger').upsert([forTable('sniper_ledger', r)], { onConflict: 'rfq_id' }); if (!one.error) { stats.inserted += 1; continue; } }
           }
           if (/23505|duplicate|unique|violates/i.test(one.error.message || '')) { stats.rejected = (stats.rejected || 0) + 1; rejected.add(r.rfq_id); log(`[SNIPER] ledger row rejected rfq=${r.rfq_id}: ${one.error.message}`); }
           else ok = false;

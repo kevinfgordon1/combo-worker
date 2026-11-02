@@ -33,6 +33,7 @@
 //     Locks' reconcile skips every quote / order / fill the sniper owns (isSniperFill).
 'use strict';
 const { decidePoly } = require('./engine');
+const { hedgeColumns, hedgeFillColumns, rescoreHedge, safe } = require('../sniper/hedge-cost');
 const { resolveQuoteFill, listSelfExecutedQuotes, quoteIdOf, orderIdOfQuote, fetchQuoteByIds, isExecutedQuoteStatus } = require('../polymarket-fill-reconcile');
 
 const num = (v, d) => (v == null || v === '' || !Number.isFinite(Number(v)) ? d : Number(v));
@@ -311,7 +312,7 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
     };
     quotes.set(quoteId, rec); byRfq.set(rfq.rfqId, quoteId);
     hourPosts.push(t); stats.posted += 1;
-    if (store) store.insertQuote({ quote_id: quoteId, rfq_id: rfq.rfqId, symbol: rec.symbol, combo_key: rec.combo, games: rec.games, legs: rec.legs, leg_detail: rec.legDetail, phase: 'quoted', buy_price: rec.buyPrice, fair: rec.fair, edge: rec.roi, min_edge: rec.minRoi, contracts: rec.contracts, quoted_risk: Math.round(rec.quotedRisk * 1e6) / 1e6, settle_at: new Date(settleAt).toISOString() });
+    if (store) store.insertQuote({ quote_id: quoteId, rfq_id: rfq.rfqId, symbol: rec.symbol, combo_key: rec.combo, games: rec.games, legs: rec.legs, leg_detail: rec.legDetail, phase: 'quoted', buy_price: rec.buyPrice, fair: rec.fair, edge: rec.roi, min_edge: rec.minRoi, contracts: rec.contracts, quoted_risk: Math.round(rec.quotedRisk * 1e6) / 1e6, settle_at: new Date(settleAt).toISOString(), ...(safe(() => hedgeColumns(d.hedge)) || {}) });
     if (stats.posted <= 20 || stats.posted % 50 === 0) say(`QUOTED rfq=${rfq.rfqId} quote_id=${quoteId} buy=${rec.buyPrice} fair=${rec.fair.toFixed(4)} edge=${(rec.roi * 100).toFixed(1)}% risk=$${rec.quotedRisk.toFixed(2)} n=${stats.posted}`);
     for (const ev of buffered) ev.release(true);
     return { posted: true, quoteId };
@@ -484,6 +485,8 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
       return decline(rec, `confirm_failed:${String((e && e.message) || '').slice(0, 60)}`, now());
     }
     rec.phase = 'confirmed'; rec.confirmedAt = now(); stats.confirmed += 1;
+    // LOG-ONLY hedge cost at confirm (fresh books from the reprice above, our resting price, accepted size).
+    { const h = safe(() => rescoreHedge(rp.d && rp.d.hedge, { q: rec.buyPrice, n, makerRate: 0 })); if (h) { rec.hedgeFill = h; rec.hedgeFillAt = rec.confirmedAt; } }
     persist(rec.quoteId, { phase: 'confirmed', confirmed_at: new Date(rec.confirmedAt).toISOString(), risk });
     say(`CONFIRMED quote_id=${rec.quoteId} rfq=${rec.rfqId} n=${n} buy=${rec.buyPrice} fair_now=${rp.d.fair.toFixed(4)} risk=$${risk.toFixed(2)} ms=${rec.confirmedAt - rec.acceptedAt}`);
     return { confirmed: true };
@@ -516,7 +519,10 @@ function createPolySniperLive({ env = process.env, engineConfig, feed, store = n
     rec.filledAt = rec.filledAt || t;
     if (rec.symbol) { const a = symbolFills.get(rec.symbol) || []; a.push({ qty: evt.contracts, at: t }); symbolFills.set(rec.symbol, a); }
     stats.filled += 1; stats.fillContracts += evt.contracts;
-    persist(rec.quoteId, { phase: rec.phase, filled_contracts: rec.filled, filled_cost: rec.filledCost, risk: rec.risk, order_id: rec.orderId, fill_ids: [...rec.fillIds], filled_at: new Date(rec.filledAt).toISOString() });
+    // hedge_fill rides on the first fill write only (log-only; no extra write).
+    const hf = !rec.hedgeFillWritten && rec.hedgeFill ? (safe(() => hedgeFillColumns(rec.hedgeFill, rec.hedgeFillAt)) || {}) : {};
+    if (hf.hedge_fill) rec.hedgeFillWritten = true;
+    persist(rec.quoteId, { phase: rec.phase, filled_contracts: rec.filled, filled_cost: rec.filledCost, risk: rec.risk, order_id: rec.orderId, fill_ids: [...rec.fillIds], filled_at: new Date(rec.filledAt).toISOString(), ...hf });
     say(`FILL quote_id=${rec.quoteId} rfq=${rec.rfqId} +${evt.contracts} (total ${rec.filled}) @ ${rec.buyPrice} risk=$${rec.risk.toFixed(2)}${full ? '' : ' PARTIAL'} src=${evt.source || 'ws'}`);
     notify(`✅ FILL ${evt.contracts} contracts @ ${rec.buyPrice} (risk $${(evt.contracts * (1 - rec.buyPrice)).toFixed(2)}, edge ${(rec.roi * 100).toFixed(1)}%) rfq ${rec.rfqId}`);
     return evt;

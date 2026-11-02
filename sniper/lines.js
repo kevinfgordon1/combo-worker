@@ -160,9 +160,12 @@ function createLinesBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 2
     for (const v of ['kalshi', 'polymarket', 'novig', 'prophetx']) { const r = evalVenue(v, o[v]); if (r) sources.push(r); }
     const used = sources.filter((s) => s.used);
     const own = []; { const m0 = asks.get(`${leg.gameId}|${leg.outcome}`) || {}; for (const v of ['kalshi', 'polymarket', 'novig', 'prophetx']) { const r = evalVenue(v, m0[v]); if (r && r.reason !== 'stale' && r.topAmerican != null) own.push({ venue: v, topAmerican: r.topAmerican }); } }
-    if (!used.length) return { p: null, reason: 'no_venue_depth', sources, own };
+    // LOG-ONLY hedge cost (sniper/hedge-cost.js): cost to BUY this outcome itself on each venue (Kalshi via the Yes/No
+    // of whichever strike carries it). Lazy: only evaluated for posted quotes / fills.
+    const hedgeSources = () => { const m0 = asks.get(`${leg.gameId}|${leg.outcome}`) || {}; const hs = []; for (const v of ['kalshi', 'polymarket', 'novig', 'prophetx']) { const r = evalVenue(v, m0[v]); if (r) hs.push(r); } return hs; };
+    if (!used.length) return { p: null, reason: 'no_venue_depth', sources, own, hedgeSources };
     const best = used.reduce((x, y) => (y.cost < x.cost ? y : x));
-    return { p: 1 - best.cost, american: american(1 - best.cost), best: best.venue, sources, own };
+    return { p: 1 - best.cost, american: american(1 - best.cost), best: best.venue, sources, own, hedgeSources };
   }
   // Kalshi tickers worth polling: only strikes that equal a current main line (keeps the budget small).
   function mainTickers(allTickers) {

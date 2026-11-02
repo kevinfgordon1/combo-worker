@@ -11,6 +11,7 @@ const { shouldConfirmAccept } = require('../engine');
 const { RESERVE_TTL_MS } = require('../reserve');
 const { formatFillAlert } = require('./fill-alert');
 const { mapLimit } = require('./release-batch');
+const { hedgeColumns, hedgeFillColumns, safe } = require('./hedge-cost');
 // 'http_409:rfq_closed' | 'stale_drop:queue_wait' | 'error' — Kalshi error body code when present.
 function postFailKey(err) {
   const m = String((err && err.message) || err || '');
@@ -23,6 +24,8 @@ const usdS = (x) => `$${(Number(x) || 0).toFixed(2)}`;
 
 function createLiveSniper({
   config, trader, store, coord, caps, reprice, alert = () => {}, log = console.log,
+  // rehedge(rfq, d, n): LOG-ONLY hedge cost at confirm time (sniper/hedge-cost.js); never gates anything.
+  rehedge = null,
   now = () => Date.now(), ttlMs = RESERVE_TTL_MS, fillRetries = 4, fillRetryMs = 1500,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)), onHalt = () => {},
   onHold = () => {}, startedReason = () => null, kickoffOf = () => null, onFilled = () => {}, pullConcurrency = 4, pullGuard = true, requoteMemo = null,
@@ -185,7 +188,7 @@ function createLiveSniper({
       pending.set(res.quoteId, entry); byRfq.set(rfq.rfqId, res.quoteId);
       const ea = earlyAccepts.get(rfq.rfqId);
       if (ea) { earlyAccepts.delete(rfq.rfqId); if (!ea.evt.quoteId || ea.evt.quoteId === res.quoteId) { stats.earlyAcceptReplayed += 1; onAccepted(ea.evt).catch((e) => log(`[SNIPER] accept error: ${e.message}`)); } }
-      await store.update(d.rfqId, { phase: 'quoted', quote_id: res.quoteId, no_bid: res.noBid });
+      await store.update(d.rfqId, { phase: 'quoted', quote_id: res.quoteId, no_bid: res.noBid, ...(safe(() => hedgeColumns(d.hedge)) || {}) });
       const cur = pending.get(res.quoteId);
       if (cur && isClosed(rfq.rfqId) && !cur.accepted && !confirming.has(res.quoteId)) {
         clearTimeout(cur.timer); pending.delete(res.quoteId); byRfq.delete(rfq.rfqId); noteDropped(res.quoteId, cur, 'closed_during_post');
@@ -198,7 +201,7 @@ function createLiveSniper({
       return { sent: true, quoteId: res.quoteId };
     }
     posted.set(rfq.rfqId, res.quoteId);
-    try { await store.update(d.rfqId, { phase: 'quoted', quote_id: res.quoteId, no_bid: res.noBid }); } finally { posted.delete(rfq.rfqId); }
+    try { await store.update(d.rfqId, { phase: 'quoted', quote_id: res.quoteId, no_bid: res.noBid, ...(safe(() => hedgeColumns(d.hedge)) || {}) }); } finally { posted.delete(rfq.rfqId); }
     if (isClosed(rfq.rfqId)) {
       // RFQ closed while our POST was in flight: the quote died with it. No TTL timer, no cancel.
       await store.release(d.rfqId, 'cancelled', {}); stats.cancelled += 1; stats.cancelSkipped += 1; stats.cancelAvoided.closed_during_post += 1;
@@ -464,6 +467,8 @@ function createLiveSniper({
         return { confirmed: false, reason: 'confirm_failed' };
       }
       stats.confirmed += 1;
+      // LOG-ONLY hedge cost at the moment we confirmed (fresh books, our quoted price, accepted size).
+      if (rehedge) { const h = safe(() => rehedge(rfq, d, n)); if (h) p.hedgeFill = h; p.hedgeFillAt = now(); }
       // One Telegram message per fill: sent from onExecuted once fills are confirmed.
       log(`[SNIPER] ACCEPTED+confirmed rfq=${rfq.rfqId} quote_id=${quoteId} n=${n} yes=${d.quoteYes} fair=${fresh.toFixed(4)} roi=${(e.roi * 100).toFixed(1)}% risk=$${e.risk.toFixed(2)}`);
       return { confirmed: true };
@@ -493,6 +498,7 @@ function createLiveSniper({
       phase: 'filled', order_id: evt.orderId, filled_contracts: book.contracts,
       filled_cost: Math.round(cost * 1e4) / 1e4, filled_fee: Math.round(fee * 1e4) / 1e4,
       fill_ids: book.book.map((r) => r.fill_id), market_ticker: p.rfq.marketTicker || (book.book[0] && book.book[0].ticker) || null,
+      ...(safe(() => hedgeFillColumns(p.hedgeFill, p.hedgeFillAt)) || {}),
     });
     stats.fills += 1; pending.delete(quoteId); byRfq.delete(p.rfq.rfqId);
     alert(formatFillAlert({ d: p.d, contracts: book.contracts, cost, fee, kickoffOf }));
