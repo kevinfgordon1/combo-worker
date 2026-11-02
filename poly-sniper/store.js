@@ -131,12 +131,22 @@ function createPolySniperStore({ supabase, log = console.log, retries = 3, retry
       return out;
     },
     // Today's (ET) realized P&L and new filled risk, for the daily loss stop and the daily risk cap.
-    async dayTotals(dayStartIso) {
+    // Index use (Nov 1): filled_at has no index, so a bare filled_at >= day-start read seq-scanned the whole
+    // ledger (~3.7 GB) every refresh. Every fill comes from an accepted quote (accepted_at is written on
+    // accept, before confirm and fill), so filled_at >= accepted_at; bounding accepted_at by the day start
+    // minus acceptLookbackMs lets Postgres use poly_sniper_ledger_accepted_idx. The filled_at filter is kept,
+    // so the rows returned are the same (measured accept -> first fill lag: max ~61s; lookback is 48h).
+    // realized uses settled_at, which already has its own index (poly_sniper_ledger_settled_idx).
+    async dayTotals(dayStartIso, { acceptLookbackMs = 48 * 3600e3 } = {}) {
       const out = { realized: 0, filledRisk: 0 };
       const a = await supabase.from('poly_sniper_ledger').select('realized_pnl').gte('settled_at', dayStartIso).limit(5000);
       if (a.error) throw new Error(a.error.message);
       for (const r of a.data || []) out.realized += Number(r.realized_pnl) || 0;
-      const b = await supabase.from('poly_sniper_ledger').select('filled_contracts,buy_price').gte('filled_at', dayStartIso).limit(5000);
+      const startMs = Date.parse(dayStartIso);
+      if (!Number.isFinite(startMs)) throw new Error(`dayTotals: bad day start ${dayStartIso}`);
+      const b = await supabase.from('poly_sniper_ledger').select('filled_contracts,buy_price')
+        .gte('accepted_at', new Date(startMs - acceptLookbackMs).toISOString())
+        .gte('filled_at', dayStartIso).limit(5000);
       if (b.error) throw new Error(b.error.message);
       for (const r of b.data || []) out.filledRisk += (Number(r.filled_contracts) || 0) * (1 - (Number(r.buy_price) || 0));
       return out;
