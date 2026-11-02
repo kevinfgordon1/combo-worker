@@ -19,10 +19,12 @@ assert.strictEqual(env.PX_SANDBOX, '1');
 for (const [k, v] of Object.entries(env)) {
   assert.ok(!FORBIDDEN_ENV_RE.test(k), `forbidden key name in [env]: ${k}`);
   assert.ok(!/KEY|SECRET|TOKEN|PRIVATE|PASSPHRASE|PEM/i.test(k), `no credential in [env]: ${k}`);
+  if (k === 'PX_ODDS_RELAY_URL') { assert.strictEqual(v, 'http://kaygo-odds-relay.internal:8787', 'relay over Fly private network only'); continue; }
   if (/^https?:\/\//.test(v)) assert.ok(SANDBOX_HOST_RE.test(new URL(v).hostname), `${k} must be a sandbox host`);
   assert.ok(!/prophetx\.co\b/i.test(v), `${k} points at ProphetX production`);
 }
 const g = checkSandboxEnv({ ...env, PROPHETX_SANDBOX_API_KEY: 'x', PROPHETX_SANDBOX_SECRET_KEY: 'y' });
 assert.ok(g.ok, g.problems.join('; '));
 assert.ok(!checkSandboxEnv({ ...env, PROPHETX_SANDBOX_API_KEY: 'x', PROPHETX_SANDBOX_SECRET_KEY: 'y', PROPHETX_API_BASE: 'https://cash.api.prophetx.co/partner' }).ok, 'production PROPHETX_API_BASE refused');
+assert.ok(!checkSandboxEnv({ ...env, PROPHETX_SANDBOX_API_KEY: 'x', PROPHETX_SANDBOX_SECRET_KEY: 'y', PX_ODDS_RELAY_URL: 'https://evil.example.com' }).ok, 'relay must be *.internal / *.fly.dev');
 console.log('px/fly-toml.test.js ok');

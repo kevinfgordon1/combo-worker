@@ -1,4 +1,4 @@
-// VENDORED verbatim from aibetbuilder origin/main 768ea81 lib/book-depth.js. Do not edit here; re-vendor instead.
+// VENDORED verbatim from aibetbuilder origin/main e2e6697 lib/book-depth.js (#550 wrong-game fix). Do not edit here; re-vendor instead.
 'use strict';
 
 // On-demand prediction-market depth for Promo true-odds lines.
@@ -62,12 +62,44 @@ const KALSHI_SERIES = {
   baseball_mlb: { ML: 'KXMLBGAME', SPR: 'KXMLBSPREAD', TOT: 'KXMLBTOTAL' },
   americanfootball_nfl: { ML: 'KXNFLGAME', SPR: 'KXNFLSPREAD', TOT: 'KXNFLTOTAL' },
   americanfootball_ncaaf: { ML: 'KXNCAAFGAME', SPR: 'KXNCAAFSPREAD', TOT: 'KXNCAAFTOTAL' },
-  // prophetx-worker addition (not in aibetbuilder's copy yet): NBA, same series as Combo Locks #453.
+  // NHL / NBA / NCAAB / soccer spreads + totals were missing, so every leg on
+  // those leagues came back kalshi_series_unknown (no Kalshi depth at all).
+  // Tickers verified against live Kalshi Oct 29 2026 (KXNHLGAME-26OCT29CHIDET,
+  // KXNBASPREAD-26OCT29CLEATL, KXNCAAMBGAME-26NOV01NDVILL, KXEPLTOTAL-26OCT31CFCMUN).
+  icehockey_nhl: { ML: 'KXNHLGAME', SPR: 'KXNHLSPREAD', TOT: 'KXNHLTOTAL' },
   basketball_nba: { ML: 'KXNBAGAME', SPR: 'KXNBASPREAD', TOT: 'KXNBATOTAL' },
-  soccer_epl: { ML: 'KXEPLGAME' },
-  soccer_usa_mls: { ML: 'KXMLSGAME' },
+  basketball_wnba: { ML: 'KXWNBAGAME', SPR: 'KXWNBASPREAD', TOT: 'KXWNBATOTAL' },
+  basketball_ncaab: { ML: 'KXNCAAMBGAME', SPR: 'KXNCAAMBSPREAD', TOT: 'KXNCAAMBTOTAL' },
+  soccer_epl: { ML: 'KXEPLGAME', SPR: 'KXEPLSPREAD', TOT: 'KXEPLTOTAL' },
+  soccer_usa_mls: { ML: 'KXMLSGAME', SPR: 'KXMLSSPREAD', TOT: 'KXMLSTOTAL' },
+  soccer_spain_la_liga: { ML: 'KXLALIGAGAME', SPR: 'KXLALIGASPREAD', TOT: 'KXLALIGATOTAL' },
+  soccer_italy_serie_a: { ML: 'KXSERIEAGAME', SPR: 'KXSERIEASPREAD', TOT: 'KXSERIEATOTAL' },
+  soccer_germany_bundesliga: { ML: 'KXBUNDESLIGAGAME', SPR: 'KXBUNDESLIGASPREAD', TOT: 'KXBUNDESLIGATOTAL' },
+  soccer_france_ligue_one: { ML: 'KXLIGUE1GAME', SPR: 'KXLIGUE1SPREAD', TOT: 'KXLIGUE1TOTAL' },
+  soccer_uefa_champs_league: { ML: 'KXUCLGAME', SPR: 'KXUCLSPREAD', TOT: 'KXUCLTOTAL' },
   mma_mixed_martial_arts: { ML: 'KXUFCFIGHT' },
 };
+
+// Kalshi names NHL/NBA teams by city only. Shared-city labels ("New York I",
+// "Los Angeles C") tokenize to bare city words, which never identify a team,
+// so expand them to the full franchise name before matching.
+const KALSHI_LABEL_ALIASES = {
+  icehockey_nhl: {
+    'los angeles': 'Los Angeles Kings',
+    'new york i': 'New York Islanders',
+    'new york r': 'New York Rangers',
+  },
+  basketball_nba: {
+    'los angeles c': 'Los Angeles Clippers',
+    'los angeles l': 'Los Angeles Lakers',
+    'new york': 'New York Knicks',
+  },
+};
+function kalshiTeamLabel(sport, raw) {
+  const s = String(raw || '').trim();
+  const map = KALSHI_LABEL_ALIASES[String(sport || '')];
+  return (map && map[s.toLowerCase()]) || s;
+}
 
 const STOP = new Set([
   'the', 'and', 'vs', 'versus', 'at', 'over', 'under', 'total', 'points', 'scored',
@@ -95,7 +127,33 @@ const MAX_EVENT_START_GAP_MS = 36 * 60 * 60 * 1000;
 
 const catalogCache = new Map();
 
-function fetchJson(url, { method = 'GET', headers = {}, body, timeoutMs = FETCH_MS } = {}) {
+// A venue call that failed (timeout, network, 429, 5xx) says nothing about
+// liquidity. Loaders throw this so the catalog cache never stores an empty
+// "no events" answer from a rate-limited burst (that cached miss used to make
+// every leg on the venue look thin for a full minute — the intermittent
+// "N picks hidden by Hide low liquidity").
+class TransientDepthError extends Error {
+  constructor(msg) { super(msg); this.transient = true; }
+}
+function isTransientStatus(status) {
+  return status === 0 || status === 408 || status === 425 || status === 429 || status >= 500;
+}
+function failIfTransient(res, what) {
+  if (res && !res.ok && isTransientStatus(res.status)) throw new TransientDepthError(`${what}_${res.status}`);
+}
+const RETRY_DELAY_MS = 350;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// One retry with a short backoff on transient statuses.
+async function fetchJson(url, opts = {}) {
+  const first = await fetchJsonOnce(url, opts);
+  if (first.ok || !isTransientStatus(first.status)) return first;
+  const ra = Number(first.retryAfter);
+  await sleep(isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 1500) : RETRY_DELAY_MS);
+  return fetchJsonOnce(url, opts);
+}
+
+function fetchJsonOnce(url, { method = 'GET', headers = {}, body, timeoutMs = FETCH_MS } = {}) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   return fetch(url, {
@@ -109,7 +167,8 @@ function fetchJson(url, { method = 'GET', headers = {}, body, timeoutMs = FETCH_
     if (text) {
       try { json = JSON.parse(text); } catch (_) { json = null; }
     }
-    return { ok: r.ok, status: r.status, json, text };
+    const retryAfter = r.headers && typeof r.headers.get === 'function' ? r.headers.get('retry-after') : null;
+    return { ok: r.ok, status: r.status, json, text, retryAfter };
   }).catch((e) => ({ ok: false, status: 0, json: null, text: String(e && e.message || e) }))
     .finally(() => clearTimeout(t));
 }
@@ -130,7 +189,8 @@ function cached(key, loader) {
 }
 
 function nameTokens(s) {
-  const raw = String(s || '').toLowerCase()
+  // "Montréal Canadiens" → montreal (accents used to split it into montr + al).
+  const raw = String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
     .filter(Boolean);
@@ -226,9 +286,51 @@ function isDrawLabel(lab) {
   return /\b(draw|tie)\b/i.test(String(lab || ''));
 }
 
-function eventMatchesTeams(title, away, home) {
+// Title tokens left after one team's distinctive words are used up (one
+// occurrence per needle token), so the other team cannot match the same word.
+function withoutHits(hayTokens, needleTokens) {
+  const want = distinctiveTokens(needleTokens);
+  const used = new Set();
+  for (const needle of want) {
+    const i = (hayTokens || []).findIndex((h, idx) => !used.has(idx) && h === needle);
+    if (i >= 0) used.add(i);
+  }
+  return (hayTokens || []).filter((_, idx) => !used.has(idx));
+}
+
+// Both teams must match DIFFERENT title words. Texas A&M-CC @ Texas State
+// (Nov 2 2026) used to match Novig's "Texas A&M Commerce @ Oklahoma" because
+// the one "texas" in the title counted for both teams; the leg then priced off
+// Texas A&M-Commerce's +9900 (Oklahoma 99c) book. Each team must still match after
+// the other team's words are used up, in both orders; score = the better order.
+function eventMatchScore(title, away, home) {
   const t = nameTokens(title);
-  return tokensHit(t, nameTokens(away)) && tokensHit(t, nameTokens(home));
+  const a = nameTokens(away);
+  const h = nameTokens(home);
+  let best = 0;
+  for (const [x, y] of [[a, h], [h, a]]) {
+    const sx = scoreTokenSets(t, x);
+    const sy = sx ? scoreTokenSets(withoutHits(t, x), y) : 0;
+    if (!sx || !sy) return 0;
+    if (sx + sy > best) best = sx + sy;
+  }
+  return best;
+}
+
+function eventMatchesTeams(title, away, home) {
+  return eventMatchScore(title, away, home) > 0;
+}
+
+// Only the best-scoring title matches (full names beat partial ones) go on to
+// the start-time pick.
+function bestScoringEvents(events, titleOf, away, home) {
+  let top = 0;
+  const scored = [];
+  for (const e of events || []) {
+    const sc = eventMatchScore(titleOf(e), away, home);
+    if (sc > 0) { scored.push({ e, sc }); if (sc > top) top = sc; }
+  }
+  return scored.filter((x) => x.sc === top).map((x) => x.e);
 }
 
 // Several events can name the same team (NYG @ HOU next week, NO @ NYG this
@@ -371,6 +473,8 @@ async function fetchKalshiSeriesEvents(seriesTicker) {
       const url = `${KALSHI_BASE}/events?series_ticker=${encodeURIComponent(seriesTicker)}`
         + `&status=open&with_nested_markets=true&limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
       const res = await fetchJson(url);
+      // Any failed page: do not cache a missing or partial catalog.
+      failIfTransient(res, 'kalshi_catalog');
       const batch = res.ok && res.json && res.json.events;
       if (Array.isArray(batch)) batch.forEach((e) => events.push(e));
       cursor = (res.json && res.json.cursor) || '';
@@ -380,23 +484,52 @@ async function fetchKalshiSeriesEvents(seriesTicker) {
   });
 }
 
-// Fighters rematch, so a UFC Kalshi event must also be on the fight's date
-// (ticker KXUFCFIGHT-26OCT17...; within 1 day of commence_time for UTC/ET skew).
+// Kalshi event tickers carry the game date (KXNHLGAME-26OCT29CHIDET). Teams
+// meet more than once inside the open window (CHI@DET twice a week in NHL/NBA,
+// MLB series, UFC rematches), so the event must be on the leg's date (within
+// 1.5 days for UTC/ET skew and NCAAF's off-by-one ML tickers) and the closest
+// such event wins. UFC still requires a parseable date; other leagues with no
+// date in the ticker fall back to the first title match.
 const KALSHI_MONTHS = { JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5, JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11 };
+const KALSHI_DATE_WINDOW_MS = 1.5 * 24 * 60 * 60 * 1000;
+function kalshiEventDateMs(ev) {
+  const m = /-(\d{2})([A-Z]{3})(\d{2})/.exec(String((ev && ev.event_ticker) || ''));
+  if (!m || KALSHI_MONTHS[m[2]] == null) return null;
+  return Date.UTC(2000 + Number(m[1]), KALSHI_MONTHS[m[2]], Number(m[3]));
+}
+function kalshiEventDateGap(ev, sel) {
+  const startMs = sel && sel.commence_time ? Date.parse(sel.commence_time) : NaN;
+  const evMs = kalshiEventDateMs(ev);
+  if (!isFinite(startMs) || evMs == null) return null;
+  return Math.abs(evMs - startMs);
+}
 function kalshiEventDateOk(ev, sel) {
-  if (!sel || sel.sport !== 'mma_mixed_martial_arts' || !sel.commence_time) return true;
-  const m = /-(\d{2})([A-Z]{3})(\d{2})/.exec(String(ev.event_ticker || ''));
-  if (!m || KALSHI_MONTHS[m[2]] == null) return false;
-  const evMs = Date.UTC(2000 + Number(m[1]), KALSHI_MONTHS[m[2]], Number(m[3]));
-  const startMs = Date.parse(sel.commence_time);
-  if (!isFinite(startMs)) return false;
-  return Math.abs(evMs - startMs) <= 1.5 * 24 * 60 * 60 * 1000;
+  if (!sel || !sel.commence_time) return true;
+  const gap = kalshiEventDateGap(ev, sel);
+  if (gap == null) return sel.sport !== 'mma_mixed_martial_arts';
+  return gap <= KALSHI_DATE_WINDOW_MS;
+}
+
+function kalshiEventText(ev, sport) {
+  const labels = (ev.markets || []).map((m) => kalshiTeamLabel(sport, m.yes_sub_title || ''));
+  return `${ev.title || ''} ${ev.sub_title || ''} ${ev.event_ticker || ''} ${labels.join(' ')}`;
+}
+
+function pickKalshiEvent(sel, events) {
+  const hits = (events || []).filter((ev) => eventMatchesTeams(kalshiEventText(ev, sel.sport), sel.away, sel.home)
+    && kalshiEventDateOk(ev, sel));
+  if (hits.length <= 1) return hits[0] || null;
+  let best = hits[0];
+  let bestGap = kalshiEventDateGap(best, sel);
+  for (const ev of hits.slice(1)) {
+    const gap = kalshiEventDateGap(ev, sel);
+    if (gap != null && (bestGap == null || gap < bestGap)) { best = ev; bestGap = gap; }
+  }
+  return best;
 }
 
 function matchKalshiMarket(sel, events) {
-  const titleHit = (ev) => eventMatchesTeams(`${ev.title || ''} ${ev.sub_title || ''} ${ev.event_ticker || ''}`, sel.away, sel.home)
-    && kalshiEventDateOk(ev, sel);
-  const ev = (events || []).find(titleHit);
+  const ev = pickKalshiEvent(sel, events);
   if (!ev) return null;
   const markets = ev.markets || [];
   if (sel.market === 'TOT') {
@@ -410,7 +543,7 @@ function matchKalshiMarket(sel, events) {
   }
   if (sel.market === 'ML') {
     const buySide = sel.buySide === 'no' ? 'no' : 'yes';
-    const marketLabel = (m) => m.yes_sub_title || m.subtitle || m.title || '';
+    const marketLabel = (m) => kalshiTeamLabel(sel.sport, m.yes_sub_title || m.subtitle || m.title || '');
     if (/^draw$/i.test(sel.team)) {
       const drawM = markets.find((m) => isDrawLabel(marketLabel(m)));
       return drawM ? { ticker: drawM.ticker, buySide, market: drawM } : null;
@@ -422,11 +555,12 @@ function matchKalshiMarket(sel, events) {
     const wantTeam = nameTokens(sel.team);
     for (const m of markets) {
       const lab = m.yes_sub_title || m.subtitle || m.title || '';
-      const parsed = /^(.*?)\s+wins by over\s+([\d.]+)/i.exec(lab);
+      // NHL/NBA/NFL: "X wins by over 1.5"; soccer: "X wins by more than 1.5 goals".
+      const parsed = /^(.*?)\s+wins by (?:over|more than)\s+([\d.]+)/i.exec(lab);
       if (!parsed) continue;
       const favLine = -parseFloat(parsed[2]);
       const dogLine = parseFloat(parsed[2]);
-      const favTokens = nameTokens(parsed[1]);
+      const favTokens = nameTokens(kalshiTeamLabel(sel.sport, parsed[1]));
       if (tokensHit(favTokens, wantTeam) && lineEqual(sel.line, favLine)) {
         return { ticker: m.ticker, buySide: 'yes' };
       }
@@ -474,6 +608,7 @@ async function fetchKalshiDepth(sel) {
   const hit = matchKalshiMarket(sel, events);
   if (!hit) return { levels: [], reason: 'kalshi_unmatched' };
   const res = await fetchJson(`${KALSHI_BASE}/markets/${encodeURIComponent(hit.ticker)}/orderbook?depth=8`);
+  failIfTransient(res, 'kalshi_orderbook');
   const fp = res.ok && res.json && res.json.orderbook_fp;
   if (!fp) return { levels: [], reason: 'kalshi_orderbook_empty' };
   return { levels: sortAsksBestFirst(kalshiAsksFromOrderbook(fp, hit.buySide), 'kalshi'), reason: 'ok' };
@@ -587,12 +722,50 @@ function teamSearchPhrases(away, home) {
   const h = nameTokens(home);
   const compact = (t) => (t.length >= 3 ? t.slice(0, 2) : t).join(' ');
   const first = (t) => t[0] || '';
+  const last = (t) => t[t.length - 1] || '';
+  // Nickname / full-name phrases first. City-only phrases ("chicago detroit")
+  // return other sports' games (Tigers vs Cubs) ahead of the real one.
   return [...new Set([
+    `${away} ${home}`.trim(),
+    `${last(a)} ${last(h)}`.trim(),
     `${compact(a)} ${compact(h)}`.trim(),
     `${first(a)} ${compact(h)}`.trim(),
     `${first(a)} ${first(h)}`.trim(),
-    `${away} ${home}`.trim(),
   ])].filter(Boolean);
+}
+
+// Polymarket (gamma) event slug prefixes per Odds API sport key. A leg's
+// event must come from its own league: "chicago detroit" also matches
+// mlb-det-chc-*, wnba-*, mls-* events. Unknown sports skip the prefix check.
+const POLY_SLUG_PREFIXES = {
+  icehockey_nhl: ['nhl-'],
+  basketball_nba: ['nba-'],
+  basketball_wnba: ['wnba-'],
+  basketball_ncaab: ['cbb-'],
+  basketball_wncaab: ['cwbb-'],
+  americanfootball_nfl: ['nfl-'],
+  americanfootball_ncaaf: ['cfb-'],
+  baseball_mlb: ['mlb-'],
+};
+
+function polyEventStart(e) {
+  return (e && (e.startTime || e.endDate)) || null;
+}
+
+// Event must be: the leg's two teams, still open, the leg's league, and the
+// game closest to commence_time (within MAX_EVENT_START_GAP_MS).
+function polyEventCandidateOk(e, sel) {
+  if (!e || e.closed === true) return false;
+  if (!eventMatchesTeams(`${e.title || ''} ${e.slug || ''}`, sel.away, sel.home)) return false;
+  const prefixes = POLY_SLUG_PREFIXES[String(sel.sport || '')];
+  if (prefixes && !prefixes.some((pre) => String(e.slug || '').startsWith(pre))) return false;
+  return true;
+}
+
+function pickPolymarketEvent(events, sel) {
+  const ok = (events || []).filter((e) => polyEventCandidateOk(e, sel));
+  if (!ok.length) return null;
+  return pickEventByStart(ok, sel.commence_time, polyEventStart);
 }
 
 async function fetchPolymarketDepth(sel) {
@@ -601,18 +774,22 @@ async function fetchPolymarketDepth(sel) {
   if (!phrases.length) return { levels: [], reason: 'polymarket_no_query' };
   let ev = null;
   for (const phrase of phrases) {
-    const search = await fetchJson(`${POLY_GAMMA}/public-search?q=${encodeURIComponent(phrase)}`);
+    const search = await fetchJson(`${POLY_GAMMA}/public-search?q=${encodeURIComponent(phrase)}&events_status=active&limit_per_type=20`);
+    failIfTransient(search, 'polymarket_search');
     const events = (search.ok && search.json && (search.json.events || search.json.data)) || [];
-    ev = events.find((e) => eventMatchesTeams(`${e.title || ''} ${e.slug || ''}`, sel.away, sel.home));
+    ev = pickPolymarketEvent(events, sel);
     if (ev) break;
   }
   if (!ev) return { levels: [], reason: 'polymarket_unmatched_event' };
   let markets = ev.markets || [];
   if (!markets.length && ev.slug) {
     const full = await fetchJson(`${POLY_GAMMA}/events?slug=${encodeURIComponent(ev.slug)}`);
+    failIfTransient(full, 'polymarket_event');
     const first = Array.isArray(full.json) ? full.json[0] : full.json;
     markets = (first && first.markets) || [];
   }
+  // A resolved/closed market's leftover CLOB asks are not a live price.
+  markets = markets.filter((m) => m && m.closed !== true && m.acceptingOrders !== false);
   let token = null;
   if (sel.market === 'ML' && !/^draw$/i.test(sel.team)) {
     const candidates = [];
@@ -637,6 +814,7 @@ async function fetchPolymarketDepth(sel) {
   }
   if (!token) return { levels: [], reason: 'polymarket_unmatched_market' };
   const book = await fetchJson(`${POLY_CLOB}/book?token_id=${encodeURIComponent(token)}`);
+  failIfTransient(book, 'polymarket_book');
   if (!book.ok || !book.json) return { levels: [], reason: 'polymarket_book_empty' };
   return { levels: sortAsksBestFirst(polymarketAsksFromBook(book.json), 'polymarket'), reason: 'ok' };
 }
@@ -707,6 +885,7 @@ async function prophetXAuthHeader() {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ access_key: access, secret_key: secret }),
     });
+    failIfTransient(res, 'prophetx_auth');
     return (res.ok && res.json && res.json.data && res.json.data.access_token) || null;
   });
 }
@@ -718,6 +897,7 @@ async function fetchProphetXDepth(sel) {
     const res = await fetchJson(`${PROPHETX_BASE}/affiliate/get_sport_events`, {
       headers: { authorization: auth },
     });
+    failIfTransient(res, 'prophetx_events');
     const data = res.ok && res.json && (res.json.data || res.json);
     return (data && (data.sport_events || data.events)) || [];
   });
@@ -733,6 +913,7 @@ async function fetchProphetXDepth(sel) {
     `${PROPHETX_BASE}/v3/affiliate/get_markets?event_id=${encodeURIComponent(ev.event_id)}&market_types=${type}`,
     { headers: { authorization: auth } },
   );
+  failIfTransient(res, 'prophetx_markets');
   const markets = (res.ok && res.json && (Array.isArray(res.json.data) ? res.json.data : (res.json.data && res.json.data[ev.event_id]))) || [];
   if (sel.market === 'ML' && !/^draw$/i.test(sel.team)) {
     const candidates = [];
@@ -850,8 +1031,10 @@ async function fetchNovigCatalogEvents(league) {
     const res = await fetchJson(`${NOVIG_BASE}/v3/public/catalog/events?league=${encodeURIComponent(league)}&limit=100${after ? `&after=${encodeURIComponent(after)}` : ''}`);
     const items = (res.ok && res.json && Array.isArray(res.json.items)) ? res.json.items : null;
     if (!items) {
-      // First page failed: unknown, not empty — do not cache it.
-      if (!out.length) { const e = new Error('novig_catalog_unavailable'); e.novigCatalog = true; throw e; }
+      // Any failed page: unknown, not empty — do not cache it.
+      if (!out.length || isTransientStatus(res.status)) {
+        const e = new TransientDepthError('novig_catalog_unavailable'); e.novigCatalog = true; throw e;
+      }
       break;
     }
     out.push(...items);
@@ -869,13 +1052,14 @@ async function fetchNovigDepth(sel) {
   const events = await cached(`novig:events:${league}`, () => fetchNovigCatalogEvents(league));
   const live = (e) => e.status === 'OPEN_PREGAME' || e.status === 'OPEN_INGAME';
   const ev = pickEventByStart(
-    events.filter((e) => live(e) && eventMatchesTeams(e.description || '', sel.away, sel.home)),
+    bestScoringEvents(events.filter(live), (e) => e.description || '', sel.away, sel.home),
     sel.commence_time,
     (e) => Number(e.startsTs),
   );
   if (!ev) return { levels: [], reason: 'novig_unmatched_event' };
   const markets = await cached(`novig:markets:${ev.eventId}`, async () => {
     const res = await fetchJson(`${NOVIG_BASE}/v3/public/catalog/markets?event=${encodeURIComponent(ev.eventId)}&marketType=MONEY,SPREAD,TOTAL&limit=500`);
+    failIfTransient(res, 'novig_markets');
     return (res.ok && res.json && Array.isArray(res.json.items)) ? res.json.items : [];
   });
   const [away, home] = String(ev.description || '').split(' @ ');
@@ -890,6 +1074,7 @@ async function fetchNovigDepth(sel) {
     const outcome = novigPickOutcome(sel, m, codes);
     if (!outcome) continue;
     const res = await fetchJson(`${NOVIG_BASE}/v3/public/catalog/markets/${encodeURIComponent(m.marketId)}/book`);
+    failIfTransient(res, 'novig_book');
     if (!res.ok || !res.json) return { levels: [], reason: `novig_book_${res.status}` };
     const levels = sortAsksBestFirst(novigAsksFromBook(res.json, m, outcome.outcomeId, novigLiveFeeRate(ev, m, sel)), 'novig');
     return { levels, reason: levels.length ? 'ok' : 'novig_empty_book' };
@@ -917,7 +1102,11 @@ async function fetchPolymarketPlayerDepth(sel) {
   const date = sel.commence_time ? playerTd.easternDate(sel.commence_time) : '';
   const slug = spec && sel.away && sel.home && date ? spec.slug(sel.away, sel.home, date) : '';
   if (!slug) return { levels: [], reason: 'polymarket_no_slug' };
-  const ev = await cached(`pmus-ev:${slug}`, () => fetchJson(`${POLY_US_GATEWAY}/v1/events/slug/${encodeURIComponent(slug)}`));
+  const ev = await cached(`pmus-ev:${slug}`, async () => {
+    const r = await fetchJson(`${POLY_US_GATEWAY}/v1/events/slug/${encodeURIComponent(slug)}`);
+    failIfTransient(r, 'polymarket_us_event');
+    return r;
+  });
   const event = ev && ev.ok && ev.json ? (ev.json.event || ev.json) : null;
   if (!event) return { levels: [], reason: 'polymarket_unmatched_event' };
   const want = nameTokens(sel.player);
@@ -930,6 +1119,7 @@ async function fetchPolymarketPlayerDepth(sel) {
   });
   if (!market || !market.slug) return { levels: [], reason: 'polymarket_unmatched_market' };
   const book = await fetchJson(`${POLY_US_GATEWAY}/v1/markets/${encodeURIComponent(market.slug)}/book`);
+  failIfTransient(book, 'polymarket_us_book');
   if (!book.ok || !book.json) return { levels: [], reason: 'polymarket_book_empty' };
   return { levels: noLevelsFromPolymarketBook(book.json), reason: 'ok' };
 }
@@ -944,7 +1134,8 @@ async function fetchVenueDepth(sel) {
     if (sel.venue === 'novig') return await fetchNovigDepth(sel);
     return { levels: [], reason: 'venue_unsupported' };
   } catch (e) {
-    return { levels: [], reason: `error:${e && e.message || e}` };
+    // Any thrown error is "could not read", never "thin".
+    return { levels: [], reason: `error:${e && e.message || e}`, transient: true };
   }
 }
 
@@ -963,6 +1154,7 @@ async function resolveLegsDepth(legs) {
       venue: (sel && sel.venue) || String(leg.bestOppBook || ''),
       levels: fetched.levels || [],
       reason: fetched.reason || 'ok',
+      ...(fetched.transient ? { transient: true } : {}),
     };
   }));
   return results;
@@ -972,8 +1164,11 @@ module.exports = {
   DEPTH_VENUES,
   MAX_LEGS,
   KALSHI_SERIES,
+  kalshiTeamLabel,
+  pickKalshiEvent,
   parseOppSelection,
   eventMatchesTeams,
+  eventMatchScore,
   pickEventByStart,
   scoreTokenSets,
   lineEqual,
@@ -1002,7 +1197,11 @@ module.exports = {
   novigLiveFeeRate,
   resolveLegsDepth,
   fetchVenueDepth,
+  isTransientStatus,
+  TransientDepthError,
   depthKey,
   teamSearchPhrases,
+  pickPolymarketEvent,
+  polyEventCandidateOk,
   _resetCatalogCache() { catalogCache.clear(); },
 };

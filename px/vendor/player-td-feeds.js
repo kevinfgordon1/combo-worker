@@ -1,4 +1,4 @@
-// VENDORED verbatim from aibetbuilder origin/main 768ea81 lib/player-td-feeds.js. Do not edit here; re-vendor instead.
+// VENDORED verbatim from aibetbuilder origin/main e2e6697 lib/player-td-feeds.js. Do not edit here; re-vendor instead.
 'use strict';
 
 // First-party NFL player touchdown quotes for the New Odds Board.
@@ -35,7 +35,8 @@ const UNDERDOG_BASE = 'https://api.underdogfantasy.com';
 const UNDERDOG_CLIENT_VERSION = '20260918170103';
 const UNDERDOG_PRODUCT = 'fantasy';
 const UNDERDOG_STATE_CONFIG_ID = 'f8996742-f10c-4d32-955a-dcbcaa5dc5c0';
-const UNDERDOG_PRODUCT_EXPERIENCE_ID = '018e1234-5678-9abc-def0-123456789009';
+// Phone experience (see lib/underdog-lobby.js DEFAULT_PRODUCT_EXPERIENCE_ID).
+const UNDERDOG_PRODUCT_EXPERIENCE_ID = 'b34dfd93-d0e8-4da3-8bf4-45c15c548dec';
 const UNDERDOG_TD_FILTER_ID = '8ccbe039-9d73-4513-ac40-200d2eb5f09e';
 
 // First TD is its own series. Anytime and 2+ share KXNFLTD (ticker suffix).

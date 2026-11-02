@@ -35,6 +35,9 @@ kill_timeout = "10s"
   # Vendored book-depth.js defaults its ProphetX venue to production; pin it to sandbox too
   # (it is unused anyway: no production ProphetX key is ever on this app).
   PROPHETX_API_BASE = "https://api.sandbox.prophetx.dev/partner"
+  # Polymarket US + ProphetX opposing ladders: odds relay read-only /board over Fly private network.
+  # The relay holds the production ProphetX key (read-only); this app never does.
+  PX_ODDS_RELAY_URL = "http://kaygo-odds-relay.internal:8787"
   PX_MAX_RISK = "1000"        # Kevin Oct 20: $1,000 risk cap per order (partial fills still count as clean)
   PX_OFFER_SIGN = "participant"
   MLB_ENABLED = "0"           # Kevin Oct 30: MLB season over

@@ -30,6 +30,13 @@ function confirmPriceOf(p) {
   return null;
 }
 
+// "k +189 n +203 pm - px +195": each venue's $500 opposing price (fee-included), '-' = none.
+const VENUE_ABBR = { kalshi: 'k', novig: 'n', polymarket: 'pm', prophetx: 'px' };
+function venueTxt(v) {
+  if (!v || typeof v !== 'object' || v.opp) return '-';
+  return Object.entries(v).map(([k, a]) => `${VENUE_ABBR[k] || k} ${a == null ? '-' : (a > 0 ? '+' : '') + a}`).join(' ');
+}
+
 function createRunner({ env = process.env, logger = console, fetch: f = globalThis.fetch } = {}) {
   const g = checkSandboxEnv(env);
   if (!g.ok) throw new Error(`[PX-GUARD] refusing to start: ${g.problems.join('; ')}`);
@@ -45,7 +52,8 @@ function createRunner({ env = process.env, logger = console, fetch: f = globalTh
   };
   const session = createSession({ apiBase: g.apiBase, accessKey: env.PROPHETX_SANDBOX_API_KEY, secretKey: env.PROPHETX_SANDBOX_SECRET_KEY, fetch: f, logger });
   const catalog = createCatalog({ apiBase: g.apiBase, parlayBase: g.parlayBase, session, fetch: f, logger });
-  const pricer = createPricer({ logger });
+  // Polymarket US + ProphetX ladders come from the odds relay's read-only /board (no key here).
+  const pricer = createPricer({ logger, relayBase: env.PX_ODDS_RELAY_URL || '', relayPollMs: num(env.PX_RELAY_POLL_MS, 5000), fetch: f });
   const store = createStore({ url: env.SUPABASE_URL, key: env.SUPABASE_SERVICE_KEY || env.SUPABASE_SERVICE_ROLE_KEY, fetch: f, logger });
   const quotes = new Map(); // parlay_id → { legs, priced, at }
   const firstSeen = new Set();
@@ -72,7 +80,7 @@ function createRunner({ env = process.env, logger = console, fetch: f = globalTh
   async function priceLegs(infos) {
     const got = await withTimeout(Promise.all(infos.map((i) => pricer.legPrice(i))), cfg.priceTimeoutMs);
     if (!got) return null;
-    return infos.map((info, i) => ({ strike_id: info.strikeId, info, p: got[i] && got[i].p, at: got[i] && got[i].at, best: got[i] && got[i].best }));
+    return infos.map((info, i) => ({ strike_id: info.strikeId, info, p: got[i] && got[i].p, at: got[i] && got[i].at, best: got[i] && got[i].best, venues: got[i] && got[i].venues }));
   }
 
   async function onAsk(data) {
@@ -112,12 +120,12 @@ function createRunner({ env = process.env, logger = console, fetch: f = globalTh
     }
     store.bump('quoted');
     quotes.set(p.parlay_id, { legs, priced, price, at: Date.now() });
-    const legTxt = legs.map((l) => `${l.info.team} ${Q.participantAmericanFloor(l.p) > 0 ? '+' : ''}${Q.participantAmericanFloor(l.p)}(${l.best.venue})`).join(' | ');
+    const legTxt = legs.map((l) => `${l.info.team} ${Q.participantAmericanFloor(l.p) > 0 ? '+' : ''}${Q.participantAmericanFloor(l.p)}(${l.best.venue}; opp ${venueTxt(l.venues)})`).join(' | ');
     logger.log(`[PX] QUOTE ${p.parlay_id} ${legs.length}L fair ${priced.fairAmerican > 0 ? '+' : ''}${priced.fairAmerican} → offer ${priced.participantAmerican > 0 ? '+' : ''}${priced.participantAmerican} (sent price=${price} valid=${Math.round(cfg.validMs / 1000)}s) max_risk $${cfg.maxRisk} qty $${p.quantity ?? p.stake} :: ${legTxt}`);
     store.insertQuote({
       parlay_id: p.parlay_id,
       n_legs: legs.length,
-      legs: legs.map((l) => ({ s: l.strike_id, t: l.info.team, p: Number(l.p.toFixed(5)), v: l.best.venue, o: l.best.american })),
+      legs: legs.map((l) => ({ s: l.strike_id, t: l.info.team, p: Number(l.p.toFixed(5)), v: l.best.venue, o: l.best.american, vs: l.venues || undefined })),
       stake: num(p.quantity != null ? p.quantity : p.stake, null),
       fair_american: priced.fairAmerican,
       quote_american: priced.participantAmerican,
@@ -220,7 +228,7 @@ function createRunner({ env = process.env, logger = console, fetch: f = globalTh
   let pusher = null;
   const timers = [];
   async function start() {
-    logger.log(`[PX] prophetx-worker SANDBOX api=${new URL(g.apiBase).host} parlay=${new URL(g.parlayBase).host} max_risk=$${cfg.maxRisk} offer_sign=${cfg.offerSign} db=${store.enabled ? 'on' : 'off'}`);
+    logger.log(`[PX] prophetx-worker SANDBOX api=${new URL(g.apiBase).host} parlay=${new URL(g.parlayBase).host} max_risk=$${cfg.maxRisk} offer_sign=${cfg.offerSign} db=${store.enabled ? 'on' : 'off'} relay=${env.PX_ODDS_RELAY_URL ? new URL(env.PX_ODDS_RELAY_URL).host : 'off'}`);
     for (let i = 0; ; i += 1) {
       try { await session.token(); break; } catch (e) {
         if (i >= 8) throw e;
@@ -246,7 +254,7 @@ function createRunner({ env = process.env, logger = console, fetch: f = globalTh
       logger.log(`[PX-STATS] ${JSON.stringify(store.counts())} ws=${pusher.state.connected ? 'up' : 'down'} reconnects=${pusher.state.reconnects} auth=${JSON.stringify({ logins: session.stats().logins, refreshes: session.stats().refreshes })} unsupported_top=${[...unsupported.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, v]) => `${k}:${v}`).join(',')}`);
     }, 60_000));
   }
-  function stop() { timers.forEach(clearInterval); if (pusher) pusher.stop(); return store.flushStats(); }
+  function stop() { timers.forEach(clearInterval); if (pusher) pusher.stop(); pricer.stop(); return store.flushStats(); }
   return { start, stop, onEvent, store, quotes, catalog, cfg };
 }
 

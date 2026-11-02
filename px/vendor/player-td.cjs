@@ -1,4 +1,4 @@
-// VENDORED verbatim from aibetbuilder origin/main 768ea81 lib/player-td.cjs. Do not edit here; re-vendor instead.
+// VENDORED verbatim from aibetbuilder origin/main e2e6697 lib/player-td.cjs. Do not edit here; re-vendor instead.
 // Generated from lib/player-td.mjs with esbuild (CommonJS for Node API routes). Do not edit by hand.
 // Source sha256: 8c2c79af16b577655b98bec0ec780a1e44f38b196755c16e238c191c4fcd0a7d
 var __defProp = Object.defineProperty;

@@ -16,6 +16,8 @@ Every callback URL from ProphetX is checked to be a sandbox host before we POST 
 | `PROPHETX_SANDBOX_API_KEY`, `PROPHETX_SANDBOX_SECRET_KEY` | sandbox access/secret key pair |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` | logging (optional; without them rows are logged to stdout) |
 | `PROPHETX_API_BASE` | optional; if set it must be a sandbox host (guard) |
+| `PX_ODDS_RELAY_URL` | odds relay for Polymarket US + ProphetX ladders (GET only; `*.internal` / `*.fly.dev` only, guard) |
+| `PX_RELAY_POLL_MS` (default 5000) | relay board poll interval |
 | `PX_MAX_RISK` (default 10; Fly sets 1000) | `max_risk` per offer, $ |
 | `PX_OFFER_SIGN` (`participant` default / `mm`) | sign convention for the offer `price` |
 
@@ -28,13 +30,30 @@ Every callback URL from ProphetX is checked to be a sandbox host before we POST 
    else reject → `price_probability` legs scaled so their product = implied(−confirmed_price) (docs "mirror").
 5. `order.finalized` / `order.settled` patch the row.
 
-## Pricing (unchanged inverse bet method)
-Leg fair = sign-flip of the opponent's best fee-included price walked to **$500 profit** across
-Kalshi / Polymarket / Novig public books (`px/vendor/book-depth.js` + `blendAskLadder.cjs`, vendored
-verbatim from aibetbuilder 768ea81; `ourTrueFromOpponents` from `unhedged-quote.js`). A venue whose
-ladder cannot fund $500 is ignored. Leg prices older than **15 s** are never quoted. Parlay fair =
-product of legs; offer = fair × `DEFAULT_QUOTE_MULT` (1.05), participant American floored in our favor.
-ProphetX production depth is NOT a source (needs a production key this process must not hold).
+## Pricing (inverse bet method, best of four venues — Kevin Nov 2 2026)
+Leg fair = sign-flip of the BEST opponent price walked to **$500 profit**, across all four venues, each fee-included:
+
+| Venue | Source | Fee |
+| --- | --- | --- |
+| Kalshi | public orderbook (`px/vendor/book-depth.js`) | taker 0.07·p·(1−p) (sports series are standard quadratic; `series-fee.js` is maker fees for combos) |
+| Novig | public v3 book (`book-depth.js`) | pregame $0 (live fee per book-depth) |
+| Polymarket US | odds relay `GET /board?venue=polymarket` (+ `/lines` for spreads/totals) | 0.0695·p·(1−p) |
+| ProphetX | odds relay `GET /board?venue=prophetx` (production prices, read-only) | 2% of net winnings |
+
+The relay (`PX_ODDS_RELAY_URL`, Fly private network) holds the production ProphetX key read-only; **this
+process never holds it**. book-depth's own `polymarket` path is international Polymarket, so it is not used.
+Relay boards are polled in the background (`PX_RELAY_POLL_MS`, default 5 s, only boards a leg asked for in
+the last 10 min). Freshness: Polymarket US = max(confirmed_at, updated_at); ProphetX = board read time while
+its feed is flowing (newest board change within 15 s), else that quote's updated_at. Any venue price older
+than **15 s** is ignored. A venue whose ladder cannot fund $500 is ignored. Parlay fair = product of legs;
+offer = fair × `DEFAULT_QUOTE_MULT` (1.05), participant American floored in our favor.
+
+Game matching (aibetbuilder #550, vendored at e2e6697): both teams must match DIFFERENT title words, the
+strongest name match wins before the start-time compare (no more "Texas" counting for two teams).
+Rogue-ladder guard (#550): a venue ladder is dropped if its top is 20+ points, or 3x+ in odds terms, better
+than that venue's own feed price (relay board top for Kalshi/Novig), or sits at ≤2c when the reference is not
+a long shot. With no feed price the reference is the median top of the other venues.
+Logs show every venue's $500 price per leg (`opp k +189 n +203 pm +181 px +196`); rows store them in `legs[].vs`.
 
 ## No quote (silent decline)
 <2 or >8 legs, any strike we did not register, two legs from one game (correlated / SGP), game started,

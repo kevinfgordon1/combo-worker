@@ -33,6 +33,11 @@ function checkSandboxEnv(env = process.env) {
     const u = (() => { try { return new URL(env.PROPHETX_API_BASE); } catch (_) { return null; } })();
     if (!u || u.protocol !== 'https:' || !SANDBOX_HOST_RE.test(u.hostname)) problems.push('PROPHETX_API_BASE must be an https sandbox.prophetx.dev host');
   }
+  // Odds relay (read-only GET /board for Polymarket US + ProphetX prices): Fly private network or fly.dev only.
+  if (env.PX_ODDS_RELAY_URL) {
+    const u = (() => { try { return new URL(env.PX_ODDS_RELAY_URL); } catch (_) { return null; } })();
+    if (!u || !/^https?:$/.test(u.protocol) || !/(^|\.)(internal|fly\.dev)$/i.test(u.hostname) || u.username || u.password) problems.push('PX_ODDS_RELAY_URL must be a *.internal or *.fly.dev relay URL');
+  }
   if (!env.PROPHETX_SANDBOX_API_KEY) problems.push('PROPHETX_SANDBOX_API_KEY missing');
   if (!env.PROPHETX_SANDBOX_SECRET_KEY) problems.push('PROPHETX_SANDBOX_SECRET_KEY missing');
   const forbidden = Object.keys(env).filter((k) => FORBIDDEN_ENV_RE.test(k) && env[k]);

@@ -1,4 +1,4 @@
-// VENDORED verbatim from aibetbuilder origin/main 768ea81 lib/underdog-freshness.js. Do not edit here; re-vendor instead.
+// VENDORED verbatim from aibetbuilder origin/main e2e6697 lib/underdog-freshness.js. Do not edit here; re-vendor instead.
 'use strict';
 
 // Phone-quote freshness shared by /api/underdog-predict and the CJS Promo

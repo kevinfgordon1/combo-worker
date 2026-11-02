@@ -1,4 +1,4 @@
-// VENDORED from aibetbuilder origin/main 768ea81 src/promoOppGuard.js (ESM→CJS, logic unchanged).
+// VENDORED from aibetbuilder origin/main e2e6697 src/promoOppGuard.js (ESM→CJS, logic unchanged; includes #550 ladderTopLooksRogue).
 "use strict";
 // Promo true-odds sanity: reject inverted / wrong-side opponent quotes.
 //
@@ -53,6 +53,39 @@ function quoteLooksAbsurdVsReference(reference, candidate, edge = ABSURD_TRUE_ED
   const pb = impliedFromAmerican(candidate);
   if (pa == null || pb == null) return false;
   return Math.abs(pa - pb) >= edge;
+}
+
+// A live depth ladder whose BEST ask beats the feed's quoted best price by
+// 20+ points of implied probability is not this market's book: a wrong-game
+// match or a closed market's leftover asks. Blackhawks ML (2026-10-29): feed
+// Polymarket +134 (≈43%), ladder from the closed MLB Tigers/Cubs market
+// +426/+2244/+9256 (≤19%) → Red Wings "true" −337 vs BetMGM −160. Deeper
+// levels being WORSE than the quote is normal; better by this much is not.
+const LADDER_TOP_MAX_IMPROVE = 0.20;
+
+// Points of probability miss longshots: Texas A&M-CC ML (2026-11-02) feed Novig
+// +456 (≈18%) vs a wrong-game ladder topped at +9900 (1%) is only 17 points,
+// yet 22x the odds. A top whose odds (p/(1−p)) beat the quote's by 3x or more
+// is rogue too, and so is a ≤2c top (+4900 or longer) when the quote is not.
+const LADDER_TOP_MAX_ODDS_RATIO = 3;
+const LADDER_PENNY_TOP_PROB = 0.02;
+
+function oddsOf(p) { return p / (1 - p); }
+
+function ladderTopLooksRogue(quoted, levels, maxImprove = LADDER_TOP_MAX_IMPROVE) {
+  const pq = impliedFromAmerican(quoted);
+  if (pq == null) return false;
+  let top = null;
+  for (const l of levels || []) {
+    const a = Number(l && l.american);
+    if (!isFinite(a) || a === 0) continue;
+    if (top == null || a > top) top = a;
+  }
+  const pt = impliedFromAmerican(top);
+  if (pt == null) return false;
+  if (pq - pt >= maxImprove) return true;
+  if (pt < pq && oddsOf(pq) / oddsOf(pt) >= LADDER_TOP_MAX_ODDS_RATIO) return true;
+  return pt <= LADDER_PENNY_TOP_PROB && pq > LADDER_PENNY_TOP_PROB * 2;
 }
 
 // Opposite-side Yes quotes whose implieds do not sum to a 2-way (~1).
@@ -151,7 +184,18 @@ function pickBestAmericanQuote(quotes, { allBooks } = {}) {
     best: best.price,
     bestBook: best.book,
     bestSize: best.size ?? null,
+    // Every depth venue's (fee-adjusted) quote that passed the same guards,
+    // best-first. Only used by the owner-only blended Min depth per leg.
+    venues: depthVenueQuotes(pool),
   };
+}
+
+const DEPTH_QUOTE_VENUES = new Set(["kalshi", "polymarket", "novig", "prophetx"]);
+function depthVenueQuotes(pool) {
+  return (pool || [])
+    .filter((q) => DEPTH_QUOTE_VENUES.has(String(q.book || "").toLowerCase()))
+    .map((q) => ({ book: q.book, american: Number(q.price), size: q.size ?? null }))
+    .sort((a, b) => b.american - a.american);
 }
 
 function resolveOppWithSideGuard({
@@ -159,6 +203,7 @@ function resolveOppWithSideGuard({
   trustedBook,
   trustedCount,
   trustedSize,
+  trustedVenues,
   sameBookOpp,
   sameBookKey,
   sameBookSize,
@@ -171,6 +216,7 @@ function resolveOppWithSideGuard({
       bestOppBook: trustedBook,
       bestOppCount: trustedCount,
       bestOppSize: trustedSize ?? null,
+      ...(Array.isArray(trustedVenues) && trustedVenues.length ? { bestOppVenues: trustedVenues } : {}),
       sameBookFallback: false,
     };
   }
@@ -206,4 +252,4 @@ function rankPicksAfterOppGuard(picks) {
   return [...pool].sort((a, b) => (Number(b && b.ev) || 0) - (Number(a && a.ev) || 0));
 }
 
-module.exports = { ABSURD_TRUE_EDGE, DECISIVE_IMPLIED_DEV, TWO_WAY_SUM_MIN, TWO_WAY_SUM_MAX, impliedFromAmerican, probToAmericanOdds, quoteLooksWrongSideOf, quoteLooksAbsurdVsReference, twoWayQuotesLookIncoherent, trueAmericanFromOpp, oppQuoteLooksInverted, isExchangeBookKey, quoteConflictsWithSportsbookConsensus, quoteMagnitudeConflictsWithSportsbookConsensus, pickBestAmericanQuote, resolveOppWithSideGuard, pickHasInvertedOpp, rankPicksAfterOppGuard };
+module.exports = { ABSURD_TRUE_EDGE, DECISIVE_IMPLIED_DEV, TWO_WAY_SUM_MIN, TWO_WAY_SUM_MAX, impliedFromAmerican, probToAmericanOdds, quoteLooksWrongSideOf, quoteLooksAbsurdVsReference, LADDER_TOP_MAX_IMPROVE, LADDER_TOP_MAX_ODDS_RATIO, LADDER_PENNY_TOP_PROB, ladderTopLooksRogue, twoWayQuotesLookIncoherent, trueAmericanFromOpp, oppQuoteLooksInverted, isExchangeBookKey, quoteConflictsWithSportsbookConsensus, quoteMagnitudeConflictsWithSportsbookConsensus, pickBestAmericanQuote, depthVenueQuotes, resolveOppWithSideGuard, pickHasInvertedOpp, rankPicksAfterOppGuard };
