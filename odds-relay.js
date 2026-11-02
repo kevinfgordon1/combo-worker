@@ -2628,13 +2628,18 @@ const novigFeed = (() => {
       tokens = Math.min(Math.max(1, r), tokens + ((t - last) / 1000) * r);
       last = t;
     };
+    const others = () => queues.high.length + queues.mid.length + queues.low.length;
+    const liveWaiting = () => queues.live.length + queues.liveSide.length;
+    const waiting = () => liveWaiting() + others();
+    // At most ONE pending pump timer. pump() runs from run(), from every job's finally() and from
+    // its own timer; it used to set `timer = null` on every call without clearing the pending
+    // timeout, so each call while requests were queued started another 50 ms timer chain that
+    // re-armed itself until the queue drained. With a standing backlog (NCAAB slate, Oct 30) the
+    // queue never drained: ~627k chains after 62h, CPU pegged, most of it GC (Kevin Nov 2).
     const pump = () => {
-      timer = null;
+      if (timer) { clearTimeout(timer); timer = null; }
       refill();
       const t = now();
-      const others = () => queues.high.length + queues.mid.length + queues.low.length;
-      const liveWaiting = () => queues.live.length + queues.liveSide.length;
-      const waiting = () => liveWaiting() + others();
       while (waiting() && active < concurrency && tokens >= 1 && t >= pausedUntil) {
         let q = null;
         if (liveWaiting() && (liveRun < liveRunMax || !others())) {
@@ -2655,9 +2660,16 @@ const novigFeed = (() => {
         active += 1;
         next();
       }
-      if (waiting() && !timer) {
-        const wait = t < pausedUntil ? pausedUntil - t : 50;
-        timer = setTimeout(pump, wait);
+      // At full concurrency a running job's finally() pumps again, so no timer is needed.
+      // Otherwise wake once: at the end of a backoff, or when the next token is due.
+      if (waiting() && active < concurrency) {
+        let wait;
+        if (t < pausedUntil) wait = pausedUntil - t;
+        else {
+          const r = t < slowUntil ? rate * 0.75 : rate;
+          wait = tokens >= 1 ? 0 : Math.ceil(((1 - tokens) / r) * 1000);
+        }
+        timer = setTimeout(pump, Math.max(5, wait));
         if (timer.unref) timer.unref();
       }
     };
@@ -2679,7 +2691,7 @@ const novigFeed = (() => {
         slowUntil = t + 120_000;
       },
       stats() {
-        return { rps: rate, queued: { live: queues.live.length, liveSide: queues.liveSide.length, high: queues.high.length, mid: queues.mid.length, low: queues.low.length }, active, pausedUntil };
+        return { rps: rate, queued: { live: queues.live.length, liveSide: queues.liveSide.length, high: queues.high.length, mid: queues.mid.length, low: queues.low.length }, active, pausedUntil, timerArmed: !!timer };
       },
       clear() {
         queues.live.length = 0;
