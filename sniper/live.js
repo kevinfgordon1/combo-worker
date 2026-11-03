@@ -141,7 +141,7 @@ function createLiveSniper({
     let res;
     const tPost = now();
     inflight.add(rfq.rfqId);
-    try { res = await trader.postQuote(rfq, d.quoteYes, config.tick, { priority: Number.isFinite(e.ev) ? e.ev : 0 }); } catch (err) {
+    try { res = await trader.postQuote(rfq, d.quoteYes, config.tick, { priority: Number.isFinite(e.ev) ? e.ev : 0, fairYes: fresh }); } catch (err) {
       inflight.delete(rfq.rfqId); earlyAccepts.delete(rfq.rfqId);
       // Free the reservation first so a failed POST never sits in pending risk.
       const postMs = now() - tPost;

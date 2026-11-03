@@ -71,6 +71,21 @@ function quoteYesBid(source, noBid) {
   return YES_DECLINE;
 }
 
+// Kevin Nov 2 2026 (sniper 409 quote_timed_out): the implied YES bid (1 - no_bid) sits ABOVE fair by
+// our whole edge (e.g. fair YES 5.4c, quote 12.8c -> we bid 13c for YES). Requesters take that side
+// ("yes" accept), we must decline it (we only sell parlays), and Kalshi counts every unconfirmed
+// accept as a quoting penalty: ~4-5 min of 409 quote_timed_out on EVERY new quote. Shading the YES
+// bid to fairYes * (1 - shade) keeps a real YES price (dollar RFQs still size) but removes the free
+// edge. Never above the implied YES (yes + no <= $1), never below 1c, same decimals as the NO bid.
+function shadedYesBid(impliedYes, fairYes, shade, noBid) {
+  const imp = parseFloat(impliedYes); const f = Number(fairYes); const sh = Number(shade);
+  if (!isRealYesBid(impliedYes) || !(f > 0 && f < 1) || !(sh > 0 && sh < 1)) return impliedYes;
+  const dp = String(noBid || impliedYes).split('.')[1] ? Math.max(2, String(noBid || impliedYes).split('.')[1].length) : 2;
+  const fl = dp >= 3 ? floor3 : floor2;
+  const y = Math.max(0.01, Math.min(imp, fl(f * (1 - sh))));
+  return y.toFixed(dp >= 3 ? 3 : 2);
+}
+
 function buildQuoteBody(rfqId, noBid, yesBid, restRemainder) {
   return {
     rfq_id: rfqId,
@@ -369,7 +384,7 @@ module.exports = {
   floor2, floor3, subcentEnabled, isSubcentPrice,
   decideAtFill, impliedProb, hedgeCap, fillView, americanFromProb,
   isFreeBetRow, freeBetRiskfreeMissingCap,
-  YES_DECLINE, yesBidForQuote, impliedYesBid, quoteYesBid, isRealYesBid,
+  YES_DECLINE, yesBidForQuote, impliedYesBid, quoteYesBid, isRealYesBid, shadedYesBid,
   shouldConfirmAccept, contractsFromQuoteResponse,
   buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, isPriceGridFailure, pennyNoBid,
   isInsufficientFundsFailure, quoteFailureSkipReason,
