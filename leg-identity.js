@@ -11,7 +11,18 @@
 // combo RFQs use game slugs `aec-{league}-{t1}-{t2}-{YYYY-MM-DD}` with
 // BUY = first team and SELL = second; those parse without HTTP. Skip when
 // the market type is not a full-game moneyline Combo Locks can price, or
-// more than one parlay matches. TEAM:no canonicalizes to opponent:yes.
+// more than one parlay matches. TEAM:no canonicalizes to opponent:yes
+// on 2-way moneylines (MLB/NBA/NHL/NFL).
+//
+// UCL (KXUCLGAME) is 3-way. Yes means that club wins in regulation, or that
+// the match is a draw on Kalshi's TIE market. No is that same binary's No,
+// not the other club's Yes. Polymarket US full-time winner slugs are
+// `atc-ucl-{codes}-{YYYY-MM-DD}-{outcome}` (gamma also uses `ucl-…-{outcome}`),
+// type soccer_team_full_time_winner. Novig is MONEYLINE_3_WAY_WIN /
+// MONEYLINE_3_WAY_DRAW, not MONEY. Club names fold through soccer-clubs
+// (Bayern Munich = FC Bayern München, PSG = Paris Saint-Germain,
+// Inter = Internazionale). Inter Miami is a different club. Kalshi MUN is
+// Man United; ESPN's MUN is Bayern and is never used as a Kalshi code.
 //
 // NCAAF (college football): Kalshi KXNCAAF* and Poly cfb use DIFFERENT team codes, so
 // every NCAAF team is translated through ncaaf-crosswalk.json (built from real Kalshi
@@ -45,6 +56,7 @@ const { parseKalshiTickerStart, parseTs } = require('./started');
 const NCAAF = require('./ncaaf-crosswalk');
 const NCAAB = require('./ncaab-crosswalk');
 const PROPX = require('./player-prop-crosswalk');
+const clubs = require('./soccer-clubs.mjs');
 
 const MONTHS = {
   JAN: 1, FEB: 2, MAR: 3, APR: 4, MAY: 5, JUN: 6,
@@ -56,6 +68,9 @@ const SERIES = {
   KXNBAGAME: { league: 'nba', marketType: 'moneyline', period: 'full', teamLen: 3 },
   KXNHLGAME: { league: 'nhl', marketType: 'moneyline', period: 'full', teamLen: null }, // LA/NJ/SJ/TB are 2 letters
   KXNFLGAME: { league: 'nfl', marketType: 'moneyline', period: 'full', teamLen: null },
+  // 3-way full-time result. Selection TIE is the draw. teamLen null: codes
+  // split only through the known UCL code list (MUN is Man United, not Bayern).
+  KXUCLGAME: { league: 'ucl', marketType: 'moneyline_3way', period: 'full', teamLen: null, threeWay: true },
 };
 
 const PRICEABLE_SPORT_TYPES = new Set([
@@ -84,6 +99,14 @@ const TEAM_ALIASES = {
   // Polymarket US slugs use mon/nas/veg/was; Kalshi KXNHLGAME uses MTL/NSH/VGK/WSH.
   nhl: { mon: 'mtl', nas: 'nsh', veg: 'vgk', was: 'wsh', utah: 'uta', lak: 'la', njd: 'nj', sjs: 'sj', tbl: 'tb', cal: 'cgy' },
 };
+
+// Kalshi KXUCLGAME code → club id, plus Polymarket US slug codes that differ
+// (Bayern is `bay` on Poly and `BMU` on Kalshi; Man United is `mnu` on Poly
+// and `MUN` on Kalshi). `tie` / `draw` are the draw binary, not a club.
+const UCL_POLY_CODE = { bmu: 'bay', mun: 'mnu' };
+const UCL_ALIASES = { tie: 'draw', draw: 'draw', bay: 'bayern', mnu: 'manutd' };
+for (const [code, id] of Object.entries(clubs.UCL_CODE_CLUB)) UCL_ALIASES[code.toLowerCase()] = id;
+TEAM_ALIASES.ucl = UCL_ALIASES;
 
 const NFL_CODES = [
   'ari', 'atl', 'bal', 'buf', 'car', 'chi', 'cin', 'cle', 'dal', 'den', 'det',
@@ -119,7 +142,14 @@ function normTeam(league, code) {
   const raw = String(code || '').trim().toLowerCase();
   if (!raw) return '';
   const aliases = TEAM_ALIASES[league] || {};
-  return aliases[raw] || raw;
+  if (aliases[raw]) return aliases[raw];
+  // Spoken club names ("FC Bayern München", "Paris Saint-Germain", "Inter").
+  // A Kalshi code already resolved above, so MUN stays Man United.
+  if (league === 'ucl') {
+    const id = clubs.soccerClubId(code);
+    if (id) return id;
+  }
+  return raw;
 }
 
 function participantCode(id) {
@@ -243,6 +273,11 @@ function makeIdentity(partial) {
   // First-pitch / kickoff ms (Kalshi ticker HHMM, or Poly gameStartTime). NOT part
   // of the key; used only by startTimesAgree() to reject doubleheader mix-ups.
   if (partial.startMs != null && Number.isFinite(partial.startMs)) id.startMs = partial.startMs;
+  const threeWay = partial.threeWay === true || partial.league === 'ucl' || partial.marketType === 'moneyline_3way';
+  if (threeWay) {
+    id.marketType = 'moneyline_3way';
+    id.threeWay = true;
+  }
   if (id.teams.length >= 2) {
     const uniq = [...new Set(id.teams)].sort();
     id.teams = uniq;
@@ -250,8 +285,11 @@ function makeIdentity(partial) {
   // 2-way ML: TEAM:no is the opponent winning. Combo Locks keys are always
   // the winner at :yes so Kalshi TEX:yes matches a Poly game-slug SELL
   // (long=tb / first slug team, side=no).
+  // 3-way (UCL): No stays that binary's No. PSG:no is not Villarreal:yes,
+  // and TIE:no is not a club.
   if (
-    id.marketType === 'moneyline'
+    !threeWay
+    && id.marketType === 'moneyline'
     && id.line == null
     && id.side === 'no'
     && id.teams.length === 2
@@ -317,9 +355,22 @@ function kalshiTickerPieces(text, sideOverride) {
     selection = teamsBlob.slice(selDash + 1);
     teamsBlob = teamsBlob.slice(0, selDash);
   }
-  const pair = splitTeams(teamsBlob, spec.league, spec.teamLen);
+  let pair;
+  if (spec.threeWay) {
+    const codes = clubs.splitUclCodes(teamsBlob);
+    if (!codes) return null;
+    pair = [codes[0].toLowerCase(), codes[1].toLowerCase()];
+    // The outcome is part of the ticker (PSG / VIL / TIE). Do not guess the
+    // first club — that would turn a bare event into a side.
+    if (!selection) return null;
+    const sel = String(selection).toLowerCase();
+    if (sel !== 'tie' && sel !== 'draw' && sel !== pair[0] && sel !== pair[1]) return null;
+  } else {
+    pair = splitTeams(teamsBlob, spec.league, spec.teamLen);
+    if (!pair) return null;
+    if (!selection) selection = pair[0];
+  }
   if (!pair) return null;
-  if (!selection) selection = pair[0];
 
   return {
     series,
@@ -330,6 +381,7 @@ function kalshiTickerPieces(text, sideOverride) {
     side,
     marketType: spec.marketType,
     period: spec.period,
+    threeWay: !!spec.threeWay,
   };
 }
 
@@ -344,6 +396,7 @@ function parseKalshiTicker(text, sideOverride) {
     period: pieces.period,
     selection: pieces.selection,
     side: pieces.side,
+    threeWay: pieces.threeWay,
   });
 }
 
@@ -990,6 +1043,10 @@ function retailSpreadOrTotal(market) {
 
 function classifySportType(st) {
   if (!st) return null;
+  // Full-time soccer winner is 3-way (one Yes/No binary per club, plus draw).
+  // It ends in `_winner` but is not a 2-way full_game_winner — check it first
+  // so it is not dropped as an unpriceable prop.
+  if (st === 'soccer_team_full_time_winner') return { marketType: 'moneyline_3way', period: 'full', threeWay: true };
   if (PRICEABLE_SPORT_TYPES.has(st)) return { marketType: 'moneyline', period: 'full' };
   if (/_full_game_spread$/.test(st) || /_full_game_total$/.test(st)) {
     return { marketType: st.endsWith('spread') ? 'spread' : 'total', period: 'full', priceable: false };
@@ -1072,6 +1129,11 @@ function identityFromNcaafMlMarket(market, rfqSide) {
 function identityFromMarket(marketRaw, rfqSide, opts) {
   const market = unwrapMarket(marketRaw);
   if (!market) return { identity: null, reason: 'missing_metadata' };
+  const earlySlug = String(market.slug || '').toLowerCase();
+  const earlyType = String(market.sportsMarketType || market.sports_market_type || sportTypeOf(market) || '');
+  if (earlyType === 'soccer_team_full_time_winner' || earlySlug.startsWith('atc-ucl-') || /^ucl-[a-z0-9]+-[a-z0-9]+-\d{4}-\d{2}-\d{2}-/.test(earlySlug)) {
+    return identityFromUclPolyMarket(market, rfqSide);
+  }
   if (opts && opts.ncaaf && (/^aec-cfb-/i.test(String(market.slug || '')) || retailLeagueIsCfb(market))) {
     return identityFromNcaafMlMarket(market, rfqSide);
   }
@@ -1154,12 +1216,126 @@ function polymarketYesNo(sideRaw) {
   return null;
 }
 
+// UCL full-time winner slug: atc-ucl-vil-psg-2026-11-03-psg (Polymarket US)
+// or ucl-vil-psg-2026-11-03-psg (gamma). The last token is the outcome
+// (club code or draw), not "the other team". Exact-score / player props
+// (astatc-, tsc-, …-exact-score-) do not match.
+const UCL_SLUG_RE = /^(?:atc-)?ucl-([a-z0-9]+)-([a-z0-9]+)-(\d{4})-(\d{2})-(\d{2})-([a-z0-9]+)$/;
+
+function uclSlugSelection(token, pair) {
+  const t = String(token || '').toLowerCase();
+  if (t === 'draw' || t === 'tie') return 'draw';
+  const id = normTeam('ucl', t);
+  const teams = pair.map((c) => normTeam('ucl', c));
+  if (id && teams.includes(id) && id !== 'draw') return id;
+  return null;
+}
+
+function uclWinnerFromQuestion(q) {
+  const text = String(q || '').trim();
+  if (!text) return null;
+  if (/end in a draw/i.test(text)) return 'draw';
+  const will = /will\s+(.+?)\s+win\b/i.exec(text);
+  if (!will) return null;
+  return normTeam('ucl', will[1]) || null;
+}
+
+function identityFromUclSlug(symbol, rfqSide) {
+  const s = String(symbol || '').trim().toLowerCase();
+  const m = UCL_SLUG_RE.exec(s);
+  if (!m) return null;
+  const yesNo = polymarketYesNo(rfqSide);
+  if (!yesNo) return null;
+  const pair = [m[1], m[2]];
+  const selection = uclSlugSelection(m[6], pair);
+  if (!selection) return null;
+  return makeIdentity({
+    league: 'ucl',
+    date: `${m[3]}-${m[4]}-${m[5]}`,
+    teams: pair,
+    marketType: 'moneyline_3way',
+    threeWay: true,
+    period: 'full',
+    selection,
+    side: yesNo,
+  });
+}
+
+function identityFromUclPolyMarket(market, rfqSide) {
+  const st = String(market.sportsMarketType || market.sports_market_type || sportTypeOf(market) || '');
+  if (st && st !== 'soccer_team_full_time_winner') return { identity: null, reason: 'not_priceable' };
+  const yesNo = polymarketYesNo(rfqSide);
+  if (!yesNo) return { identity: null, reason: 'unmatched_leg' };
+  const id = identityFromUclSlug(market.slug, yesNo);
+  if (!id) return { identity: null, reason: 'missing_metadata' };
+  const labeled = uclWinnerFromQuestion(`${market.question || ''} ${market.title || ''}`);
+  // Disagreement is not priceable. A slug fallback would ignore the question
+  // and could quote the wrong binary.
+  if (labeled && labeled !== id.selection) return { identity: null, reason: 'not_priceable' };
+  const start = market.gameStartTime || market.game_start_time || market.startTime;
+  if (start) {
+    const metaDate = etDateFromValue(start);
+    if (metaDate && metaDate !== id.date) return { identity: null, reason: 'not_priceable' };
+    const ms = Date.parse(start);
+    if (Number.isFinite(ms)) id.startMs = ms;
+  }
+  const sides = market.marketSides || market.market_sides;
+  if (Array.isArray(sides) && id.selection !== 'draw') {
+    const longs = sides.filter((x) => x && x.long === true);
+    const name = longs[0] && longs[0].team && longs[0].team.name;
+    if (name && normTeam('ucl', name) !== id.selection) return { identity: null, reason: 'not_priceable' };
+  }
+  return { identity: id, reason: null };
+}
+
+// Novig soccer 3-way is one Yes/No market per outcome, not MONEY (2-way).
+// "Inter MONEYLINE_3_WAY_WIN" / "Inter @ Feyenoord MONEYLINE_3_WAY_DRAW".
+function novigThreeWayKind(marketType) {
+  const t = String(marketType || '').toUpperCase();
+  if (t === 'MONEYLINE_3_WAY_WIN') return 'win';
+  if (t === 'MONEYLINE_3_WAY_DRAW') return 'draw';
+  return null;
+}
+
+function identityFromNovigThreeWay(market, ctx) {
+  const kind = novigThreeWayKind(market && (market.marketType || market.type));
+  if (!kind || !ctx) return null;
+  const away = normTeam('ucl', ctx.away);
+  const home = normTeam('ucl', ctx.home);
+  if (!away || !home || away === home || away === 'inter-miami' || home === 'inter-miami') return null;
+  const date = etDateFromValue(ctx.date || ctx.start || ctx.startsTs || ctx.commence_time);
+  if (!date) return null;
+  let selection;
+  if (kind === 'draw') selection = 'draw';
+  else {
+    const desc = String((market && market.description) || '').replace(/\s*MONEYLINE_3_WAY_WIN\s*/ig, ' ').trim();
+    selection = normTeam('ucl', desc);
+    if (selection !== away && selection !== home) return null;
+    if (selection === 'inter-miami') return null;
+  }
+  const sideRaw = String(ctx.side || ctx.outcome || 'yes').toLowerCase();
+  const side = sideRaw === 'no' ? 'no' : (sideRaw === 'yes' ? 'yes' : null);
+  if (!side) return null;
+  return makeIdentity({
+    league: 'ucl',
+    date,
+    teams: [away, home],
+    marketType: 'moneyline_3way',
+    threeWay: true,
+    selection,
+    side,
+  });
+}
+
 // Production combo RFQs use game slugs `aec-{league}-{t1}-{t2}-{YYYY-MM-DD}`
 // (no pick). BUY = first slug team; SELL = second. Suffixed `…-{pick}` slugs
 // still appear in tests. astatc / asc / other prefixes are not Combo Locks ML.
+// UCL winner markets are `atc-ucl-…-{outcome}` (or `ucl-…-{outcome}`): the
+// outcome token is the binary, and SELL is that binary's No.
 function identityFromPolymarketSlug(symbol, rfqSide) {
   if (symbol == null || symbol === '') return null;
   const s = String(symbol).trim().toLowerCase();
+  if (/^(?:atc-)?ucl-/.test(s)) return identityFromUclSlug(s, rfqSide);
   const tokens = s.split(/[-_./]/).filter(Boolean);
   if (!tokens.length || tokens[0] !== 'aec') return null;
   const yesNo = polymarketYesNo(rfqSide);
@@ -1345,7 +1521,11 @@ module.exports = {
   isPolyLineSlug,
   PRICEABLE_SPORT_TYPES,
   TEAM_ALIASES,
+  UCL_POLY_CODE,
   normTeam,
+  novigThreeWayKind,
+  identityFromNovigThreeWay,
+  identityFromUclSlug,
   participantCode,
   teamsFromRetailSides,
   unwrapMarket,

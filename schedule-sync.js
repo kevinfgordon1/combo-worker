@@ -8,7 +8,7 @@
 'use strict';
 const G = require('./game-schedule');
 
-const SYNC_LEAGUES = ['NFL', 'NCAAF', 'NBA', 'NHL', 'MLB', 'WNBA', 'MLS', 'EPL', 'NCAAMB'];
+const SYNC_LEAGUES = ['NFL', 'NCAAF', 'NBA', 'NHL', 'MLB', 'WNBA', 'MLS', 'EPL', 'UCL', 'NCAAMB'];
 const H = 3600000;
 const yieldLoop = () => new Promise((r) => setImmediate(r)); // let quoting run between ESPN pulls / parses
 
