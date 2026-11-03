@@ -509,6 +509,8 @@ async function main(env = process.env) {
     subaccount: sniperSubaccount(env), limiter: lim.kalshiTrade, readLimiter: lim.kalshiTradeRead, log,
     maxConcurrent: num(env.SNIPER_QUOTE_CONCURRENCY, 8), maxQueued: num(env.SNIPER_QUOTE_MAX_QUEUED, sendWin.enabled ? 200 : 24),
     sendWindow: sendWin.enabled ? sendWin : null,
+    // Nov 2 2026: YES bid = fair x (1 - shade) on dollar RFQs (0 = old implied YES). See engine.shadedYesBid.
+    yesShade: Math.min(0.5, Math.max(0, num(env.SNIPER_YES_BID_SHADE, 0))),
   });
   // Kevin Oct 26: parlays settling within soonHours may use the sniper's live cash as total cap.
   const soonCap = createSoonCap({ totalCap: config.totalExposureCap, hours: config.soonHours, enabled: !!config.soonCap && sniperSubaccount(env) >= 1, fetchBalanceUsd: () => trader.subBalanceUsd(), log });

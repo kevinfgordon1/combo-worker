@@ -13,7 +13,7 @@ const { signedRequest, signedNow } = require('../kalshi-auth');
 const { createKalshiRestPair, QUOTE_TIMEOUT_MS } = require('../kalshi-http');
 const { createQuoteSender, rfqAgeMs, DEFAULT_MAX_RFQ_AGE_MS } = require('../quote-sender');
 const { createPostEstimator } = require('./send-window');
-const { buildQuoteBody, quoteYesBid, YES_DECLINE } = require('../engine');
+const { buildQuoteBody, quoteYesBid, shadedYesBid, YES_DECLINE } = require('../engine');
 const { fillsQuery, fillReferencesOrder, bookFromQuoteExecution } = require('../kalshi-fill-confirm');
 
 const QUOTE_PATH = '/trade-api/v2/communications/quotes';
@@ -42,7 +42,7 @@ class LiveGateClosed extends Error { constructor(op) { super(`LIVE_GATE_CLOSED $
 // sendWindow (sniper/send-window.js sendWindowConfig): hard per-RFQ deadline on the quote queue.
 // Quote sends/s for the estimate = the trade limiter's rate minus the routine-cancel share; sends
 // waiting in the urgent lane (risk-reducing cancels) count as ahead of every quote.
-function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = null, readLimiter = null, request = null, log = console.log, maxConcurrent = 8, maxQueued = 24, sendWindow = null, now = () => Date.now(), serverNow = () => signedNow() } = {}) {
+function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = null, readLimiter = null, request = null, log = console.log, maxConcurrent = 8, maxQueued = 24, sendWindow = null, now = () => Date.now(), serverNow = () => signedNow(), yesShade = 0 } = {}) {
   const live = !!(gate && gate.live);
   let pair = null;
   const pools = () => { if (!pair) pair = createKalshiRestPair(); return pair; };
@@ -80,11 +80,13 @@ function createSniperTrader({ gate, keyId, pem, subaccount = null, limiter = nul
   }
   function mustBeLive(op) { if (!live) { stats.refused += 1; throw new LiveGateClosed(op); } }
 
-  async function postQuote(rfq, quoteYes, tick, { priority = 0 } = {}) {
+  async function postQuote(rfq, quoteYes, tick, { priority = 0, fairYes = null } = {}) {
     mustBeLive('quote');
     if (!(subaccount >= 1)) throw new LiveGateClosed('quote_no_subaccount');
     const noBid = noBidFor(quoteYes, tick);
-    const yesBid = quoteYesBid(sizeSource(rfq), noBid);
+    let yesBid = quoteYesBid(sizeSource(rfq), noBid);
+    // Nov 2 2026: dollar RFQs only (contract-count RFQs already send "0.00"). See engine.shadedYesBid.
+    if (yesShade > 0 && fairYes != null) { const s = shadedYesBid(yesBid, fairYes, yesShade, noBid); if (s !== yesBid) { stats.yesShaded = (stats.yesShaded || 0) + 1; yesBid = s; } }
     const body = JSON.stringify({ ...buildQuoteBody(rfq.rfqId, noBid, yesBid, false), subaccount });
     let wireMs = null;
     const r = await sender.send(rfq.rfqId, rfq.createdTs, (ctx) => raw('POST', QUOTE_PATH, {

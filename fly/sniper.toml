@@ -67,3 +67,4 @@ kill_timeout = "60s"   # Oct 25: room to cancel every open quote on SIGTERM
   SNIPER_NCAAB_HOURS = "24"       # NCAAB legs must tip within 24h (code caps this at 36h)
   SNIPER_NCAAB_GAME_HOURS = "3"   # NCAAB settle_at = last tip + 3h
   SNIPER_ODDS_RELAY_URL = "http://kaygo-odds-relay.internal:8787"
+  SNIPER_YES_BID_SHADE = "0.08"   # Nov 2: YES bid = fair -8% on dollar RFQs (was 1 - no_bid = fair +edge -> YES accepts we decline -> Kalshi 409 quote_timed_out penalty)
