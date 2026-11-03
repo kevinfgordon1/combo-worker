@@ -31,6 +31,26 @@ assert.strictEqual(iso('KXNCAAFGAME-26OCT31CLEMFSU-FSU'), '2026-10-31T23:00:00.0
 assert.strictEqual(iso('KXNFLGAME-26NOV01INDJAC-IND'), '2026-11-01T18:00:00.000Z');
 assert.strictEqual(iso('KXNFLGAME-26NOV01PHIWAS-PHI'), '2026-11-02T01:20:00.000Z');
 
+// UCL Nov 3 2026: Kalshi codes vs ESPN names. PSG ticker resolves to the ESPN kickoff.
+// Bayern's ESPN abbreviation is MUN, which is also Kalshi's code for Man United — those must not cross.
+function uclBoard(home, away, iso) {
+  const team = (abbr, display) => ({ abbreviation: abbr, location: display, name: display, displayName: display, shortDisplayName: display });
+  return { events: [{ id: 'ucl', date: iso, status: { type: { name: 'STATUS_SCHEDULED', state: 'pre', shortDetail: '3:00 PM' } }, competitions: [{ date: iso, timeValid: true, competitors: [
+    { homeAway: 'home', team: team(home.abbr, home.name) },
+    { homeAway: 'away', team: team(away.abbr, away.name) },
+  ] }] }] };
+}
+assert.strictEqual(G.LEAGUES.UCL.espn, 'soccer/uefa.champions');
+const uclPsg = G.espnRows('UCL', uclBoard({ abbr: 'VIL', name: 'Villarreal' }, { abbr: 'PSG', name: 'Paris Saint-Germain' }, '2026-11-03T20:00:00Z'));
+assert.strictEqual(G.resolveStart('KXUCLGAME-26NOV03VILPSG-PSG', uclPsg).iso, '2026-11-03T20:00:00.000Z');
+const uclBay = G.espnRows('UCL', uclBoard({ abbr: 'ATM', name: 'Atlético Madrid' }, { abbr: 'MUN', name: 'Bayern Munich' }, '2026-11-03T20:00:00Z'));
+assert.strictEqual(G.resolveStart('KXUCLGAME-26NOV03ATMBMU-BMU', uclBay).iso, '2026-11-03T20:00:00.000Z');
+assert.strictEqual(G.resolveStart('KXUCLGAME-26NOV03MUNROM-MUN', uclBay).verified, false);
+const uclInt = G.espnRows('UCL', uclBoard({ abbr: 'FEY', name: 'Feyenoord Rotterdam' }, { abbr: 'INT', name: 'Internazionale' }, '2026-11-03T20:00:00Z'));
+assert.strictEqual(G.resolveStart('KXUCLGAME-26NOV03FEYINT-INT', uclInt).iso, '2026-11-03T20:00:00.000Z');
+const uclMan = G.espnRows('UCL', uclBoard({ abbr: 'MAN', name: 'Manchester United' }, { abbr: 'ROMA', name: 'AS Roma' }, '2026-11-03T20:00:00Z'));
+assert.strictEqual(G.resolveStart('KXUCLGAME-26NOV03MUNROM-MUN', uclMan).iso, '2026-11-03T20:00:00.000Z');
+
 // Fallback order: canonical → venue → lock starts_at → ticker date (never dropped; verified:false + warn).
 const none = [];
 let r = G.resolveStart('KXNBAGAME-26OCT27BKNBOS-BOS', none, { venue: { 'KXNBAGAME-26OCT27BKNBOS': '2026-10-27T23:35:00Z' }, lockStart: '2026-10-27T23:00:00Z' });

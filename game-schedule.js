@@ -1,6 +1,6 @@
 // Canonical game schedule (Kevin, Oct 27 2026: "fix start times permanently").
 // One place that answers "when does this Kalshi game start?" for the sniper, Combo Locks, the needle and Promo.
-//   * Official source: ESPN public scoreboard (NFL, NCAAF FBS+FCS, NBA, WNBA, NHL, MLB, MLS, EPL, NCAAB).
+//   * Official source: ESPN public scoreboard (NFL, NCAAF FBS+FCS, NBA, WNBA, NHL, MLB, MLS, EPL, UCL, NCAAB).
 //   * Cross-checks: Kalshi occurrence/expected_expiration (−3h), Polymarket / Novig / Underdog / odds_cache times.
 //     A venue time more than 15 min off the official time is flagged (disagreement), never silently used.
 //   * Resolver order: canonical (ESPN, verified) → venue time (unverified) → lock starts_at → ticker date only.
@@ -21,6 +21,10 @@ const LEAGUES = {
   MLB: { espn: 'baseball/mlb', dateShift: [0, 1] },
   MLS: { espn: 'soccer/usa.1' },
   EPL: { espn: 'soccer/eng.1' },
+  // UEFA Champions League. Kickoff is the ESPN scoreboard (soccer/uefa.champions).
+  // Kalshi codes and ESPN abbreviations differ (Kalshi MUN = Man United, ESPN MUN = Bayern),
+  // so matching uses the club id in sideMatches, not the raw abbreviation.
+  UCL: { espn: 'soccer/uefa.champions' },
   NCAAMB: { espn: 'basketball/mens-college-basketball', groups: ['50'], dateShift: [0, 1] },
   NCAAB: { espn: 'basketball/mens-college-basketball', groups: ['50'], dateShift: [0, 1] },
 };
@@ -34,6 +38,7 @@ const SAME = {
   EPL: [['LIV', 'LFC'], ['MNC', 'MCI'], ['BHA', 'BRI'], ['NFO', 'NOT'], ['WHU', 'WHM']],
   MLS: [],
 };
+const clubs = require('./soccer-clubs.mjs');
 const ALIAS = {};
 for (const [lg, groups] of Object.entries(SAME)) { ALIAS[lg] = {}; for (const g of groups) for (const c of g) ALIAS[lg][c] = g[0]; }
 const canon = (lg, c) => { const u = String(c || '').toUpperCase(); return (ALIAS[lg] && ALIAS[lg][u]) || u; };
@@ -67,13 +72,29 @@ function codeMatches(league, code, t) { return sideMatches(league, code, sideKey
 
 // Precomputed per-side match keys (canonical abbr + normalized names for college). Built once per game object.
 const NCAA = new Set(['NCAAF', 'NCAAMB', 'NCAAB']);
+function espnClub(t) {
+  if (!t) return null;
+  for (const part of [t.display, t.short, t.name, t.location]) {
+    const id = clubs.soccerClubId(part);
+    if (id) return id;
+  }
+  return null;
+}
 function sideKeys(league, t) {
   const abbr = canon(league, String((t && t.abbr) || ''));
   const names = NCAA.has(league) ? new Set([t.location, t.display, t.short, t.name].map(norm).filter(Boolean)) : null;
-  return { abbr, names };
+  const club = league === 'UCL' ? espnClub(t) : null;
+  return { abbr, names, club };
 }
 function sideMatches(league, code, k) {
   const c = String(code).toUpperCase();
+  if (league === 'UCL') {
+    const club = clubs.uclClubFromCode(c);
+    // Club id wins. Raw abbreviation equality would pair Kalshi Man United (MUN)
+    // with ESPN Bayern (also MUN).
+    if (club && k.club) return club === k.club;
+    if (club) return false;
+  }
   if (canon(league, c) === k.abbr) return true;
   if (k.names) { const names = ncaafNames()[c]; if (names) for (const n of names) if (k.names.has(n)) return true; }
   return false;

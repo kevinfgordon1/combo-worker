@@ -227,6 +227,7 @@ const LEAGUE_SLUG_TOKENS = {
   nhl: ['nhl', 'hockey'],
   ncaaf: ['ncaaf', 'cfb', 'football'],
   ncaab: ['cbb'], // men's college basketball (aec-cbb-…); identities only from ncaab-crosswalk
+  ucl: ['ucl'],
 };
 
 function normalizePolymarketSide(side) {
@@ -374,7 +375,16 @@ function identityHitsTokens(id, tokens) {
   // Line legs (spread/total) ride asc-/tsc- slugs instead. Mapped player props (astatc,
   // anytime TD / MLB HR) carry a `line` too but are NEVER token-matched: they only match
   // through the exact verified slug-identity set (see couldMatchActiveLocks).
-  if (id.line != null ? !(tokens.has('asc') || tokens.has('tsc')) : !tokens.has('aec')) return false;
+  // UCL winner markets are `atc-ucl-…` (token `atc`, not `astatc`). The outcome
+  // token has to be this binary (club or draw), not merely the two clubs.
+  if (id.line != null) {
+    if (!(tokens.has('asc') || tokens.has('tsc'))) return false;
+  } else if (id.threeWay || id.league === 'ucl' || id.marketType === 'moneyline_3way') {
+    if (!(tokens.has('atc') && tokens.has('ucl'))) return false;
+    if (id.selection === 'draw') {
+      if (!tokens.has('draw') && !tokens.has('tie')) return false;
+    } else if (!teamInTokens(id.league, id.selection, tokens)) return false;
+  } else if (!tokens.has('aec')) return false;
   const leagueTokens = LEAGUE_SLUG_TOKENS[id.league] || (id.league ? [id.league] : []);
   if (!leagueTokens.some((t) => tokens.has(t))) return false;
   if (!tokensHaveDate(tokens, id.date)) return false;

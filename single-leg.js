@@ -7,7 +7,9 @@
 //               from the lock's fill odds net of the series maker fee
 //               (quadratic 0 / maker 0.0175×m / combo-maker 0.035×m).
 //   Polymarket  US single moneyline market (aec-{league}-{t1}-{t2}-{date}),
-//               buy the other team. Maker fee is 0 and we assume NO rebate
+//               buy the other team. UCL is 3-way: the hedge is No on the same
+//               binary (atc-ucl-…-{outcome}), not the other club's Yes.
+//               Maker fee is 0 and we assume NO rebate
 //               (US rebates need $10M+ monthly maker volume from Oct 19), so
 //               the price is just 1 - implied(fill), floored to the tick.
 //
@@ -40,7 +42,7 @@
 // Off unless SINGLE_LEG_LIVE=1 (log-only dry run with SINGLE_LEG_LIVE=dry).
 'use strict';
 
-const { kalshiTickerPieces, parseKalshiTicker, identityFromMarket, identityKey, TEAM_ALIASES, normTeam } = require('./leg-identity');
+const { kalshiTickerPieces, parseKalshiTicker, identityFromMarket, identityKey, TEAM_ALIASES, normTeam, UCL_POLY_CODE } = require('./leg-identity');
 const { parseKalshiTickerStart, parseTs } = require('./started');
 
 const impliedProb = (a) => (a > 0 ? 100 / (a + 100) : Math.abs(a) / (Math.abs(a) + 100));
@@ -114,10 +116,35 @@ function polyCodesFor(league, code) {
   return [...out];
 }
 
+// UCL Polymarket US market slug. Kalshi BMU/MUN are bay/mnu on that book.
+// Draw is the `draw` token (Kalshi TIE). Both team orders, never `aec-`.
+function uclPolySlugCandidates(pc) {
+  const raw = pc.teams.map((c) => String(c).toLowerCase());
+  const poly = raw.map((c) => UCL_POLY_CODE[c] || c);
+  const selRaw = String(pc.selection || '').toLowerCase();
+  const out = [];
+  const push = (a, b, sel) => {
+    out.push(`atc-ucl-${a}-${b}-${pc.date}-${sel}`);
+    out.push(`atc-ucl-${b}-${a}-${pc.date}-${sel}`);
+  };
+  if (selRaw === 'tie' || selRaw === 'draw') {
+    for (const sel of ['draw', 'tie']) push(raw[0], raw[1], sel);
+    if (poly[0] !== raw[0] || poly[1] !== raw[1]) {
+      for (const sel of ['draw', 'tie']) push(poly[0], poly[1], sel);
+    }
+  } else {
+    push(raw[0], raw[1], selRaw);
+    const selPoly = UCL_POLY_CODE[selRaw] || selRaw;
+    if (poly[0] !== raw[0] || poly[1] !== raw[1] || selPoly !== selRaw) push(poly[0], poly[1], selPoly);
+  }
+  return [...new Set(out)].filter((s) => !s.startsWith('aec-')).slice(0, 12);
+}
+
 // Candidate Poly game slugs for a Kalshi moneyline ticker (both team orders).
 function polySlugCandidates(ticker) {
   const pc = kalshiTickerPieces(ticker);
-  if (!pc || pc.marketType !== 'moneyline') return [];
+  if (!pc || (pc.marketType !== 'moneyline' && pc.marketType !== 'moneyline_3way')) return [];
+  if (pc.league === 'ucl' || pc.threeWay) return uclPolySlugCandidates(pc);
   const [a, b] = pc.teams;
   const out = [];
   for (const x of polyCodesFor(pc.league, a)) {
@@ -130,8 +157,11 @@ function polySlugCandidates(ticker) {
 }
 
 // Given the Poly market (metadata verified) and the lock leg, which intent
-// hedges the user. Lock identity is canonical "team T wins : yes".
-// Returns { intent, longWinsForUser } or null if the market is not this game.
+// hedges the user. 2-way lock identity is canonical "team T wins : yes"
+// (No already flipped to the opponent). UCL keeps No on the same binary:
+// user Yes → buy No (BUY_SHORT); user No → buy Yes (BUY_LONG). The other
+// club's market does not match.
+// Returns { intent } or null if the market is not this outcome.
 function polyHedgeIntent(leg, market) {
   const lockId = parseKalshiTicker(leg.ticker, String(leg.side || 'yes').toLowerCase());
   if (!lockId) return null;
@@ -355,6 +385,7 @@ module.exports = {
   kalshiHedge,
   polyHedgeCost,
   polySlugCandidates,
+  uclPolySlugCandidates,
   polyHedgeIntent,
   polyOrderBody,
   lockStartMs,
