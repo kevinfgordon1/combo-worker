@@ -63,6 +63,24 @@ assert.deepStrictEqual(b.misses, [{ event: 'KXNBAGAME-26OCT27XXXYYY', why: 'no_o
 const back = games.map((g) => G.rowToGame(G.gameToRow(g)));
 assert.strictEqual(G.resolveStart('KXNCAAFGAME-26OCT30KSUCOLO-KSU', back).iso, '2026-10-31T18:00:00.000Z');
 
+// Same ESPN game on two scoreboard days (UCL, 2026-11-03). Keep the listing whose scoreboard
+// date is the kickoff's ET date; when both match, keep the later scoreboard.
+const ucl = (board, iso) => ({ league: 'UCL', espn_id: '7001', scoreboard_date: board, start_ms: Date.parse(iso), home: { abbr: 'RMA' }, away: { abbr: 'MCI' } });
+const dup = G.dedupeGames([
+  ucl('2026-11-03', '2026-11-03T20:00:00Z'), // 15:00 ET Nov 3 — scoreboard date matches kickoff
+  ucl('2026-11-04', '2026-11-03T22:00:00Z'), // listed again the next day; kickoff is still Nov 3 ET
+]);
+assert.strictEqual(dup.length, 1);
+assert.strictEqual(dup[0].scoreboard_date, '2026-11-03');
+assert.strictEqual(new Date(dup[0].start_ms).toISOString(), '2026-11-03T20:00:00.000Z');
+const postponed = G.dedupeGames([
+  ucl('2026-11-03', '2026-11-03T20:00:00Z'),
+  ucl('2026-11-04', '2026-11-04T20:00:00Z'), // both boards match their own kickoff; latest ESPN data wins
+]);
+assert.strictEqual(postponed.length, 1);
+assert.strictEqual(postponed[0].scoreboard_date, '2026-11-04');
+assert.strictEqual(new Date(postponed[0].start_ms).toISOString(), '2026-11-04T20:00:00.000Z');
+
 // Sniper kickoff resolver prefers canonical, falls back to the old chain when canonical is unverified.
 const K = createKickoffResolver();
 K.setKalshiOccurrence('KXNBAGAME-26OCT27BKNBOS-BOS', Date.parse('2026-10-28T03:00:00Z'));
@@ -101,5 +119,48 @@ assert.strictEqual(K.resolve('KXNBAGAME-26OCT27BKNBOS-BOS').source, 'kalshi_occ_
   // Missing table: sync keeps working in memory and still audits.
   const s2 = createScheduleSync({ env: { SUPABASE_URL: 'https://x.supabase.co', SUPABASE_SERVICE_KEY: 'k' }, fetchFn: async (u, o) => (u.includes('game_schedule') ? { ok: false, status: 404, json: async () => ({}), text: async () => 'relation "game_schedule" does not exist' } : fetchFn(u, o)), log: () => {}, now: () => NOW });
   await s2.tick(); assert.strictEqual(s2.stats().tableMissing, true); assert.ok(s2.resolve('KXNBAGAME-26OCT27BKNBOS-BOS').verified);
+
+  // Duplicated game across two scoreboard days is upserted once. A rejected league batch is logged
+  // and does not drop the other leagues (UCL, 2026-11-03, modeled on EPL + a failing NBA write).
+  const NOW2 = Date.parse('2026-11-03T18:00:00Z');
+  const posts2 = []; const logs2 = [];
+  const ev = (id, iso, home, away) => ({ id, date: iso, status: { type: { name: 'STATUS_SCHEDULED', state: 'pre', shortDetail: 'ok' } }, competitions: [{ date: iso, timeValid: true, competitors: [
+    { homeAway: 'home', team: { abbreviation: home, location: home, name: home, displayName: home, shortDisplayName: home } },
+    { homeAway: 'away', team: { abbreviation: away, location: away, name: away, displayName: away, shortDisplayName: away } },
+  ] }] });
+  const fetchDup = async (url, opts = {}) => {
+    const ok = (body) => ({ ok: true, status: 200, json: async () => body, text: async () => '' });
+    if (url.includes('espn.com')) {
+      const d = (/dates=(\d+)/.exec(url) || [])[1];
+      if (url.includes('/soccer/eng.1/') && d === '20261103') return ok({ events: [ev('7001', '2026-11-03T20:00:00Z', 'ARS', 'MCI')] });
+      if (url.includes('/soccer/eng.1/') && d === '20261104') return ok({ events: [ev('7001', '2026-11-03T22:00:00Z', 'ARS', 'MCI')] });
+      if (url.includes('/basketball/nba/') && d === '20261103') return ok({ events: [ev('8001', '2026-11-04T00:00:00Z', 'BOS', 'NY')] });
+      return ok({ events: [] });
+    }
+    if (url.includes('game_schedule') && opts.method === 'POST') {
+      const rows = JSON.parse(opts.body);
+      posts2.push(rows);
+      if (rows.some((r) => r.league === 'NBA')) return { ok: false, status: 409, json: async () => ({}), text: async () => 'ON CONFLICT DO UPDATE command cannot affect row a second time' };
+      return { ok: true, status: 201, json: async () => null, text: async () => '' };
+    }
+    return ok([]);
+  };
+  const s3 = createScheduleSync({ env: { SUPABASE_URL: 'https://x.supabase.co', SUPABASE_SERVICE_KEY: 'k' }, fetchFn: fetchDup, log: (m) => logs2.push(m), now: () => NOW2 });
+  await s3.tick();
+  const epl = posts2.flat().filter((r) => r.league === 'EPL' && r.espn_id === '7001');
+  assert.strictEqual(epl.length, 1, `duplicate game upserted ${epl.length} times`);
+  assert.strictEqual(epl[0].start_time_utc, '2026-11-03T20:00:00.000Z');
+  for (const rows of posts2) {
+    const keys = rows.map((r) => `${r.league}|${r.espn_id}`);
+    assert.strictEqual(new Set(keys).size, keys.length, 'upsert batch still has a repeated conflict key');
+    assert.strictEqual(new Set(rows.map((r) => r.league)).size, 1);
+  }
+  assert.ok(posts2.some((rows) => rows.some((r) => r.league === 'NBA')));
+  assert.ok(logs2.some((m) => /save NBA error/.test(m) && /cannot affect row a second time/.test(m)), logs2.join('\n'));
+  assert.ok(logs2.some((m) => /deduped 1 duplicate game/.test(m)));
+  assert.strictEqual(s3.stats().upserted, 1);
+  const mem = s3.games().filter((g) => g.espn_id === '7001');
+  assert.strictEqual(mem.length, 1);
+  assert.strictEqual(new Date(mem[0].start_ms).toISOString(), '2026-11-03T20:00:00.000Z');
   console.log('game-schedule tests passed');
 })().catch((e) => { console.error(e); process.exit(1); });

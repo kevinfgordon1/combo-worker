@@ -97,14 +97,20 @@ function espnRows(league, j) {
   return out;
 }
 
+function boardDate(ymd) {
+  const m = /^(\d{4})-?(\d{2})-?(\d{2})$/.exec(String(ymd || ''));
+  return m ? `${m[1]}-${m[2]}-${m[3]}` : String(ymd || '');
+}
+
 async function fetchEspnDay(league, ymd, fetchFn = globalThis.fetch) {
   const L = LEAGUES[league]; if (!L) return [];
   const groups = L.groups || [null]; const rows = [];
+  const scoreboard_date = boardDate(ymd); // which scoreboard day this payload came from (not the kickoff)
   for (const g of groups) {
-    const url = `https://site.api.espn.com/apis/site/v2/sports/${L.espn}/scoreboard?dates=${ymd.replace(/-/g, '')}&limit=400${g ? `&groups=${g}` : ''}`;
+    const url = `https://site.api.espn.com/apis/site/v2/sports/${L.espn}/scoreboard?dates=${String(ymd).replace(/-/g, '')}&limit=400${g ? `&groups=${g}` : ''}`;
     const r = await fetchFn(url, { headers: { accept: 'application/json' } });
     if (!r.ok) throw new Error(`ESPN ${league} ${ymd} HTTP ${r.status}`);
-    rows.push(...espnRows(league, await r.json()));
+    for (const row of espnRows(league, await r.json())) { row.scoreboard_date = scoreboard_date; rows.push(row); }
   }
   return rows;
 }
@@ -113,6 +119,30 @@ async function fetchEspnDay(league, ymd, fetchFn = globalThis.fetch) {
 // in #298 (14 ms per sniper leg → event-loop stall + OOM on kaygo-sniper, Oct 27 2026).
 const ET_FMT = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' });
 const etDate = (ms) => ET_FMT.format(new Date(ms));
+
+// ESPN lists some games on two scoreboard days (UCL, 2026-11-03). The upsert key is (league, espn_id);
+// a batch that contains that key twice is rejected entirely ("ON CONFLICT cannot affect a row twice").
+function boardMatchesKickoff(g) {
+  return !!(g && g.scoreboard_date && Number.isFinite(g.start_ms) && g.scoreboard_date === etDate(g.start_ms));
+}
+function preferScheduleGame(a, b) {
+  const am = boardMatchesKickoff(a); const bm = boardMatchesKickoff(b);
+  if (am !== bm) return am ? a : b; // the listing whose scoreboard date is the kickoff date
+  const ad = a.scoreboard_date || ''; const bd = b.scoreboard_date || '';
+  if (ad !== bd) return bd > ad ? b : a; // otherwise the later scoreboard (latest ESPN data)
+  return b;
+}
+/** One game per upsert key (league, espn_id). Input order is the fetch order. */
+function dedupeGames(games) {
+  const m = new Map();
+  for (const g of games || []) {
+    if (!g) continue;
+    const k = `${g.league}|${g.espn_id}`;
+    const prev = m.get(k);
+    m.set(k, prev ? preferScheduleGame(prev, g) : g);
+  }
+  return [...m.values()];
+}
 
 /** Small LRU (Map insertion order). */
 function makeLru(cap) {
@@ -252,4 +282,4 @@ function buildRows(events, games, checks = {}, now = Date.now()) {
   return { rows, misses };
 }
 
-module.exports = { indexGames, makeLru, MATCH_CACHE_MAX, gameToRow, rowToGame, parseEvent, espnRows, fetchEspnDay, matchEvent, resolveStart, buildRows, kalshiStartGuess, codeMatches, LEAGUES, ALIAS, DISAGREE_MS, etDate, addDays };
+module.exports = { indexGames, makeLru, MATCH_CACHE_MAX, gameToRow, rowToGame, parseEvent, espnRows, fetchEspnDay, dedupeGames, matchEvent, resolveStart, buildRows, kalshiStartGuess, codeMatches, LEAGUES, ALIAS, DISAGREE_MS, etDate, addDays };
