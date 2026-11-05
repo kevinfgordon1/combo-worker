@@ -1,6 +1,6 @@
 // Low-balance-only pre-quote cash check for Combo Locks (Kevin Nov 4 2026).
 //
-// Combo Locks' only limits are the user's contract cap and the cash in the
+// Combo Locks' only SIZE limits are the user's contract cap and the cash in the
 // prediction-market account. The exchange already refuses a fill the account
 // cannot cover, but on Polymarket an accepted quote we cannot pay for counts as
 // a DECLINE (poly-decline-guard: ~15% declines pauses the whole maker account),

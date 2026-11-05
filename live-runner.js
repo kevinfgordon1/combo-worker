@@ -84,11 +84,18 @@
 //   No public-tape lookup. Precision rejects stay console + unfilled.
 //   Quote-watcher stays parked (same KALSHI_KEY_ID unsubscribes this WS).
 //   We do not write combo_matches or watcher_debug.
-// RFQ FINGERPRINT: lock-matched RFQs are fingerprinted (sorted legs +
-//   contracts + target_cost + creator_id when non-empty) for History grouping
-//   only. There is NO repeat-request cooldown (removed Kevin Nov 4 2026): the
-//   only Combo Locks limits are the user's contract cap and account cash
-//   (balance-gate.js). Exact-lock matching unchanged. Quote-watcher stays parked.
+// RFQ REPEAT: lock-matched RFQs about to quote are fingerprinted
+//   (sorted legs + contracts + target_cost + creator_id when non-empty).
+//   Cooldown / skip rfq_repeat ONLY when creator_id is known. Anonymous
+//   WS RFQs (empty creator — common) always POST, even if Ari+Jax 6-contract
+//   is identical. Known-creator loops allow RFQ_REPEAT_MAX_QUOTES successful
+//   quotes (default 8) then go dark for RFQ_REPEAT_COOLDOWN_MS (default 300s;
+//   0 disables). During dark, persist skip_reason=rfq_repeat on Miss tape
+//   and Telegram once per window. After dark ends the quote counter resets.
+//   Failed POST (incl. 409 rfq_closed) does not claim — the next live
+//   auction can still quote. History fingerprint is still written for
+//   grouping. Exact-lock matching unchanged. Poly is not wired.
+//   Quote-watcher stays parked.
 // UNHEDGED: default WORKER_MODE=combo does NOT schedule unhedged /markets
 //   refresh, fill ticks, or shadow-miss persist. That work is
 //   unhedged-runner.js (npm run start:unhedged) — its own Railway job,
@@ -99,6 +106,8 @@
 //
 // Env: KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
+//      RFQ_REPEAT_MAX_QUOTES (optional; default 8)
+//      RFQ_REPEAT_COOLDOWN_MS (optional; default 300000; 0 disables)
 //      COMBO_BALANCE_GATE=0 disables the low-balance pre-quote check (balance-gate.js);
 //        COMBO_BALANCE_GATE_COMFORT (default 2) = cash multiple of quote cost + holds
 //        above which the check is skipped entirely.
@@ -178,7 +187,16 @@ const { confirmedFullFill } = require('./full-fill');
 const { liveRunnerFillRow, resolveFillLookup, findPendingFill, submissionAlreadyFilled, claimFillKey, isKalshiTradeFill, countsTowardCap } = require('./fills-attr');
 const { bookFromQuoteExecution, fillsQuery, fillReferencesOrder } = require('./kalshi-fill-confirm');
 const { findPolyEconomicTwin } = require('./polymarket-fill-reconcile');
-const { fingerprintRfq, creatorIdFromQuoteResponse } = require('./rfq-repeat');
+const {
+  fingerprintRfq,
+  cooldownFingerprint,
+  creatorIdFromQuoteResponse,
+  createRepeatGuard,
+  readCooldownMs,
+  readMaxQuotes,
+  formatRepeatSkipAlert,
+  REPEAT_SKIP_REASON,
+} = require('./rfq-repeat');
 const { createBalanceGate, sumHoldsUsd, kalshiPendingCostUsd, quoteCostUsd: gateCostUsd } = require('./balance-gate');
 const { createKalshiRestPair, QUOTE_WARM_MS, QUOTE_CONNECTIONS, QUOTE_TIMEOUT_MS } = require('./kalshi-http');
 const { createQuoteSender, rfqAgeMs, DEFAULT_MAX_RFQ_AGE_MS } = require('./quote-sender');
@@ -424,12 +442,17 @@ const counts = {
   limitReached: 0,
   posted: 0, postFailed: 0, dollarRfqs: 0, filled: 0,
   tapeMatched: 0, tapeNone: 0,
+  rfqRepeat: 0,
   balanceGateSkips: 0, polyBalanceGateSkips: 0,
 };
 // Oversized-RFQ partial-quote DRY-RUN counter (COMBO_PARTIAL_QUOTE_OVERSIZED,
 // default OFF). Observability only — Kalshi quotes cannot be smaller than the RFQ.
 const partialQuote = createPartialQuoteDryRun();
 
+const repeatGuard = createRepeatGuard({
+  cooldownMs: readCooldownMs(process.env),
+  maxQuotes: readMaxQuotes(process.env),
+});
 let lastLockFingerprint = '';
 const LOCK_MISS_LOG_MS = 10000;
 let lastLockMissLogAt = 0;
@@ -2703,6 +2726,37 @@ async function onRfq(rfq, env) {
   }
 
   const fingerprint = fingerprintRfq(rfq);
+  const cooldownFp = cooldownFingerprint(rfq);
+  const peeked = cooldownFp ? repeatGuard.peek(cooldownFp) : { skip: false, gated: false };
+  const claimed = peeked.skip ? repeatGuard.noteSkip(cooldownFp) : peeked;
+  if (claimed.skip) {
+    counts.rfqRepeat++;
+    const extra = {
+      ...skipPersistExtra({
+        skipReason: REPEAT_SKIP_REASON,
+        contracts: size.contracts != null ? size.contracts : rfq.contracts,
+        remaining: d && d.remaining != null ? d.remaining : null,
+        marketTicker: rfq.marketTicker,
+      }),
+      rfq_fingerprint: fingerprint,
+    };
+    logAsync(p, rfq, d, 'declined', extra);
+    console.log(
+      `[${MODE}] SKIP ${REPEAT_SKIP_REASON} ${p.label} rfq=${rfq.rfqId} ` +
+      `fp=${fingerprint} remaining=${claimed.remainingMs}ms skips=${claimed.skipCount}`
+    );
+    if (claimed.alert) {
+      sendAlert(formatRepeatSkipAlert({
+        label: p.label,
+        contracts: size.contracts != null ? size.contracts : rfq.contracts,
+        cooldownMs: claimed.cooldownMs,
+        skipCount: claimed.skipCount,
+        venue: 'kalshi',
+      })).catch(() => {});
+    }
+    return;
+  }
+
   counts.wouldQuote++;
   const t1 = performance.now(); // after match + price
 
@@ -2797,11 +2851,17 @@ async function onRfq(rfq, env) {
         `${exposureBit(capBook.enabled ? outstanding : outstanding + reservedContracts)}/${d.totalLimit} locks=${d.locks}`
       );
 
-      // REST may return rfq_creator_id after we already posted. Persist it for History.
+      // REST may return rfq_creator_id after we already posted. Persist it
+      // for History; start the creator-gated window only after POST landed.
+      if (cooldownFp) repeatGuard.claim(cooldownFp);
       const restCreator = creatorIdFromQuoteResponse(result);
       const quotedFingerprint = restCreator && !rfq.creatorId
         ? fingerprintRfq({ ...rfq, creatorId: restCreator })
         : fingerprint;
+      if (restCreator && !cooldownFp) {
+        const learned = cooldownFingerprint({ ...rfq, creatorId: restCreator });
+        if (learned) repeatGuard.claim(learned);
+      }
 
       if (p && p.user_id) Promise.resolve(userLocation.onQuoted(p.user_id)).catch(() => {});
       // Fire-and-forget after POST (Step 1)
@@ -2966,7 +3026,8 @@ async function main() {
     `Unaccepted quotes are DELETE'd after ${RESERVE_TTL_MS / 1000}s. ` +
     `rfq_deleted releases immediately. ` +
     `Skipped oversized/cap RFQs get a targeted tape lookup after close. ` +
-    `No repeat-request cooldown (cap + account cash are the only limits). ` +
+    `RFQ repeat ${repeatGuard.maxQuotes} quotes then ${repeatGuard.cooldownMs}ms dark creator-gated ` +
+    `(RFQ_REPEAT_MAX_QUOTES / RFQ_REPEAT_COOLDOWN_MS; 0 cooldown disables; empty creator_id always quotes). ` +
     `Low-balance gate ${balanceGate.enabled ? `on (skip check when cash >= ${balanceGate.comfort}x quote cost + open holds)` : 'off'}. ` +
     `WORKER_MODE=${workerMode}. ` +
     (runUnhedged

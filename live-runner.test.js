@@ -417,14 +417,176 @@ assert.ok(
   !/parlays = p \|\| \[\]/.test(shadowSrc),
   'shadow refresh must not coerce null parlays data to []'
 );
-// Repeat-request cooldown removed (Kevin Nov 4 2026): fingerprints stay for History only.
 assert.ok(
-  /require\('\.\/rfq-repeat'\)/.test(liveSrc) && liveSrc.includes('rfq_fingerprint'),
-  'History still persists rfq_fingerprint'
+  /require\('\.\/rfq-repeat'\)/.test(liveSrc) &&
+    /cooldownFingerprint\(rfq\)/.test(liveSrc) &&
+    /cooldownFp \? repeatGuard\.peek\(cooldownFp\)/.test(liveSrc),
+  'Kalshi quote path must peek cooldown only when creator_id is known'
 );
 assert.ok(
-  !/repeatGuard|cooldownFingerprint|formatRepeatSkipAlert|REPEAT_SKIP_REASON|readCooldownMs|readMaxQuotes/.test(liveSrc),
-  'no repeat-request cooldown on the Kalshi quote path'
+  /peeked\.skip \? repeatGuard\.noteSkip\(cooldownFp\)/.test(liveSrc),
+  'repeat skip must noteSkip without claiming a new window'
+);
+assert.ok(
+  /if \(cooldownFp\) repeatGuard\.claim\(cooldownFp\)/.test(liveSrc) &&
+    /await postQuote\(rfq\.rfqId/.test(liveSrc),
+  'creator-gated cooldown starts only after a successful quote POST'
+);
+assert.ok(
+  liveSrc.indexOf('await postQuote(rfq.rfqId') < liveSrc.indexOf('if (cooldownFp) repeatGuard.claim(cooldownFp)'),
+  'claim must sit after postQuote so 409 rfq_closed cannot start the dark skip'
+);
+assert.ok(
+  /skipReason:\s*REPEAT_SKIP_REASON/.test(liveSrc) && liveSrc.includes('rfq_fingerprint'),
+  'repeat skips must persist skip_reason=rfq_repeat + rfq_fingerprint'
+);
+assert.ok(
+  /if \(claimed\.alert\) \{[\s\S]*?sendAlert\(formatRepeatSkipAlert/.test(liveSrc),
+  'Telegram only when creator-gated cooldown applies — not every repeat tick'
+);
+assert.ok(
+  /formatRepeatSkipAlert\(\{[\s\S]*?venue:\s*'kalshi'/.test(liveSrc),
+  'RFQ REPEAT Telegram is labeled Kalshi (Poly repeat is not wired)'
+);
+assert.ok(
+  /RFQ_REPEAT_COOLDOWN_MS/.test(liveSrc) &&
+    /RFQ_REPEAT_MAX_QUOTES/.test(liveSrc) &&
+    /readMaxQuotes\(process\.env\)/.test(liveSrc) &&
+    /rfqRepeat:\s*0/.test(liveSrc),
+  'cooldown and max quotes must be env-tunable and tallied'
+);
+assert.ok(
+  /creator-gated/.test(liveSrc) && /empty creator_id always quotes/.test(liveSrc),
+  'startup log must say anonymous RFQs still quote'
+);
+assert.ok(
+  /creatorIdFromQuoteResponse\(result\)/.test(liveSrc) &&
+    /await postQuote\(rfq\.rfqId/.test(liveSrc),
+  'REST rfq_creator_id is stored after a successful POST, not before'
+);
+assert.ok(
+  /http: kalshiQuoteHttp/.test(liveSrc) &&
+    /createKalshiRestPair/.test(liveSrc),
+  'quote POST/confirm/cancel must use the dedicated quote HTTP client'
+);
+assert.ok(
+  /kalshiSigned\('POST', QUOTE_PATH[\s\S]*?http: kalshiQuoteHttp/.test(liveSrc),
+  'postQuote must send on kalshiQuoteHttp, not the GET pool'
+);
+assert.ok(
+  /kalshiSigned\('PUT', path[\s\S]*?http: kalshiQuoteHttp/.test(liveSrc) &&
+    /kalshiSigned\('DELETE', path, \{ http: kalshiQuoteHttp \}/.test(liveSrc),
+  'confirm and cancel share the quote client'
+);
+assert.ok(
+  /warmOne\(kalshiHttp, 'rest', 1\)/.test(liveSrc) &&
+    /warmOne\(kalshiQuoteHttp, 'quote', QUOTE_CONNECTIONS\)/.test(liveSrc),
+  'both REST pools must be warmed so the first quote POST is not a cold TLS'
+);
+assert.ok(
+  /if \(runUnhedged\) \{[\s\S]*?setImmediate\(\(\) => \{[\s\S]*?shadowUnhedgedMiss\(missRfq/.test(liveSrc),
+  'unhedged miss persist is WORKER_MODE=all only and must yield so a lock can POST first'
+);
+assert.ok(
+  /setImmediate\(\(\) => \{[\s\S]*?RFQ-SAMPLE/.test(liveSrc) &&
+    /setImmediate\(\(\) => \{[\s\S]*?EMPTY-LEGS/.test(liveSrc) &&
+    /setImmediate\(\(\) => \{[\s\S]*?LOCK-MISS/.test(liveSrc),
+  'RFQ-SAMPLE / EMPTY-LEGS / LOCK-MISS logs must not run on the quote tick'
+);
+assert.ok(
+  /function unlessQuoteHot\(/.test(liveSrc) &&
+    /setInterval\(unlessQuoteHot\(\(\) => \{ refresh\(\); \}\)/.test(liveSrc) &&
+    /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?cancelUnacceptedQuotes/.test(liveSrc) &&
+    /setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?reconcileSkipTapes/.test(liveSrc),
+  'refresh / cancel / skip-tape must pause while quote-hot'
+);
+assert.ok(
+  !/setInterval\(unlessQuoteHot\(\(\) => \{[\s\S]*?unhedgedFills\.tick/.test(liveSrc),
+  'combo default must not schedule unhedged fill ticks on the Combo Locks timer'
+);
+assert.ok(
+  /if \(runUnhedged\) \{[\s\S]*?startUnhedgedSide\(/.test(liveSrc) &&
+    /shouldPause:\s*\(\) => quoteHot\.inFlight/.test(liveSrc),
+  'WORKER_MODE=all still boots unhedged via startUnhedgedSide and pauses /markets while quote-hot'
+);
+assert.ok(
+  /Unhedged \/markets, fill ticks, and shadow miss are off/.test(liveSrc),
+  'combo default startup log says unhedged is a separate Railway job'
+);
+assert.ok(
+  /WORKER_MODE=unhedged — use start-unhedged/.test(liveSrc),
+  'live-runner must refuse WORKER_MODE=unhedged (wrong entrypoint)'
+);
+assert.ok(
+  /skip_reason: 'rfq_closed'/.test(liveSrc) &&
+    /QUOTE LATE/.test(liveSrc) &&
+    /formatQuoteLatency/.test(liveSrc) &&
+    /isRfqClosedFailure/.test(liveSrc),
+  '409 rfq_closed must persist skip_reason, log QUOTE LATE with [LAT] ms'
+);
+assert.ok(
+  /✅ QUOTED[\s\S]*?match→POST \$\{totalMs\}ms/.test(liveSrc) &&
+    /❌ QUOTE LATE[\s\S]*?match→POST \$\{totalMs\}ms/.test(liveSrc),
+  'QUOTED and QUOTE LATE Telegram both include match→POST total ms'
+);
+assert.ok(
+  /require\('\.\/kalshi-http'\)/.test(liveSrc) &&
+    !/new Client\('https:\/\/external-api\.kalshi\.com'/.test(liveSrc),
+  'do not construct a single shared undici Client for all Kalshi REST'
+);
+assert.ok(
+  !/await fetchSkipRfq\(rfq\.rfqId\)/.test(liveSrc.split('async function onRfq')[1] || ''),
+  'first quote must not wait on REST GET for creator_id'
+);
+assert.ok(
+  !/require\('\.\/quote-watcher'\)/.test(liveSrc),
+  'quote-watcher stays parked'
+);
+assert.ok(
+  /require\('\.\/quote-hot'\)/.test(liveSrc) &&
+    /createQuoteHot/.test(liveSrc) &&
+    /lockNeedlePlan/.test(liveSrc),
+  'quote-hot needles + in-flight tracker must be wired'
+);
+assert.ok(
+  /shouldDeferCreated:\s*\(raw\) => quoteHot\.shouldDeferCreated\(raw\)/.test(liveSrc),
+  'Kalshi WS must defer unmatched firehose frames while a quote POST is in flight'
+);
+assert.ok(
+  /shouldDropCreated:\s*\(raw\) => quoteHot\.shouldDropCreated\(raw\)/.test(liveSrc) &&
+    /createKalshiFirehose/.test(liveSrc) &&
+    /DEFAULT_LIVE_SHARD_FACTOR/.test(liveSrc),
+  'live runner must shard the communications firehose and fast-drop non-lock rfq_created'
+);
+assert.ok(
+  /ws-throughput/.test(liveSrc) && /wsBacklog/.test(liveSrc) && /wsAlerter\.poll/.test(liveSrc),
+  'throughput, backlog, and sustained-down alerts must be logged'
+);
+assert.ok(
+  /function withQuoteHot\(/.test(liveSrc) &&
+    /return withQuoteHot\(async \(\) => \{/.test(liveSrc),
+  'quote POST and confirm must mark quote-hot so the firehose yields'
+);
+assert.ok(
+  liveSrc.indexOf('async function postQuote') < liveSrc.indexOf('async function confirmQuote') &&
+    /async function postQuote[\s\S]*?withQuoteHot[\s\S]*?async function confirmQuote[\s\S]*?withQuoteHot/.test(liveSrc),
+  'both POST and confirm wrap withQuoteHot'
+);
+assert.ok(
+  /if \(!quoteHot\.inFlight\) tasks\.push\(warmOne\(kalshiQuoteHttp, 'quote', QUOTE_CONNECTIONS\)\)/.test(liveSrc),
+  'do not steal the quote pool for a warm GET during POST/confirm'
+);
+assert.ok(
+  /setInterval\(warmConnection, QUOTE_WARM_MS\)/.test(liveSrc) &&
+    /QUOTE_WARM_MS/.test(liveSrc),
+  'quote pool warm must use QUOTE_WARM_MS (15s), not a 45s idle gap'
+);
+assert.ok(
+  // setHotPlan = quoteHot.setPlan + mirror to the COMBO_INTAKE_WORKER thread.
+  /setHotPlan\(needlePlan\)/.test(liveSrc) &&
+    /function setHotPlan\(plan\) \{\n  quoteHot\.setPlan\(plan\);/.test(liveSrc) &&
+    /lockNeedlePlan\(parlays\)/.test(liveSrc),
+  'refresh must restage lock needles after parlays apply'
 );
 assert.ok(
   !/setInterval\(warmConnection, 45000\)/.test(liveSrc),
@@ -432,7 +594,7 @@ assert.ok(
 );
 assert.ok(
   !/require\('\.\/rfq-repeat'\)/.test(fs.readFileSync(path.join(__dirname, 'polymarket-rfq.js'), 'utf8')),
-  'Poly path has no repeat-request cooldown'
+  'Poly path is not wired unless the same spam pattern appears'
 );
 
 assert.ok(

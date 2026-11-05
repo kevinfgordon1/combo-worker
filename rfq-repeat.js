@@ -1,14 +1,19 @@
-// Identical-RFQ fingerprint for Combo Locks History grouping.
-// Fingerprint = sorted legs + contracts + target_cost (+ creator when present).
-// The repeat-request cooldown (8 quotes then 300s dark per creator) was REMOVED
-// (Kevin Nov 4 2026): Combo Locks' only limits are the user's contract cap and
-// the cash in their prediction-market account. Fingerprints are still written
-// to combo_submissions.rfq_fingerprint; nothing here skips a quote.
-// REPEAT_SKIP_REASON stays so old rfq_repeat Miss-tape rows still classify.
+// Identical-RFQ fingerprint + in-memory cooldown for Combo Locks quotes.
+// History fingerprint = sorted legs + contracts + target_cost (+ creator when
+// present). Cooldown / skip rfq_repeat ONLY when creator_id is non-empty —
+// Kalshi WS often omits it, and two real people requesting the same Ari+Jax
+// 6-contract must both quote. Does not change matchParlay / exact-lock matching.
+// Known-creator loops allow RFQ_REPEAT_MAX_QUOTES successful quotes (default 8)
+// then go dark for RFQ_REPEAT_COOLDOWN_MS (default 300s). After dark ends the
+// quote counter resets.
 'use strict';
 const { normalizeLegKey } = require('./rfq');
+const { formatAlertStatus } = require('./venue-alert');
 
+const DEFAULT_COOLDOWN_MS = 300_000;
+const DEFAULT_MAX_QUOTES = 8;
 const REPEAT_SKIP_REASON = 'rfq_repeat';
+const MAX_ENTRIES = 256;
 
 function compactNum(n) {
   if (n == null || n === '') return '';
@@ -37,6 +42,13 @@ function fingerprintRfq(rfq) {
   return `v1|${legs.join(',')}|c=${contracts}|t=${target}|u=${creator}`;
 }
 
+// Cooldown key is creator-primary. Empty/missing creator → null (always quote).
+function cooldownFingerprint(rfq) {
+  const creator = normalizedCreatorId(rfq);
+  if (!creator) return null;
+  return fingerprintRfq(rfq);
+}
+
 function isAnonymousFingerprint(fingerprint) {
   return !fingerprint || /\|u=$/.test(String(fingerprint));
 }
@@ -55,11 +67,181 @@ function creatorIdFromQuoteResponse(result) {
   return s || null;
 }
 
+function readCooldownMs(env = process.env) {
+  const raw = env && env.RFQ_REPEAT_COOLDOWN_MS;
+  if (raw == null || raw === '') return DEFAULT_COOLDOWN_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_COOLDOWN_MS;
+  return n;
+}
+
+function readMaxQuotes(env = process.env) {
+  const raw = env && env.RFQ_REPEAT_MAX_QUOTES;
+  if (raw == null || raw === '') return DEFAULT_MAX_QUOTES;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_MAX_QUOTES;
+  return Math.floor(n);
+}
+
+function formatRepeatSkipAlert({ label, contracts, cooldownMs, skipCount, venue = 'kalshi' } = {}) {
+  const secs = Math.max(0, Math.round((cooldownMs || 0) / 1000));
+  const n = contracts != null && contracts !== '' ? String(contracts) : '?';
+  let text =
+    `${formatAlertStatus('⏭️ RFQ REPEAT', venue)} — ${label || '(unknown)'}\n` +
+    `same ${n}-contract fingerprint · cooling ${secs}s\n` +
+    `further identical RFQs skipped (Miss tape: ${REPEAT_SKIP_REASON})`;
+  if (skipCount > 1) text += `\n×${skipCount} this window`;
+  return text;
+}
+
+function createRepeatGuard({
+  cooldownMs = DEFAULT_COOLDOWN_MS,
+  maxQuotes = DEFAULT_MAX_QUOTES,
+  now = () => Date.now(),
+  maxEntries = MAX_ENTRIES,
+} = {}) {
+  const map = new Map();
+  const nowMs = () => (typeof now === 'function' ? now() : now);
+  const quoteCap = Number.isFinite(maxQuotes) && maxQuotes >= 1
+    ? Math.floor(maxQuotes)
+    : DEFAULT_MAX_QUOTES;
+
+  function inDark(entry, t) {
+    return entry && entry.darkAt != null && t - entry.darkAt < cooldownMs;
+  }
+
+  function darkExpired(entry, t) {
+    return entry && entry.darkAt != null && t - entry.darkAt >= cooldownMs;
+  }
+
+  function prune(t) {
+    if (!(cooldownMs > 0)) {
+      map.clear();
+      return;
+    }
+    for (const [k, v] of map) {
+      if (darkExpired(v, t)) map.delete(k);
+    }
+    while (map.size > maxEntries) {
+      const oldest = map.keys().next().value;
+      if (oldest == null) break;
+      map.delete(oldest);
+    }
+  }
+
+  function activeEntry(fingerprint, t) {
+    const prev = map.get(fingerprint);
+    if (darkExpired(prev, t)) {
+      map.delete(fingerprint);
+      return null;
+    }
+    return prev || null;
+  }
+
+  function openReturn({ skip = false, gated = true, quoteCount = 0 } = {}) {
+    return { skip, cooldownMs, maxQuotes: quoteCap, quoteCount, gated };
+  }
+
+  function peek(fingerprint, at) {
+    const t = at != null ? at : nowMs();
+    if (!fingerprint || isAnonymousFingerprint(fingerprint) || !(cooldownMs > 0)) {
+      return openReturn({ skip: false, gated: false });
+    }
+    const prev = activeEntry(fingerprint, t);
+    if (inDark(prev, t)) {
+      return {
+        skip: true,
+        remainingMs: cooldownMs - (t - prev.darkAt),
+        skipCount: prev.skipCount,
+        skipAlerted: prev.skipAlerted,
+        cooldownMs,
+        maxQuotes: quoteCap,
+        quoteCount: prev.quoteCount,
+        firstAt: prev.darkAt,
+        gated: true,
+      };
+    }
+    return openReturn({ skip: false, gated: true, quoteCount: prev ? prev.quoteCount : 0 });
+  }
+
+  function noteSkip(fingerprint, at) {
+    const seen = peek(fingerprint, at);
+    if (!seen.skip) return seen;
+    const prev = map.get(fingerprint);
+    prev.skipCount += 1;
+    const alert = !prev.skipAlerted;
+    prev.skipAlerted = true;
+    return {
+      ...seen,
+      skipCount: prev.skipCount,
+      alert,
+      gated: true,
+    };
+  }
+
+  // Count a successful quote POST. Dark starts only after quoteCap claims.
+  // Claiming before send turned 409 rfq_closed into a skip of the next live auction.
+  function claim(fingerprint, at) {
+    const t = at != null ? at : nowMs();
+    if (!fingerprint || isAnonymousFingerprint(fingerprint) || !(cooldownMs > 0)) {
+      return openReturn({ skip: false, gated: false });
+    }
+    const prev = activeEntry(fingerprint, t);
+    if (inDark(prev, t)) {
+      prev.skipCount += 1;
+      const alert = !prev.skipAlerted;
+      prev.skipAlerted = true;
+      return {
+        skip: true,
+        remainingMs: cooldownMs - (t - prev.darkAt),
+        skipCount: prev.skipCount,
+        alert,
+        cooldownMs,
+        maxQuotes: quoteCap,
+        quoteCount: prev.quoteCount,
+        firstAt: prev.darkAt,
+        gated: true,
+      };
+    }
+    const next = prev || { quoteCount: 0, lastQuoteAt: t, darkAt: null, skipCount: 0, skipAlerted: false };
+    next.quoteCount += 1;
+    next.lastQuoteAt = t;
+    if (next.quoteCount >= quoteCap) next.darkAt = t;
+    map.set(fingerprint, next);
+    prune(t);
+    return {
+      skip: false,
+      first: next.quoteCount === 1,
+      cooldownMs,
+      maxQuotes: quoteCap,
+      quoteCount: next.quoteCount,
+      gated: true,
+    };
+  }
+
+  return {
+    peek,
+    noteSkip,
+    claim,
+    get size() { return map.size; },
+    cooldownMs,
+    maxQuotes: quoteCap,
+  };
+}
+
 module.exports = {
+  DEFAULT_COOLDOWN_MS,
+  DEFAULT_MAX_QUOTES,
   REPEAT_SKIP_REASON,
+  MAX_ENTRIES,
   compactNum,
   normalizedCreatorId,
   fingerprintRfq,
+  cooldownFingerprint,
   isAnonymousFingerprint,
   creatorIdFromQuoteResponse,
+  readCooldownMs,
+  readMaxQuotes,
+  formatRepeatSkipAlert,
+  createRepeatGuard,
 };
