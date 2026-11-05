@@ -48,6 +48,7 @@ const { decideAtFill, isFreeBetRow, quoteFailureSkipReason, isRfqClosedFailure }
 const { createLatencyStats } = require('./latency-stats');
 const { findStartedEvent } = require('./started');
 const { createDeclineGuard, readDeclineGuardConfig } = require('./poly-decline-guard');
+const { sumHoldsUsd, polyPendingCostUsd, quoteCostUsd: gateCostUsd } = require('./balance-gate');
 const {
   RESERVE_TTL_MS,
   sumOutstanding,
@@ -813,7 +814,7 @@ function evaluatePolymarketRfq({
     // requester's accept fills that FULL size. Production data (198 clipped
     // quotes, 5 executed) shows the venue recorded the full RFQ size every time,
     // so a "clipped" quote was really a full-size quote. Oversized RFQs
-    // (size > min(remaining, per-fill cap)) are declined as rfq_too_large.
+    // (size > remaining on the user's cap) are declined as rfq_too_large.
     allowPartial: false,
     isFreeBet: isFreeBetRow(parlay),
     // Price actually sent + credited maker rebate: hit/miss/worst are computed at it, and with
@@ -1571,6 +1572,8 @@ function startPolymarketRfqLoop(ctx = {}) {
   const live = enableLocks && !dryRun && isPolymarketRfqLive(env);
   const creds = inspectPolymarketCreds({ keyId, secretKey }, env);
   const pendingQuotes = ctx.pendingQuotes || new Map();
+  // Low-balance-only cash check (balance-gate.js, in-memory; absent = off).
+  const balanceGate = ctx.balanceGate && typeof ctx.balanceGate.check === 'function' ? ctx.balanceGate : null;
   const confirmingQuotes = ctx.confirmingQuotes || new Set();
   const clock = typeof ctx.now === 'function' ? ctx.now : () => Date.now();
   const capBook = ctx.capBook || createCapBook({
@@ -2033,6 +2036,28 @@ function startPolymarketRfqLoop(ctx = {}) {
       return { ...evaluation, post: false, reason: gate.reason };
     }
 
+    // Low cash vs (this quote + open Poly holds): skip instead of posting a quote
+    // we could not pay for (an unpayable accept is a decline on Polymarket).
+    // Normal cash takes the in-memory 'fast' path; never any network call here.
+    if (balanceGate) {
+      const unit = 1 - Number(q.buyPrice);
+      const cash = balanceGate.check({
+        venue: 'polymarket',
+        costUsd: gateCostUsd(d.contracts, unit),
+        holdsUsd: () => sumHoldsUsd(pendingQuotes, polyPendingCostUsd),
+        unitCost: unit,
+      });
+      if (!cash.ok) {
+        bump('polyBalanceGateSkips');
+        console.log(
+          `[${MODE}] SKIP low balance ${p.label} rfq=${rfq.rfqId} contracts=${d.contracts} ` +
+          `cost=$${cash.costUsd.toFixed(2)} cash=$${cash.cashUsd.toFixed(2)} holds=$${cash.holdsUsd.toFixed(2)}` +
+          (cash.maxContracts != null ? ` fits=${cash.maxContracts}` : '')
+        );
+        persistLockTape(evaluation, 'declined', { skip_reason: 'insufficient_balance', contracts: d.contracts });
+        return { ...evaluation, post: false, reason: 'insufficient_balance' };
+      }
+    }
     const reserveKey = `reserve:pm:${++reserveSeq}`;
     const sizeMeta = quoteSizeMeta(rfq, evaluation);
     pendingQuotes.set(reserveKey, pendingEntry(p, rfq, d.contracts, sizeMeta));

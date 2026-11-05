@@ -131,7 +131,8 @@ function shouldPostQuote(size) {
 
 // Underfunded quote create/confirm — persist skip_reason=insufficient_balance
 // on combo_submissions (Combo Locks Miss tape / lock card). No pre-flight
-// balance poll; we label the exchange reject.
+// balance poll: balance-gate.js only skips on LOW cash using the reporter's
+// in-memory ~60s snapshot; the exchange reject labeled here stays the backup.
 //
 // Kalshi: error.code `insufficient_balance` / `INSUFFICIENT_BALANCE`.
 // Polymarket shapes seen on CLOB / Retail HTTP (message, error, code,
@@ -276,11 +277,12 @@ function hedgeCap({ stake, boostAmerican, fillAmerican, mode = '1x' }) {
 // remaining = maxContracts - filledSoFar - outstanding.
 // When remaining <= 0 the RFQ is DECLINED ('limit_reached').
 // IMPORTANT: Kalshi maker quotes have NO size — accepting our quote fills the FULL RFQ.
-// So we must DECLINE when rfqContracts > remaining (cannot "partial quote"). Same for
-// rfqContracts > per-fill hedge cap.
-// Polymarket can size the maker quote (qtyDecimal). Pass allowPartial: true so a
-// leftover remaining > 0 still quotes min(rfq, remaining, per-fill cap) instead
-// of rfq_too_large. Kalshi live-runner must leave allowPartial off.
+// So we must DECLINE when rfqContracts > remaining (cannot "partial quote").
+// There is NO per-fill hedge-mode limit (Kevin Nov 4 2026): the only size limits are
+// the user's contract cap (remaining) and the cash in the account (balance-gate.js).
+// The hedge-mode size (hedgeCap) is only the fallback ceiling when no max_contracts
+// is saved. allowPartial: true quotes min(rfq, remaining) instead of rfq_too_large;
+// Kalshi live-runner and Polymarket both leave it off.
 //
 // isFreeBet   : the row is a free bet (combo_parlays.is_free_bet / bet_type 'free').
 //               Original 'riskfree' mode on a free bet MUST carry a saved max_contracts.
@@ -305,8 +307,8 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
     return { ok: false, reason: 'no_cap', cap: 0, totalLimit: 0, filledSoFar: filledSoFar > 0 ? filledSoFar : 0, outstanding: outstanding > 0 ? outstanding : 0, remaining: 0 };
   }
   const dec = aToDec(parlayAmerican), winReturn = parlayStake * dec, bookHit = winReturn - parlayStake, bookMiss = -parlayStake;
-  const cap = hedgeCap({ stake: parlayStake, boostAmerican: parlayAmerican, fillAmerican, mode: hedgeMode }); // per-fill hedge shape
-  // Total ceiling: the persisted limit if set, else fall back to the mode's hedge size.
+  const cap = hedgeCap({ stake: parlayStake, boostAmerican: parlayAmerican, fillAmerican, mode: hedgeMode }); // hedge-mode size (fallback ceiling only)
+  // Total ceiling: the user's persisted cap if set, else fall back to the mode's hedge size.
   const totalLimit = (maxContracts != null && maxContracts > 0) ? maxContracts : cap;
   const alreadyFilled = filledSoFar > 0 ? filledSoFar : 0;
   const reserved = outstanding > 0 ? outstanding : 0;
@@ -317,7 +319,8 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
   if (remainingBefore <= 0 || (remainingBefore < 1 && totalLimit >= 1)) {
     return { ok: false, reason: 'limit_reached', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved, remaining: 0 };
   }
-  const maxThisFill = Math.min(remainingBefore, cap);
+  // Only the user's cap limits a single fill: remaining = cap - filled - outstanding.
+  const maxThisFill = remainingBefore;
   // Full-RFQ-only venue: never quote if the RFQ is larger than we can still sell.
   if (rfqContracts > maxThisFill && !allowPartial) {
     return {

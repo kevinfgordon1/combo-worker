@@ -108,6 +108,9 @@
 //      TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHAT_ID (optional)
 //      RFQ_REPEAT_MAX_QUOTES (optional; default 8)
 //      RFQ_REPEAT_COOLDOWN_MS (optional; default 300000; 0 disables)
+//      COMBO_BALANCE_GATE=0 disables the low-balance pre-quote check (balance-gate.js);
+//        COMBO_BALANCE_GATE_COMFORT (default 2) = cash multiple of quote cost + holds
+//        above which the check is skipped entirely.
 //      WORKER_MODE=combo|unhedged|all (default combo)
 //      COMBO_CAP_AT_CONFIRM=1 (optional; default off) — enforce cap at confirm,
 //        not by reserving every open quote. Polymarket close/overfill guards
@@ -194,6 +197,7 @@ const {
   formatRepeatSkipAlert,
   REPEAT_SKIP_REASON,
 } = require('./rfq-repeat');
+const { createBalanceGate, sumHoldsUsd, kalshiPendingCostUsd, quoteCostUsd: gateCostUsd } = require('./balance-gate');
 const { createKalshiRestPair, QUOTE_WARM_MS, QUOTE_CONNECTIONS, QUOTE_TIMEOUT_MS } = require('./kalshi-http');
 const { createQuoteSender, rfqAgeMs, DEFAULT_MAX_RFQ_AGE_MS } = require('./quote-sender');
 const { createQuoteHot, lockNeedlePlan, fastDropDisabled, dropDeletedDisabled, createDeletedFilter } = require('./quote-hot');
@@ -388,6 +392,9 @@ function setHotPlan(plan) {
   if (intakeHost) intakeHost.setPlan(plan);
 }
 const polyPendingQuotes = new Map();
+// Low-balance-only pre-quote cash check (balance-gate.js). Fed by the balance
+// reporter's ~60s reads; check() is pure in-memory arithmetic, no I/O.
+const balanceGate = createBalanceGate({ env: process.env });
 const seenFillIds = new Set();
 let polyLoop = null;
 // Poly fill GET/tape uses this client, created before the shared tracker.
@@ -436,6 +443,7 @@ const counts = {
   posted: 0, postFailed: 0, dollarRfqs: 0, filled: 0,
   tapeMatched: 0, tapeNone: 0,
   rfqRepeat: 0,
+  balanceGateSkips: 0, polyBalanceGateSkips: 0,
 };
 // Oversized-RFQ partial-quote DRY-RUN counter (COMBO_PARTIAL_QUOTE_OVERSIZED,
 // default OFF). Observability only — Kalshi quotes cannot be smaller than the RFQ.
@@ -1019,6 +1027,7 @@ function pendingEntry(p, rfq, contracts, extra) {
     leg_keys: p.leg_keys || p.legKeys,
     maxContracts: p.max_contracts,
     yesBid: extra && extra.yesBid != null ? extra.yesBid : undefined,
+    noBid: extra && extra.noBid != null ? extra.noBid : undefined,
     postedAt: extra && extra.postedAt != null ? extra.postedAt : Date.now(),
   };
 }
@@ -2759,9 +2768,29 @@ async function onRfq(rfq, env) {
 
   // ─── LIVE POST first (Step 1) ─────────────────────────────────────────
   if (!engaged) {
+    // Low-balance-only cash check: in-memory snapshot, no network. Normal cash
+    // takes the 'fast' path; only low cash vs (this quote + open holds) skips.
+    const cash = balanceGate.check({
+      venue: 'kalshi',
+      costUsd: gateCostUsd(d.contracts, noBid),
+      holdsUsd: () => sumHoldsUsd(pendingQuotes, kalshiPendingCostUsd),
+      unitCost: noBid,
+    });
+    if (!cash.ok) {
+      counts.declined++;
+      counts.balanceGateSkips++;
+      console.log(
+        `[${MODE}] SKIP low balance ${p.label} rfq=${rfq.rfqId} contracts=${d.contracts} ` +
+        `cost=$${cash.costUsd.toFixed(2)} cash=$${cash.cashUsd.toFixed(2)} holds=$${cash.holdsUsd.toFixed(2)}` +
+        (cash.maxContracts != null ? ` fits=${cash.maxContracts}` : '')
+      );
+      // Same Miss-tape row + bucket top-up / low-cash alert as an exchange insufficient_balance reject.
+      logFundingSkip(p, rfq, d, { costDollars: cash.costUsd });
+      return;
+    }
     // Reserve BEFORE the await so a parallel RFQ sees this size in outstanding.
     const reserveKey = `reserve:${++reserveSeq}`;
-    pendingQuotes.set(reserveKey, pendingEntry(p, rfq, d.contracts, { yesBid }));
+    pendingQuotes.set(reserveKey, pendingEntry(p, rfq, d.contracts, { yesBid, noBid }));
     const t2 = performance.now();
     try {
       let result;
@@ -2813,7 +2842,7 @@ async function onRfq(rfq, env) {
         console.log(`[${MODE}] LATE POST ok rfq=${rfq.rfqId} rfq_age=${Math.round(postNote.ageMs)}ms post=${(t3 - t2).toFixed(1)}ms`);
       }
       pendingQuotes.delete(reserveKey);
-      pendingQuotes.set(result.id, pendingEntry(p, rfq, reservedContracts, { yesBid: sentYesBid }));
+      pendingQuotes.set(result.id, pendingEntry(p, rfq, reservedContracts, { yesBid: sentYesBid, noBid: sentNoBid }));
 
       console.log(
         `[${MODE}] QUOTED ${p.label} rfq=${rfq.rfqId} quote_id=${result.id} ` +
@@ -2976,6 +3005,8 @@ async function main() {
       signed: SPLIT.runKalshi ? (method, signPath, opts) => kalshiSigned(method, signPath, opts) : null,
       wrap: unlessQuoteHot,
       log: (m) => console.log(`[${MODE}] ${m}`),
+      // Same reads feed the in-memory low-balance gate (no extra exchange calls).
+      onRows: (rows) => balanceGate.update(rows),
     });
   } catch (e) {
     console.error(`[${MODE}] balance reporter not started: ${e && e.message}`);
@@ -2997,6 +3028,7 @@ async function main() {
     `Skipped oversized/cap RFQs get a targeted tape lookup after close. ` +
     `RFQ repeat ${repeatGuard.maxQuotes} quotes then ${repeatGuard.cooldownMs}ms dark creator-gated ` +
     `(RFQ_REPEAT_MAX_QUOTES / RFQ_REPEAT_COOLDOWN_MS; 0 cooldown disables; empty creator_id always quotes). ` +
+    `Low-balance gate ${balanceGate.enabled ? `on (skip check when cash >= ${balanceGate.comfort}x quote cost + open holds)` : 'off'}. ` +
     `WORKER_MODE=${workerMode}. ` +
     (runUnhedged
       ? `Unhedged RFQ shadow in-process (UNHEDGED_RFQ_SHADOW=${isUnhedgedRfqShadow(process.env) ? 'on' : 'off'}, ` +
@@ -3150,6 +3182,7 @@ async function main() {
     sniperRouter: polySniper && polySniper.router ? polySniper.router : null,
     pendingQuotes: polyPendingQuotes,
     kalshiPendingQuotes: pendingQuotes,
+    balanceGate,
     capBook,
     getOutstanding: outstandingFor,
     getParlays: () => comboLocksOnly(parlays),

@@ -15,6 +15,8 @@
 // material, request body, or raw response text is ever logged or stored.
 //
 // BALANCE_REPORT_MS (default 60000, min 15000); BALANCE_REPORT=0 disables.
+// onRows(rows) gets every read (before the DB write) so the quote path can keep
+// the latest cash in memory (balance-gate.js) without any extra exchange call.
 'use strict';
 
 const { createKalshiBucketClient, MAIN_SHARD, BUCKET_SHARD } = require('./bucket-manager');
@@ -75,6 +77,7 @@ function createBalanceReporter({
   polyHttp = null,
   now = () => new Date(),
   log = (m) => console.log(m),
+  onRows = null,
 } = {}) {
   if (!supabase) throw new Error('supabase client required');
   if (!userId) throw new Error('userId required');
@@ -161,6 +164,9 @@ function createBalanceReporter({
       const rows = [];
       if (kalshi) rows.push(...await readKalshi());
       if (polyHttp) rows.push(...await readPoly());
+      if (typeof onRows === 'function' && rows.length) {
+        try { onRows(rows.map(({ _statusOnly, ...r }) => r)); } catch (_) { /* never break reporting */ }
+      }
       if (rows.length) await write(rows);
       const bad = rows.filter((r) => !r.ok);
       if (bad.length && Date.now() - lastErrLog > 10 * 60 * 1000) {
@@ -183,13 +189,13 @@ function createBalanceReporter({
 }
 
 // Wiring helper for live-runner: returns a stop() or null when disabled.
-function startBalanceReporter({ supabase, scope, env = process.env, signed, wrap = (f) => f, log, polyFactory = createPolymarketHttp } = {}) {
+function startBalanceReporter({ supabase, scope, env = process.env, signed, wrap = (f) => f, log, polyFactory = createPolymarketHttp, onRows = null } = {}) {
   if (!reportEnabled(env) || !scope || scope.invalid) return null;
   const userId = scope.writeUserId || OWNER_USER_ID;
   const keyId = env.POLYMARKET_KEY_ID;
   const secretKey = env.POLYMARKET_SECRET_KEY;
   const polyHttp = keyId && secretKey ? polyFactory({ keyId, secretKey }) : null;
-  const reporter = createBalanceReporter({ supabase, userId, signed, polyHttp, log });
+  const reporter = createBalanceReporter({ supabase, userId, signed, polyHttp, log, onRows });
   const ms = reportIntervalMs(env);
   const run = wrap(() => { reporter.tick(); });
   const first = setTimeout(run, 5_000);

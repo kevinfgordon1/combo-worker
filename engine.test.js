@@ -329,9 +329,19 @@ assert.strictEqual(contractsFromQuoteResponse(null, 43), 43);
     hedgeMode: '1x',
     maxContracts: openCap,
   });
-  assert.strictEqual(between.ok, false, '1× still declines an RFQ between 2100 and the open cap');
-  assert.strictEqual(between.reason, 'rfq_too_large');
+  // No per-fill hedge-mode limit (Kevin Nov 4 2026): the user's cap (2166) is the only ceiling,
+  // so a 1× lock quotes an RFQ between the 2100 hedge size and its saved cap.
+  assert.strictEqual(between.ok, true, '1× quotes up to the saved cap, not the 2100 hedge size');
+  assert.strictEqual(between.contracts, 2166);
   assert.strictEqual(between.cap, 2100);
+  assert.strictEqual(between.totalLimit, 2166);
+  // No saved cap: the hedge-mode size is still the fallback total ceiling.
+  const noSaved = decideAtFill({
+    parlayStake: stake, parlayAmerican: boost, fillAmerican: fill,
+    rfqContracts: 2101, hedgeMode: '1x', maxContracts: null,
+  });
+  assert.strictEqual(noSaved.reason, 'rfq_too_large');
+  assert.strictEqual(noSaved.totalLimit, 2100);
 }
 
 // Free bet: cash at risk is $0, profit is still face × (decimal − 1).
