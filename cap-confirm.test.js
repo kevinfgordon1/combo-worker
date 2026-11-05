@@ -106,9 +106,11 @@ assert.strictEqual(CLOSED_CONTEXT_TTL_MS, 60_000);
     maxContracts: openCap,
     outstanding: book.exposure(openQuotes, P),
   });
-  assert.strictEqual(oneX.ok, false);
-  assert.strictEqual(oneX.reason, 'rfq_too_large');
+  // No per-fill hedge-mode limit (Kevin Nov 4 2026): the saved cap (2166) is the only ceiling.
+  assert.strictEqual(oneX.ok, true);
+  assert.strictEqual(oneX.contracts, 2166);
   assert.strictEqual(oneX.cap, 2100);
+  assert.strictEqual(oneX.totalLimit, 2166);
 }
 
 // Polymarket can fill more than we quoted. Cap against the larger number.

@@ -1382,6 +1382,46 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     loopG.stop();
   }
 
+  // Nov 4 2026: low-balance-only cash gate. Normal cash posts (fast path, no I/O); cash below
+  // this quote + open holds skips as insufficient_balance with no POST.
+  {
+    const { createBalanceGate } = require('./balance-gate');
+    const mk = (cash) => {
+      const g = createBalanceGate({ env: {}, now: () => Date.parse('2026-08-14T12:00:10Z') });
+      g.update([{ venue: 'polymarket_us', shard: 0, ok: true, available_usd: cash, fetched_at: '2026-08-14T12:00:00Z' }]);
+      return g;
+    };
+    const run = async (gate, id, pending = new Map()) => {
+      const tapes = [];
+      const loopB = startPolymarketRfqLoop({
+        env: { POLYMARKET_KEY_ID: 'key-id-fixture', POLYMARKET_SECRET_KEY: SEED_B64, POLYMARKET_RFQ_LIVE: 'true' },
+        http: fakeHttp, startWs: false, getParlays: () => [pmParlay], filledSoFarFor: () => 0, getOutstanding: () => 0,
+        pendingQuotes: pending, reconcileMs: 60 * 60 * 1000, balanceGate: gate,
+        logAsync: (p, rfq, d, status, extra) => { tapes.push([status, extra && extra.skip_reason]); return Promise.resolve(null); },
+      });
+      const before = posts.length;
+      const out = await loopB.handleRfq({ ...pmRfq, id });
+      loopB.stop();
+      return { out, posted: posts.length - before, tapes };
+    };
+    const rich = await run(mk(10000), 'rfq_cash_rich');
+    assert.strictEqual(rich.out.post, true, 'plenty of cash: quote posts');
+    assert.strictEqual(rich.posted, 1);
+    const poor = await run(mk(5), 'rfq_cash_poor');
+    assert.strictEqual(poor.out.post, false);
+    assert.strictEqual(poor.out.reason, 'insufficient_balance');
+    assert.strictEqual(poor.posted, 0, 'low cash: no POST');
+    // $12 covers this 10 × (1 − 0.222) = $7.78 quote alone, but not with $5 already held open.
+    const held = new Map([['q_open', { parlayId: 'other', contracts: 10, buyPrice: '0.5' }]]);
+    const tight = await run(mk(12), 'rfq_cash_tight', held);
+    assert.strictEqual(tight.out.reason, 'insufficient_balance', 'open holds count when cash is low');
+    const ok = await run(mk(12), 'rfq_cash_ok');
+    assert.strictEqual(ok.out.post, true, 'low but enough cash still quotes');
+    const stale = createBalanceGate({ env: {}, now: () => Date.parse('2026-08-14T13:00:00Z') });
+    stale.update([{ venue: 'polymarket_us', shard: 0, ok: true, available_usd: 1, fetched_at: '2026-08-14T12:00:00Z' }]);
+    assert.strictEqual((await run(stale, 'rfq_cash_stale')).out.post, true, 'stale snapshot never blocks (exchange reject is backup)');
+  }
+
   // Confirm-after-start: BUY accept must not confirm; quote is deleted.
   const startedDeletes = [];
   const startedConfirms = [];

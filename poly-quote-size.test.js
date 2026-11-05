@@ -62,13 +62,19 @@ const cashOk = ev({ id: 'e', cashOrderQty: '10' });
 assert.strictEqual(cashOk.action, 'quoteable');
 assert.strictEqual(cashOk.decision.contracts, 41.84); // venue size: 41.84 × 0.222 + $0.71 taker fee ≤ $10
 
-// per-fill hedge cap (not just remaining) also declines
-const lowCap = { ...lock, max_contracts: 100000 };
+// No per-fill hedge-mode limit (Kevin Nov 4 2026): only the user's cap (remaining) limits size.
+const bigCap = { ...lock, max_contracts: 100000 };
 const hedge = evaluatePolymarketRfq({
-  rfq: { id: 'f', status: 'RFQ_STATUS_OPEN', qtyDecimal: '100000', comboLegs: legs }, parlays: [lowCap],
+  rfq: { id: 'f', status: 'RFQ_STATUS_OPEN', qtyDecimal: '100000', comboLegs: legs }, parlays: [bigCap],
   filledSoFar: 0, outstanding: 0, now: Date.parse('2026-08-14T12:00:00Z'),
 });
-assert.strictEqual(hedge.reason, 'rfq_too_large');
+assert.strictEqual(hedge.action, 'quoteable', 'RFQ within the user cap quotes even above the hedge-mode size');
+assert.strictEqual(hedge.decision.contracts, 100000);
+const overCap = evaluatePolymarketRfq({
+  rfq: { id: 'f2', status: 'RFQ_STATUS_OPEN', qtyDecimal: '100001', comboLegs: legs }, parlays: [bigCap],
+  filledSoFar: 0, outstanding: 0, now: Date.parse('2026-08-14T12:00:00Z'),
+});
+assert.strictEqual(overCap.reason, 'rfq_too_large', 'above the user cap still declines');
 
 // venue-recorded size helper
 assert.strictEqual(acceptedVenueQty({ quote: { buyQtyDecimal: '566.2', sellQtyDecimal: '0' } }, 'SIDE_BUY'), 566.2);
