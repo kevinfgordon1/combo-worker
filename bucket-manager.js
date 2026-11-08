@@ -662,6 +662,9 @@ function createBucketManager({
   readPolyCash,
   appAlerts = null,
   config: configOverride = null,
+  // false: startup and the interval do not GET /portfolio/balance. A funds
+  // failure still reads, because that is what decides a top-up.
+  scheduleBalanceReads = true,
 } = {}) {
   const config = configOverride || loadBucketConfig(env);
   const kalshi = client || (signed ? createKalshiBucketClient(signed) : null);
@@ -1376,9 +1379,11 @@ function createBucketManager({
     );
     if (timer) clearInterval(timer);
     timer = setInterval(() => {
+      if (scheduleBalanceReads === false) return;
       requestCheck('interval').catch(() => {});
     }, ms);
-    requestCheck('startup').catch(() => {});
+    if (scheduleBalanceReads !== false) requestCheck('startup').catch(() => {});
+    else log('[BUCKET] balance poll off — read on a funds failure, or before a quote when the cache is stale');
     return stop;
   }
 

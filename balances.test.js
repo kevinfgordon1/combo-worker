@@ -107,6 +107,19 @@ function kalshiSigned(byShard) {
     assert.ok(!logs[0].includes('secret-ish'));
   }
 
+  // Demand mode: the timer must not GET Kalshi. Polymarket can still report.
+  {
+    const sb = fakeSupabase();
+    const signed = kalshiSigned({ 0: { balance: 100 }, 1: { balance: 200 } });
+    const poly = { calls: [], async request() { this.calls.push(1); return { statusCode: 200, json: { balances: [{ currency: 'USD', currentBalance: 5, buyingPower: 4 }] } }; } };
+    const r = br.createBalanceReporter({ supabase: sb, userId: 'u4', signed, polyHttp: poly, pollKalshi: false, log: () => {} });
+    const rows = await r.tick();
+    assert.equal(signed.calls.length, 0, 'idle timer does not read Kalshi balance');
+    assert.equal(poly.calls.length, 1);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].venue, 'polymarket_us');
+  }
+
   // Wiring: owner worker writes under Kevin's main id; tester under its own; invalid/disabled -> null.
   {
     const scopeOwner = { userIds: ['a', 'b'], writeUserId: null, isTester: false, invalid: false };

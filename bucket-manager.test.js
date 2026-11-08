@@ -1488,3 +1488,25 @@ main().catch((err) => {
   assert.ok(logs.some((l) => /previous check stuck/.test(l)));
   console.log('bucket stuck-check unstick ok');
 })().catch((e) => { console.error(e); process.exit(1); });
+
+// Scheduled balance polls stay off. A funds failure still reads.
+(async () => {
+  const calls = { getShard: 0 };
+  const client = {
+    async getShard() { calls.getShard += 1; return { availableCents: 100, portfolioCents: 0 }; },
+    async transfer() { return { transferId: 't' }; },
+    async getTransfers() { return []; },
+    async shardActivity() { return { restingOrders: false, openPositions: false, uncertain: false }; },
+  };
+  const mgr = createBucketManager({
+    env: {}, now: () => new Date('2026-11-08T06:31:00Z'), alert() {}, log() {},
+    sleep: async () => {}, client, readPolyCash: null, scheduleBalanceReads: false,
+  });
+  const stop = mgr.start();
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(calls.getShard, 0, 'startup and the interval do not read balance');
+  stop();
+  await mgr.onInsufficientBalance('kalshi');
+  assert.ok(calls.getShard >= 2, 'a funds failure still reads both shards');
+  console.log('bucket demand-driven balance ok');
+})().catch((e) => { console.error(e); process.exit(1); });

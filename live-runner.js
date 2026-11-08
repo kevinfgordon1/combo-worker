@@ -219,6 +219,7 @@ const {
   isBalancePath,
   isTransferPost,
   readBalanceCacheMs,
+  readIfBalanceStale,
 } = require('./kalshi-account-limiter');
 const { createTesterFunder, logOwnKeyScopes } = require('./tester-funder');
 const { startBalanceReporter } = require('./balance-reporter');
@@ -295,8 +296,7 @@ function noteInsufficientBalance(venue, info = null) {
   if (testerFunder && String(venue || '').toLowerCase() !== 'polymarket') {
     Promise.resolve(testerFunder.check('insufficient_balance')).catch(() => {});
   }
-  // Quote or confirm was rejected for funds. Refresh the cached balance.
-  // Not done per RFQ — only after that failure (and on a fill, and on the slow timer).
+  // Funds failure marks the cache stale and reads once. Not a timer, and not per RFQ.
   if (String(venue || 'kalshi').toLowerCase() !== 'polymarket') scheduleKalshiBalanceRefresh('insufficient_balance');
   if (!bucketManager) return;
   Promise.resolve(bucketManager.onInsufficientBalance(venue, info)).catch((e) => {
@@ -351,8 +351,25 @@ function rememberKalshiBalance(method, signPath, opts, res) {
   }]);
 }
 
-// A fill or a transfer changes cash. The next read misses the cache and
-// hits the exchange, still on the 1/s balance bucket. Not called per RFQ.
+// Combo cash the gate uses. Shard 0 is not read here: one balance call, and
+// only when the 20s cache is stale. Idle (no quote about to post) does not
+// call this.
+const QUOTE_BALANCE_QUERY = 'exchange_index=1';
+async function ensureKalshiQuoteBalance() {
+  try {
+    return await readIfBalanceStale({
+      cache: kalshiBalanceCache,
+      path: `${BALANCE_PATH}?${QUOTE_BALANCE_QUERY}`,
+      read: () => kalshiGet(BALANCE_PATH, QUOTE_BALANCE_QUERY),
+    });
+  } catch (e) {
+    console.error(`[${MODE}] quote balance read`, e && e.message);
+    return { fetched: false, error: true };
+  }
+}
+
+// A fill or a funds failure changes cash. Mark the cache stale and read once
+// so the next quote does not use the old number. Not a timer and not per RFQ.
 function scheduleKalshiBalanceRefresh(reason) {
   kalshiBalanceCache.markStale();
   if (balanceRefreshQueued) return;
@@ -2912,7 +2929,9 @@ async function onRfq(rfq, env) {
 
   // ─── LIVE POST first (Step 1) ─────────────────────────────────────────
   if (!engaged) {
-    // Low-balance-only cash check: in-memory snapshot, no network. Normal cash
+    // One shard-1 read, and only when the 20s cache is stale. No timer.
+    await ensureKalshiQuoteBalance();
+    // Low-balance-only cash check: in-memory snapshot. Normal cash
     // takes the 'fast' path; only low cash vs (this quote + open holds) skips.
     const cash = balanceGate.check({
       venue: 'kalshi',
@@ -3125,6 +3144,8 @@ async function main() {
     // moves money or writes Kevin's alerts.
     appAlerts: createAppAlerts({ client: SCOPE.isTester ? null : supabase }),
     signed: (method, signPath, opts) => kalshiSigned(method, signPath, opts),
+    // No startup or interval balance GET. Funds failures still read.
+    scheduleBalanceReads: false,
   });
   // Kalshi-only: the Polymarket service never moves Kalshi bucket money.
   if (!SPLIT.runKalshi) bucketManager = null;
@@ -3153,6 +3174,8 @@ async function main() {
       env: process.env,
       // poly-worker has no Kalshi key: report Polymarket only there.
       signed: SPLIT.runKalshi ? (method, signPath, opts) => kalshiSigned(method, signPath, opts) : null,
+      // Kalshi balance is read before a quote when the cache is stale, not on this timer.
+      pollKalshi: false,
       wrap: unlessQuoteHot,
       log: (m) => console.log(`[${MODE}] ${m}`),
       // Same reads feed the in-memory low-balance gate (no extra exchange calls).

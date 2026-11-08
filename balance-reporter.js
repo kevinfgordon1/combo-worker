@@ -78,6 +78,9 @@ function createBalanceReporter({
   now = () => new Date(),
   log = (m) => console.log(m),
   onRows = null,
+  // false: this reporter does not GET Kalshi balance. The quote path reads
+  // shard 1 itself, and only when that cache is stale.
+  pollKalshi = true,
 } = {}) {
   if (!supabase) throw new Error('supabase client required');
   if (!userId) throw new Error('userId required');
@@ -111,6 +114,7 @@ function createBalanceReporter({
   }
 
   async function readKalshi() {
+    if (pollKalshi === false) return [];
     const rows = [];
     for (const shard of [BUCKET_SHARD, MAIN_SHARD]) {
       try {
@@ -189,20 +193,21 @@ function createBalanceReporter({
 }
 
 // Wiring helper for live-runner: returns a stop() or null when disabled.
-function startBalanceReporter({ supabase, scope, env = process.env, signed, wrap = (f) => f, log, polyFactory = createPolymarketHttp, onRows = null } = {}) {
+function startBalanceReporter({ supabase, scope, env = process.env, signed, wrap = (f) => f, log, polyFactory = createPolymarketHttp, onRows = null, pollKalshi = true } = {}) {
   if (!reportEnabled(env) || !scope || scope.invalid) return null;
   const userId = scope.writeUserId || OWNER_USER_ID;
   const keyId = env.POLYMARKET_KEY_ID;
   const secretKey = env.POLYMARKET_SECRET_KEY;
   const polyHttp = keyId && secretKey ? polyFactory({ keyId, secretKey }) : null;
-  const reporter = createBalanceReporter({ supabase, userId, signed, polyHttp, log, onRows });
+  const reporter = createBalanceReporter({ supabase, userId, signed, polyHttp, log, onRows, pollKalshi });
   const ms = reportIntervalMs(env);
   const run = wrap(() => { reporter.tick(); });
   const first = setTimeout(run, 5_000);
   const t = setInterval(run, ms);
   if (t.unref) t.unref();
   if (first.unref) first.unref();
-  (log || console.log)(`[balances] reporting every ${Math.round(ms / 1000)}s for user=${userId.slice(0, 8)} (kalshi${polyHttp ? ' + polymarket_us' : ''})`);
+  const kalshiNote = pollKalshi === false ? 'kalshi on demand' : 'kalshi';
+  (log || console.log)(`[balances] reporting every ${Math.round(ms / 1000)}s for user=${userId.slice(0, 8)} (${kalshiNote}${polyHttp ? ' + polymarket_us' : ''})`);
   return { reporter, stop: () => { clearInterval(t); clearTimeout(first); } };
 }
 
