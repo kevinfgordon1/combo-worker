@@ -1,10 +1,16 @@
 'use strict';
 const assert = require('assert');
+const { decideAtFill } = require('./engine');
 const {
   querySoftFailed,
   applyRefreshParlays,
   applyRefreshKillByUser,
   applyRefreshFilledByParlay,
+  CAP_FILL_PAGE_SIZE,
+  noteCapFill,
+  sumCapFills,
+  applyCapFillPage,
+  loadCapFillRows,
 } = require('./refresh-state');
 
 function silentLog() {
@@ -134,4 +140,119 @@ const ARI_JAC = {
   assert.strictEqual(next.p1, 7);
 }
 
-console.log('refresh-state.test.js ok');
+// $300 at +230, cap 990. Kalshi 702.83 + Polymarket 286.55 = 989.38.
+// The cap must see both, and a later snapshot of the same rows must not add them again.
+{
+  const LOCK = '69ec5e47-8b31-4207-b83f-936cf8e9352f';
+  const memory = {};
+  const session = {};
+  noteCapFill(memory, session, LOCK, 702.83);
+  noteCapFill(memory, session, LOCK, 286.55);
+  assert.strictEqual(memory[LOCK], 989.38);
+  assert.strictEqual(session[LOCK], 989.38);
+  assert.strictEqual(Math.max(memory[LOCK], session[LOCK]), 989.38, 'session and memory are not summed');
+
+  const rows = [
+    { parlay_id: LOCK, fill_id: 'kalshi-1', count: 702.83 },
+    { parlay_id: LOCK, fill_id: 'poly-1', count: 286.55 },
+  ];
+  const merged = applyCapFillPage(memory, { ok: true, rows });
+  assert.strictEqual(merged[LOCK], 989.38, 'refresh must not add the in-memory Polymarket fill on top of the same row');
+  assert.notStrictEqual(merged, memory);
+
+  const dup = applyCapFillPage(memory, { ok: true, rows: rows.concat([{ ...rows[1] }]) });
+  assert.strictEqual(dup[LOCK], 989.38, 'a repeated fill_id counts once');
+
+  const quote = {
+    parlayStake: 300, parlayAmerican: 230, fillAmerican: 195,
+    rfqContracts: 164, hedgeMode: '1x', maxContracts: 990, outstanding: 0,
+  };
+  const blocked = decideAtFill({ ...quote, filledSoFar: merged[LOCK] });
+  assert.strictEqual(blocked.ok, false);
+  assert.strictEqual(blocked.reason, 'limit_reached');
+  const kalshiOnly = decideAtFill({ ...quote, filledSoFar: 702.83 });
+  assert.strictEqual(kalshiOnly.ok, true);
+  assert.strictEqual(kalshiOnly.contracts, 164, 'ignoring Polymarket would still quote 164 into a 0.62 remainder');
+
+  const ahead = { [LOCK]: 989.38 };
+  const staleDb = applyCapFillPage(ahead, { ok: true, rows: [{ parlay_id: LOCK, fill_id: 'kalshi-1', count: 702.83 }] });
+  assert.strictEqual(staleDb[LOCK], 989.38, 'a snapshot that missed the Polymarket row must not wipe the in-memory count');
+
+  const failed = applyCapFillPage(ahead, { ok: false, rows: [{ parlay_id: LOCK, fill_id: 'x', count: 1 }], error: { message: 'timeout' } });
+  assert.strictEqual(failed, ahead, 'a failed page returns the same map');
+  assert.strictEqual(failed[LOCK], 989.38);
+}
+
+{
+  const seen = [];
+  function fakeSupabase(all) {
+    return {
+      from() {
+        const state = { parlayId: null };
+        const q = {
+          select() { return q; },
+          eq(col, val) { if (col === 'parlay_id') state.parlayId = val; return q; },
+          not() { return q; },
+          order() { return q; },
+          range(from, to) {
+            seen.push([from, to]);
+            let batch = all.slice(from, to + 1);
+            if (state.parlayId) batch = all.filter((r) => r.parlay_id === state.parlayId).slice(from, to + 1);
+            return Promise.resolve({ data: batch, error: null });
+          },
+        };
+        return q;
+      },
+    };
+  }
+  const all = [];
+  for (let i = 0; i < 1500; i++) {
+    all.push({ parlay_id: 'L', fill_id: `f${i}`, count: 1, order_id: `o${i}`, raw: {} });
+  }
+  all.push({ parlay_id: 'L', fill_id: 'f0', count: 50, order_id: 'dup', raw: {} });
+  loadCapFillRows(fakeSupabase(all)).then((page) => {
+    assert.strictEqual(page.ok, true);
+    assert.strictEqual(page.rows.length, 1501);
+    assert.deepStrictEqual(seen, [[0, 999], [1000, 1999]]);
+    const summed = sumCapFills(page.rows);
+    assert.strictEqual(summed.L, 1500, '1500 rows plus a repeated fill_id is 1500, not the first page of 1000');
+    assert.strictEqual(CAP_FILL_PAGE_SIZE, 1000);
+
+    const memory = { L: 40 };
+    const merged = applyCapFillPage(memory, page);
+    assert.strictEqual(merged.L, 1500);
+
+    seen.length = 0;
+    return loadCapFillRows(fakeSupabase(all), { parlayId: 'L' });
+  }).then((one) => {
+    assert.strictEqual(one.ok, true);
+    assert.strictEqual(sumCapFills(one.rows).L, 1500);
+    let n = 0;
+    const boom = {
+      from() {
+        const q = {
+          select() { return q; },
+          eq() { return q; },
+          not() { return q; },
+          order() { return q; },
+          range() {
+            n += 1;
+            if (n === 1) return Promise.resolve({ data: all.slice(0, 1000), error: null });
+            return Promise.resolve({ data: null, error: { message: 'page 2 failed' } });
+          },
+        };
+        return q;
+      },
+    };
+    return loadCapFillRows(boom);
+  }).then((bad) => {
+    assert.strictEqual(bad.ok, false);
+    assert.strictEqual(bad.rows.length, 1000, 'the first page is not a complete cap sum');
+    const memory = { L: 989.38 };
+    assert.strictEqual(applyCapFillPage(memory, bad), memory);
+    console.log('refresh-state.test.js ok');
+  }).catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}

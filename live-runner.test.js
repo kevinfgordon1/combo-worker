@@ -230,8 +230,10 @@ assert.ok(
   'Polymarket reads the same filtered lock list as Kalshi, so a paused lock stops on both'
 );
 assert.ok(
-  /cancelPausedLock/.test(liveSrc) && /polyLoop\.cancelOpenQuotesForParlay\(parlayId, \{ kind: 'paused' \}\)/.test(liveSrc),
-  'pausing a lock cancels its open Kalshi and Polymarket quotes'
+  /cancelPausedLock/.test(liveSrc) && /polyLoop\.cancelOpenQuotesForParlay\(parlayId, reason\)/.test(liveSrc)
+    && /CANCEL market-check pause/.test(liveSrc) && /CANCEL lock paused/.test(liveSrc)
+    && /pauseCancelKind\(probePauseUntil, parlayId\)/.test(liveSrc),
+  'pausing a lock cancels its open Kalshi and Polymarket quotes; a market check is not logged as a manual pause'
 );
 assert.ok(
   /pollPaused\(\)/.test(liveSrc) && /, 5000\);/.test(liveSrc),
@@ -402,8 +404,11 @@ assert.ok(
   'live refresh must not coerce null parlays data to []'
 );
 assert.ok(
-  /applyRefreshKillByUser/.test(liveSrc) && /applyRefreshFilledByParlay/.test(liveSrc),
-  'live refresh must keep killByUser / filledByParlay when those queries soft-fail'
+  /applyRefreshKillByUser/.test(liveSrc) && /loadCapFillRows/.test(liveSrc)
+    && /applyCapFillPage\(filledByParlay, fillsPage/.test(liveSrc)
+    && /keeping in-memory cap counts/.test(liveSrc)
+    && /noteCapFill\(filledByParlay, sessionFilledByParlay, pending\.parlayId, contracts\)/.test(liveSrc),
+  'live refresh pages combo_fills and keeps in-memory cap counts when a page fails; both venues note fills'
 );
 assert.ok(
   /require\('\.\/refresh-state'\)/.test(shadowSrc) && /applyRefreshParlays/.test(shadowSrc),

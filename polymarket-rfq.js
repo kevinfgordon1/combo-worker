@@ -2205,7 +2205,9 @@ function startPolymarketRfqLoop(ctx = {}) {
     }
     const rfqId = pending && pending.rfqId;
     if (live && rfqId) {
-      const failKind = (reason && reason.started) ? 'game started' : (reason && reason.kind) || '';
+      const failKind = (reason && reason.started) ? 'game started'
+        : (reason && reason.kind === 'probe_pause') ? 'market-check pause'
+        : (reason && reason.kind) || '';
       await deleteQuoteReliably(rfqId, quoteId, {
         label: `CANCEL ${failKind} ${(pending && pending.label) || '(unknown)'}`.trim(),
       });

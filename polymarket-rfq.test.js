@@ -54,6 +54,10 @@ const { createMarketCache } = require('./polymarket-market-cache');
 const polySrc = fs.readFileSync(path.join(__dirname, 'polymarket-rfq.js'), 'utf8');
 assert.ok(polySrc.includes('createPolyMissTape'), 'reconcile must persist Combo Locks Miss tape');
 assert.ok(
+  /kind === 'probe_pause'\) \? 'market-check pause'/.test(polySrc),
+  'a market-check pause cancels Poly quotes as a market-check pause'
+);
+assert.ok(
   /allowPartial:\s*false/.test(polySrc) && !/allowPartial:\s*true/.test(polySrc),
   'Poly must never clip: CreateQuote has no size field, the venue fills the full RFQ size'
 );

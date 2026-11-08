@@ -66,6 +66,13 @@ function diffPaused(prev, next) {
   return { pausedNow, resumed };
 }
 
+// probeUntil holds locks paused only by a market check (paused stays false).
+// A manual pause is not in that map, so it keeps the lock-paused cancel line.
+function pauseCancelKind(probeUntil, id) {
+  if (probeUntil && typeof probeUntil.has === 'function' && probeUntil.has(id)) return 'probe_pause';
+  return 'paused';
+}
+
 // Fast poll of {id, paused} for active locks so a toggle takes effect in
 // seconds instead of waiting for the 30s refresh.
 // filterRows: keep only this process's locks (tester children: their own user), so the
@@ -106,5 +113,5 @@ function createPausePoller({ supabase, log = () => {}, now = () => Date.now(), f
 }
 
 module.exports = {
-  isPaused, isManuallyPaused, probePauseEnd, splitPaused, expiredProbePauses, diffPaused, createPausePoller, PROBE_PAUSE_MAX_MS,
+  isPaused, isManuallyPaused, probePauseEnd, splitPaused, expiredProbePauses, diffPaused, pauseCancelKind, createPausePoller, PROBE_PAUSE_MAX_MS,
 };

@@ -181,7 +181,9 @@ const {
   querySoftFailed,
   applyRefreshParlays,
   applyRefreshKillByUser,
-  applyRefreshFilledByParlay,
+  noteCapFill,
+  applyCapFillPage,
+  loadCapFillRows,
 } = require('./refresh-state');
 const { confirmedFullFill } = require('./full-fill');
 const { liveRunnerFillRow, resolveFillLookup, findPendingFill, submissionAlreadyFilled, claimFillKey, isKalshiTradeFill, countsTowardCap } = require('./fills-attr');
@@ -208,7 +210,7 @@ const { formatAlertStatus } = require('./venue-alert');
 const { createBucketManager } = require('./bucket-manager');
 const { createTesterFunder, logOwnKeyScopes } = require('./tester-funder');
 const { startBalanceReporter } = require('./balance-reporter');
-const { splitPaused, diffPaused, createPausePoller, expiredProbePauses } = require('./lock-pause');
+const { splitPaused, diffPaused, pauseCancelKind, createPausePoller, expiredProbePauses } = require('./lock-pause');
 const { createUserCancelPoller } = require('./user-cancel');
 const { createLiveUserGate } = require('./live-users');
 const { resolveWorkerScope, scopeLabel } = require('./worker-scope');
@@ -506,16 +508,21 @@ const userCredits = createUserCredits({ client: supabase, log: (m) => console.lo
 const pausePoller = createPausePoller({ supabase, filterRows: (rows) => liveUsers.filterParlays(rows), log: (m) => console.log(`[${MODE}] ${m.replace(/^\[PAUSE\] /, 'PAUSE ')}`) });
 const userCancelPoller = createUserCancelPoller({ supabase, log: (m) => console.log(`[${MODE}] ${m.replace(/^\[USER-CANCEL\] /, 'USER-CANCEL ')}`) });
 
+function quotePauseReason(parlayId) {
+  return { kind: pauseCancelKind(probePauseUntil, parlayId) };
+}
+
 async function cancelPausedLock(parlayId) {
+  const reason = quotePauseReason(parlayId);
   try {
     const rows = (await loadOpenSubmissionQuotes()).filter((r) => r.parlay_id === parlayId);
-    await cancelOpenQuotesForParlay(parlayId, { kind: 'paused' }, rows);
+    await cancelOpenQuotesForParlay(parlayId, reason, rows);
   } catch (e) {
     console.error(`[${MODE}] pause cancel (kalshi)`, e.message);
   }
   if (polyLoop && typeof polyLoop.cancelOpenQuotesForParlay === 'function') {
     try {
-      await polyLoop.cancelOpenQuotesForParlay(parlayId, { kind: 'paused' });
+      await polyLoop.cancelOpenQuotesForParlay(parlayId, reason);
     } catch (e) {
       console.error(`[${MODE}] pause cancel (poly)`, e.message);
     }
@@ -523,11 +530,18 @@ async function cancelPausedLock(parlayId) {
 }
 
 // Record the paused set; cancel open quotes for locks that just became paused.
+// A market-check stamp leaves combo_parlays.paused false. Say so, instead of
+// logging a manual pause.
 function notePausedIds(next) {
   const { pausedNow, resumed } = diffPaused(pausedParlayIds, next);
   pausedParlayIds = next;
   for (const id of pausedNow) {
-    console.log(`[${MODE}] PAUSED lock ${id} — no longer quoting (Kalshi + Polymarket); cancelling open quotes`);
+    const probe = pauseCancelKind(probePauseUntil, id) === 'probe_pause';
+    console.log(
+      probe
+        ? `[${MODE}] MARKET-CHECK pause ${id} — no longer quoting (Kalshi + Polymarket); cancelling open quotes`
+        : `[${MODE}] PAUSED lock ${id} — no longer quoting (Kalshi + Polymarket); cancelling open quotes`
+    );
     cancelPausedLock(id);
   }
   for (const id of resumed) console.log(`[${MODE}] RESUMED lock ${id} — quoting again`);
@@ -629,16 +643,13 @@ async function pollPaused() {
 
 async function refresh() {
   try {
-    const [parlaysQ, settingsQ, fillsQ, usersQ] = await Promise.all([
+    const [parlaysQ, settingsQ, fillsPage, usersQ] = await Promise.all([
       supabase.from('combo_parlays').select('*').eq('active', true),
       supabase.from('combo_settings').select('user_id,kill_switch'),
       // Confirmed contracts only. Quote-execution stubs (source=live-runner)
-      // are not Kalshi fills and must not consume max_contracts.
-      supabase.from('combo_fills')
-        .select('parlay_id,count,fill_id,order_id,raw')
-        .eq('is_combo', true)
-        .eq('is_taker', false)
-        .not('parlay_id', 'is', null),
+      // are not Kalshi fills and must not consume max_contracts. Paged so a
+      // 1000-row PostgREST cap cannot replace the in-memory total.
+      loadCapFillRows(supabase),
       // Who may trade (combo_live_users): can_trade, paused, caps.
       liveUsers.query(supabase),
     ]);
@@ -660,10 +671,16 @@ async function refresh() {
     // Per-user per-lock $ cap clamps max_contracts in memory (no-op for Kevin).
     parlays = userCaps.applyLockCaps(parlays);
     killByUser = liveUsers.filterKillByUser(applyRefreshKillByUser(killByUser, settingsQ, refreshLog));
-    const fillsForCap = querySoftFailed(fillsQ)
-      ? fillsQ
-      : { data: (fillsQ.data || []).filter(countsTowardCap), error: null };
-    filledByParlay = applyRefreshFilledByParlay(filledByParlay, fillsForCap, 'count', refreshLog);
+    // A short or failed page leaves filledByParlay alone. A complete page
+    // merges with max(), so a Polymarket fill already noted in memory is not
+    // added on top of the same combo_fills row.
+    const nextFilled = applyCapFillPage(filledByParlay, fillsPage, { keepRow: countsTowardCap });
+    if (nextFilled === filledByParlay) {
+      const why = (fillsPage && fillsPage.error && (fillsPage.error.message || fillsPage.error)) || 'incomplete page';
+      console.error(`[${MODE}] refresh soft-fail fills: ${why} — keeping in-memory cap counts`);
+    } else {
+      filledByParlay = nextFilled;
+    }
     userCaps.refreshDay({ supabase, parlays, filledSoFarFor }).catch(() => {});
     userCredits.refresh([...new Set((parlays || []).map((p) => p && p.user_id).filter(Boolean))]).catch(() => {});
 
@@ -737,17 +754,15 @@ async function refresh() {
 async function freshFilledFor(parlayId) {
   if (!parlayId) return null;
   try {
-    const { data, error } = await supabase
-      .from('combo_fills')
-      .select('parlay_id,count,fill_id,order_id,raw')
-      .eq('is_combo', true)
-      .eq('is_taker', false)
-      .eq('parlay_id', parlayId);
-    if (error) {
-      console.error(`[${MODE}] last-look fills read`, error.message);
+    const page = await loadCapFillRows(supabase, { parlayId });
+    // Null on a short or failed page so a partial sum never lowers the count.
+    if (!page.ok) {
+      const why = (page.error && (page.error.message || page.error)) || 'incomplete page';
+      console.error(`[${MODE}] last-look fills read ${why}`);
       return null;
     }
-    return (data || []).filter(countsTowardCap).reduce((n, r) => n + (Number(r.count) || 0), 0);
+    const summed = applyCapFillPage({}, page, { keepRow: countsTowardCap });
+    return summed[parlayId] || 0;
   } catch (e) {
     console.error(`[${MODE}] last-look fills read`, e && e.message);
     return null;
@@ -761,8 +776,8 @@ async function lastLookFilledFor(parlayId) {
   return fresh == null ? 0 : fresh;
 }
 
-// Use the larger of DB fills vs session fills so a restart can't under-count,
-// and we don't double-count the same contracts from both sources.
+// Use the larger of the DB map vs session fills so a restart can't under-count,
+// and a fill noted into both (Kalshi or Polymarket) is not counted twice.
 const filledSoFarFor = (id) => Math.max(filledByParlay[id] || 0, sessionFilledByParlay[id] || 0);
 // Not allowlisted => always engaged, whatever combo_settings says.
 const killEngagedFor = (userId, lock = null) => !liveUsers.isAllowed(userId)
@@ -1094,6 +1109,9 @@ function cancelLogLine(quoteId, pending, reason) {
       rfqBit +
       ` source=${reason.source} at=${reason.at}`
     );
+  }
+  if (reason && reason.kind === 'probe_pause') {
+    return `[${MODE}] CANCEL market-check pause ${label} quote_id=${quoteId}` + rfqBit;
   }
   if (reason && reason.kind === 'paused') {
     return `[${MODE}] CANCEL lock paused ${label} quote_id=${quoteId}` + rfqBit;
@@ -2220,8 +2238,7 @@ function startKalshiFillWatch(pending, quoteId, orderId) {
         const confirmed = await bookConfirmedKalshiFills(pending, { quoteId, orderId, contracts: pending.contracts });
         if (confirmed.newContracts > 0) {
           console.log(`[${MODE}] WATCHDOG booked kalshi quote_id=${quoteId} contracts=${confirmed.newContracts} after ${ms}ms`);
-          sessionFilledByParlay[pending.parlayId] = (sessionFilledByParlay[pending.parlayId] || 0) + confirmed.newContracts;
-          filledByParlay[pending.parlayId] = (filledByParlay[pending.parlayId] || 0) + confirmed.newContracts;
+          noteCapFill(filledByParlay, sessionFilledByParlay, pending.parlayId, confirmed.newContracts);
           releaseConfirmedFill(capBook, {
             parlayId: pending.parlayId, quoteId, partial: confirmed.partial, contracts: confirmed.newContracts,
           });
@@ -2293,8 +2310,7 @@ async function rebookKalshiHold(row, res) {
     quoteId: row.quoteId, orderId: res && res.orderId, contracts: pending.contracts,
   });
   if (confirmed.newContracts > 0) {
-    sessionFilledByParlay[row.parlayId] = (sessionFilledByParlay[row.parlayId] || 0) + confirmed.newContracts;
-    filledByParlay[row.parlayId] = (filledByParlay[row.parlayId] || 0) + confirmed.newContracts;
+    noteCapFill(filledByParlay, sessionFilledByParlay, row.parlayId, confirmed.newContracts);
     releaseConfirmedFill(capBook, {
       parlayId: row.parlayId, quoteId: row.quoteId, partial: confirmed.partial, contracts: confirmed.newContracts,
     });
@@ -2401,11 +2417,10 @@ async function onQuoteExecuted(evt) {
     }
   }
 
-  sessionFilledByParlay[pending.parlayId] =
-    (sessionFilledByParlay[pending.parlayId] || 0) + contracts;
-  if (venue !== 'polymarket' && pending.parlayId) {
-    filledByParlay[pending.parlayId] = (filledByParlay[pending.parlayId] || 0) + contracts;
-  }
+  // Kalshi and Polymarket both count. noteCapFill adds the contracts once to
+  // each map; filledSoFarFor takes the max, and refresh merges with max, so
+  // the same fill is not counted again when combo_fills is re-read.
+  noteCapFill(filledByParlay, sessionFilledByParlay, pending.parlayId, contracts);
   // Actual size is already in the cap. Drop the confirm hold in the same turn
   // so the next accept cannot see neither number.
   releaseConfirmedFill(capBook, {
