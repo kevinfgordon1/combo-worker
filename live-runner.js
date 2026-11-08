@@ -212,7 +212,14 @@ const { resolveWorkerMode, shouldRunUnhedged } = require('./worker-mode');
 const { startUnhedgedSide } = require('./unhedged-boot');
 const { createWsStatusAlerter, formatWsAlert } = require('./ws-status-alert');
 const { formatAlertStatus } = require('./venue-alert');
-const { createBucketManager } = require('./bucket-manager');
+const { createBucketManager, parseShardBalance, BALANCE_PATH } = require('./bucket-manager');
+const {
+  createKalshiAccountLimiter,
+  createKalshiBalanceCache,
+  isBalancePath,
+  isTransferPost,
+  readBalanceCacheMs,
+} = require('./kalshi-account-limiter');
 const { createTesterFunder, logOwnKeyScopes } = require('./tester-funder');
 const { startBalanceReporter } = require('./balance-reporter');
 const { splitPaused, diffPaused, pauseCancelKind, createPausePoller, expiredProbePauses } = require('./lock-pause');
@@ -288,6 +295,9 @@ function noteInsufficientBalance(venue, info = null) {
   if (testerFunder && String(venue || '').toLowerCase() !== 'polymarket') {
     Promise.resolve(testerFunder.check('insufficient_balance')).catch(() => {});
   }
+  // Quote or confirm was rejected for funds. Refresh the cached balance.
+  // Not done per RFQ — only after that failure (and on a fill, and on the slow timer).
+  if (String(venue || 'kalshi').toLowerCase() !== 'polymarket') scheduleKalshiBalanceRefresh('insufficient_balance');
   if (!bucketManager) return;
   Promise.resolve(bucketManager.onInsufficientBalance(venue, info)).catch((e) => {
     console.error(`[${MODE}] bucket notify`, e && e.message);
@@ -302,6 +312,11 @@ const sniperGuard = require('./sniper-guard').createSniperGuard({ supabase });
 // behind unhedged /markets pagination or skip-tape GETs (undici Client
 // defaults to one connection).
 const { rest: kalshiHttp, quote: kalshiQuoteHttp } = createKalshiRestPair();
+// One account limiter for every Kalshi REST call this process makes (quotes,
+// confirms, cancels, balance, fills, warm, markets). Sniper code is separate.
+const kalshiLimit = createKalshiAccountLimiter({ env: process.env });
+const kalshiBalanceCache = createKalshiBalanceCache({ ttlMs: readBalanceCacheMs(process.env) });
+let balanceRefreshQueued = false;
 const quoteHot = createQuoteHot();
 // Quote-path latency / late-post / reconnect metrics → [LATENCY] log + combo_worker_stats.latency.
 const latency = createLatencyStats();
@@ -310,29 +325,102 @@ let latencyClient = null; // the kalshi firehose, set in main()
 const QUOTE_PATH = '/trade-api/v2/communications/quotes';
 const WARM_PATH = '/trade-api/v2/exchange/status';
 
+function balanceRequestPath(signPath, opts) {
+  return (opts && opts.path) || signPath;
+}
+
+function rememberKalshiBalance(method, signPath, opts, res) {
+  if (String(method).toUpperCase() !== 'GET' || !isBalancePath(signPath)) return;
+  if (!res || res.statusCode < 200 || res.statusCode >= 300 || res.text == null) return;
+  const full = balanceRequestPath(signPath, opts);
+  kalshiBalanceCache.store(full, res.text);
+  let json = null;
+  try { json = JSON.parse(res.text); } catch (_) { json = null; }
+  let parsed = null;
+  try { parsed = parseShardBalance(json); } catch (_) { parsed = null; }
+  if (!parsed) return;
+  const shard = Number(kalshiBalanceCache.shardOf(full));
+  if (!Number.isFinite(shard)) return;
+  balanceGate.update([{
+    user_id: null,
+    venue: 'kalshi',
+    shard,
+    ok: true,
+    available_usd: parsed.availableCents / 100,
+    fetched_at: new Date().toISOString(),
+  }]);
+}
+
+// A fill or a transfer changes cash. The next read misses the cache and
+// hits the exchange, still on the 1/s balance bucket. Not called per RFQ.
+function scheduleKalshiBalanceRefresh(reason) {
+  kalshiBalanceCache.markStale();
+  if (balanceRefreshQueued) return;
+  balanceRefreshQueued = true;
+  const timer = setTimeout(() => {
+    balanceRefreshQueued = false;
+    // Combo cash (shard 1) first, then main. The limiter spaces the two calls.
+    kalshiGet(BALANCE_PATH, 'exchange_index=1').catch((e) => {
+      console.error(`[${MODE}] balance refresh ${reason} shard 1`, e && e.message);
+    }).then(() => kalshiGet(BALANCE_PATH, 'exchange_index=0')).catch((e) => {
+      console.error(`[${MODE}] balance refresh ${reason} shard 0`, e && e.message);
+    });
+  }, 0);
+  if (timer.unref) timer.unref();
+}
+
 // Sign immediately before send; retry once on header_timestamp_expired
 // after applying Kalshi's Date header. Quote POST / confirm / cancel / GET
 // share this so Combo Locks REST cannot keep the #61 WS-only clock offset.
+// Every attempt takes a token from the shared account limiter first.
 async function kalshiSigned(method, signPath, opts = {}) {
+  const full = balanceRequestPath(signPath, opts);
+  if (String(method).toUpperCase() === 'GET' && isBalancePath(signPath) && !(opts && opts.freshBalance)) {
+    const hit = kalshiBalanceCache.lookup(full);
+    if (hit) { kalshiLimit.noteCacheHit(); return hit; }
+    return kalshiBalanceCache.coalesce(full, () => kalshiSignedHttp(method, signPath, opts));
+  }
+  return kalshiSignedHttp(method, signPath, opts);
+}
+
+async function kalshiSignedHttp(method, signPath, opts = {}) {
   const http = opts.http || kalshiHttp;
-  return signedRequest(async ({ method: m, path, headers, body }) => {
-    const req = { method: m, path, headers };
-    if (body != null) req.body = body;
-    if (opts.timeoutMs) { req.headersTimeout = opts.timeoutMs; req.bodyTimeout = opts.timeoutMs; }
-    const { statusCode, headers: resHeaders, body: resBody } = await http.request(req);
-    const text = await resBody.text();
-    return { statusCode, headers: resHeaders, text };
-  }, {
-    keyId: KEY_ID,
-    pem: PEM,
-    method,
-    signPath,
-    path: opts.path,
-    headers: opts.headers,
-    body: opts.body,
-    shouldRetryExpired: opts.shouldRetryExpired,
-    onSent: opts.onSent,
-  });
+  // GETs are safe to repeat. A 429 means Kalshi did not apply the write either.
+  const maxAttempts = String(method).toUpperCase() === 'GET' ? 3 : 2;
+  let res;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    await kalshiLimit.acquire(method, signPath, { priority: opts.priority });
+    res = await signedRequest(async ({ method: m, path, headers, body }) => {
+      const req = { method: m, path, headers };
+      if (body != null) req.body = body;
+      if (opts.timeoutMs) { req.headersTimeout = opts.timeoutMs; req.bodyTimeout = opts.timeoutMs; }
+      const { statusCode, headers: resHeaders, body: resBody } = await http.request(req);
+      const text = await resBody.text();
+      return { statusCode, headers: resHeaders, text };
+    }, {
+      keyId: KEY_ID,
+      pem: PEM,
+      method,
+      signPath,
+      path: opts.path,
+      headers: opts.headers,
+      body: opts.body,
+      shouldRetryExpired: opts.shouldRetryExpired,
+      onSent: opts.onSent,
+    });
+    if (res && res.statusCode === 429 && attempt + 1 < maxAttempts) {
+      kalshiLimit.note429(method, signPath, res.headers);
+      continue;
+    }
+    if (res && res.statusCode === 429) kalshiLimit.note429(method, signPath, res.headers);
+    else kalshiLimit.noteOk(method, signPath);
+    rememberKalshiBalance(method, signPath, opts, res);
+    if (isTransferPost(method, signPath) && res && res.statusCode >= 200 && res.statusCode < 300) {
+      kalshiBalanceCache.markStale();
+    }
+    return res;
+  }
+  return res;
 }
 
 // Oct 18 hotfix: gate quote POSTs (concurrency = quote sockets, stale drop,
@@ -412,6 +500,18 @@ let unhedgedPrices = null;
 function openOutstanding(parlayId, excludeQuoteId) {
   return sumOutstanding(pendingQuotes, parlayId, excludeQuoteId)
     + sumOutstanding(polyPendingQuotes, parlayId, excludeQuoteId);
+}
+
+// Cash already reserved by quotes other than the one we are about to confirm.
+function holdsExcept(quotes, quoteId) {
+  if (!quotes || typeof quotes.entries !== 'function') return 0;
+  let total = 0;
+  for (const [id, q] of quotes.entries()) {
+    if (id === quoteId) continue;
+    const v = kalshiPendingCostUsd(q);
+    if (v > 0) total += v;
+  }
+  return total;
 }
 
 function outstandingFor(parlayId, excludeQuoteId) {
@@ -1608,6 +1708,29 @@ async function onQuoteAccepted(evt) {
       console.warn(formatMissingContext(MODE, quoteId, rfqId));
       return;
     }
+    if (pending && balanceGate.enabled) {
+      // Cached cash only. Unknown or stale: do not cancel; Kalshi rejects if we cannot pay.
+      const funding = balanceGate.afford({
+        venue: 'kalshi',
+        costUsd: kalshiPendingCostUsd(pending),
+        holdsUsd: () => holdsExcept(pendingQuotes, quoteId),
+      });
+      if (!funding.ok) {
+        console.log(
+          `[${MODE}] CONFIRM SKIPPED ${funding.path === 'unknown' ? 'unknown balance' : 'low balance'} ` +
+          `quote_id=${quoteId} rfq_id=${rfqId} label=${pending.label || '(unknown)'} ` +
+          `cost=$${Number(funding.costUsd || 0).toFixed(2)} ` +
+          `cash=${funding.cashUsd == null ? 'unknown' : ('$' + Number(funding.cashUsd).toFixed(2))} ` +
+          `holds=$${Number(funding.holdsUsd || 0).toFixed(2)}`
+        );
+        if (funding.path === 'low') noteInsufficientBalance('kalshi', { costDollars: funding.costUsd });
+        else scheduleKalshiBalanceRefresh('confirm');
+        await cancelQuoteAndDrop(quoteId, pending, {
+          kind: funding.path === 'unknown' ? 'unknown_balance' : 'insufficient_balance',
+        });
+        return;
+      }
+    }
     if (!pending) {
       // Never confirm the isolated sniper's quotes (same account, own key) — fail closed if unsure.
       const sg = require('./sniper-guard').isNonPrimarySubaccount(evt && evt.raw)
@@ -2495,6 +2618,7 @@ async function onQuoteExecuted(evt) {
     });
   }
 
+  if (venue !== 'polymarket') scheduleKalshiBalanceRefresh('fill');
   const venueTag = venue === 'polymarket' ? ' POLY' : '';
   console.log(
     `[${MODE}] FILL CONFIRMED${venueTag} ${pending.label} quote_id=${quoteId} order_id=${orderId} ` +
@@ -3061,6 +3185,9 @@ async function main() {
         `UNHEDGED_RFQ_LIVE=${isUnhedgedRfqLive(process.env) ? 'on' : 'off'}) — never posts.`
       : 'Unhedged /markets, fill ticks, and shadow miss are off — run npm run start:unhedged.')
   );
+  if (SPLIT.runKalshi) {
+    console.log(`[${MODE}] kalshi limiter ${kalshiLimit.describe()} balanceCacheMs=${kalshiBalanceCache.ttlMs}`);
+  }
 
   if (runUnhedged) {
     unhedgedSide = startUnhedgedSide({
@@ -3447,6 +3574,7 @@ async function main() {
       wsLoopLagMs: h && h.loopLagMs,
       wsRecv: h && h.recv,
       wsDrop: h && h.drop,
+      kalshiLimit: kalshiLimit.rollStats(),
     });
   }, 60000);
   process.on('SIGINT', () => {
