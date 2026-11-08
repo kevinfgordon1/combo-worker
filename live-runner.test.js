@@ -208,8 +208,14 @@ assert.ok(
   'underfunded Kalshi POST must persist declined + skip_reason, not silent unfilled'
 );
 assert.ok(
-  /logFundingSkip\(p, rfq, d(, \{[^}]*\})?\)/.test(liveSrc) && /logAsync\(p, rfq, d, 'unfilled'\)/.test(liveSrc),
-  'non-funding POST fails stay unfilled'
+  /logFundingSkip\(p, rfq, d(, \{[^}]*\})?\)/.test(liveSrc) &&
+    /else if \(closed\) \{[\s\S]*?logAsync\(p, rfq, d, 'unfilled', \{[\s\S]*?skip_reason: 'rfq_closed'/.test(liveSrc) &&
+    /logAsync\(p, rfq, d, 'declined', \{[\s\S]*?skip_reason: quotePostSkipValue\(e\.message\)/.test(liveSrc),
+  'funding stays declined; 409 stays unfilled+rfq_closed; other POST fails are declined with a classified skip_reason'
+);
+assert.ok(
+  /logAsync\(p, rfq, d, 'quoted', \{[\s\S]*?quote_id: result\.id/.test(liveSrc),
+  'a posted Kalshi quote still persists as quoted (stored unfilled) with quote_id'
 );
 assert.ok(
   /costDollars:\s*quoteCostDollars\(d && d\.contracts, noBid\)/.test(liveSrc) &&

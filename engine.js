@@ -151,16 +151,64 @@ function quoteFailureSkipReason(message) {
 }
 
 // 409 after the auction already executed / expired. Distinct from funding
-// (declined + skip_reason=insufficient_balance) and precision rejects.
-// Persist as unfilled + skip_reason=rfq_closed (null quote_id).
+// (declined + skip_reason=insufficient_balance) and from a send that never
+// landed. Kalshi still persists this as unfilled + skip_reason=rfq_closed
+// (null quote_id). Polymarket create failures use isCreateClosedFailure and
+// persist declined + rfq_closed.
 function isRfqClosedFailure(message) {
   return /rfq[_-]?closed|already[_ -]?closed/i.test(String(message || ''));
 }
 
+// Polymarket create: auction gone. Wider than Kalshi's rfq_closed body
+// (not open / expired). Same check the Poly latency counter already uses.
+function isCreateClosedFailure(message) {
+  const msg = String(message || '');
+  return isRfqClosedFailure(msg) || /closed|not[_ ]?open|expired/i.test(msg);
+}
+
+function isPostTimeoutFailure(message) {
+  return /HeadersTimeout|BodyTimeout|UND_ERR_(?:HEADERS|BODY)_TIMEOUT|Headers Timeout|Body Timeout|ETIMEDOUT|\btimed?\s*out\b|\btimeout\b/i.test(String(message || ''));
+}
+
+// combo_submissions has no error column. The code is the skip_reason prefix;
+// a short sanitized exchange message follows it (`post_failed: …`).
+const QUOTE_SKIP_MAX = 200;
+
+function sanitizeQuoteError(message) {
+  let s = String(message == null ? '' : message).replace(/[\r\n\t]+/g, ' ').replace(/[ ]{2,}/g, ' ').trim();
+  if (!s) return '';
+  s = s.replace(/-----BEGIN [A-Z0-9 ]+-----[\s\S]*?-----END [A-Z0-9 ]+-----/g, '[redacted]');
+  s = s.replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]');
+  s = s.replace(/\b(authorization|api[_-]?key|secret(?:[_-]?key)?|signature|access[_-]?token|kalshi-access-signature|polymarket-signature)\b\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)/gi, '$1=[redacted]');
+  s = s.replace(/\b[A-Za-z0-9+/_=-]{48,}\b/g, '[redacted]');
+  return s;
+}
+
+// insufficient_balance | rfq_closed | stale_drop | post_timeout | post_failed.
+// `closed` is the Polymarket create-closed check (isCreateClosedFailure).
+function quotePostSkipCode(message, { closed = false } = {}) {
+  const msg = String(message || '');
+  if (isInsufficientFundsFailure(msg)) return 'insufficient_balance';
+  // A stale drop says "expired" because the RFQ aged out before we sent.
+  // That is not an auction-closed response.
+  if (/STALE_DROP/i.test(msg)) return 'stale_drop';
+  if (isPostTimeoutFailure(msg)) return 'post_timeout';
+  if (closed || isRfqClosedFailure(msg)) return 'rfq_closed';
+  return 'post_failed';
+}
+
+function quotePostSkipValue(message, opts) {
+  const code = quotePostSkipCode(message, opts);
+  const detail = sanitizeQuoteError(message);
+  if (!detail) return code;
+  const prefix = `${code}: `;
+  const room = QUOTE_SKIP_MAX - prefix.length;
+  const body = detail.length > room ? `${detail.slice(0, Math.max(0, room - 1))}…` : detail;
+  return `${prefix}${body}`;
+}
+
 function quotePostFailReason(message) {
-  if (isInsufficientFundsFailure(message)) return 'insufficient_balance';
-  if (isRfqClosedFailure(message)) return 'rfq_closed';
-  return null;
+  return quotePostSkipCode(message);
 }
 
 function formatQuoteLatency({
@@ -172,8 +220,10 @@ function formatQuoteLatency({
 }
 
 // Telegram skip only. Funding still writes a declined skip_reason row.
-// Precision rejects (dollar-RFQ + yes_bid "0.00") stay console + unfilled.
-// rfq_closed stays loud — that is the late-POST race we are measuring.
+// Precision rejects (dollar-RFQ + yes_bid "0.00"), stale drops, and timeouts
+// stay off Telegram. They persist as declined + post_failed / stale_drop /
+// post_timeout, not as an unfilled quote. rfq_closed stays loud — that is
+// the late-POST race we are measuring.
 function isSilentQuoteFailure(message) {
   const msg = String(message || '');
   if (isInsufficientFundsFailure(msg)) return true;
@@ -391,5 +441,6 @@ module.exports = {
   shouldConfirmAccept, contractsFromQuoteResponse,
   buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, isPriceGridFailure, pennyNoBid,
   isInsufficientFundsFailure, quoteFailureSkipReason,
-  isRfqClosedFailure, quotePostFailReason, formatQuoteLatency,
+  isRfqClosedFailure, isCreateClosedFailure, quotePostFailReason, formatQuoteLatency,
+  sanitizeQuoteError, quotePostSkipCode, quotePostSkipValue,
 };
