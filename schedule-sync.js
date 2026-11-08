@@ -5,6 +5,7 @@
 //    an owner in-app alert + Telegram (one per game per day), and a lock leg whose saved starts_at is > 15 min off the
 //    official time is reported too (that is the "today vs tomorrow" class of bug). Never touches quoting.
 // Errors never throw out of tick(); a missing table (migration not run yet) logs once and the sync idles.
+// Upserts are per league: one rejected batch is logged and the other leagues still write.
 'use strict';
 const G = require('./game-schedule');
 
@@ -39,21 +40,33 @@ function createScheduleSync({ env = process.env, fetchFn = globalThis.fetch, log
   }
 
   async function save(fresh) {
-    if (!base || !key || tableMissing || !fresh.length) return 0;
-    const dates = [...new Set(fresh.map((g) => G.etDate(g.start_ms)))];
+    const gamesIn = G.dedupeGames(fresh);
+    if (!base || !key || tableMissing || !gamesIn.length) return 0;
+    const dates = [...new Set(gamesIn.map((g) => G.etDate(g.start_ms)))];
     let prev = [];
     try { prev = await rest(`game_schedule?select=league,espn_id,start_time_utc,previous_start_utc&et_date=in.(${dates.join(',')})`) || []; } catch (e) {
       if (e.status === 404 || /42P01|game_schedule/.test(e.message)) { tableMissing = true; log('[SCHEDULE] table public.game_schedule missing — run migrations/20261027_game_schedule.sql; sync keeps an in-memory schedule only'); return 0; }
       throw e;
     }
     const pm = new Map(prev.map((r) => [`${r.league}|${r.espn_id}`, r]));
-    const rows = fresh.map((g) => {
+    const byLeague = new Map();
+    for (const g of gamesIn) {
       const p = pm.get(`${g.league}|${g.espn_id}`);
       if (p && Date.parse(p.start_time_utc) !== g.start_ms) log(`[SCHEDULE] time change ${g.league} ${g.away.abbr}@${g.home.abbr}: ${p.start_time_utc} → ${new Date(g.start_ms).toISOString()}`);
-      return G.gameToRow(g, now(), p);
-    });
-    for (let i = 0; i < rows.length; i += 500) await rest('game_schedule?on_conflict=league,espn_id', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(rows.slice(i, i + 500)) });
-    stats.upserted += rows.length; return rows.length;
+      const row = G.gameToRow(g, now(), p);
+      const list = byLeague.get(row.league); if (list) list.push(row); else byLeague.set(row.league, [row]);
+    }
+    let wrote = 0;
+    for (const [lg, list] of byLeague) {
+      for (let i = 0; i < list.length; i += 500) {
+        const slice = list.slice(i, i + 500);
+        try {
+          await rest('game_schedule?on_conflict=league,espn_id', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(slice) });
+          wrote += slice.length;
+        } catch (e) { log(`[SCHEDULE] save ${lg} error: ${e.message}`); }
+      }
+    }
+    stats.upserted += wrote; return wrote;
   }
 
   function merge(fresh) {
@@ -133,13 +146,15 @@ function createScheduleSync({ env = process.env, fetchFn = globalThis.fetch, log
   async function tick() {
     try {
       const full = now() - lastFull >= Number(env.SCHEDULE_FULL_MS || 30 * 60000);
-      const fresh = await pullEspn(full ? [-1, 0, 1, 2, 3, 4, 5, 6, 7] : [0, 1]);
+      const pulled = await pullEspn(full ? [-1, 0, 1, 2, 3, 4, 5, 6, 7] : [0, 1]);
       if (full) lastFull = now();
+      const fresh = G.dedupeGames(pulled);
+      if (fresh.length < pulled.length) log(`[SCHEDULE] deduped ${pulled.length - fresh.length} duplicate game(s) before upsert`);
       merge(fresh);
       await save(fresh).catch((e) => log(`[SCHEDULE] save error: ${e.message}`));
       await auditLocks().catch((e) => log(`[SCHEDULE] audit error: ${e.message}`));
       stats.passes += 1; stats.lastPass = new Date(now()).toISOString();
-      log(`[SCHEDULE] pass ${stats.passes} ${full ? 'full' : 'quick'} fetched=${fresh.length} games=${games.length} lookups=${stats.lookups} cache=${resolveCache.size} unverifiedLegs=${stats.unverifiedLegs} lookupsOff=${lookupsOff}`);
+      log(`[SCHEDULE] pass ${stats.passes} ${full ? 'full' : 'quick'} fetched=${pulled.length} games=${games.length} lookups=${stats.lookups} cache=${resolveCache.size} unverifiedLegs=${stats.unverifiedLegs} lookupsOff=${lookupsOff}`);
     } catch (e) { log(`[SCHEDULE] tick error: ${e.message}`); }
   }
 
