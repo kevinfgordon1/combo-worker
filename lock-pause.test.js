@@ -118,6 +118,10 @@ function fakeSupabase(result) {
   assert.deepStrictEqual(s2.live.map((r) => r.id), ['live']);
   assert.deepStrictEqual(expiredProbePauses(s2.pausedIds, s2.probeUntil, T + 10000), []);
   assert.deepStrictEqual(expiredProbePauses(s2.pausedIds, s2.probeUntil, T + 25000), ['p']);
+  const { pauseCancelKind } = require('./lock-pause');
+  assert.strictEqual(pauseCancelKind(s2.probeUntil, 'p'), 'probe_pause');
+  assert.strictEqual(pauseCancelKind(s2.probeUntil, 'm'), 'paused', 'manual pause is not a market check');
+  assert.strictEqual(pauseCancelKind(new Map(), 'p'), 'paused');
 }
 
 (async () => {
