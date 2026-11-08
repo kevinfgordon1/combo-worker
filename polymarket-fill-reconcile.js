@@ -1417,11 +1417,12 @@ function matchActivitiesToLocks(activities, locks, {
   return events;
 }
 
-async function listActivitiesPage(http, { limit = 100, maxPages = 8, marketSlug } = {}) {
+async function listActivitiesPage(http, { limit = 100, maxPages = 8, marketSlug, pageGapMs = 0, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
   if (!http || typeof http.listActivities !== 'function') return [];
   const out = [];
   let cursor;
   for (let page = 0; page < maxPages; page += 1) {
+    if (page > 0 && pageGapMs > 0) await sleep(pageGapMs);
     let listed;
     try {
       listed = await http.listActivities({
@@ -1481,7 +1482,7 @@ let slugFullPassDone = false;
 const SLUGS_PER_TICK = Number(process.env.POLY_ACT_SLUGS_PER_TICK) > 0
   ? Number(process.env.POLY_ACT_SLUGS_PER_TICK) : 8;
 
-async function listActivitiesForMarketSlugs(http, slugs, { limit = 100, maxPages = 4, perTick = SLUGS_PER_TICK, full } = {}) {
+async function listActivitiesForMarketSlugs(http, slugs, { limit = 100, maxPages = 4, perTick = SLUGS_PER_TICK, full, gapMs = 0, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
   const out = [];
   const all = (slugs || []).map(normalizeMarketSlug).filter((k) => isComboActivitySlug(k));
   const doFull = full != null ? full : !slugFullPassDone;
@@ -1492,9 +1493,11 @@ async function listActivitiesForMarketSlugs(http, slugs, { limit = 100, maxPages
     slugScanOffset = (slugScanOffset + perTick) % all.length;
   }
   if (doFull) slugFullPassDone = true;
-  for (const key of pick) {
+  for (let i = 0; i < pick.length; i += 1) {
+    const key = pick[i];
+    if (i > 0 && gapMs > 0) await sleep(gapMs);
     try {
-      const rows = await listActivitiesPage(http, { limit, maxPages, marketSlug: key });
+      const rows = await listActivitiesPage(http, { limit, maxPages, marketSlug: key, pageGapMs: gapMs, sleep });
       out.push(...rows);
     } catch (e) {
       if (e && e.statusCode === 429) break; // rate limited: stop, next tick continues
@@ -1508,6 +1511,12 @@ async function reconcileLockActivityEvents(http, {
   seenFillIds,
   includePositions = true,
   maxPages = 8,
+  pageGapMs = 0,
+  slugGapMs = 0,
+  // Boot passes fullSlugs: false. The global activity page is enough then;
+  // scanning every caoc slug in one burst is what tripped Cloudflare 1015.
+  fullSlugs = null,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   slugMap,
   slugRecords,
   submissions,
@@ -1530,7 +1539,7 @@ async function reconcileLockActivityEvents(http, {
   }
   let activities = [];
   try {
-    activities = await listAllActivities(http, { maxPages });
+    activities = await listAllActivities(http, { maxPages, pageGapMs, sleep });
   } catch (_) {
     activities = [];
   }
@@ -1539,7 +1548,7 @@ async function reconcileLockActivityEvents(http, {
     try {
       activities = mergeActivities(
         activities,
-        await listActivitiesForMarketSlugs(http, slugs)
+        await listActivitiesForMarketSlugs(http, slugs, { gapMs: slugGapMs, sleep, full: fullSlugs })
       );
     } catch (_) { /* global page still used */ }
   }
@@ -1567,6 +1576,7 @@ async function reconcileLockActivityEvents(http, {
   const uncovered = locks.filter((p) => p && p.id && !covered.has(p.id));
   if (!uncovered.length) return events;
   try {
+    if (pageGapMs > 0) await sleep(pageGapMs);
     const listed = await http.listPositions({ limit: 100 });
     return events.concat(matchPositionsToLocks(positionsFromListed(listed), uncovered, {
       seenFillIds,

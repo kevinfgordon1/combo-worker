@@ -12,6 +12,7 @@ const {
 } = require('./polymarket-auth');
 
 const { sharedPolyLimiter } = require('./poly-limiter');
+const { retryAfterMs } = require('./poly-startup-rest');
 const DEFAULT_BASE = 'https://api.polymarket.us';
 const DEFAULT_WS = 'wss://api.polymarket.us/v1/ws/private';
 const WS_SIGN_PATH = '/v1/ws/private';
@@ -133,16 +134,24 @@ function createPolymarketHttp({
     b.hits += 1;
     b.step = Math.min(b.step + 1, 10);
     const exp = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * (2 ** (b.step - 1)));
-    const ra = Number(res && res.headers && (res.headers['retry-after'] || res.headers['Retry-After']));
-    const base = Number.isFinite(ra) && ra > 0 ? Math.min(BACKOFF_MAX_MS, ra * 1000) : exp;
-    const wait = Math.round(base * (0.75 + Math.random() * 0.5)); // +/-25% jitter
+    const ra = retryAfterMs(res && res.headers, nowMs());
+    // Retry-After is a floor. Jitter may add time; it must not retry early.
+    let wait;
+    if (ra != null) {
+      const capped = Math.min(BACKOFF_MAX_MS, ra);
+      const extra = Math.round(capped * 0.25 * Math.random());
+      wait = Math.min(BACKOFF_MAX_MS, capped + extra);
+    } else {
+      wait = Math.round(exp * (0.75 + Math.random() * 0.5));
+    }
     b.until = nowMs() + wait;
     b.last = nowMs();
     if (/\b1015\b/.test(String((res && res.text) || ''))) {
       globalBan.hits += 1;
       globalBan.step = Math.min(globalBan.step + 1, 6);
       const g = Math.min(BACKOFF_MAX_MS, CF_COOLDOWN_MS * (2 ** (globalBan.step - 1)));
-      globalBan.until = Math.max(globalBan.until, nowMs() + Math.round(g * (0.75 + Math.random() * 0.5)));
+      const banWait = Math.max(wait, Math.round(g * (0.75 + Math.random() * 0.5)));
+      globalBan.until = Math.max(globalBan.until, nowMs() + banWait);
     }
     return wait;
   }
