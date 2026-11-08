@@ -600,6 +600,14 @@ assert.ok(
   'balance refreshes on a fill and is served from cache between reads'
 );
 assert.ok(
+  /await ensureKalshiQuoteBalance\(\)/.test(liveSrc) &&
+    liveSrc.indexOf('await ensureKalshiQuoteBalance()') < liveSrc.indexOf('balanceGate.check(') &&
+    /pollKalshi: false/.test(liveSrc) &&
+    /scheduleBalanceReads: false/.test(liveSrc) &&
+    /readIfBalanceStale/.test(liveSrc),
+  'Kalshi balance is read only before a quote when the cache is stale, not on a timer'
+);
+assert.ok(
   /if \(!quoteHot\.inFlight\) tasks\.push\(warmOne\(kalshiQuoteHttp, 'quote', QUOTE_CONNECTIONS\)\)/.test(liveSrc),
   'do not steal the quote pool for a warm GET during POST/confirm'
 );

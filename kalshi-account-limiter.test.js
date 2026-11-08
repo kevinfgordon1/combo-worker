@@ -166,6 +166,27 @@ async function main() {
   assert.strictEqual(fetches, 1);
 }
 
+{
+  let t = 0;
+  let reads = 0;
+  const { createKalshiBalanceCache, readIfBalanceStale } = require('./kalshi-account-limiter');
+  const cache = createKalshiBalanceCache({ ttlMs: 20000, now: () => t });
+  const path = '/trade-api/v2/portfolio/balance?exchange_index=1';
+  const first = await readIfBalanceStale({ cache, path, read: async () => { reads += 1; cache.store(path, '{"balance":100}'); } });
+  assert.strictEqual(first.fetched, true);
+  assert.strictEqual(reads, 1);
+  const second = await readIfBalanceStale({ cache, path, read: async () => { reads += 1; } });
+  assert.strictEqual(second.fetched, false);
+  assert.strictEqual(reads, 1, 'fresh cache does not read');
+  cache.markStale();
+  const third = await readIfBalanceStale({ cache, path, read: async () => { reads += 1; cache.store(path, '{"balance":80}'); } });
+  assert.strictEqual(third.fetched, true);
+  assert.strictEqual(reads, 2, 'fill or funds failure invalidation forces the next read');
+  t = 20000;
+  const fourth = await readIfBalanceStale({ cache, path, read: async () => { reads += 1; } });
+  assert.strictEqual(fourth.fetched, true, '20s cache expiry reads again');
+}
+
 console.log('kalshi-account-limiter.test.js ok');
 }
 

@@ -333,6 +333,14 @@ function createKalshiBalanceCache({ ttlMs = 20_000, now = () => Date.now() } = {
   return { lookup, store, markStale, coalesce, shardOf: balanceShard, ttlMs };
 }
 
+// Quote-time read. A fresh cache entry is not a network call. The caller
+// supplies the GET; this only decides whether it has to run.
+async function readIfBalanceStale({ cache, path, read }) {
+  if (cache && cache.lookup(path)) return { fetched: false };
+  await read();
+  return { fetched: true };
+}
+
 module.exports = {
   TIERS,
   DEFAULT_COST,
@@ -346,4 +354,5 @@ module.exports = {
   createKalshiAccountLimiter,
   createKalshiBalanceCache,
   balanceShard,
+  readIfBalanceStale,
 };
