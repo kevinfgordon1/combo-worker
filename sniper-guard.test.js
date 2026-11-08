@@ -9,6 +9,10 @@ const db = (rows, err) => ({ from: () => ({ select: () => ({ eq: (col, val) => (
   assert.strictEqual(await g.isSniperFill({ order_id: 'O' }), true);
   assert.strictEqual(await g.isSniperFill({ order_id: 'Z', ticker: 'KXMVE-S' }), true);
   assert.strictEqual(await g.isSniperFill({ order_id: 'Z', ticker: 'KXMVE-L' }), false);
+  // Our own lock order on a combo market the sniper once quoted: not a sniper fill.
+  assert.strictEqual(await g.isSniperFill({ order_id: 'Z', ticker: 'KXMVE-S' }, { ourOrder: true }), false);
+  // Exact sniper order_id still wins.
+  assert.strictEqual(await g.isSniperFill({ order_id: 'O', ticker: 'KXMVE-S' }, { ourOrder: true }), true);
   const none = createSniperGuard({ supabase: db([], { code: '42P01', message: 'relation does not exist' }) });
   assert.deepStrictEqual(await none.isSniperQuote('Q'), { sniper: false });
   const bad = createSniperGuard({ supabase: db([], { message: 'timeout' }) });
