@@ -5,7 +5,8 @@ const path = require('path');
 let {
   decideAtFill, hedgeCap, fillView, buildQuoteBody, yesBidForQuote, shouldPostQuote, isSilentQuoteFailure,
   isInsufficientFundsFailure, quoteFailureSkipReason,
-  isRfqClosedFailure, quotePostFailReason, formatQuoteLatency,
+  isRfqClosedFailure, isCreateClosedFailure, quotePostFailReason, formatQuoteLatency,
+  sanitizeQuoteError, quotePostSkipCode, quotePostSkipValue,
   YES_DECLINE, impliedYesBid, quoteYesBid, isRealYesBid, shouldConfirmAccept, contractsFromQuoteResponse,
 } = require('./engine');
 // These cases pin the pre-series 0.0175 maker schedule (quadratic_with_maker_fees ×1).
@@ -244,7 +245,40 @@ assert.strictEqual(
   quotePostFailReason('Kalshi quote failed 400: {"error":{"code":"insufficient_balance"}}'),
   'insufficient_balance'
 );
-assert.strictEqual(quotePostFailReason('fetch failed'), null);
+assert.strictEqual(quotePostFailReason('fetch failed'), 'post_failed');
+assert.strictEqual(quotePostSkipCode('STALE_DROP expired age=3200ms'), 'stale_drop');
+assert.strictEqual(quotePostSkipCode('UND_ERR_HEADERS_TIMEOUT'), 'post_timeout');
+assert.strictEqual(quotePostSkipCode('Headers Timeout Error'), 'post_timeout');
+assert.strictEqual(quotePostSkipCode('Kalshi quote failed 400: invalid_yes_bid'), 'post_failed');
+assert.strictEqual(quotePostSkipCode('not open', { closed: true }), 'rfq_closed');
+assert.strictEqual(quotePostSkipCode('auction expired', { closed: true }), 'rfq_closed');
+assert.ok(isCreateClosedFailure('Polymarket POST /v1/rfqs/quotes 400 RFQ_CLOSED'));
+assert.ok(isCreateClosedFailure('request not open'));
+assert.ok(!isCreateClosedFailure('Kalshi quote failed 400: invalid_yes_bid'));
+{
+  const stale = quotePostSkipValue('STALE_DROP expired age=3200ms');
+  assert.ok(stale.startsWith('stale_drop: STALE_DROP expired'));
+  assert.ok(!stale.includes('\n'));
+  const grid = quotePostSkipValue('Kalshi quote failed 400: invalid_yes_bid');
+  assert.ok(grid.startsWith('post_failed: Kalshi quote failed 400: invalid_yes_bid'));
+  const secret = 'Authorization: Bearer supersecret.token.value api_key=abcd1234 signature=zzzz';
+  const clean = sanitizeQuoteError(secret);
+  assert.ok(!clean.includes('supersecret'));
+  assert.ok(!clean.includes('abcd1234'));
+  assert.ok(!clean.includes('zzzz'));
+  const pem = sanitizeQuoteError('-----BEGIN PRIVATE KEY-----\nMIIBsecret\n-----END PRIVATE KEY----- boom');
+  assert.ok(!pem.includes('MIIBsecret'));
+  assert.ok(pem.includes('[redacted]'));
+  assert.ok(pem.includes('boom'));
+  const long = quotePostSkipValue(`Kalshi quote failed 500 ${'word '.repeat(80)}`);
+  assert.ok(long.startsWith('post_failed: Kalshi quote failed 500 '));
+  assert.ok(long.length <= 200);
+  assert.ok(long.endsWith('…'));
+  const blob = sanitizeQuoteError(`token ${'a'.repeat(60)} tail`);
+  assert.ok(!blob.includes('a'.repeat(60)));
+  assert.ok(blob.includes('[redacted]'));
+  assert.ok(blob.includes('tail'));
+}
 assert.ok(!isSilentQuoteFailure('Kalshi quote failed 409: {"error":{"code":"rfq_closed"}}'));
 {
   const ok = formatQuoteLatency({

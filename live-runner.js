@@ -81,7 +81,12 @@
 //   declined combo_submissions row for the lock card. The generic QUOTE
 //   FAILED Telegram stays silent. bucket-manager.js sends a loud alert
 //   (1 per 10 min per venue) and checks the combo bucket immediately.
-//   No public-tape lookup. Precision rejects stay console + unfilled.
+//   No public-tape lookup. A send that never lands (stale drop, timeout,
+//   precision reject, other POST error) persists declined + skip_reason
+//   stale_drop / post_timeout / post_failed, with a short sanitized message
+//   in that same column. It is not an unfilled quote. 409 rfq_closed stays
+//   unfilled + skip_reason=rfq_closed. A posted quote (quote_id) stays quoted,
+//   which normalizeStatus stores as unfilled.
 //   Quote-watcher stays parked (same KALSHI_KEY_ID unsubscribes this WS).
 //   We do not write combo_matches or watcher_debug.
 // RFQ REPEAT: lock-matched RFQs about to quote are fingerprinted
@@ -130,7 +135,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { createKalshiFirehose, readShardFactor, DEFAULT_LIVE_SHARD_FACTOR, summarizeThroughput } = require('./kalshi-ws');
 const { normalizePem, clockOffset, signedRequest, signedNow } = require('./kalshi-auth');
 const { matchParlay } = require('./rfq');
-const { decideAtFill, isFreeBetRow, fillView, subcentEnabled, isPriceGridFailure, pennyNoBid, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, isRfqClosedFailure, quotePostFailReason, formatQuoteLatency, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse, isSubcentPrice } = require('./engine');
+const { decideAtFill, isFreeBetRow, fillView, subcentEnabled, isPriceGridFailure, pennyNoBid, buildQuoteBody, shouldPostQuote, isSilentQuoteFailure, quoteFailureSkipReason, isRfqClosedFailure, quotePostFailReason, quotePostSkipValue, formatQuoteLatency, YES_DECLINE, impliedYesBid, quoteYesBid, shouldConfirmAccept, contractsFromQuoteResponse, isSubcentPrice } = require('./engine');
 const { findStartedEvent } = require('./started');
 const {
   RESERVE_TTL_MS,
@@ -2926,7 +2931,13 @@ async function onRfq(rfq, env) {
           rfq_fingerprint: fingerprint,
         });
       } else {
-        logAsync(p, rfq, d, 'unfilled');
+        // Never landed, so this is not a quote. combo_submissions has no
+        // error column: skip_reason is `stale_drop|post_timeout|post_failed`
+        // plus a short sanitized message.
+        logAsync(p, rfq, d, 'declined', {
+          skip_reason: quotePostSkipValue(e.message),
+          rfq_fingerprint: fingerprint,
+        });
       }
       if (!isSilentQuoteFailure(e.message)) {
         sendAlert(

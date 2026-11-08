@@ -44,7 +44,7 @@
 'use strict';
 const { createPolyFillScheduler, isPositionPush } = require('./poly-fill-scheduler');
 const { matchParlay } = require('./rfq');
-const { decideAtFill, isFreeBetRow, quoteFailureSkipReason, isRfqClosedFailure } = require('./engine');
+const { decideAtFill, isFreeBetRow, quoteFailureSkipReason, isCreateClosedFailure, quotePostSkipCode, quotePostSkipValue } = require('./engine');
 const { createLatencyStats } = require('./latency-stats');
 const { findStartedEvent } = require('./started');
 const { createDeclineGuard, readDeclineGuardConfig } = require('./poly-decline-guard');
@@ -2093,21 +2093,21 @@ function startPolymarketRfqLoop(ctx = {}) {
       return { ...evaluation, post: true, quoteId };
     } catch (e) {
       pendingQuotes.delete(reserveKey);
+      const closed = isCreateClosedFailure(e && e.message);
       latency.notePost({
         totalMs: Date.now() - tMatch0, createdTs: rfq.createdTime, ok: false,
-        rfqClosed: isRfqClosedFailure(e && e.message) || /closed|not[_ ]?open|expired/i.test(String((e && e.message) || '')),
+        rfqClosed: closed,
       });
       console.error(`[${MODE}] POST FAILED ${p.label} rfq=${rfq.rfqId}`, e.message);
-      const skipReason = quoteFailureSkipReason(e.message);
-      if (skipReason) {
-        persistLockTape(evaluation, 'declined', {
-          skip_reason: skipReason,
-          contracts: d.contracts,
-        });
-      } else {
-        persistLockTape(evaluation, 'unfilled');
-      }
-      return { ...evaluation, post: false, reason: skipReason || 'post_failed', error: e.message };
+      const code = quotePostSkipCode(e.message, { closed });
+      // A posted quote (quote_id, status quoted → unfilled) is the success
+      // path above. A create that never returned an id is declined, with the
+      // reason in skip_reason (rfq_closed when the auction is gone).
+      persistLockTape(evaluation, 'declined', {
+        skip_reason: code === 'insufficient_balance' ? code : quotePostSkipValue(e.message, { closed }),
+        contracts: d.contracts,
+      });
+      return { ...evaluation, post: false, reason: code, error: e.message };
     }
   }
 

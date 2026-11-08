@@ -3055,6 +3055,7 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
   }
 
   const otherFailRows = [];
+  let createError = 'Polymarket POST /v1/rfqs/quotes 400 RFQ_CLOSED';
   const otherFailLoop = startPolymarketRfqLoop({
     env: {
       POLYMARKET_KEY_ID: 'key-id-fixture',
@@ -3066,7 +3067,7 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
       async listRfqs() { return { rfqs: [] }; },
       async listQuotes() { return { quotes: [] }; },
       async getCombo() { return { combos: [] }; },
-      async createQuote() { throw new Error('Polymarket POST /v1/rfqs/quotes 400 RFQ_CLOSED'); },
+      async createQuote() { throw new Error(createError); },
       async confirmQuote() { return {}; },
       async deleteQuote() { return { statusCode: 200 }; },
       close() {},
@@ -3083,16 +3084,38 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
         rfq_id: rfq.rfqId,
         status,
         skip_reason: extra.skip_reason || null,
+        quote_id: extra.quote_id || null,
       });
     },
   });
   try {
     const closed = await otherFailLoop.handleRfq({ ...pmRfq, id: 'rfq_closed_fail' });
     assert.strictEqual(closed.post, false);
-    assert.strictEqual(closed.reason, 'post_failed');
+    assert.strictEqual(closed.reason, 'rfq_closed');
     assert.strictEqual(otherFailRows.length, 1);
-    assert.strictEqual(otherFailRows[0].status, 'unfilled');
-    assert.strictEqual(otherFailRows[0].skip_reason, null);
+    assert.strictEqual(otherFailRows[0].status, 'declined');
+    assert.ok(String(otherFailRows[0].skip_reason).startsWith('rfq_closed: '));
+    assert.strictEqual(otherFailRows[0].quote_id, null);
+    assert.ok(!otherFailRows[0].skip_reason.includes('SEED'));
+
+    createError = 'STALE_DROP expired age=3100ms';
+    const stale = await otherFailLoop.handleRfq({ ...pmRfq, id: 'rfq_stale_fail' });
+    assert.strictEqual(stale.reason, 'stale_drop');
+    assert.strictEqual(otherFailRows[1].status, 'declined');
+    assert.ok(otherFailRows[1].skip_reason.startsWith('stale_drop: STALE_DROP expired'));
+
+    createError = 'HeadersTimeoutError: Headers Timeout Error';
+    const timed = await otherFailLoop.handleRfq({ ...pmRfq, id: 'rfq_timeout_fail' });
+    assert.strictEqual(timed.reason, 'post_timeout');
+    assert.strictEqual(otherFailRows[2].status, 'declined');
+    assert.ok(otherFailRows[2].skip_reason.startsWith('post_timeout: '));
+
+    createError = 'Polymarket POST /v1/rfqs/quotes 500 boom Authorization: Bearer supersecret.token.value';
+    const other = await otherFailLoop.handleRfq({ ...pmRfq, id: 'rfq_other_fail' });
+    assert.strictEqual(other.reason, 'post_failed');
+    assert.strictEqual(otherFailRows[3].status, 'declined');
+    assert.ok(otherFailRows[3].skip_reason.startsWith('post_failed: Polymarket POST'));
+    assert.ok(!otherFailRows[3].skip_reason.includes('supersecret'));
   } finally {
     otherFailLoop.stop();
   }
