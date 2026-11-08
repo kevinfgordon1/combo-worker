@@ -25,10 +25,14 @@ function createSniperGuard({ supabase, ttlMs = 60_000, now = Date.now } = {}) {
   async function isSniperQuote(quoteId) {
     try { return { sniper: await lookup('quote_id', quoteId) }; } catch (e) { return { sniper: false, unknown: true, error: e.message }; }
   }
-  async function isSniperFill(row) {
+  // opts.ourOrder: the fill's order_id belongs to a Combo Locks quote (combo_submissions). Then only
+  // an exact order_id hit in sniper_ledger counts; a market_ticker hit just means the sniper once
+  // quoted the same combo market (Nov 8: a released Nov 3 sniper quote hid a real lock fill).
+  async function isSniperFill(row, opts = {}) {
     if (isNonPrimarySubaccount(row)) return true;
     try {
       if (row && row.order_id && await lookup('order_id', row.order_id)) return true;
+      if (opts.ourOrder) return false;
       if (row && row.ticker && await lookup('market_ticker', row.ticker)) return true;
       return false;
     } catch (_) { return false; }
