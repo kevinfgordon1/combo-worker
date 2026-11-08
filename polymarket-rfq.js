@@ -43,6 +43,7 @@
 // (default off) is what stops open quotes from reserving; these checks stay on.
 'use strict';
 const { createPolyFillScheduler, isPositionPush } = require('./poly-fill-scheduler');
+const { createPolyStartupRest } = require('./poly-startup-rest');
 const { matchParlay } = require('./rfq');
 const { decideAtFill, isFreeBetRow, quoteFailureSkipReason, isCreateClosedFailure, quotePostSkipCode, quotePostSkipValue } = require('./engine');
 const { createLatencyStats } = require('./latency-stats');
@@ -2513,7 +2514,15 @@ function startPolymarketRfqLoop(ctx = {}) {
     return evt;
   }
 
+  const startupGapMs = envIntLocal('POLY_STARTUP_GAP_MS', 1200);
+  let firstFillHydrate = true;
+  let fillReconcileBusy = false;
   async function reconcileLockFills() {
+    if (fillReconcileBusy) return [];
+    fillReconcileBusy = true;
+    const bootHydrate = firstFillHydrate;
+    firstFillHydrate = false;
+    try {
     if (!http || !enableLocks) return [];
     let submissions = [];
     if (typeof ctx.loadUnfilledPolyQuotes === 'function') {
@@ -2584,6 +2593,11 @@ function startPolymarketRfqLoop(ctx = {}) {
             slugRecords,
             pendingQuotes,
             bookedFills: events.concat(bookedPrior),
+            // Space every activities page, slug, and the positions read.
+            // The boot call does not scan every slug; that burst 429'd.
+            pageGapMs: polyRole ? startupGapMs : 0,
+            slugGapMs: polyRole ? startupGapMs : 0,
+            fullSlugs: polyRole && bootHydrate ? false : null,
           })).filter(notSniper);
         } catch (e) {
           console.error(`[${MODE}] fill reconcile activities`, e && e.message);
@@ -2602,6 +2616,9 @@ function startPolymarketRfqLoop(ctx = {}) {
       console.log(`[${MODE}] fill reconcile booked=${events.length + extra.length}`);
     }
     return events.concat(extra);
+    } finally {
+      fillReconcileBusy = false;
+    }
   }
 
   function emitOrderFill(evt) {
@@ -3052,26 +3069,32 @@ function startPolymarketRfqLoop(ctx = {}) {
     try { ws.start(); } catch (e) { console.error(`[${MODE}] ws start`, e.message); }
   }
 
-  http.getUserId().then((j) => {
-    const id = j && (j.rfqUserId || j.rfq_user_id);
-    console.log(`[${MODE}] auth ok rfqUserId=${id || '(none)'} live=${live}`);
-  }).catch((e) => {
-    const classify = (e && e.auth) || classifyPolymarketAuthError({
-      statusCode: e && e.statusCode,
-      text: e && e.message,
+  function checkUserId() {
+    return http.getUserId().then((j) => {
+      const id = j && (j.rfqUserId || j.rfq_user_id);
+      console.log(`[${MODE}] auth ok rfqUserId=${id || '(none)'} live=${live}`);
+      return j;
+    }).catch((e) => {
+      const classify = (e && e.auth) || classifyPolymarketAuthError({
+        statusCode: e && e.statusCode,
+        text: e && e.message,
+      });
+      console.error(
+        `[${MODE}] user-id failed`,
+        e && e.message,
+        formatAuthFailure({
+          statusCode: (e && e.statusCode) || 401,
+          classify,
+          creds,
+          signMode: e && e.signMode,
+          includeStatus: false,
+        })
+      );
     });
-    console.error(
-      `[${MODE}] user-id failed`,
-      e && e.message,
-      formatAuthFailure({
-        statusCode: (e && e.statusCode) || 401,
-        classify,
-        creds,
-        signMode: e && e.signMode,
-        includeStatus: false,
-      })
-    );
-  });
+  }
+  // poly-worker runs this through the startup queue so it does not land in
+  // the same instant as the fill hydrate. Other roles keep the immediate check.
+  if (!polyRole) checkUserId();
 
   const crawlEnabled = !!http && ctx.crawl !== false && (ctx.crawlMs == null || ctx.crawlMs > 0);
   const crawlMs = ctx.crawlMs != null ? ctx.crawlMs : envIntLocal('POLY_CRAWL_MS', DEFAULT_CRAWL_MS);
@@ -3170,7 +3193,7 @@ function startPolymarketRfqLoop(ctx = {}) {
     const warmOnce = () => http.warmQuotePool().then((r) => {
       if (r && !r.ok && r.reason !== 'backoff') console.warn(`[${MODE}] quote warm failed ${r.error || r.statusCode || r.reason || ''}`);
     }).catch(() => {});
-    warmOnce();
+    if (!polyRole) warmOnce();
     warmTimer = setInterval(warmOnce, warmMs);
     if (warmTimer.unref) warmTimer.unref();
   }
@@ -3204,7 +3227,24 @@ function startPolymarketRfqLoop(ctx = {}) {
     reconcileOpenRfqs().catch((e) => console.error(`[${MODE}] reconcile`, e.message));
   }, ctx.reconcileMs != null ? ctx.reconcileMs : RECONCILE_MS);
   const fillReconcileMs = ctx.fillReconcileMs != null ? ctx.fillReconcileMs : FILL_RECONCILE_MS;
-  if (ctx.initialFillReconcile) {
+  let startupRest = null;
+  if (polyRole && ctx.startWs !== false) {
+    // One startup read at a time: account check, quote warm, then activities
+    // and positions. A 429 holds the rest of the queue for Retry-After.
+    startupRest = createPolyStartupRest({
+      gapMs: startupGapMs,
+      limiter: http && http.limiter ? http.limiter : null,
+    });
+    startupRest.schedule('user-id', () => checkUserId(), { method: 'GET', path: '/v1/rfqs/user-id' });
+    if (live && http && typeof http.warmQuotePool === 'function' && warmMs > 0) {
+      startupRest.schedule('quote-warm', () => http.warmQuotePool(), { method: 'GET', path: '/v1/rfqs/user-id' });
+    }
+    if (ctx.initialFillReconcile) {
+      startupRest.schedule('fills', () => fillScheduler.run('startup', () => reconcileLockFills().catch((e) => {
+        console.error(`[${MODE}] initial fill reconcile`, e.message);
+      })), { method: 'GET', path: '/v1/portfolio/activities' });
+    }
+  } else if (ctx.initialFillReconcile) {
     reconcileLockFills().catch((e) => console.error(`[${MODE}] initial fill reconcile`, e.message));
   }
   const fillReconcileTimer = setInterval(() => {
@@ -3240,6 +3280,7 @@ function startPolymarketRfqLoop(ctx = {}) {
   return {
     stop() {
       stopped = true;
+      if (startupRest && startupRest.stop) startupRest.stop();
       clearInterval(reconcileTimer);
       for (const t of startTimers) clearTimeout(t);
       if (crawlTimer) clearInterval(crawlTimer);
