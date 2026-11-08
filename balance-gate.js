@@ -8,9 +8,10 @@
 // quotes the account clearly cannot honor.
 //
 // Hot path cost: NONE beyond arithmetic. Cash comes from the balance reporter's
-// own ~60s reads (balance-reporter.js onRows -> update), held in memory here.
-// check() never does network or DB I/O. Holds (cost of quotes we already have
-// open) are an in-memory sum the caller supplies lazily.
+// own ~60s reads (balance-reporter.js onRows -> update) and from the shared
+// balance cache (refresh on fill / interval, never once per RFQ), held in
+// memory here. check() and afford() never do network or DB I/O. Holds (cost of
+// quotes we already have open) are an in-memory sum the caller supplies lazily.
 //
 //   no fresh snapshot / gate off      -> allow (exchange rejection is the backup)
 //   cash >= COMFORT x (cost + holds)  -> allow (normal case, no further check)
@@ -125,6 +126,16 @@ function createBalanceGate({ env = process.env, now = () => Date.now() } = {}) {
     return s.cashUsd;
   }
 
+  // Last successful read, any age. A failed refresh does not erase it and
+  // does not replace it with a larger guess (update() ignores ok:false).
+  function knownCash(venue) {
+    const k = venueKey(venue);
+    if (!k) return null;
+    const s = snap.get(k);
+    if (!s || !Number.isFinite(s.cashUsd)) return null;
+    return s.cashUsd;
+  }
+
   // venue: 'kalshi' | 'polymarket'; costUsd: this quote's max cost;
   // holdsUsd: number or () => number (in-memory sum; skipped when no fresh snapshot);
   // unitCost: per-contract cost, used to report how many contracts would fit.
@@ -149,8 +160,33 @@ function createBalanceGate({ env = process.env, now = () => Date.now() } = {}) {
     return { ok: false, path: 'low', reason: 'insufficient_balance', ...base };
   }
 
+  // Accept / confirm, using the cached balance only. No network.
+  // A fresh last-known cash that cannot cover this accept plus other open
+  // quotes is skipped, so we do not wait for Kalshi to time the confirm out.
+  // No reading, or a stalled one (older than maxAge): do not block. Kalshi
+  // already rejects an underfunded confirm. Inventing a zero balance there
+  // would cancel accepts we can pay.
+  function afford({ venue, costUsd, holdsUsd = 0, unitCost = null } = {}) {
+    if (!enabled) return { ok: true, path: 'off' };
+    const cost = Number(costUsd);
+    if (!(cost > 0)) return { ok: true, path: 'no_cost' };
+    const k = venueKey(venue);
+    const s = k ? snap.get(k) : null;
+    if (!s || !Number.isFinite(s.cashUsd) || now() - s.atMs > maxAgeMs) {
+      return { ok: true, path: 'unknown', costUsd: cost };
+    }
+    const cash = s.cashUsd;
+    const holds = Math.max(0, typeof holdsUsd === 'function' ? Number(holdsUsd()) || 0 : Number(holdsUsd) || 0);
+    const free = cash - holds;
+    const u = Number(unitCost);
+    const maxContracts = u > 0 && u < 1.0001 ? Math.max(0, Math.floor((free / u) * 100 + 1e-9) / 100) : null;
+    const base = { cashUsd: cash, holdsUsd: holds, freeUsd: free, costUsd: cost, maxContracts };
+    if (free + 1e-9 >= cost) return { ok: true, path: 'known', ...base };
+    return { ok: false, path: 'low', reason: 'insufficient_balance', ...base };
+  }
+
   return {
-    enabled, comfort, maxAgeMs, update, cashFor, check,
+    enabled, comfort, maxAgeMs, update, cashFor, knownCash, check, afford,
     stats: () => ({ ...stats }),
   };
 }

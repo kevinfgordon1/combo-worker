@@ -584,6 +584,22 @@ assert.ok(
   'both POST and confirm wrap withQuoteHot'
 );
 assert.ok(
+  /createKalshiAccountLimiter/.test(liveSrc) &&
+    /await kalshiLimit\.acquire\(method, signPath/.test(liveSrc) &&
+    /kalshiLimit\.note429\(method, signPath, res\.headers\)/.test(liveSrc),
+  'every Kalshi REST send must take a shared-limiter token and back off on 429'
+);
+assert.ok(
+  liveSrc.indexOf('balanceGate.afford(') !== -1 &&
+    liveSrc.indexOf('balanceGate.afford(') < liveSrc.indexOf('confirmAgainstCap(capBook'),
+  'confirm must check last known cash minus holds before it confirms'
+);
+assert.ok(
+  /scheduleKalshiBalanceRefresh\('fill'\)/.test(liveSrc) &&
+    /kalshiBalanceCache\.lookup/.test(liveSrc),
+  'balance refreshes on a fill and is served from cache between reads'
+);
+assert.ok(
   /if \(!quoteHot\.inFlight\) tasks\.push\(warmOne\(kalshiQuoteHttp, 'quote', QUOTE_CONNECTIONS\)\)/.test(liveSrc),
   'do not steal the quote pool for a warm GET during POST/confirm'
 );

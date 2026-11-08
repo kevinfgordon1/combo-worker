@@ -75,6 +75,10 @@ assert.strictEqual(G.sumHoldsUsd(null, G.kalshiPendingCostUsd), 0);
   t = T0 + 181_000;
   assert.strictEqual(g.cashFor('kalshi'), null);
   assert.strictEqual(g.check({ venue: 'kalshi', costUsd: 5000 }).path, 'no_data');
+  // A stalled reading must not block the accept. Kalshi rejects if we cannot pay.
+  const stale = g.afford({ venue: 'kalshi', costUsd: 5000, holdsUsd: 0 });
+  assert.strictEqual(stale.ok, true);
+  assert.strictEqual(stale.path, 'unknown');
   const st = g.stats();
   assert.ok(st.fast >= 1 && st.checked >= 1 && st.skipped >= 2 && st.noData >= 1);
 }
@@ -82,6 +86,18 @@ assert.strictEqual(G.sumHoldsUsd(null, G.kalshiPendingCostUsd), 0);
   const off = G.createBalanceGate({ env: { COMBO_BALANCE_GATE: '0' }, now: () => T0 });
   off.update([row('kalshi', 1, 0)]);
   assert.deepStrictEqual(off.check({ venue: 'kalshi', costUsd: 50 }), { ok: true, path: 'off' });
+  assert.strictEqual(off.afford({ venue: 'kalshi', costUsd: 50 }).path, 'off');
+}
+{
+  const g = G.createBalanceGate({ env: {}, now: () => T0 });
+  assert.strictEqual(g.afford({ venue: 'kalshi', costUsd: 10 }).ok, true);
+  assert.strictEqual(g.afford({ venue: 'kalshi', costUsd: 10 }).path, 'unknown');
+  assert.strictEqual(g.afford({ venue: 'kalshi', costUsd: 0 }).path, 'no_cost');
+  g.update([row('kalshi', 1, 25)]);
+  assert.strictEqual(g.afford({ venue: 'kalshi', costUsd: 10, holdsUsd: () => 20 }).ok, false);
+  assert.strictEqual(g.afford({ venue: 'kalshi', costUsd: 10, holdsUsd: 0 }).ok, true);
+  g.update([{ venue: 'kalshi', shard: 1, ok: false, available_usd: 9999, fetched_at: new Date(T0).toISOString() }]);
+  assert.strictEqual(g.knownCash('kalshi'), 25, 'a failed read must not raise the known cash');
 }
 
 // Reporter hands its reads to onRows (before the DB write) — no extra exchange call.
