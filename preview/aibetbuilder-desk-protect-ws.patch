@@ -1,0 +1,493 @@
+From ff61f24fb6532c0e971c0b96bea86ebe50029156 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 9 Nov 2026 04:12:12 +0000
+Subject: [PATCH] Re-rest a websocket protect cancel through the existing
+ sweep.
+
+op ws-replace continues one replacement after poly-worker has already cancelled. It uses the same chain cap, reconcile, and create-unknown adoption as the 1.5s sweep, and it will not place a second order if that sweep won the claim.
+---
+ api/desk-protect-sweep.js      |  46 ++++++++++-
+ api/desk-protect-sweep.test.js |  30 +++++++
+ lib/desk-protect-audit.js      |  12 ++-
+ lib/desk-protect-sweep.js      | 146 +++++++++++++++++++++++++++++++++
+ lib/desk-protect-sweep.test.js | 109 +++++++++++++++++++++++-
+ sql/desk_protect_ws.sql        |  26 ++++++
+ 6 files changed, 363 insertions(+), 6 deletions(-)
+ create mode 100644 sql/desk_protect_ws.sql
+
+diff --git a/api/desk-protect-sweep.js b/api/desk-protect-sweep.js
+index c9e81df..fdaa9a7 100644
+--- a/api/desk-protect-sweep.js
++++ b/api/desk-protect-sweep.js
+@@ -2,7 +2,9 @@
+ // POST /api/desk-protect-sweep
+ // Header X-Desk-Protect-Secret = DESK_PROTECT_SWEEP_SECRET, or ADMIN_API_SECRET
+ // when the dedicated name is unset. Body { op: "sweep", mode: "adverse-only" }.
+-// Same cancel / re-rest as the desk. The secret cannot place or cancel.
++// Same cancel / re-rest as the desk. The secret cannot place a new order.
++// op ws-replace only continues a replacement after the poly-worker already
++// cancelled an armed rest. It uses the same chain cap and idempotency as sweep.
+ // Armed rests only (desk rests are armed by default; an order switched off is
+ // not in the registry, so it is never touched).
+ // Polymarket US rests and Novig rests (market_slug novig:<uuid>) are swept in
+@@ -14,7 +16,7 @@ const auth = require('./polymarket-us-auth');
+ const { createPolymarketUsClient } = require('./polymarket-us-client');
+ const { createSupabaseProtectStore } = require('../lib/desk-protect-registry');
+ const { createSupabaseOrderTrackStore } = require('../lib/desk-order-tracks');
+-const { runProtectSweep } = require('../lib/desk-protect-sweep');
++const { runProtectSweep, runProtectWsHandoff } = require('../lib/desk-protect-sweep');
+ const { createSupabaseProtectAudit } = require('../lib/desk-protect-audit');
+ const { sendProtectPing } = require('../lib/desk-protect-notify');
+ const { watcherEventsFromActions } = require('../lib/desk-protect-events');
+@@ -87,6 +89,7 @@ const defaults = {
+   notify: (text) => sendProtectPing(text),
+   now: () => Date.now(),
+   runSweep: runProtectSweep,
++  runHandoff: runProtectWsHandoff,
+   clientFromCreds(creds) {
+     return createPolymarketUsClient({
+       keyId: creds.keyId,
+@@ -157,7 +160,44 @@ async function handler(req, res) {
+   const body = parseBody(req);
+   const op = String(body.op || '').trim().toLowerCase();
+   const mode = String(body.mode || 'adverse-only').trim().toLowerCase();
+-  if (op !== 'sweep' || mode !== 'adverse-only') {
++  if (mode !== 'adverse-only') {
++    json(res, 400, { ok: false, error: 'Adverse sweep only.' });
++    return;
++  }
++  if (op === 'ws-replace') {
++    const creds = deps.creds();
++    if (!creds.ok) {
++      json(res, 503, auth.missingKeysError(creds.missing));
++      return;
++    }
++    try {
++      const out = await deps.runHandoff({
++        client: deps.clientFromCreds(creds),
++        store: deps.protectStore(),
++        notify: deps.notify,
++        now: deps.now,
++        tracks: deps.trackStore(),
++        audits: typeof deps.auditStore === 'function' ? deps.auditStore() : defaultAudit(),
++        orderId: body.orderId,
++        trigger: body.trigger,
++        book: body.book,
++        tradeYes: body.tradeYes,
++        latencyMs: body.latencyMs,
++        canceled: body.canceled === true,
++      });
++      if (!out || out.ok === false) {
++        json(res, (out && out.status) || 503, { ok: false, error: (out && out.error) || 'Replace failed' });
++        return;
++      }
++      json(res, 200, { ok: true, fired: out.fired || 0, actions: out.actions || [], skipped: out.skipped || null });
++    } catch (err) {
++      const detail = sweepErrorDetail(err);
++      console.error('[desk-protect-sweep] ws-replace failed:', detail);
++      json(res, 502, { ok: false, error: 'Sweep failed', detail });
++    }
++    return;
++  }
++  if (op !== 'sweep') {
+     json(res, 400, { ok: false, error: 'Adverse sweep only.' });
+     return;
+   }
+diff --git a/api/desk-protect-sweep.test.js b/api/desk-protect-sweep.test.js
+index 0448f13..190ac62 100644
+--- a/api/desk-protect-sweep.test.js
++++ b/api/desk-protect-sweep.test.js
+@@ -375,6 +375,36 @@ async function post(headers, body) {
+   assert.equal(handler._sweepErrorDetail(null), 'unknown error');
+   assert.equal(handler._sweepErrorDetail(new Error('x'.repeat(500))).length, 300);
+ 
++  let handoffs = 0;
++  const sweepsBefore = sweeps;
++  handler._setDeps({
++    creds: goodCreds,
++    runSweep: async () => {
++      sweeps += 1;
++      return { ok: true, actions: [] };
++    },
++    runHandoff: async (input) => {
++      handoffs += 1;
++      assert.equal(input.orderId, 'ord-1');
++      assert.equal(input.trigger, 'ws-through');
++      assert.equal(input.canceled, true);
++      assert.equal(input.latencyMs, 21);
++      return { ok: true, fired: 0, actions: [{ result: 'cancelled', reason: 'chain-cap', orderId: 'ord-1' }] };
++    },
++  });
++  const denied = await post({}, { op: 'ws-replace', mode: 'adverse-only', orderId: 'ord-1' });
++  assert.equal(denied.statusCode, 401);
++  assert.equal(handoffs, 0);
++  const handed = await post(
++    { 'X-Admin-Secret': SECRET },
++    { op: 'ws-replace', mode: 'adverse-only', orderId: 'ord-1', trigger: 'ws-through', canceled: true, latencyMs: 21 },
++  );
++  assert.equal(handed.statusCode, 200);
++  assert.equal(handed.body.ok, true);
++  assert.equal(handed.body.actions[0].reason, 'chain-cap');
++  assert.equal(handoffs, 1);
++  assert.equal(sweeps, sweepsBefore, 'ws-replace does not run the REST sweep');
++
+   if (prevAdmin == null) delete process.env.ADMIN_API_SECRET;
+   else process.env.ADMIN_API_SECRET = prevAdmin;
+   if (prevDedicated == null) delete process.env.DESK_PROTECT_SWEEP_SECRET;
+diff --git a/lib/desk-protect-audit.js b/lib/desk-protect-audit.js
+index 9fbf1ee..5303539 100644
+--- a/lib/desk-protect-audit.js
++++ b/lib/desk-protect-audit.js
+@@ -47,6 +47,7 @@ function createMemoryProtectAudit() {
+ function createSupabaseProtectAudit({ env = process.env, client } = {}) {
+   let cached = client || null;
+   const last = new Map();
++  let latencyColumn = true;
+   function db() {
+     if (cached) return cached;
+     const url = env.SUPABASE_URL || env.VITE_SUPABASE_URL;
+@@ -63,7 +64,7 @@ function createSupabaseProtectAudit({ env = process.env, client } = {}) {
+       const supabase = db();
+       if (!supabase || !sample || !sample.orderId || !sample.ownerEmail) return null;
+       if (!gate(last, sample)) return null;
+-      const { error } = await supabase.from(TABLE).insert({
++      const row = {
+         order_id: text(sample.orderId),
+         owner_email: text(sample.ownerEmail).toLowerCase(),
+         market_slug: text(sample.marketSlug),
+@@ -78,7 +79,14 @@ function createSupabaseProtectAudit({ env = process.env, client } = {}) {
+         action: text(sample.action) || 'none',
+         cancel_result: sample.cancelResult || null,
+         replacement_id: sample.replacementId || null,
+-      });
++      };
++      if (latencyColumn && Number.isFinite(sample.latencyMs)) row.latency_ms = Math.round(sample.latencyMs);
++      let { error } = await supabase.from(TABLE).insert(row);
++      if (error && row.latency_ms != null && /latency_ms/i.test(error.message || '')) {
++        latencyColumn = false;
++        delete row.latency_ms;
++        ({ error } = await supabase.from(TABLE).insert(row));
++      }
+       if (error) throw new Error(error.message || 'protect audit insert failed');
+       return sample;
+     },
+diff --git a/lib/desk-protect-sweep.js b/lib/desk-protect-sweep.js
+index 07378c4..c59d6f6 100644
+--- a/lib/desk-protect-sweep.js
++++ b/lib/desk-protect-sweep.js
+@@ -1348,7 +1348,153 @@ function replacementFromPending(row, existing, clock) {
+   }, num(existing.quantity != null ? existing.quantity : row.pending_contracts), clock);
+ }
+ 
++function cloneBook(payload) {
++  const data = payload && (payload.marketData || payload);
++  if (!data || typeof data !== 'object') return null;
++  const offers = Array.isArray(data.offers) ? data.offers : (Array.isArray(data.asks) ? data.asks : []);
++  return {
++    marketData: {
++      ...data,
++      bids: (data.bids || []).map((level) => ({ ...level })),
++      offers: offers.map((level) => ({ ...level })),
++    },
++  };
++}
++
++// The triggering snapshot still contains our size. The re-rest prices off the
++// next level, which is what the REST sweep does after the cancel lands.
++function bookWithoutOurSize(payload, row) {
++  const copy = cloneBook(payload);
++  if (!copy) return null;
++  const yes = num(row && row.yes_price);
++  const qty = num(row && row.contracts);
++  if (!(yes > 0 && yes < 1) || !(qty > 0)) return copy;
++  const bookSide = row.outcome === 'short' ? (row.action === 'buy' ? 'sell' : 'buy') : row.action;
++  const key = bookSide === 'sell' ? 'offers' : 'bids';
++  const next = [];
++  for (const level of copy.marketData[key] || []) {
++    const px = amountOf(level && (level.px != null ? level.px : level.price));
++    const q = Number(level && (level.qty != null ? level.qty : level.quantity));
++    if (px != null && Math.abs(px - yes) <= 5e-5 && Number.isFinite(q)) {
++      const left = q - qty;
++      if (left > 1e-4) next.push({ ...level, qty: String(left) });
++      continue;
++    }
++    next.push(level);
++  }
++  copy.marketData[key] = next;
++  return copy;
++}
++
++function bookWithTradeTouch(payload, row, tradeYes) {
++  const base = bookWithoutOurSize(payload, row) || { marketData: { bids: [], offers: [] } };
++  const px = num(tradeYes);
++  if (!(px > 0 && px < 1)) return base;
++  const data = base.marketData;
++  const touch = { px: { value: px.toFixed(4), currency: 'USD' }, qty: '1' };
++  const bookSide = row.outcome === 'short' ? (row.action === 'buy' ? 'sell' : 'buy') : row.action;
++  if (bookSide === 'sell') {
++    data.offers = [touch];
++    const bids = (data.bids || []).filter((level) => {
++      const bid = amountOf(level && (level.px != null ? level.px : level.price));
++      return bid != null && bid < px - 1e-9;
++    });
++    data.bids = bids.length ? bids : [{ px: { value: Math.max(px - 0.02, 0.01).toFixed(4), currency: 'USD' }, qty: '1' }];
++  } else {
++    data.bids = [touch];
++    const offers = (data.offers || []).filter((level) => {
++      const ask = amountOf(level && (level.px != null ? level.px : level.price));
++      return ask != null && ask > px + 1e-9;
++    });
++    data.offers = offers.length ? offers : [{ px: { value: Math.min(px + 0.02, 0.99).toFixed(4), currency: 'USD' }, qty: '1' }];
++  }
++  return base;
++}
++
++const HANDOFF_DONE = new Set([
++  'replaced', 'capped', 'disarmed', 'filled', 'canceled', 'expired', 'unresolved', 'gone',
++  'partial_canceled', 'partial_expired',
++]);
++
++// Worker already cancelled. Continue with the same re-rest as the REST sweep:
++// claim, reconcile, $1,000 chain cap, create-unknown, one replacement.
++async function runProtectWsHandoff({
++  client, store, notify, tracks, audits, now = Date.now, orderId, trigger, book, tradeYes, latencyMs, canceled,
++} = {}) {
++  await loadMods();
++  if (!store || !store.configured) {
++    return { ok: false, status: 503, error: 'Bet Protect registry is not configured. Apply sql/desk_protect_rests.sql and set SUPABASE_SERVICE_KEY.' };
++  }
++  const id = String(orderId || '').trim();
++  if (!id) return { ok: false, status: 400, error: 'orderId required' };
++  let row = await store.get(id);
++  if (!row) return { ok: false, status: 404, error: 'Protect order is not in the registry.' };
++  if (String(row.market_slug || '').startsWith('novig:')) return { ok: true, skipped: 'novig', fired: 0, actions: [] };
++  if (HANDOFF_DONE.has(row.status)) return { ok: true, skipped: row.status, fired: 0, actions: [] };
++  const clock = typeof now === 'function' ? now() : Number(now);
++  const nowIso = iso(clock);
++  const kind = String(trigger || 'ws-through');
++  if (row.status === 'sweeping' && canceled === true && row.sweep_token) {
++    const moved = await store.update(id, {
++      status: 'pending_lineage',
++      sweep_token: null,
++      hold_from: null,
++      cooldown_until: null,
++    }, { token: row.sweep_token });
++    if (moved) row = moved;
++  }
++  if (row.status === 'pending_book') {
++    const readable = book && (book.marketData || book.bids || book.offers);
++    if (!readable || kind === 'ws-disconnect') {
++      await noteCheck(audits, checkSample(row, null, null, {
++        trigger: 'ws-disconnect',
++        action: 'cancelled',
++        latencyMs,
++        checkedAt: nowIso,
++      }));
++      return { ok: true, skipped: 'no-rereset-while-blind', fired: 0, actions: [{ result: 'cancelled', reason: 'ws-disconnect', orderId: id }] };
++    }
++    const moved = await store.update(id, { status: 'pending_lineage', cooldown_until: null });
++    if (!moved) return { ok: true, skipped: 'pending_book', fired: 0, actions: [] };
++    row = moved;
++  }
++  if (row.status !== 'pending_lineage' && row.status !== 'pending_rereset') {
++    return { ok: true, skipped: row.status, fired: 0, actions: [] };
++  }
++  const marketSlug = row.market_slug;
++  let market = { ok: false };
++  try {
++    if (client && client.getMarketBySlug) market = price.readMarketSides(await client.getMarketBySlug(marketSlug));
++  } catch (_) { market = { ok: false }; }
++  const markets = { [marketSlug]: market };
++  let live = new Map();
++  try {
++    if (client && client.listOpenOrders) live = orderIndex(await client.listOpenOrders(), markets);
++  } catch (_) { live = new Map(); }
++  let depth = kind === 'ws-trade' ? bookWithTradeTouch(book, row, tradeYes) : bookWithoutOurSize(book, row);
++  if (!depth && client && client.getMarketBook) {
++    try { depth = bookWithoutOurSize(await client.getMarketBook(marketSlug), row); } catch (_) { depth = null; }
++  }
++  const depths = { [marketSlug]: depth };
++  const tracked = new Set([id]);
++  if (row.replaced_by) tracked.add(row.replaced_by);
++  const outcome = row.status === 'pending_rereset'
++    ? await finishRereset({ client, store, notify, row, live, markets, tracked, clock, nowIso, tracks })
++    : await resumeLineageReplace({ client, store, notify, row, live, markets, depths, tracked, clock, nowIso, tracks });
++  const action = outcome && outcome.action;
++  await noteCheck(audits, checkSample(row, null, depth && readProtectBook(depth, clock, nowIso), {
++    trigger: kind,
++    action: (action && action.result) || 'none',
++    replacementId: action && action.newOrderId,
++    latencyMs,
++    checkedAt: nowIso,
++  }));
++  return { ok: true, fired: outcome && outcome.fired ? 1 : 0, actions: action ? [action] : [] };
++}
++
+ module.exports = {
+   runProtectSweep,
++  runProtectWsHandoff,
+   findAdopt,
++  bookWithoutOurSize,
+ };
+diff --git a/lib/desk-protect-sweep.test.js b/lib/desk-protect-sweep.test.js
+index 51f2658..6db56ef 100644
+--- a/lib/desk-protect-sweep.test.js
++++ b/lib/desk-protect-sweep.test.js
+@@ -3,7 +3,7 @@
+ const assert = require('node:assert/strict');
+ const { createMemoryProtectStore } = require('./desk-protect-registry');
+ const { createMemoryOrderTrackStore } = require('./desk-order-tracks');
+-const { runProtectSweep } = require('./desk-protect-sweep');
++const { runProtectSweep, runProtectWsHandoff } = require('./desk-protect-sweep');
+ const { sendProtectTelegram, KEVIN_ADMIN_CHAT_ID } = require('./desk-protect-notify');
+ const { createMemoryProtectAudit } = require('./desk-protect-audit');
+ 
+@@ -1229,6 +1229,113 @@ function fakeClient({ open, book, failCreates = 0, market = MARKET, idPrefix = '
+     assert.ok(Number(created.quantity) * Number(created.price.value) <= 100 + 1e-6);
+   }
+ 
++  {
++    const depth = {
++      marketData: {
++        bids: [{ px: { value: '0.550', currency: 'USD' }, qty: '1000' }],
++        offers: [{ px: { value: '0.570', currency: 'USD' }, qty: '1000' }],
++        transactTime: new Date(now).toISOString(),
++      },
++    };
++    const client = fakeClient({
++      open: [resting('ord-1', 'ORDER_INTENT_BUY_LONG', '0.600', 41)],
++      book: bbo(0.55, 0.57),
++    });
++    await client.cancelOrder('ord-1');
++    const store = createMemoryProtectStore([armedRow({ status: 'pending_lineage', cooldown_until: null })]);
++    const tracks = createMemoryOrderTrackStore();
++    const audits = createMemoryProtectAudit();
++    const out = await runProtectWsHandoff({
++      client, store, notify, tracks, audits, now: () => now,
++      orderId: 'ord-1', trigger: 'ws-through', book: depth, canceled: true, latencyMs: 21,
++    });
++    assert.equal(out.ok, true);
++    assert.equal(client.calls.create.length, 1, JSON.stringify(out.actions));
++    assert.equal(client.calls.create[0].price.value, '0.540');
++    assert.equal((await store.get('ord-1')).status, 'replaced');
++    assert.equal(audits.rows[0].trigger, 'ws-through');
++    assert.equal(audits.rows[0].latencyMs, 21);
++    const again = await runProtectWsHandoff({
++      client, store, notify, tracks, audits, now: () => now,
++      orderId: 'ord-1', trigger: 'ws-through', book: depth, canceled: true, latencyMs: 21,
++    });
++    assert.equal(again.skipped, 'replaced');
++    assert.equal(client.calls.create.length, 1, 'a second handoff must not place again');
++
++    const raced = createMemoryProtectStore([armedRow({
++      order_id: 'ord-race', status: 'pending_lineage', cooldown_until: null,
++    })]);
++    const raceClient = fakeClient({
++      open: [resting('ord-race', 'ORDER_INTENT_BUY_LONG', '0.600', 41)],
++      book: bbo(0.55, 0.57),
++    });
++    await raceClient.cancelOrder('ord-race');
++    const raceTracks = createMemoryOrderTrackStore();
++    await Promise.all([
++      runProtectSweep({ client: raceClient, store: raced, notify, tracks: raceTracks, now: () => now }),
++      runProtectWsHandoff({
++        client: raceClient, store: raced, notify, tracks: raceTracks, now: () => now,
++        orderId: 'ord-race', trigger: 'ws-through', book: depth, canceled: true,
++      }),
++    ]);
++    assert.equal(raceClient.calls.create.length, 1, 'REST sweep and ws-replace place one replacement');
++  }
++
++  {
++    const child = armedRow({
++      order_id: 'ord-2', replaces: 'ord-1', lineage_id: 'ord-1', action: 'sell',
++      yes_price: '0.400', outcome_micro: 400000, contracts: 100, status: 'pending_lineage',
++    });
++    const store = createMemoryProtectStore([child]);
++    const tracks = createMemoryOrderTrackStore([{
++      orderId: 'ord-1', ownerEmail: 'kev120909@gmail.com', marketSlug: SLUG, lineageId: 'ord-1',
++      verifiedState: 'partial_canceled', cumQty: 2000, avgYesPrice: 0.4, outcome: 'long', action: 'sell',
++    }]);
++    const client = fakeClient({
++      open: [resting('ord-2', 'ORDER_INTENT_SELL_LONG', '0.400', 100)],
++      book: bbo(0.30, 0.50),
++    });
++    await client.cancelOrder('ord-2');
++    const book = {
++      marketData: {
++        bids: [{ px: { value: '0.300', currency: 'USD' }, qty: '1000' }],
++        offers: [{ px: { value: '0.500', currency: 'USD' }, qty: '1000' }],
++        transactTime: new Date(now).toISOString(),
++      },
++    };
++    const out = await runProtectWsHandoff({
++      client, store, notify, tracks, now: () => now,
++      orderId: 'ord-2', trigger: 'ws-through', book, canceled: true,
++    });
++    assert.equal(client.calls.create.length, 0, JSON.stringify(out.actions));
++    assert.equal(out.actions[0].reason, 'chain-cap');
++  }
++
++  {
++    const store = createMemoryProtectStore([armedRow({
++      status: 'pending_lineage',
++      replaced_by: 'create-unknown',
++      pending_yes_price: '0.540',
++      pending_contracts: 41,
++      pending_intent: 'ORDER_INTENT_BUY_LONG',
++    })]);
++    const adopted = resting('ord-adopt', 'ORDER_INTENT_BUY_LONG', '0.540', 41);
++    const client = fakeClient({
++      open: [adopted],
++      book: bbo(0.55, 0.57),
++    });
++    const tracks = createMemoryOrderTrackStore();
++    const out = await runProtectWsHandoff({
++      client, store, notify, tracks, now: () => now,
++      orderId: 'ord-1', trigger: 'ws-through', canceled: true,
++    });
++    assert.equal(client.calls.create.length, 0, JSON.stringify(out.actions));
++    assert.equal(out.actions[0].newOrderId, 'ord-adopt');
++    assert.equal(out.actions[0].adopted, true);
++    assert.equal((await store.get('ord-1')).replaced_by, 'ord-adopt');
++    assert.equal((await store.get('ord-1')).status, 'replaced');
++  }
++
+   console.log('desk-protect-sweep.test.js ok');
+ })().catch((err) => {
+   console.error(err);
+diff --git a/sql/desk_protect_ws.sql b/sql/desk_protect_ws.sql
+new file mode 100644
+index 0000000..e47cf6e
+--- /dev/null
++++ b/sql/desk_protect_ws.sql
+@@ -0,0 +1,26 @@
++-- Realtime Bet Protect. Apply in the Supabase SQL editor. This file is not
++-- applied by the app. Service role only. No anon policies.
++--
++-- desk_protect_ws_control turns the poly-worker websocket on without a
++-- deploy. id 1 is the only row. enabled defaults to false.
++--
++-- desk_protect_audits.latency_ms is milliseconds from the websocket event
++-- (or disconnect detection) to the Polymarket cancel acknowledgement.
++-- Older audit rows leave it null. Until this column exists, the writers
++-- retry the insert without it.
++
++create table if not exists public.desk_protect_ws_control (
++  id integer primary key,
++  enabled boolean not null default false,
++  updated_at timestamptz not null default now(),
++  updated_by text
++);
++
++insert into public.desk_protect_ws_control (id, enabled, updated_by)
++values (1, false, 'default')
++on conflict (id) do nothing;
++
++alter table public.desk_protect_ws_control enable row level security;
++
++alter table public.desk_protect_audits
++  add column if not exists latency_ms integer;
+-- 
+2.43.0
+
