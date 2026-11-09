@@ -60,6 +60,6 @@ Turn off: `update public.poly_sniper_control set live = false ... where id = 1;`
 
 ## Realtime Bet Protect (preview)
 
-`desk-protect-ws.js` runs next to the quoter on this one machine. It subscribes to the Polymarket US market-data websocket for armed `desk_protect_rests`, cancels from here when the book or a print is through the cushion, and asks aibetbuilder `op: ws-replace` to re-rest. The 1.5s REST sweep on combo-worker stays up as the backup. Both claim the row before they cancel or replace.
+`desk-protect-ws.js` runs next to the quoter on this one machine and stays up while idle. With the flag on it polls armed rests every 2s and opens the market socket only while at least one is armed. With the flag off it polls the control row every 10s. It cancels from here when the book or a print is through the cushion, and asks aibetbuilder `op: ws-replace` to re-rest. The 1.5s REST sweep on combo-worker stays up as the backup. Both claim the row before they cancel or replace.
 
 Default off. Enable with either `fly secrets set DESK_PROTECT_WS=1 -a kaygo-poly-worker` or `update public.desk_protect_ws_control set enabled = true, updated_at = now(), updated_by = 'kevin' where id = 1;` after applying aibetbuilder `sql/desk_protect_ws.sql`. `DESK_PROTECT_WS=0` forces off. The flag is not in `fly/poly-worker.toml`. Fast re-rest also needs `DESK_PROTECT_SWEEP_URL` and `DESK_PROTECT_SWEEP_SECRET` on this app (same values as combo-worker, not a second Polymarket key). Without them the cancel still happens and the 1.5s sweep places the replacement.

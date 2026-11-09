@@ -30,7 +30,10 @@ const { createMarketFeed, ordersFromPayload } = require('./desk-protect-ws-feed'
 
 const MODE = 'DESK-PROTECT-WS';
 const ARM_MS = 2000;
+const POLL_OFF_MS = 10000;
 const HEARTBEAT_MS = 30000;
+const ARMED_COLUMNS = 'order_id,owner_email,market_slug,outcome,action,yes_price,contracts,x_cents,status';
+const ARMED_STATUSES = ['armed', 'pending_rereset', 'pending_lineage', 'pending_book', 'sweeping'];
 const SILENCE_CHECK_MS = 250;
 const DEFAULT_SILENT_MS = 1500;
 const MIN_SILENT_MS = 400;
@@ -207,8 +210,8 @@ function createSupabaseSide({ env = process.env, client } = {}) {
       if (!supabase) return [];
       const { data, error } = await supabase
         .from(RESTS)
-        .select('*')
-        .in('status', ['armed', 'pending_rereset', 'pending_lineage', 'pending_book', 'sweeping']);
+        .select(ARMED_COLUMNS)
+        .in('status', ARMED_STATUSES);
       if (error) throw new Error(error.message || 'protect list failed');
       return data || [];
     },
@@ -302,7 +305,7 @@ function createDeskProtectWs(opts = {}) {
   const handoffAt = new Map();
   let wantFeed = false;
   let stopped = false;
-  let armTimer = null;
+  let pollTimer = null;
   let beatTimer = null;
   let silenceTimer = null;
   let lastErrorAt = -Infinity;
@@ -715,22 +718,46 @@ function createDeskProtectWs(opts = {}) {
     if (Math.min(pongAge, msgAge) > silentMs) await failSafe(t);
   }
 
+  function pollDelay() {
+    if (!flag.enabled) return opts.flagPollMs || POLL_OFF_MS;
+    return opts.armMs || ARM_MS;
+  }
+
   function heartbeat() {
     const st = feed.stats();
     const age = st.lastMessageAt ? now() - st.lastMessageAt : null;
-    log(`heartbeat armed=${armedPolymarket().length} ws=${flag.enabled ? (st.open ? 'open' : 'down') : 'off'} lastMsgAgeMs=${age == null ? '-' : age} slugs=${st.slugs} flag=${flag.enabled ? flag.reason : flag.reason}`);
+    log(`heartbeat flag=${flag.enabled ? 'on' : 'off'} reason=${flag.reason} armed=${armedPolymarket().length} ws=${st.open ? 'open' : 'closed'} lastMsgAgeMs=${age == null ? '-' : age}`);
+  }
+
+  // Ref'd on purpose. An unref'd timer plus a closed socket lets Node exit 0
+  // while nothing is armed, and a rest armed later is never watched.
+  function armPoll() {
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
+    if (stopped || opts.timers === false) return;
+    pollTimer = setTimeout(() => {
+      pollTimer = null;
+      refreshArmed()
+        .catch((err) => noteError(err && err.message))
+        .then(() => { if (!stopped) armPoll(); });
+    }, pollDelay());
+  }
+
+  function holdsProcess() {
+    const refd = (timer) => !!(timer && typeof timer.hasRef === 'function' && timer.hasRef());
+    return refd(pollTimer) || refd(beatTimer);
   }
 
   function start() {
     stopped = false;
     log(`starting silentMs=${silentMs} flag=${flag.reason}`);
-    const run = () => { refreshArmed().catch((err) => noteError(err && err.message)); };
-    run();
-    if (opts.timers === false) return { enabled: flag.enabled };
-    armTimer = setInterval(run, opts.armMs || ARM_MS);
-    beatTimer = setInterval(() => heartbeat(), opts.heartbeatMs || HEARTBEAT_MS);
-    silenceTimer = setInterval(() => { checkSilence().catch((err) => noteError(err && err.message)); }, opts.silenceCheckMs || SILENCE_CHECK_MS);
-    for (const timer of [armTimer, beatTimer, silenceTimer]) if (timer.unref) timer.unref();
+    if (opts.timers !== false) {
+      beatTimer = setInterval(() => heartbeat(), opts.heartbeatMs || HEARTBEAT_MS);
+      silenceTimer = setInterval(() => { checkSilence().catch((err) => noteError(err && err.message)); }, opts.silenceCheckMs || SILENCE_CHECK_MS);
+    }
+    refreshArmed()
+      .catch((err) => noteError(err && err.message))
+      .then(() => { if (!stopped) armPoll(); });
     return { enabled: flag.enabled };
   }
 
@@ -738,10 +765,10 @@ function createDeskProtectWs(opts = {}) {
     stopped = true;
     wantFeed = false;
     feed.stop();
-    if (armTimer) clearInterval(armTimer);
+    if (pollTimer) clearTimeout(pollTimer);
     if (beatTimer) clearInterval(beatTimer);
     if (silenceTimer) clearInterval(silenceTimer);
-    armTimer = null;
+    pollTimer = null;
     beatTimer = null;
     silenceTimer = null;
   }
@@ -756,6 +783,8 @@ function createDeskProtectWs(opts = {}) {
     heartbeat,
     failSafe,
     flag: () => ({ ...flag }),
+    nextPollMs: () => pollDelay(),
+    holdsProcess,
     decisions: () => decisions.slice(),
     stats: () => ({
       armed: armedPolymarket().length,
@@ -768,14 +797,15 @@ function createDeskProtectWs(opts = {}) {
 
 if (require.main === module) {
   const env = process.env;
+  let http = null;
   if (!trim(env.POLYMARKET_KEY_ID) || !trim(env.POLYMARKET_SECRET_KEY)) {
-    console.error(`[${MODE}] Polymarket keys are not in this process. Not starting.`);
-    process.exit(0);
+    console.error(`[${MODE}] Polymarket keys are not in this process. Staying up and polling; no market socket until the keys are present.`);
+  } else {
+    http = createPolymarketHttp({
+      keyId: env.POLYMARKET_KEY_ID,
+      secretKey: env.POLYMARKET_SECRET_KEY,
+    });
   }
-  const http = createPolymarketHttp({
-    keyId: env.POLYMARKET_KEY_ID,
-    secretKey: env.POLYMARKET_SECRET_KEY,
-  });
   const engine = createDeskProtectWs({ client: http });
   engine.start();
   const shutdown = () => {
@@ -792,7 +822,10 @@ if (require.main === module) {
 
 module.exports = {
   ARM_MS,
+  POLL_OFF_MS,
   HEARTBEAT_MS,
+  ARMED_COLUMNS,
+  ARMED_STATUSES,
   DEFAULT_SILENT_MS,
   resolveWsProtectEnabled,
   createDeskProtectWs,
