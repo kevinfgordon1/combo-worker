@@ -36,7 +36,10 @@ assert.ok(/if \(!SPLIT\.runKalshi\) \{[\s\S]{0,2500}?process\.on\('SIGINT'/.test
 assert.ok(/if \(SPLIT\.runKalshi\) \{\s*setInterval\(unlessQuoteHot\(\(\) => \{\s*reconcileSkipTapes/.test(src));
 assert.ok(/venues: \['polymarket'\],\s*forceDry: polyDry/.test(src));
 const startPoly = fs.readFileSync(path.join(__dirname, 'start-poly.js'), 'utf8');
-assert.ok(startPoly.includes("COMBO_ROLE: 'poly'") && !startPoly.includes('fills-reader') && !startPoly.includes('desk-protect'));
+assert.ok(startPoly.includes("COMBO_ROLE: 'poly'") && !startPoly.includes('fills-reader'));
+// REST poller stays on combo-worker. Realtime protect is a separate child.
+assert.ok(!/['"]desk-protect\.js['"]/.test(startPoly));
+assert.ok(startPoly.includes('desk-protect-ws.js'));
 
 console.log('poly-split tests ok');
 

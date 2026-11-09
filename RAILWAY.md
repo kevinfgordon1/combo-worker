@@ -77,7 +77,7 @@ The Unhedged job uses a dedicated undici Agent + bounded retries + rate-limited 
 
 ## Adverse Protect (Kevin's Live Trading Desk)
 
-Combo Locks can poll aibetbuilder so an **armed** Polymarket US desk rest is not left as a stale gift. This worker does not call Polymarket, does not quote RFQs, and does not read combo user tables. Cancel / re-rest math stays in aibetbuilder.
+Combo Locks can poll aibetbuilder so an **armed** Polymarket US desk rest is not left as a stale gift. This worker does not call Polymarket, does not quote RFQs, and does not read combo user tables. Cancel / re-rest math stays in aibetbuilder. Realtime websocket protect runs on poly-worker (`desk-protect-ws.js`); this 1.5s poll stays the backup and still finishes a replacement the websocket handed off.
 
 The poller starts only on the Combo Locks service (`npm start` / `start-live.js`), and only when both env vars below are set. The Unhedged job does not start it. With the URL unset it logs one line and makes no request.
 

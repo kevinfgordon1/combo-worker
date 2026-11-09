@@ -64,3 +64,7 @@ kill_timeout = "30s"
   memory = "2gb"
 
 # One machine. Only app that holds the Polymarket RFQ keys.
+# DESK_PROTECT_WS is intentionally unset. Realtime Bet Protect stays off until
+# Kevin sets public.desk_protect_ws_control.enabled (sql/desk_protect_ws.sql in
+# aibetbuilder) or the secret DESK_PROTECT_WS=1. Do not set the flag in this
+# file: the next deploy would turn cancels on.

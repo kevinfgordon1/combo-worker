@@ -14,9 +14,34 @@ if (/^(1|true|yes|on)$/i.test(String(env.POLY_DRY_RUN || '').trim())) {
 }
 const dry = env.POLY_DRY_RUN === undefined ? false : /^(1|true|yes|on)$/i.test(String(env.POLY_DRY_RUN).trim());
 const args = dry ? ['-r', './dry-run-guard.js', 'live-runner.js'] : ['live-runner.js'];
-const child = spawn(process.execPath, args, { stdio: 'inherit', env, cwd: __dirname });
-child.on('exit', (code, signal) => {
+const quoter = spawn(process.execPath, args, { stdio: 'inherit', env, cwd: __dirname });
+quoter.on('exit', (code, signal) => {
   console.error(`[start-poly] live-runner.js exited code=${code} signal=${signal || ''}`);
   process.exit(code == null ? 1 : code);
 });
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => child.kill('SIGINT'));
+
+// Realtime Bet Protect. Same machine, same Polymarket keys. Stays up when the
+// flag is off and does not cancel until Kevin enables it. A crash here restarts
+// this child only — it must not take Combo Locks quoting down. The 1.5s REST
+// poller stays on combo-worker (desk-protect.js is not started here).
+let protectStopped = false;
+let protectChild = null;
+function startProtect() {
+  if (protectStopped) return;
+  protectChild = spawn(process.execPath, ['desk-protect-ws.js'], { stdio: 'inherit', env, cwd: __dirname });
+  protectChild.on('exit', (code, signal) => {
+    console.error(`[start-poly] desk-protect-ws.js exited code=${code} signal=${signal || ''}`);
+    protectChild = null;
+    if (protectStopped || (code === 0 && !signal)) return;
+    setTimeout(startProtect, 1000);
+  });
+}
+startProtect();
+
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    protectStopped = true;
+    if (protectChild) protectChild.kill('SIGINT');
+    quoter.kill('SIGINT');
+  });
+}
