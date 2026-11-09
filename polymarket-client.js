@@ -323,6 +323,7 @@ function createPolymarketHttp({
       const j = res.json;
       return (j && j.order) || j;
     },
+    listOpenOrders: (query) => getJson('/v1/orders/open', query),
     listPositions: (query) => getJson('/v1/portfolio/positions', query),
     listActivities: (query) => getJson('/v1/portfolio/activities', query),
     getMarketBySlug: async (slug) => {
