@@ -2,6 +2,7 @@
 // Never opens a Kalshi WebSocket. Pair with COMBO_POLY_ENABLED=0 on combo-worker.
 'use strict';
 const { spawn } = require('child_process');
+const { superviseChild } = require('./protect-supervise');
 
 const env = { ...process.env, COMBO_ROLE: 'poly' };
 // NBA spreads/totals mapping (leg-identity.js) is on for poly-worker unless POLY_NBA_LINES=0.
@@ -20,28 +21,25 @@ quoter.on('exit', (code, signal) => {
   process.exit(code == null ? 1 : code);
 });
 
-// Realtime Bet Protect. Same machine, same Polymarket keys. Stays up when the
-// flag is off and does not cancel until Kevin enables it. A crash here restarts
-// this child only — it must not take Combo Locks quoting down. The 1.5s REST
-// poller stays on combo-worker (desk-protect.js is not started here).
-let protectStopped = false;
-let protectChild = null;
-function startProtect() {
-  if (protectStopped) return;
-  protectChild = spawn(process.execPath, ['desk-protect-ws.js'], { stdio: 'inherit', env, cwd: __dirname });
-  protectChild.on('exit', (code, signal) => {
+// Realtime Bet Protect. Same machine, same Polymarket keys. Idle (no armed
+// rests, or the flag off) stays in this child and keeps polling. Any exit,
+// including code 0, restarts only this child. Combo Locks quoting is the
+// other child and is not restarted from here. The 1.5s REST poller stays on
+// combo-worker (desk-protect.js is not started here).
+const protect = superviseChild({
+  spawnImpl: spawn,
+  command: process.execPath,
+  args: ['desk-protect-ws.js'],
+  env,
+  cwd: __dirname,
+  onExit(code, signal) {
     console.error(`[start-poly] desk-protect-ws.js exited code=${code} signal=${signal || ''}`);
-    protectChild = null;
-    if (protectStopped || (code === 0 && !signal)) return;
-    setTimeout(startProtect, 1000);
-  });
-}
-startProtect();
+  },
+});
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
-    protectStopped = true;
-    if (protectChild) protectChild.kill('SIGINT');
+    protect.stop('SIGINT');
     quoter.kill('SIGINT');
   });
 }

@@ -17,6 +17,11 @@ const {
   resolveWsProtectEnabled,
   createDeskProtectWs,
   createMemoryAudit,
+  createSupabaseSide,
+  ARMED_COLUMNS,
+  ARMED_STATUSES,
+  ARM_MS,
+  POLL_OFF_MS,
   DEFAULT_SILENT_MS,
 } = require('./desk-protect-ws');
 
@@ -454,6 +459,140 @@ function book(bids, offers, extra) {
     assert.equal(feed.stats().open, true);
     feed.stop();
     assert.equal(feed.stats().open, false);
+  }
+
+  {
+    const calls = [];
+    const store = memoryStore([]);
+    const orig = store.listArmed.bind(store);
+    store.listArmed = async () => {
+      calls.push('list');
+      return orig();
+    };
+    const feed = fakeFeed();
+    const logs = [];
+    const engine = createDeskProtectWs({
+      env: envOn(),
+      control: { present: true, enabled: true },
+      store,
+      audits: createMemoryAudit(),
+      client: { async listOpenOrders() { return { orders: [] }; } },
+      feed,
+      fetchImpl: async () => ({ status: 200, async json() { return { ok: true, actions: [] }; }, async text() { return ''; } }),
+      now: () => 1_700_000_000_000,
+      timers: false,
+      log: (m) => logs.push(m),
+      logError: () => {},
+    });
+    const idle = await engine.refreshArmed();
+    assert.equal(idle.armed, 0);
+    assert.equal(feed.open, false, 'idle with nothing armed does not open a socket');
+    assert.equal(engine.nextPollMs(), ARM_MS);
+    engine.heartbeat();
+    assert.match(logs.join('\n'), /flag=on/);
+    assert.match(logs.join('\n'), /armed=0/);
+    assert.match(logs.join('\n'), /ws=closed/);
+    assert.match(logs.join('\n'), /lastMsgAgeMs=-/);
+    store.map.set('ord-bears', armed());
+    await engine.refreshArmed();
+    assert.equal(feed.open, true, 'arming a rest opens the socket');
+    assert.equal(feed.slugCount, 1);
+    store.map.clear();
+    await engine.refreshArmed();
+    assert.equal(feed.open, false, 'disarming the last rest closes the socket');
+    assert.ok(calls.length >= 3, 'armed set is polled while the flag is on');
+  }
+
+  {
+    const calls = [];
+    const control = { present: true, enabled: false };
+    const store = memoryStore([armed()]);
+    const orig = store.listArmed.bind(store);
+    store.listArmed = async () => {
+      calls.push('list');
+      return orig();
+    };
+    const feed = fakeFeed();
+    const engine = createDeskProtectWs({
+      env: { DESK_PROTECT_SWEEP_URL: SWEEP, DESK_PROTECT_SWEEP_SECRET: SECRET },
+      control,
+      store,
+      audits: createMemoryAudit(),
+      client: { async listOpenOrders() { return { orders: [] }; }, async cancelOrder() { throw new Error('off'); } },
+      feed,
+      fetchImpl: async () => { throw new Error('no handoff'); },
+      now: () => 1_700_000_000_000,
+      timers: false,
+      log: () => {},
+      logError: () => {},
+    });
+    await engine.refreshArmed();
+    assert.equal(engine.flag().enabled, false);
+    assert.equal(engine.nextPollMs(), POLL_OFF_MS);
+    assert.equal(feed.open, false);
+    assert.equal(calls.length, 0, 'flag off reads the control row only');
+    control.enabled = true;
+    await engine.refreshArmed();
+    assert.equal(engine.flag().enabled, true);
+    assert.equal(engine.flag().reason, 'control');
+    assert.equal(feed.open, true, 'flag off to on opens the socket without a new process');
+    assert.equal(engine.nextPollMs(), ARM_MS);
+    assert.equal(calls.length, 1);
+  }
+
+  {
+    const feed = fakeFeed();
+    const engine = createDeskProtectWs({
+      env: envOn(),
+      control: { present: true, enabled: true },
+      store: memoryStore([]),
+      audits: createMemoryAudit(),
+      client: { async listOpenOrders() { return { orders: [] }; } },
+      feed,
+      fetchImpl: async () => ({ status: 200, async json() { return { ok: true }; }, async text() { return ''; } }),
+      now: () => 1_700_000_000_000,
+      armMs: 60000,
+      heartbeatMs: 60000,
+      silenceCheckMs: 60000,
+      log: () => {},
+      logError: () => {},
+    });
+    try {
+      engine.start();
+      assert.equal(engine.holdsProcess(), true, 'idle poll keeps the process alive');
+      assert.equal(feed.open, false);
+    } finally {
+      engine.stop();
+    }
+    assert.equal(engine.holdsProcess(), false);
+  }
+
+  {
+    const queries = [];
+    function builder(table) {
+      const q = { table };
+      const api = {
+        select(cols) { q.cols = cols; return api; },
+        eq(col, val) { q.eq = [col, val]; return api; },
+        in(col, vals) { q.in = [col, vals]; return api; },
+        maybeSingle() { queries.push(q); return Promise.resolve({ data: { enabled: false }, error: null }); },
+        then(resolve, reject) {
+          queries.push(q);
+          return Promise.resolve({ data: [], error: null }).then(resolve, reject);
+        },
+      };
+      return api;
+    }
+    const side = createSupabaseSide({ client: { from: builder } });
+    await side.readControl();
+    const rows = await side.listArmed();
+    assert.deepStrictEqual(rows, []);
+    const control = queries.find((q) => q.table === 'desk_protect_ws_control');
+    const armedQuery = queries.find((q) => q.table === 'desk_protect_rests');
+    assert.deepStrictEqual(control.eq, ['id', 1]);
+    assert.equal(armedQuery.cols, ARMED_COLUMNS);
+    assert.ok(!armedQuery.cols.includes('*'));
+    assert.deepStrictEqual(armedQuery.in, ['status', ARMED_STATUSES]);
   }
 
   console.log('desk-protect-ws.test.js ok');
