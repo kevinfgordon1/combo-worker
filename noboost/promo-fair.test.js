@@ -91,9 +91,9 @@ assert.ok(lines.some((l) => /\[NOBOOST\]\[PROMO\] WOULD_QUOTE/.test(l) && /promo
 // decision stays in-memory fast
 assert.ok(r1.decision_ms < 50);
 
-// win/fill/row for the third variant
+// Win/fill must be strictly after seen_ms; avoid a same-millisecond fixture race.
 const r2 = run.onRfq(rfq('n2'));
-run.onTrade({ id: 'p1', ticker: 'KXMVECROSSCATEGORY0-n2', yes: Math.min(0.99, r2.promo.quoteYes + 0.05), count: 20, takerSide: 'yes', ms: Date.now() });
+run.onTrade({ id: 'p1', ticker: 'KXMVECROSSCATEGORY0-n2', yes: Math.min(0.99, r2.promo.quoteYes + 0.05), count: 20, takerSide: 'yes', ms: r2.seen_ms + 1 });
 assert.strictEqual(r2.promo.beat, 'win'); assert.strictEqual(r2.promo.fill, true);
 assert.ok(r2.promo.position.ev_vs_promo > 0 && r2.promo.position.caps_ok);
 assert.ok(promo.risk.total() > 0);
