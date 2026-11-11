@@ -1,16 +1,18 @@
 // Pure decision step for the Polymarket combo sniper (dry run):
 //   Poly RFQ -> mapped Kalshi-equivalent legs -> sniper fair (all venues, own fees, depth,
 //   15s, 115% vig) -> min edge -> Polymarket maker economics -> per-venue caps.
-// Polymarket combo maker fee = 0 and no maker rebate (docs.polymarket.us/fees).
+// Polymarket combo maker fee is poly-combo-fee.js ($0 before 2026-11-14T05:00:00Z,
+// then 0.03×C×p×(1−p), banker's cent). No maker rebate. This module stays off
+// until poly_sniper_control.live is turned on; pricing the fee does not post.
 // We SELL the parlay: quote buyPrice (requester buys the combo) and sellPrice "0".
 'use strict';
 const { classifyLegs, pregameCheck, nbaHorizonCheck, ncaabHorizonCheck, legDate } = require('../sniper/engine');
 const { legFairDepth } = require('../sniper/fair');
 const { minQuotePrice, comboKey, gameKey, legKey, releaseAtMs } = require('../auto-sniper');
 const { mapPolyLegs } = require('./map');
+const { polyComboMakerRate, polyComboMakerFeeDollars, POLY_COMBO_MAKER_RATE } = require('../poly-combo-fee');
 
 const num = (v, d) => (v == null || v === '' || !Number.isFinite(Number(v)) ? d : Number(v));
-const POLY_COMBO_MAKER_RATE = 0;
 
 function polySniperConfig(env = process.env) {
   return {
@@ -137,7 +139,11 @@ function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now(), skipLedger 
   if (contracts == null && cash == null) return skip('no_size', { legs, fair });
   const tick = tickOf(rfq);
   const postMinRoi = minRoi + (edgeCushion > 0 ? edgeCushion : 0);
-  const px = minQuotePrice({ fair, contracts, cash, makerRate: POLY_COMBO_MAKER_RATE, minRoi: postMinRoi, tick });
+  const makerRate = polyComboMakerRate(nowMs);
+  const px = minQuotePrice({
+    fair, contracts, cash, makerRate, minRoi: postMinRoi, tick,
+    feeDollars: (n, q) => polyComboMakerFeeDollars(n, q, nowMs),
+  });
   if (!px) return skip('roi_below_min', { legs, fair, minRoi });
   if (px.roi > config.maxRoi) return skip('roi_suspicious', { legs, fair, minRoi });
   const buyPrice = roundTick(px.q, tick);

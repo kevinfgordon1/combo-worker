@@ -24,8 +24,10 @@ function makerRateFromSeries(feeType, multiplier) {
 }
 
 // "KXMVECROSSCATEGORY0-S2026A0E…-D44B…" → "KXMVECROSSCATEGORY0"
-// Polymarket US combo tickers ("caoc-…", and "crossd-…" since Oct 2026) have no Kalshi series; makers pay 0
-// and get no rebate. "crossd-" used to fall through to a Kalshi /series/CROSSD lookup (404) and the 0.035 fallback.
+// Polymarket US combo tickers ("caoc-…", and "crossd-…" since Oct 2026) have no Kalshi series.
+// This cache stays 0 for them (Kalshi does not charge the fill). The Polymarket combo maker
+// schedule — $0 before 2026-11-14T05:00:00Z, then 0.03×C×p×(1−p) — is poly-combo-fee.js.
+// "crossd-" used to fall through to a Kalshi /series/CROSSD lookup (404) and the 0.035 fallback.
 const isPolyComboTicker = (ticker) => /^(caoc|crossd)-/i.test(String(ticker || '').trim());
 
 function seriesOfTicker(ticker) {

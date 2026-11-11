@@ -35,6 +35,7 @@
 // quote_id is one of that lock's submissions. BACKFILL_PARLAY_ID is not a
 // fallback for unmatched executed quotes.
 'use strict';
+const { polyComboMakerFeeForFill } = require('./poly-combo-fee');
 
 const USER_FILTER_SELF = 'USER_FILTER_SELF';
 const QUOTE_STATUS_EXECUTED = 'QUOTE_STATUS_EXECUTED';
@@ -775,6 +776,9 @@ function fillEventFromReconcile({
   if (cum > 0 && quoted > 0 && !orderQtyMatchesQuoted(cum, quoted, state)) return null;
   const contracts = incrementFromCum(cum, alreadyFilled);
   if (!(contracts > 0) || (!quoteId && !orderId)) return null;
+  const yesPrice = order ? (orderPx(order.avgPx || order.avg_px) || orderPx(order.price)) : null;
+  const marketTicker = symbolOf(quote) || (order && (order.marketSlug || order.market_slug)) || null;
+  const filledAt = order && (order.transactTime || order.transact_time || order.updateTime || order.updatedTime || order.createdTime || order.created_time);
   return {
     quoteId,
     orderId: orderId || null,
@@ -783,12 +787,16 @@ function fillEventFromReconcile({
     venue: 'polymarket',
     isPartial: isPartialOrderState(state) || (quoted > 0 && cum + 1e-9 < quoted),
     rfqId: rfqIdOf(quote) || (pending && pending.rfqId) || null,
-    marketTicker: symbolOf(quote) || (order && (order.marketSlug || order.market_slug)) || null,
+    marketTicker,
     label: (pending && pending.label) || null,
     parlayId: pending && pending.parlayId,
     source,
-    yesPrice: order ? (orderPx(order.avgPx || order.avg_px) || orderPx(order.price)) : null,
-    fee: 0,
+    yesPrice,
+    fee: yesPrice != null
+      ? polyComboMakerFeeForFill({
+        contracts, price: yesPrice, at: filledAt, market: marketTicker, assumeCombo: true,
+      })
+      : 0,
     pending: pending
       ? {
         parlayId: pending.parlayId,
@@ -1320,7 +1328,12 @@ function activityFillEvent({ trade, lock, source }) {
     source: kind,
     tradeTime: trade.createTime || null,
     yesPrice: trade.price > 0 ? trade.price : null,
-    fee: trade.isAggressor ? null : 0,
+    fee: trade.isAggressor ? null : polyComboMakerFeeForFill({
+      contracts: trade.qty,
+      price: trade.price,
+      at: trade.createTime,
+      market: trade.marketSlug,
+    }),
     pending: {
       parlayId: lock.id,
       userId: lock.user_id || lock.userId || null,
@@ -1602,7 +1615,7 @@ function slugYesPrice(activities, slug) {
   return q > 0 ? Math.round((c / q) * 1e6) / 1e6 : null;
 }
 
-function positionFillEvent({ pos, lock, source = 'poly-position', yesPrice = null }) {
+function positionFillEvent({ pos, lock, source = 'poly-position', yesPrice = null, at = null }) {
   const qty = positionQty(pos);
   if (!lock || !(qty > 0)) return null;
   const slug = pos.marketSlug || (pos.marketMetadata && pos.marketMetadata.slug) || 'pos';
@@ -1619,7 +1632,14 @@ function positionFillEvent({ pos, lock, source = 'poly-position', yesPrice = nul
     parlayId: lock.id,
     source,
     yesPrice,
-    fee: yesPrice != null ? 0 : null,
+    fee: yesPrice != null
+      ? polyComboMakerFeeForFill({
+        contracts: qty,
+        price: yesPrice,
+        at: at || (pos && (pos.updateTime || pos.updatedAt || pos.updated_at)) || null,
+        market: slug,
+      })
+      : null,
     pending: {
       parlayId: lock.id,
       userId: lock.user_id || lock.userId || null,

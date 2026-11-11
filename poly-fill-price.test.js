@@ -21,6 +21,6 @@ const acts = [
 ];
 assert.strictEqual(slugYesPrice(acts, 'caoc-s'), 0.091);
 assert.strictEqual(slugYesPrice(acts, 'caoc-x'), null);
-const pe = positionFillEvent({ pos: { marketSlug: 'caoc-s', netPosition: '92.07' }, lock: { id: 'L' }, yesPrice: 0.091 });
+const pe = positionFillEvent({ pos: { marketSlug: 'caoc-s', netPosition: '92.07' }, lock: { id: 'L' }, yesPrice: 0.091, at: '2026-11-13T00:00:00Z' });
 if (pe) { assert.strictEqual(pe.yesPrice, 0.091); assert.strictEqual(pe.fee, 0); }
 console.log('poly-pos price ok');

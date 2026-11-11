@@ -25,6 +25,21 @@ function fakeFeed({ cost = 0.45, kickoffMs = Date.parse('2026-10-25T17:00:00Z'),
 const rfq = (legs, extra = {}) => ({ rfqId: `rfq_${Math.random()}`, symbol: 'crossd-x', qtyDecimal: '100', tickSize: 0.001, createdTime: new Date(NOW - 50).toISOString(), comboLegs: legs, ...extra });
 const ML2 = [{ symbol: 'aec-nfl-phi-was-2026-10-25', side: 'SIDE_BUY' }, { symbol: 'aec-nfl-nyg-den-2026-10-25', side: 'SIDE_SELL' }];
 
+t('combo maker fee is $0 before the cutoff and priced in after (sniper stays a pure decision)', () => {
+  const beforeMs = Date.parse('2026-11-13T00:00:00Z');
+  const afterMs = Date.parse('2026-11-14T05:00:00Z');
+  const feed = fakeFeed({ kickoffMs: Date.parse('2026-11-20T17:00:00Z') });
+  const before = decidePoly(rfq(ML2), { feed, config: polySniperConfig({}), ledger: createVenueLedger(), nowMs: beforeMs });
+  const after = decidePoly(rfq(ML2), { feed, config: polySniperConfig({}), ledger: createVenueLedger(), nowMs: afterMs });
+  assert.strictEqual(before.action, 'quote', before.reason);
+  assert.strictEqual(after.action, 'quote', after.reason);
+  assert.strictEqual(before.fee, 0);
+  assert.ok(after.fee > 0, `fee ${after.fee}`);
+  assert.ok(after.buyPrice + 1e-12 >= before.buyPrice, `after ${after.buyPrice} before ${before.buyPrice}`);
+  // Post-fee economics still clear the minimum edge. Nothing here posts.
+  assert.ok(after.roi + 1e-12 >= after.minRoi);
+});
+
 t('NFL ML combo: quotes at >= 5% edge, sell side off, Polymarket book excluded from fair', () => {
   const d = decidePoly(rfq(ML2), { feed: fakeFeed(), config: polySniperConfig({}), ledger: createVenueLedger(), nowMs: NOW });
   assert.strictEqual(d.action, 'quote', d.reason);

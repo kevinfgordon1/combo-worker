@@ -1028,6 +1028,7 @@ const quoteable = evaluatePolymarketRfq({
   parlays: [pmParlay],
   filledSoFar: 0,
   outstanding: 0,
+  now: BEFORE_PITCH,
 });
 assert.strictEqual(quoteable.action, 'quoteable');
 assert.strictEqual(quoteable.quote.buyPrice, '0.222');
@@ -1111,6 +1112,7 @@ const cashEval = evaluatePolymarketRfq({
   parlays: [pmParlay],
   filledSoFar: 0,
   outstanding: sharedOut,
+  now: BEFORE_PITCH,
 });
 assert.strictEqual(cashEval.quote.estimatedContracts, 41.84);
 // Cash RFQ whose full size (41.84 after the requester's taker fee) exceeds what is left (116 - 2*SIZE = 30): the venue
@@ -1126,6 +1128,7 @@ const cashAlone = evaluatePolymarketRfq({
   parlays: [pmParlay],
   filledSoFar: 0,
   outstanding: SIZE,
+  now: BEFORE_PITCH,
 });
 assert.strictEqual(cashAlone.action, 'quoteable');
 assert.strictEqual(cashAlone.decision.contracts, 41.84);
@@ -1137,7 +1140,7 @@ assert.deepStrictEqual(quoteBodyFromEval(cashAlone), {
 // Cash RFQ near the cap: 43 contracts left. floor(10 / 0.222) = 45 called it rfq_too_large, but the
 // venue only creates 41.84 ($10 covers 41.84 × 0.222 + $0.71 taker fee), so it fits and is quoted.
 const cashNearCap = evaluatePolymarketRfq({
-  rfq: cashRfq, parlays: [pmParlay], filledSoFar: 0, outstanding: 116 - 43,
+  rfq: cashRfq, parlays: [pmParlay], filledSoFar: 0, outstanding: 116 - 43, now: BEFORE_PITCH,
 });
 assert.strictEqual(cashNearCap.action, 'quoteable', cashNearCap.reason);
 assert.strictEqual(cashNearCap.decision.contracts, 41.84);
@@ -1305,6 +1308,7 @@ Promise.resolve(loopOff.handleRfq(pmRfq)).then(async (out) => {
     pendingQuotes: livePending,
     kalshiPendingQuotes: kalshiPending,
     reconcileMs: 60 * 60 * 1000,
+    now: () => BEFORE_PITCH,
   });
   assert.strictEqual(loopOn.live, true);
 

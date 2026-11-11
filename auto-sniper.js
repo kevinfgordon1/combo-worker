@@ -95,8 +95,13 @@ function sniperConfig(env = process.env) {
 
 function ceilCentiCent(x) { return Math.max(0, Math.ceil(x * 1e4 - 1e-7) / 1e4); }
 
-function snipeEconomics({ fair, q, n, makerRate }) {
-  const fee = ceilCentiCent(makerRate * q * (1 - q) * n);
+function snipeEconomics({ fair, q, n, makerRate, feeDollars }) {
+  // Kalshi rounds the maker fee up to 0.0001. Polymarket passes feeDollars
+  // (poly-combo-fee.js: banker's cent, $0 before the combo maker cutoff).
+  const raw = typeof feeDollars === 'function'
+    ? Number(feeDollars(n, q))
+    : ceilCentiCent(makerRate * q * (1 - q) * n);
+  const fee = Number.isFinite(raw) && raw > 0 ? raw : 0;
   const risk = n * (1 - q) + fee;
   const ev = n * (q - fair) - fee;
   return { fee, risk, ev, roi: risk > 0 ? ev / risk : -Infinity };
@@ -104,12 +109,12 @@ function snipeEconomics({ fair, q, n, makerRate }) {
 
 // Lowest cent price q that clears minRoi. Contracts depend on q when the RFQ
 // is cash-sized (taker spends cash at q → n = cash / q).
-function minQuotePrice({ fair, contracts, cash, makerRate, minRoi, tick = 0.01 }) {
+function minQuotePrice({ fair, contracts, cash, makerRate, minRoi, tick = 0.01, feeDollars }) {
   const start = Math.max(tick, Math.ceil((fair + 1e-9) / tick) * tick);
   for (let q = start; q <= 0.99 + 1e-9; q = Math.round((q + tick) * 1e6) / 1e6) {
     const n = contracts != null ? contracts : Math.floor(cash / q);
     if (!(n > 0)) return null;
-    const e = snipeEconomics({ fair, q, n, makerRate });
+    const e = snipeEconomics({ fair, q, n, makerRate, feeDollars });
     if (e.roi >= minRoi) return { q: Math.round(q * 1e4) / 1e4, n, ...e };
   }
   return null;
