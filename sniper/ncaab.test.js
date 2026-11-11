@@ -60,7 +60,7 @@ let f = book.legFair(GID, 'VILL'); assert.ok(f.p > 0.52 && f.p < 0.57, JSON.stri
 // Polymarket US: identity from the cbb slug (aec-cbb-vill-nd :yes = VILL, the first slug team)
 const at = new Date(t).toISOString();
 assert.strictEqual(book.ingestRelay('polymarket', [{ bet_type: 'moneyline', feed: 'polymarket-us', side: 'Notre Dame', odds: 0.40, token_id: 'us:aec-cbb-vill-nd-2026-11-01:no', start: '2026-11-01T14:30:00Z', updated_at: at, depth: [{ odds: 0.40, size: 100000 }] }]), 1);
-f = book.legFair(GID, 'VILL'); assert.strictEqual(f.best, 'polymarket'); assert.ok(Math.abs(f.p - (1 - (0.40 + 0.0695 * 0.40 * 0.60))) < 1e-9, String(f.p));
+f = book.legFair(GID, 'VILL'); assert.strictEqual(f.best, 'polymarket'); assert.ok(Math.abs(f.p - (1 - (0.40 + 0.095 * 0.40 * 0.60))) < 1e-9, String(f.p));
 // slug / name disagreement => ignored
 assert.strictEqual(book.ingestRelay('polymarket', [{ bet_type: 'moneyline', feed: 'polymarket-us', side: 'Villanova', odds: 0.1, token_id: 'us:aec-cbb-vill-nd-2026-11-01:no', start: '2026-11-01T14:30:00Z', updated_at: at, depth: [{ odds: 0.1, size: 1e6 }] }]), 0);
 // Novig (ESPN-style names, no pregame fee)

@@ -119,8 +119,8 @@ assert.strictEqual(CLOSED_CONTEXT_TTL_MS, 60_000);
   assert.strictEqual(maxPolymarketFillSize(quoted, null), 377.5);
   const cash = { contracts: 227.25, cashOrderQty: '200', buyPrice: '0.3532' };
   const cashMax = maxPolymarketFillSize(cash, null);
-  // venue cash sizing: 536.49 × 0.3532 + $10.51 taker fee ≤ $200 (cash / price = 566.25 ignored the fee)
-  assert.strictEqual(cashMax, 536.49, `cash max was ${cashMax}`);
+  // venue cash sizing: 528.25 × 0.3532 + $10.51 taker fee ≤ $200 (cash / price = 566.25 ignored the fee)
+  assert.strictEqual(cashMax, 528.25, `cash max was ${cashMax}`);
   {
     const prev = process.env.POLY_CASH_FEE_SIZING;
     process.env.POLY_CASH_FEE_SIZING = '0';

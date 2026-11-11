@@ -1114,13 +1114,13 @@ const cashEval = evaluatePolymarketRfq({
   outstanding: sharedOut,
   now: BEFORE_PITCH,
 });
-assert.strictEqual(cashEval.quote.estimatedContracts, 41.84);
-// Cash RFQ whose full size (41.84 after the requester's taker fee) exceeds what is left (116 - 2*SIZE = 30): the venue
-// would fill all 41.84, so Poly declines instead of "clipping" to 30.
+assert.strictEqual(cashEval.quote.estimatedContracts, 41.10);
+// Cash RFQ whose full size (41.10 after the requester's taker fee) exceeds what is left (116 - 2*SIZE = 30): the venue
+// would fill all 41.10, so Poly declines instead of "clipping" to 30.
 assert.strictEqual(cashEval.action, 'skip');
 assert.strictEqual(cashEval.reason, 'rfq_too_large');
 assert.strictEqual(cashEval.decision.remaining, 116 - SIZE * 2);
-assert.strictEqual(cashEval.decision.rfqContracts, 41.84);
+assert.strictEqual(cashEval.decision.rfqContracts, 41.10);
 assert.strictEqual(formatQtyDecimal(30), '30');
 
 const cashAlone = evaluatePolymarketRfq({
@@ -1131,19 +1131,19 @@ const cashAlone = evaluatePolymarketRfq({
   now: BEFORE_PITCH,
 });
 assert.strictEqual(cashAlone.action, 'quoteable');
-assert.strictEqual(cashAlone.decision.contracts, 41.84);
+assert.strictEqual(cashAlone.decision.contracts, 41.10);
 assert.strictEqual(cashAlone.decision.outstanding, SIZE);
 assert.deepStrictEqual(quoteBodyFromEval(cashAlone), {
   rfqId: 'rfq_cash_45', buyPrice: '0.222', sellPrice: '0', restRemainder: false,
 });
 
 // Cash RFQ near the cap: 43 contracts left. floor(10 / 0.222) = 45 called it rfq_too_large, but the
-// venue only creates 41.84 ($10 covers 41.84 × 0.222 + $0.71 taker fee), so it fits and is quoted.
+// venue only creates 41.10 ($10 covers 41.10 × 0.222 + $0.71 taker fee), so it fits and is quoted.
 const cashNearCap = evaluatePolymarketRfq({
   rfq: cashRfq, parlays: [pmParlay], filledSoFar: 0, outstanding: 116 - 43, now: BEFORE_PITCH,
 });
 assert.strictEqual(cashNearCap.action, 'quoteable', cashNearCap.reason);
-assert.strictEqual(cashNearCap.decision.contracts, 41.84);
+assert.strictEqual(cashNearCap.decision.contracts, 41.10);
 {
   const prevSizing = process.env.POLY_CASH_FEE_SIZING;
   process.env.POLY_CASH_FEE_SIZING = '0'; // kill switch: old floor(cash / price)

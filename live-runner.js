@@ -1,3 +1,4 @@
+const { isPolyComboTicker } = require('./poly-combo-classifier');
 // ─────────────────────────────────────────────────────────────────────────
 // live-runner.js — LIVE worker (latency-optimized)
 //
@@ -2210,7 +2211,7 @@ async function loadPolySlugRecordsUncached() {
     for (const row of fillsQ.data || []) {
       if (!row || !row.parlay_id) continue;
       const venue = row.raw && row.raw.venue;
-      if (venue === 'polymarket' || (row.ticker && /^caoc-/i.test(row.ticker))) {
+      if (venue === 'polymarket' || (row.ticker && isPolyComboTicker(row.ticker))) {
         rows.push({
           ticker: row.ticker,
           market_ticker: row.ticker,

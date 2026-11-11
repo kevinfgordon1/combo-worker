@@ -33,13 +33,13 @@ const CASH_QTY_CREDIT_FACTOR = 0.85;
 
 // Cash RFQs: Polymarket sizes the order so contracts × price PLUS the requester's combo taker fee fits
 // inside the cash (docs.polymarket.us/fees, Combo Taker Fees, schedule effective 2026-10-19 1:00 PM ET):
-//   fee = C × p × [0.0695 × (1 − p) + 0.06 × (1 − p)^4], rounded half-to-even to the cent.
+//   fee = C × p × [0.095 × (1 − p) + 0.06 × (1 − p)^4], rounded half-to-even to the cent.
 // That fee is 7% of notional at +300, ~10% at +900, ~11.5% near +1900 — exactly the 7–11% by which
 // floor(cash / price) overstated the venue's real size and pushed RFQs over the lock cap (rfq_too_large).
 // Verified on real fills: $5 @ 0.1471 → 31.13 contracts (floor said 33); $3 @ 0.138 → 19.86 (floor said 21).
 // POLY_CASH_FEE_SIZING=0/false/off/no restores floor(cash / price). Caps are unchanged: this only
 // estimates the size the venue will create; confirm still checks the venue's accepted size against the cap.
-const POLY_COMBO_TAKER_RATE = 0.0695;
+const POLY_COMBO_TAKER_RATE = require('./fee-config.json').polymarketUsTakerCoefficient;
 const POLY_COMBO_TAKER_TAIL = 0.06;
 const CASH_SIZE_STEP = 0.01; // venue contract grid on cash fills
 function polyCashFeeSizingEnabled(env = process.env) {

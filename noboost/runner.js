@@ -108,6 +108,7 @@ async function main(env = process.env) {
   const store = createStore({ url: env.SUPABASE_URL, key: env.SUPABASE_SERVICE_KEY, log: logger, runId });
   // PM live inverse fair (Combo Sniper): Kalshi public orderbooks + odds-relay Polymarket US / Novig + ProphetX.
   const pmOn = !['0', 'false', 'off', 'no'].includes(String(env.NOBOOST_PM_LIVE || '1').toLowerCase());
+  const pmSeriesFees = require('../series-fee').createSeriesFeeCache();
   const pmLive = pmOn ? createPmLiveBook({ staleMs: Number(env.NOBOOST_PM_STALE_MS) || 15000 }) : null;
   if (pmLive && tdBook) pmLive.setTdBook(tdBook);
   const relayBase = env.NOBOOST_ODDS_RELAY_URL || (env.RAILWAY_SERVICE_ODDS_RELAY_URL ? `https://${env.RAILWAY_SERVICE_ODDS_RELAY_URL}` : '');
@@ -320,7 +321,8 @@ async function main(env = process.env) {
       for (let i = 0; i < kTickers.length; i += 100) {
         const chunk = kTickers.slice(i, i + 100);
         const j = await pubGet(`${P}/markets/orderbooks?${chunk.map((t) => `tickers=${encodeURIComponent(t)}`).join('&')}`);
-        pmLive.ingestKalshiOrderbooks(j.orderbooks || []);
+        await pmSeriesFees.prefetchTickers((j.orderbooks || []).map(ob=>ob.ticker || ob.market_ticker));
+        pmLive.ingestKalshiOrderbooks((j.orderbooks || []).map(ob=>({...ob,takerRate:pmSeriesFees.takerRateForTicker(ob.ticker || ob.market_ticker)})));
       }
     };
     const pmRelay = async () => {

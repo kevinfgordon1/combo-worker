@@ -210,7 +210,7 @@ function priceCombo(legs, source, opts = {}) {
   }
 
   const mEff = cfg.margin * (1 + cfg.skew * util);
-  const feeRate = venue === 'polymarket' ? polyComboMakerRate(opts.at) : kalshiMakerRate(legs.map(() => ({ league: 'nfl' })));
+  const feeRate = venue === 'polymarket' ? polyComboMakerRate(opts.at) : kalshiMakerRate(opts.ticker || opts.series);
   // Maker fee on NFL-only Kalshi combos is 0; keep the term so a non-zero rate cannot be forgotten.
   const feeAdj = feeRate ? feeRate * fair * (1 - fair) : 0;
   const yTarget = targetPrice(fair + feeAdj, mEff, cfg.marginMode);

@@ -36,7 +36,7 @@ assert.ok(f.p > 0.74 && f.p < 0.77, JSON.stringify(f)); assert.ok(/^kalshi/.test
 // Polymarket US: identity from the slug, depth ladder; cheaper KENN ask => becomes best
 book.ingestRelay('polymarket', [{ bet_type: 'moneyline', feed: 'polymarket-us', side: 'Kennesaw State', odds: 0.2, token_id: 'us:aec-cfb-librty-kenest-2026-10-22:no', start: '2026-10-22T23:00:00Z', updated_at: new Date(t).toISOString(), depth: [{ odds: 0.2, size: 100000 }] }]);
 f = book.legFair('ncaaf|2026-10-22|KENN+LIB', 'LIB');
-assert.strictEqual(f.best, 'polymarket'); assert.ok(Math.abs(f.p - (1 - (0.2 + 0.0695 * 0.2 * 0.8))) < 1e-9);
+assert.strictEqual(f.best, 'polymarket'); assert.ok(Math.abs(f.p - (1 - (0.2 + 0.095 * 0.2 * 0.8))) < 1e-9);
 // a Polymarket quote whose name disagrees with its slug is ignored
 assert.strictEqual(book.ingestRelay('polymarket', [{ bet_type: 'moneyline', feed: 'polymarket-us', side: 'Liberty', odds: 0.1, token_id: 'us:aec-cfb-librty-kenest-2026-10-22:no', start: '2026-10-22T23:00:00Z', updated_at: new Date(t).toISOString(), depth: [{ odds: 0.1, size: 1e6 }] }]), 0);
 // Novig: names mapped through the crosswalk; top-of-book only never counts

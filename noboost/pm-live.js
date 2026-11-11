@@ -11,7 +11,7 @@
 //   cost_v  = fee-included VWAP to buy $DEPTH (500) of "T loses" on venue v
 //             (Kalshi: cheaper of Yes-on-O and No-on-T; others: O's ask ladder)
 //   fair(T) = 1 − min_v cost_v           (best opposite-side price, sign-flipped)
-// Fees: Kalshi 0.07·p·(1−p), Polymarket US 0.0695·p·(1−p), Novig none, ProphetX 2% of net winnings.
+// Fees: Kalshi 0.07·p·(1−p), Polymarket US 0.095·p·(1−p), Novig pregame zero / live 0.06·p·(1−p), ProphetX 2% of net winnings.
 // A venue older than staleMs (15s) or without $DEPTH of depth is dropped for that leg (reason kept);
 // Polymarket's age is time since its last real price change; settled games are skipped at ingest.
 // at least one venue must survive. Every venue's price is returned for the audit trail.
@@ -25,7 +25,7 @@ const SETTLED_AFTER_MS = 4.5 * 3600 * 1000;
 const SETTLED_PRICE = 0.015;
 const FEES = {
   kalshi: (p) => 0.07 * p * (1 - p),
-  polymarket: (p) => 0.0695 * p * (1 - p),
+  polymarket: (p) => require('../fee-config.json').polymarketUsTakerCoefficient * p * (1 - p),
   novig: () => 0,
   prophetx: () => 0, // commission already folded into the level price (pxEffective)
 };
@@ -42,8 +42,8 @@ function american(p) {
 // levels [[price, contracts]] cheapest first. Fee-included VWAP until the bet can WIN $usd, or a failure.
 // Depth = potential PROFIT, not stake (Kevin): a contract at fee-included cost c wins 1 − c,
 // so $3,000 staked at −200 is $1,500 of depth. depthUsd / availUsd are profit $; stakeUsd is the $ spent.
-function walk(levels, venue, usd = DEPTH_USD) {
-  const fee = FEES[venue];
+function walk(levels, venue, usd = DEPTH_USD, terms = {}) {
+  const fee = venue === 'novig' ? (p => terms.is_live === true ? (Number(terms.fee_coefficient) >= 0 && terms.fee_coefficient != null && terms.fee_coefficient !== "" ? Number(terms.fee_coefficient) : require('../fee-config.json').novigLiveCoefficient)*p*(1-p) : 0) : venue === 'kalshi' ? (p => (terms.takerRate ?? require('../kalshi-fee-core').takerRateFromSeries(null, terms.fee_multiplier, terms.key))*p*(1-p)) : FEES[venue];
   let spent = 0; let got = 0; let won = 0;
   const lv = (levels || []).filter(([p, q]) => p > 0 && p < 1 && q > 0).sort((a, b) => a[0] - b[0]);
   if (!lv.length) return { fail: 'no_ask' };
@@ -92,8 +92,8 @@ function createPmLiveBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 
       const yesAsks = rows(b.no_dollars).map(([px, q]) => [Math.round((1 - px) * 1e4) / 1e4, q]);
       const noAsks = rows(b.yes_dollars).map(([px, q]) => [Math.round((1 - px) * 1e4) / 1e4, q]);
       const at = now();
-      set(asks, p.gameId, team, 'kalshi', { levels: yesAsks, at, changedAt: at, depthKnown: true, key: t });
-      set(kalshiNo, p.gameId, team, 'kalshi', { levels: noAsks, at, changedAt: at, depthKnown: true, key: `${t}:no` });
+      set(asks, p.gameId, team, 'kalshi', { levels: yesAsks, at, changedAt: at, depthKnown: true, takerRate: ob.takerRate, fee_multiplier: ob.fee_multiplier, key: t });
+      set(kalshiNo, p.gameId, team, 'kalshi', { levels: noAsks, at, changedAt: at, depthKnown: true, takerRate: ob.takerRate, fee_multiplier: ob.fee_multiplier, key: `${t}:no` });
       n += 1;
     }
     return n;
@@ -125,7 +125,7 @@ function createPmLiveBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 
       const at = venue === 'polymarket' ? Math.max(confirmedAt, changedAt) : (feedLive ? polledAt : changedAt);
       let levels; let depthKnown;
       if (Array.isArray(q.depth) && q.depth.length) { levels = q.depth.map((d) => [Number(d.odds), Number(d.size)]); depthKnown = true; } else if (q.size > 0) { levels = [[Number(q.odds), Number(q.size)]]; depthKnown = true; } else { levels = [[Number(q.odds), Infinity]]; depthKnown = false; } // relay gives top-of-book only
-      set(asks, gid, side, venue, { levels, at, changedAt, depthKnown, key: q.token_id || null });
+      set(asks, gid, side, venue, { levels, at, changedAt, depthKnown, is_live: q.is_live === true, fee_coefficient: q.fee_coefficient, key: q.token_id || null });
       n += 1;
     }
     return n;
@@ -152,7 +152,7 @@ function createPmLiveBook({ now = () => Date.now(), staleMs = 15000, depthUsd = 
   function evalVenue(v, src) {
     if (!src) return null;
     const age = now() - src.at;
-    const w = walk(src.levels, v, depthUsd);
+    const w = walk(src.levels, v, depthUsd, src);
     const out = { venue: v, key: src.key, ageMs: Math.round(age), changeAgeMs: src.changedAt ? Math.round(now() - src.changedAt) : null, topAmerican: w.top != null ? american(w.top) : null, depthKnown: src.depthKnown };
     if (age > staleMs) return { ...out, used: false, reason: 'stale' };
     if (w.fail) return { ...out, used: false, reason: w.fail };

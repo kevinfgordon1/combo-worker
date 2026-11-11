@@ -53,9 +53,11 @@ const impliedProb = (a) => (a > 0 ? 100 / (a + 100) : Math.abs(a) / (Math.abs(a)
 const aToDec = (a) => (a > 0 ? 1 + a / 100 : 1 + 100 / Math.abs(a));
 const r2 = (x) => Math.round(x * 100) / 100;
 // Our quoted price (no_bid) from the fill odds — same net-of-maker-fee math as engine/tab.
-const KFEE = 0.0175;
-const nominalProbFromEff = (sEff) => { const b = 1 - KFEE; return (-b + Math.sqrt(b * b + 4 * KFEE * sEff)) / (2 * KFEE); };
-const noBidFor = (fillAmerican) => (fillAmerican ? r2(1 - nominalProbFromEff(impliedProb(fillAmerican))) : null);
+const feeTerms = require('./series-fee').createSeriesFeeCache({log: console.warn});
+const {fillView,subcentEnabled} = require('./engine');
+const noBidFor = (fillAmerican,ticker) => fillAmerican ? Number(fillView(fillAmerican, {
+  makerRate:feeTerms.rateForTicker(ticker),subcent:subcentEnabled(),
+}).noBid) : null;
 const toNum = (v) => (v == null ? null : (typeof v === 'string' ? parseFloat(v) : Number(v)));
 
 let parlays = [];
@@ -111,6 +113,7 @@ async function loadState() {
         .order('created_at', { ascending: false }).limit(200),
     ]);
     parlays = p || [];
+    await feeTerms.prefetchTickers(parlays.map(row=>row.combo_ticker || row.market_ticker));
     const bq = {}, br = {}, seed = [];
     (subs || []).forEach((s) => {
       if (!s.quote_id) return;
@@ -118,7 +121,7 @@ async function loadState() {
       bq[s.quote_id] = rec; if (s.rfq_id) br[s.rfq_id] = rec;
       // record OUR quoted price (no_bid) + fill odds so we can learn win/loss-by-price over time
       seed.push({ quote_id: s.quote_id, rfq_id: s.rfq_id, parlay_id: s.parlay_id, label: s.label,
-        posted_at: s.created_at, fill_american: s.fill_american, no_bid: noBidFor(s.fill_american) });
+        posted_at: s.created_at, fill_american: s.fill_american, no_bid: noBidFor(s.fill_american, ((p || []).find(row=>row.id===s.parlay_id)||{}).combo_ticker) });
     });
     postedByQuote = bq; postedByRfq = br;
     // Seed a 'posted' outcome row for every quote we know about (ignore if already tracked),

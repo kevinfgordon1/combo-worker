@@ -1,3 +1,4 @@
+const { isPolyComboTicker } = require('./poly-combo-classifier');
 // Polymarket US fills outside Combo Locks (Live Trading Desk, manual orders)
 // -> one Telegram "DESK FILL" per trade. Combo Lock trades (caoc-* slugs) are
 // skipped here: live-runner already sends "FILL CONFIRMED (Polymarket)".
@@ -9,7 +10,7 @@
 const { listAllActivities, tradeFromActivity } = require('./polymarket-fill-reconcile');
 
 function isComboSlug(slug) {
-  return /^caoc-/i.test(String(slug || ''));
+  return isPolyComboTicker(slug);
 }
 
 function fmtNum(n, d = 2) {

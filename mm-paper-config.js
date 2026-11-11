@@ -3,8 +3,8 @@
 // Combo Locks quoting and the desk protect sweep are not touched.
 'use strict';
 
-const POLY_MAKER_REBATE = 0.0125;
-const POLY_TAKER_FEE = 0.0695;
+const POLY_MAKER_REBATE = 0; // Tier 1; no automatic standard-maker rebate.
+const POLY_TAKER_FEE = require('./fee-config.json').polymarketUsTakerCoefficient;
 // Kalshi KXNFLGAME (kalshi.com/fee-schedule, captured 2026-09-02, multiplier 1):
 // taker $0.07-$1.75 per 100 contracts => 0.07 * p * (1-p) per contract,
 // maker $0.02-$0.44 per 100 => 0.0175 * p * (1-p). Both round UP to the cent.

@@ -12,9 +12,9 @@ const legs = [{ symbol: 'aec-nfl-buf-mia-2026-10-18', side: 'SIDE_SELL' }, { sym
 const rfq = (id, extra = {}) => normalizePolyRfq({ rfq: { id, symbol: 'caoc-x1', status: 'RFQ_STATUS_OPEN', comboLegs: legs, qtyDecimal: '100', createdTime: new Date(T).toISOString(), tickSize: 0.001, ...extra } }, T);
 const trade = (id, ms, price = '0.2', qty = '100', side = 'SIDE_BUY') => normalizePolyTrade({ tradeId: id, symbol: 'caoc-x1', price, qtyDecimal: qty, aggressorSide: side, executedTime: new Date(ms).toISOString() });
 
-// fee: docs table — 100-lot at $0.10 pays $1.02, at $0.50 pays $1.92
-assert.ok(Math.abs(100 * polyComboTakerFee(0.1) - 1.02) < 0.006);
-assert.ok(Math.abs(100 * polyComboTakerFee(0.5) - 1.92) < 0.006); // docs table rounds 1.925 -> 1.92
+// fee: docs table — 100-lot at $0.10 pays $1.25, at $0.50 pays $2.56
+assert.ok(Math.abs(100 * polyComboTakerFee(0.1) - 1.25) < 0.006);
+assert.ok(Math.abs(100 * polyComboTakerFee(0.5) - 2.56) < 0.006); // docs table rounds 2.565 -> 2.56
 
 { // happy path: logged with venue, Kalshi-mapped legs, matched first print, multi-fill aggregated, dedupe
   const p = mk(); rows.length = 0;

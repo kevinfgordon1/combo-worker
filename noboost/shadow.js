@@ -126,7 +126,7 @@ function createNoBoostShadow({
     }
     const legsForPrice = cls.legs.map((l) => ({ ...l }));
     const util = rk.utilization(cls.legs);
-    const priced = priceCombo(legsForPrice, book.source, { cfg, util, venue });
+    const priced = priceCombo(legsForPrice, book.source, { cfg, util, venue, ticker: rfq && (rfq.market_ticker || rfq.marketTicker || rfq.ticker) });
     if (!priced.ok) { bumpSkip(`price:${priced.reason}`); return { action: 'skip', reason: `price:${priced.reason}`, priced, legs: cls.legs }; }
     counts.priceable += 1;
 
@@ -145,7 +145,7 @@ function createNoBoostShadow({
     }
     counts.would_quote += 1;
     rk.registerQuote(rfqId, {
-      venue, legs: cls.legs, quoteYes: priced.quoteYes, fair: priced.fair, contracts,
+      venue, ticker: rfq.market_ticker || rfq.marketTicker || rfq.ticker, legs: cls.legs, quoteYes: priced.quoteYes, fair: priced.fair, contracts,
       guardrail: cfg.guardrail === 'lock',
     });
     pending = (
@@ -174,7 +174,7 @@ function createNoBoostShadow({
   // Re-price every open paper quote with the CURRENT book; pull those that went stale.
   function sweep() {
     const pulled = rk.sweepQuotes((q) => {
-      const p = priceCombo(q.legs.map((l) => ({ ...l })), book.source, { cfg, util: 0, venue: q.venue });
+      const p = priceCombo(q.legs.map((l) => ({ ...l })), book.source, { cfg, util: 0, venue: q.venue, ticker: q.ticker });
       return p.ok ? { fair: p.fair, yLock: p.yLock } : null;
     });
     for (const p of pulled) {

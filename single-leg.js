@@ -214,7 +214,7 @@ function lockStartMs(p) {
 
 // ── Fees / odds ────────────────────────────────────────────────────────────
 const KALSHI_TAKER_K = 0.07;
-const POLY_TAKER_THETA = 0.0695; // Polymarket US taker: 0.0695 × C × p(1−p)
+const POLY_TAKER_THETA = require('./fee-config.json').polymarketUsTakerCoefficient; // Polymarket US taker: 0.095 × C × p(1−p)
 const takerFee = (k, q) => k * q * (1 - q);
 // American odds for buying a contract at cost c (0..1).
 function americanFromCost(c) {

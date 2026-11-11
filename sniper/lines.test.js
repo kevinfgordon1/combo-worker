@@ -79,7 +79,7 @@ console.log('lines.test ok', decision.action, decision.reason || '');
   assert.strictEqual(b2.legFair(L.classifyLineLeg(`${SP}:yes`)).reason, 'not_main_line', 'Polymarket never sets the main line');
   b2.ingestRelay('novig', 'nfl', [{ ...base, feed: undefined, side: 'Carolina Panthers', line: 7.5, odds: 0.52, depth: [{ odds: 0.52, size: 10000 }], is_alt: false }]);
   const f2 = b2.legFair(L.classifyLineLeg(`${SP}:yes`)); // opposite CAR +7.5: Poly 0.45 + fee vs Novig 0.52
-  const polyFee = 0.0695 * 0.45 * 0.55;
+  const polyFee = 0.095 * 0.45 * 0.55;
   assert.strictEqual(f2.best, 'polymarket'); assert.ok(Math.abs(f2.p - (1 - (0.45 + polyFee))) < 1e-9, 'Polymarket fee applied');
   // wrong number from Polymarket is ignored
   const b3 = L.createLinesBook({ now: () => t2, depthUsd: 2000 }); b3.addGamesFromTickers([SP]);

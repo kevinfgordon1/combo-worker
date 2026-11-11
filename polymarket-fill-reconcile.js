@@ -1,3 +1,4 @@
+const { isPolyComboTicker } = require('./poly-combo-classifier');
 // Durable Polymarket Combo Lock fill recovery.
 //
 // Live WS orderExecution is the fast path. It is not sufficient:
@@ -848,7 +849,7 @@ function normalizeMarketSlug(slug) {
 
 function isComboActivitySlug(slug) {
   const s = normalizeMarketSlug(slug);
-  return !!(s && s.startsWith('caoc-'));
+  return isPolyComboTicker(s);
 }
 
 function slugOfRecord(row) {

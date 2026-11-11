@@ -764,6 +764,7 @@ function pmRfq(id, symbols, extra = {}) {
       'KXNFLGAME-26SEP071330BUFKC-KC:yes',
       'KXNFLGAME-26SEP071330DALPHI-PHI:yes',
     ]);
+    nflRfq.marketTicker = 'KXMVECROSSCATEGORY0-NFL';
     const nflOut = await maybePersistUnhedged(nflRfq, {
       venue: 'kalshi',
       priceCache: nflCache,

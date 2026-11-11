@@ -530,6 +530,7 @@ function classifyUnhedgedRfq(rfq, opts = {}) {
   }));
 
   const priced = priceClassified({
+    ticker: rfq && (rfq.market_ticker || rfq.marketTicker || rfq.ticker),
     venue,
     legs: legsJson,
     priceCache: opts.priceCache,
@@ -562,7 +563,7 @@ function annotatePersistedLegs(legs, priceCache) {
   return legs.map((leg) => annotateLegOdds(leg, quotesFn(leg)));
 }
 
-function priceClassified({ venue, legs, priceCache, getOurTrue, getYesProb, env, margin }) {
+function priceClassified({ venue, legs, priceCache, getOurTrue, getYesProb, env, margin, ticker }) {
   if (priceCache && typeof priceCache.watch === 'function') {
     priceCache.watch(venue, legs);
   }
@@ -581,6 +582,7 @@ function priceClassified({ venue, legs, priceCache, getOurTrue, getYesProb, env,
   if (!ourTrueFn && !yesFn) return empty;
   const mult = margin != null ? margin : quoteMultFromEnv(env);
   const priced = priceUnhedgedCombo({
+    ticker,
     venue,
     legs,
     getOurTrue: ourTrueFn || undefined,
