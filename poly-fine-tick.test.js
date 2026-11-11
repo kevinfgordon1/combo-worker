@@ -2,8 +2,14 @@
 // Sharper longshot pricing: quote on the RFQ's own tickSize (combos are 0.0001) so the price is the
 // closest tick that still never beats the lock.
 const assert = require('assert');
-const Q = require('./polymarket-quote');
+const Qraw = require('./polymarket-quote');
 const { impliedProb } = require('./engine');
+// Pin the no-fee tick grid. Combo maker fee coverage is poly-combo-fee.test.js.
+const PRE_FEE_AT = '2026-11-13T00:00:00Z';
+const Q = {
+  ...Qraw,
+  buildPolymarketQuote: (o) => Qraw.buildPolymarketQuote({ at: PRE_FEE_AT, ...(o || {}) }),
+};
 const env = {};
 const am = (p) => (p < 0.5 ? (100 * (1 - p)) / p : (-100 * p) / (1 - p));
 

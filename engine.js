@@ -1,5 +1,6 @@
 // Fill-odds lock engine — mirrors src/ComboLocks.jsx exactly.
 'use strict';
+const { polyComboMakerFeePerContract } = require('./poly-combo-fee');
 // The fill odds you enter are the odds you SELL at AFTER your maker fee — already baked in.
 // So the lock math uses them directly (no separate fee term). KFEE/TAKER_FEE are only used to
 // recover the nominal exchange price and the taker's matched odds for display.
@@ -382,14 +383,16 @@ function decideAtFill({ parlayStake, parlayAmerican, fillAmerican, fairAmerican 
   if (!(N > 0)) return { ok: false, reason: 'zero_cap', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved, remaining: remainingBefore };
   const s = impliedProb(fillAmerican); // already net of your maker fee
   const hit = bookHit + N * s - N, miss = bookMiss + N * s, worst = Math.min(hit, miss);
-  // Polymarket US branch (polyQuote = { buyPrice, credit, enforce }). The venue price is the YES price the
-  // taker pays (we SELL YES), so the quote is never run through the Kalshi NO-bid / maker-fee view. We net
-  // buyPrice + the credited maker rebate per contract. With enforce (POLY_EXACT_TARGET) that net must be
-  // >= the target or the quote is refused; hit/miss/worst are computed at the price actually sent.
+  // Polymarket US branch (polyQuote = { buyPrice, credit, enforce, at }). The venue price is the YES
+  // price the taker pays (we SELL YES). We net buyPrice − the combo maker fee + any credited rebate.
+  // Fee is $0 before 2026-11-14T05:00:00Z and 0.03×C×p×(1−p) after (poly-combo-fee.js). With enforce
+  // (POLY_EXACT_TARGET) that net must be >= the target or the quote is refused; hit/miss/worst are
+  // computed at the price actually sent, after the fee.
   if (polyQuote) {
     const px = parseFloat(polyQuote.buyPrice);
     const credit = Number(polyQuote.credit) > 0 ? Number(polyQuote.credit) : 0;
-    const sQ = px + credit;
+    const drag = polyComboMakerFeePerContract(px, N, polyQuote.at);
+    const sQ = px + credit - drag;
     if (!(px >= 0.001 && px <= 0.999) || (polyQuote.enforce && !(sQ + 1e-12 >= s))) {
       return {
         ok: false, reason: 'quote_below_target', cap, totalLimit, filledSoFar: alreadyFilled, outstanding: reserved,

@@ -3,14 +3,17 @@
 process.env.POLY_EXACT_TARGET = '0';
 const assert = require('assert');
 const { impliedProb } = require('./engine');
+const Q = require('./polymarket-quote');
 const {
   TICK,
   SELL_PRICE_DECLINE,
-  fillAmericanToBuyPrice,
-  buildPolymarketQuote,
   shouldConfirmPolymarketAccept,
   shouldPostPolymarketQuote,
-} = require('./polymarket-quote');
+} = Q;
+// Legacy floor cases are the pre-fee grid. The maker fee is covered in poly-combo-fee.test.js.
+const PRE_FEE_AT = '2026-11-13T00:00:00Z';
+const fillAmericanToBuyPrice = (a, o) => Q.fillAmericanToBuyPrice(a, { at: PRE_FEE_AT, ...(o && typeof o === 'object' ? o : {}) });
+const buildPolymarketQuote = (o) => Q.buildPolymarketQuote({ at: PRE_FEE_AT, ...(o || {}) });
 
 assert.strictEqual(TICK, 0.001);
 assert.strictEqual(SELL_PRICE_DECLINE, '0');

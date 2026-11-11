@@ -5,6 +5,15 @@
 const assert = require('assert');
 const { impliedProb, decideAtFill, americanFromProb } = require('./engine');
 const Q = require('./polymarket-quote');
+// These cases pin the pre-fee grid (rebate math). The combo maker fee is off until
+// 2026-11-14T05:00:00Z; poly-combo-fee.test.js covers the cutoff.
+const PRE_FEE_AT = '2026-11-13T00:00:00Z';
+const _exact = Q.fillAmericanToExactQuote;
+Q.fillAmericanToExactQuote = (a, o) => _exact(a, { at: PRE_FEE_AT, ...(o || {}) });
+const _build = Q.buildPolymarketQuote;
+Q.buildPolymarketQuote = (o) => _build({ at: PRE_FEE_AT, ...(o || {}) });
+const _buy = Q.fillAmericanToBuyPrice;
+Q.fillAmericanToBuyPrice = (a, o) => _buy(a, { at: PRE_FEE_AT, ...(o && typeof o === 'object' ? o : {}) });
 const { createPolymarketHttp } = require('./polymarket-client');
 const { evaluatePolymarketRfq, startPolymarketRfqLoop, quoteBodyFromEval } = require('./polymarket-rfq');
 
@@ -127,7 +136,7 @@ assert.strictEqual(Q.fillAmericanToExactQuote(-100000, { contracts: 100, env: R 
 {
   const base = { parlayStake: 100, parlayAmerican: 400, fillAmerican: 910, rfqContracts: 91.61, hedgeMode: '1x', maxContracts: 1000 };
   const q = Q.buildPolymarketQuote({ fillAmerican: 910, qtyDecimal: 91.61, env: R });
-  const d = decideAtFill({ ...base, polyQuote: { buyPrice: q.buyPrice, credit: q.rebateCredit, enforce: true } });
+  const d = decideAtFill({ ...base, polyQuote: { buyPrice: q.buyPrice, credit: q.rebateCredit, enforce: true, at: PRE_FEE_AT } });
   assert.ok(d.ok, d.reason);
   assert.strictEqual(d.venue, 'polymarket');
   assert.strictEqual(d.quotedBuyPrice, '0.098');
@@ -144,16 +153,16 @@ assert.strictEqual(Q.fillAmericanToExactQuote(-100000, { contracts: 100, env: R 
   assert.strictEqual(d.quotedEffAmerican, americanFromProb(sQ));
   assert.strictEqual(d.effTakerOdds, americanFromProb(0.098));
   // refuses a price whose net is below the target
-  const bad = decideAtFill({ ...base, polyQuote: { buyPrice: '0.097', credit: 0.001, enforce: true } });
+  const bad = decideAtFill({ ...base, polyQuote: { buyPrice: '0.097', credit: 0.001, enforce: true, at: PRE_FEE_AT } });
   assert.strictEqual(bad.ok, false);
   assert.strictEqual(bad.reason, 'quote_below_target');
   assert.strictEqual(bad.quotedBuyPrice, '0.097');
   // ...but only when enforcing (legacy POLY_EXACT_TARGET=0 keeps its old floor and is not refused)
-  const legacy = decideAtFill({ ...base, polyQuote: { buyPrice: '0.099', credit: 0, enforce: false } });
+  const legacy = decideAtFill({ ...base, polyQuote: { buyPrice: '0.099', credit: 0, enforce: false, at: PRE_FEE_AT } });
   assert.ok(legacy.ok);
   // out-of-range price never posts
-  assert.strictEqual(decideAtFill({ ...base, polyQuote: { buyPrice: '1.000', credit: 0, enforce: false } }).reason, 'quote_below_target');
-  assert.strictEqual(decideAtFill({ ...base, polyQuote: { buyPrice: '0.000', credit: 0, enforce: false } }).reason, 'quote_below_target');
+  assert.strictEqual(decideAtFill({ ...base, polyQuote: { buyPrice: '1.000', credit: 0, enforce: false, at: PRE_FEE_AT } }).reason, 'quote_below_target');
+  assert.strictEqual(decideAtFill({ ...base, polyQuote: { buyPrice: '0.000', credit: 0, enforce: false, at: PRE_FEE_AT } }).reason, 'quote_below_target');
   // Kalshi path untouched
   const k = decideAtFill({ ...base, subcent: true });
   assert.ok(k.ok && k.quote.no_bid && k.subcent === true);

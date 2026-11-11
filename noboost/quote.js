@@ -36,8 +36,8 @@ const { americanFromProb } = require('../engine');
 const {
   validProb, productFair, ourTrueFromOpponents, feeIncludedAmerican,
   applyTakerFeeToProb, takerThetaForVenue, bestOpponentAmerican, kalshiMakerRate,
-  POLY_MAKER_RATE,
 } = require('../unhedged-quote');
+const { polyComboMakerRate } = require('../poly-combo-fee');
 
 const DEFAULTS = Object.freeze({
   margin: 0.10,
@@ -210,7 +210,7 @@ function priceCombo(legs, source, opts = {}) {
   }
 
   const mEff = cfg.margin * (1 + cfg.skew * util);
-  const feeRate = venue === 'polymarket' ? POLY_MAKER_RATE : kalshiMakerRate(legs.map(() => ({ league: 'nfl' })));
+  const feeRate = venue === 'polymarket' ? polyComboMakerRate(opts.at) : kalshiMakerRate(legs.map(() => ({ league: 'nfl' })));
   // Maker fee on NFL-only Kalshi combos is 0; keep the term so a non-zero rate cannot be forgotten.
   const feeAdj = feeRate ? feeRate * fair * (1 - fair) : 0;
   const yTarget = targetPrice(fair + feeAdj, mEff, cfg.marginMode);

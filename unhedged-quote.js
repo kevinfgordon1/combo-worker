@@ -11,17 +11,21 @@
 // NFL: SEA ask 0.63 + θ=0.07 → −183; NE ask 0.39 + θ=0.07 → +146.
 // Mid 0.625 / 0.385 → −179 / +149, which is wrong vs the live book.
 //
-// Combo WRAP (unchanged, Combos row is separate): NFL-only maker 0;
-// MLB/NCAAF/mixed 0.035*p*(1-p). Polymarket maker 0, no rebate. Then
+// Combo WRAP (Combos row is separate): NFL-only maker 0;
+// MLB/NCAAF/mixed 0.035*p*(1-p). Polymarket combo maker is polyComboMakerRate
+// (0 before 2026-11-14T05:00:00Z, else 0.03), no rebate. Then
 // 1.05 * net_cost, first penny up.
 // annotateLegOdds writes per-leg blotter fields from opponentQuotes:
 // fair_american (invert), kalshi/poly/best opponent Americans. Null if missing.
 'use strict';
 const { americanFromProb } = require('./engine');
+const { polyComboMakerRate } = require('./poly-combo-fee');
 
 const KALSHI_COMBO_MAKER = 0.035; // Combos row: 50% of Kalshi taker 0.07
 const KALSHI_NFL_MAKER = 0;
-const POLY_MAKER_RATE = 0; // rebates ignored; never bake rebate income into the quote
+// Pre-cutoff combo maker coefficient. Live quotes use polyComboMakerRate(at)
+// ($0 before 2026-11-14T05:00:00Z, else 0.03). Rebates are never credited.
+const POLY_MAKER_RATE = 0;
 const DEFAULT_QUOTE_MULT = 1.05;
 const KALSHI_TAKER_BASE = 0.07;
 const KALSHI_TAKER_THETA = 0.07; // multiplier 1 (NFL / NCAAF / most markets)
@@ -83,8 +87,8 @@ function kalshiMakerRate(legs) {
   return isKalshiNflOnly(legs) ? KALSHI_NFL_MAKER : KALSHI_COMBO_MAKER;
 }
 
-function venueMakerRate(venue, legs) {
-  if (venue === 'polymarket') return POLY_MAKER_RATE;
+function venueMakerRate(venue, legs, at) {
+  if (venue === 'polymarket') return polyComboMakerRate(at);
   if (venue === 'kalshi') return kalshiMakerRate(legs);
   return null;
 }
@@ -264,12 +268,12 @@ function annotateLegOdds(leg, quotes) {
   };
 }
 
-function priceUnhedgedCombo({ venue, legs, getOurTrue, getYesProb, margin = DEFAULT_QUOTE_MULT } = {}) {
+function priceUnhedgedCombo({ venue, legs, getOurTrue, getYesProb, margin = DEFAULT_QUOTE_MULT, at } = {}) {
   const empty = { our_fair_american: null, our_quote_american: null, fairYes: null, quoteYes: null };
   if (!venue || !Array.isArray(legs) || !legs.length) return empty;
   if (typeof getOurTrue !== 'function' && typeof getYesProb !== 'function') return empty;
 
-  const feeRate = venueMakerRate(venue, legs);
+  const feeRate = venueMakerRate(venue, legs, at);
   if (feeRate == null) return empty;
 
   const probs = [];

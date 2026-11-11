@@ -82,8 +82,12 @@ assert.strictEqual(kalshiMakerRate(nflLegs), 0);
 assert.strictEqual(kalshiMakerRate(mlbLegs), 0.035);
 assert.strictEqual(kalshiMakerRate(ncaafLegs), 0.035);
 assert.strictEqual(kalshiMakerRate(mixedLegs), 0.035);
-assert.strictEqual(venueMakerRate('polymarket', mlbLegs), 0);
-assert.strictEqual(venueMakerRate('polymarket', nflLegs), 0);
+const PRE_POLY_MAKER = '2026-11-13T00:00:00Z';
+const POST_POLY_MAKER = '2026-11-14T05:00:00Z';
+assert.strictEqual(venueMakerRate('polymarket', mlbLegs, PRE_POLY_MAKER), 0);
+assert.strictEqual(venueMakerRate('polymarket', nflLegs, PRE_POLY_MAKER), 0);
+assert.strictEqual(venueMakerRate('polymarket', mlbLegs, POST_POLY_MAKER), 0.03);
+assert.strictEqual(venueMakerRate('polymarket', nflLegs, POST_POLY_MAKER), 0.03);
 
 // Kevin: fair 0.10, MLB, fee 0.035*0.1*0.9=0.00315, net=0.10315,
 // quote YES=0.1083 → 0.11 after penny grid.
@@ -165,6 +169,7 @@ function lookup(_venue, key) {
 {
   const poly = priceUnhedgedCombo({
     venue: 'polymarket',
+    at: PRE_POLY_MAKER,
     legs: [
       { league: 'mlb', symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'yes' },
       { league: 'mlb', symbol: 'aec-mlb-bos-pit-2026-08-14-pit', side: 'yes' },
@@ -432,6 +437,7 @@ function lookup(_venue, key) {
 
   const polyInv = priceUnhedgedCombo({
     venue: 'polymarket',
+    at: PRE_POLY_MAKER,
     legs: [
       { league: 'mlb', symbol: 'aec-mlb-wsh-atl-2026-08-14-wsh', side: 'yes' },
       { league: 'mlb', symbol: 'aec-mlb-cws-det-2026-08-14-cws', side: 'yes' },

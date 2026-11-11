@@ -77,6 +77,7 @@ const {
   shouldPostPolymarketQuote,
   shouldConfirmPolymarketAccept,
 } = require('./polymarket-quote');
+const { polyComboMakerFeeForFill } = require('./poly-combo-fee');
 const {
   isPolymarketRfqLive,
   inspectPolymarketCreds,
@@ -789,12 +790,15 @@ function evaluatePolymarketRfq({
     };
   }
 
+  // Same clock as game-start: a replay dated before the combo maker fee stays at $0.
+  const quoteAt = now != null ? now : Date.now();
   const quote = buildPolymarketQuote({
     fillAmerican: parlay.fill_american,
     cashOrderQty: rfq.cashOrderQty,
     qtyDecimal: rfq.qtyDecimal,
     exact: exactTarget,
     tickSize: rfq.tickSize,
+    at: quoteAt,
   });
   if (!shouldPostPolymarketQuote(quote)) {
     return { action: 'skip', reason: 'bad_size', rfq, parlay, quote };
@@ -820,7 +824,7 @@ function evaluatePolymarketRfq({
     isFreeBet: isFreeBetRow(parlay),
     // Price actually sent + credited maker rebate: hit/miss/worst are computed at it, and with
     // POLY_EXACT_TARGET the quote is refused unless price + rebate >= the lock target.
-    polyQuote: { buyPrice: quote.buyPrice, credit: quote.rebateCredit, enforce: quote.exact },
+    polyQuote: { buyPrice: quote.buyPrice, credit: quote.rebateCredit, enforce: quote.exact, at: quoteAt },
   });
   if (!decision.ok) {
     return {
@@ -1091,11 +1095,21 @@ function execYesPrice(ex) {
   return null;
 }
 
+function executionInstant(ex) {
+  const order = (ex && ex.order) || {};
+  return (ex && (ex.transactTime || ex.transact_time || ex.timestamp || ex.eventTime || ex.event_time))
+    || order.transactTime || order.transact_time || order.updateTime || order.updatedTime
+    || order.createdTime || order.created_time
+    || null;
+}
+
 function orderFillEvent(ex, pending, pendingId) {
   const typ = normalizeExecutionType(ex && ex.type);
   const orderId = orderIdFromExecution(ex);
   const quoteId = quoteIdFromExecution(ex) || pendingId || null;
   const contracts = contractsFromExecution(ex, pending);
+  const yesPrice = execYesPrice(ex);
+  const market = pending && (pending.marketTicker || pending.market_ticker || pending.symbol);
   return {
     quoteId,
     orderId: orderId || null,
@@ -1103,8 +1117,13 @@ function orderFillEvent(ex, pending, pendingId) {
     contracts,
     venue: 'polymarket',
     isPartial: typ === 'EXECUTION_TYPE_PARTIAL_FILL',
-    yesPrice: execYesPrice(ex),
-    fee: 0,
+    yesPrice,
+    // Combo RFQ loop only. A single-market slug still pays $0.
+    fee: yesPrice != null
+      ? polyComboMakerFeeForFill({
+        contracts, price: yesPrice, at: executionInstant(ex), market, assumeCombo: true,
+      })
+      : 0,
     rfqId: (pending && pending.rfqId) || rfqIdFromExecution(ex) || null,
     marketTicker: (pending && (pending.marketTicker || pending.market_ticker || pending.symbol)) || null,
     label: pending && pending.label,
@@ -1962,6 +1981,7 @@ function startPolymarketRfqLoop(ctx = {}) {
       outstanding: matched ? outstandingFor(matched.id) : 0,
       startedFor,
       killEngaged: killEngagedFor,
+      now: typeof ctx.now === 'function' ? ctx.now() : Date.now(),
     });
 
     let intakeAgeMs = null;
