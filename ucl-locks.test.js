@@ -271,14 +271,14 @@ assert.strictEqual(identityKey(novigBay), keyOf(`${BAY}:yes`));
 assert.notStrictEqual(identityKey(novigBay), keyOf(`${MUN}:yes`));
 
 // Hedge is No on the same contract. Fees stay the inverse-bet rates:
-// Kalshi taker 0.07*P*(1-P), Polymarket US 0.0695*P*(1-P), Novig $0 pregame,
+// Kalshi taker 0.07*P*(1-P), Polymarket US 0.095*P*(1-P), Novig $0 pregame,
 // ProphetX 2% of net winnings. Maker fee is the KXUCLGAME series rate.
 assert.strictEqual(SL.KALSHI_TAKER_K, 0.07);
-assert.strictEqual(SL.POLY_TAKER_THETA, 0.0695);
+assert.strictEqual(SL.POLY_TAKER_THETA, 0.095);
 assert.strictEqual(seriesOfTicker(`${PSG}:yes`), 'KXUCLGAME');
 assert.strictEqual(seriesOfTicker('caoc-ucl'), null);
 const kalshiFee = (p) => 0.07 * p * (1 - p);
-const polyFee = (p) => 0.0695 * p * (1 - p);
+const polyFee = (p) => 0.095 * p * (1 - p);
 const noAsk = 0.45;
 const oppYes = 0.20;
 const fair = 1 - (noAsk + kalshiFee(noAsk));

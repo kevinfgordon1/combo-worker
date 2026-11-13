@@ -67,7 +67,7 @@ const promo = createNoBoostShadow({ book, env: { ...env, NOBOOST_FAIR_METHOD: 'p
 const rows = [];
 const run = createPaperRun({ book, primary, lockcf, promo, margin: 0.1, persist: (r, k) => k !== 'patch' && rows.push(r) });
 const keys = ['KXNFLGAME-26OCT04ARINYG-ARI:yes', 'KXNFLGAME-26OCT04DENSF-DEN:yes'];
-const rfq = (id) => ({ rfqId: id, marketTicker: `KXMVE-${id}`, legKeys: keys, contracts: 20, createdMs: Date.now() });
+const rfq = (id) => ({ rfqId: id, marketTicker: `KXMVECROSSCATEGORY0-${id}`, legKeys: keys, contracts: 20, createdMs: Date.now() });
 
 // no sportsbook feed yet => promo cannot price (never invents), others still quote
 let r0 = run.onRfq(rfq('n0'));
@@ -91,9 +91,9 @@ assert.ok(lines.some((l) => /\[NOBOOST\]\[PROMO\] WOULD_QUOTE/.test(l) && /promo
 // decision stays in-memory fast
 assert.ok(r1.decision_ms < 50);
 
-// win/fill/row for the third variant
+// Win/fill must be strictly after seen_ms; avoid a same-millisecond fixture race.
 const r2 = run.onRfq(rfq('n2'));
-run.onTrade({ id: 'p1', ticker: 'KXMVE-n2', yes: Math.min(0.99, r2.promo.quoteYes + 0.05), count: 20, takerSide: 'yes', ms: Date.now() });
+run.onTrade({ id: 'p1', ticker: 'KXMVECROSSCATEGORY0-n2', yes: Math.min(0.99, r2.promo.quoteYes + 0.05), count: 20, takerSide: 'yes', ms: r2.seen_ms + 1 });
 assert.strictEqual(r2.promo.beat, 'win'); assert.strictEqual(r2.promo.fill, true);
 assert.ok(r2.promo.position.ev_vs_promo > 0 && r2.promo.position.caps_ok);
 assert.ok(promo.risk.total() > 0);

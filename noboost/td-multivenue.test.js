@@ -24,13 +24,13 @@ tb.setNames([{ ticker: HENRY, title: 'Derrick Henry: 1+ touchdowns' }, { ticker:
 tb.ingest([{ ticker: HENRY, orderbook_fp: { yes_dollars: [['0.53', '5000']], no_dollars: [['0.44', '5000']] } }]);
 const row = (o) => ({ market: o.market, player: o.player, team: o.team || '', away: o.away || 'Baltimore Ravens', home: o.home || 'Cleveland Browns',
   start: '2026-10-18T17:00:00Z', live: false, yes: o.yes, no: o.no, fee_coefficient: o.coef, updated_at: new Date(now).toISOString(), confirmed_at: new Date(now).toISOString() });
-// Polymarket: no ask 0.44 (+0.0695 fee) -> cheaper NO than Kalshi 0.47+0.07 fee.
-tb.ingestVenue('polymarket', [row({ market: 'pm-henry', player: 'Derrick Henry', team: 'BAL', coef: 0.0695, yes: [{ odds: 0.58, size: 5000 }], no: [{ odds: 0.44, size: 5000 }] })], { polledAt: now });
+// Polymarket: no ask 0.44 (+0.095 fee) -> cheaper NO than Kalshi 0.47+0.07 fee.
+tb.ingestVenue('polymarket', [row({ market: 'pm-henry', player: 'Derrick Henry', team: 'BAL', coef: 0.095, yes: [{ odds: 0.58, size: 5000 }], no: [{ odds: 0.44, size: 5000 }] })], { polledAt: now });
 // Novig: no ask 0.46, no fee pregame, but thin YES side -> dropped for depth.
 tb.ingestVenue('novig', [row({ market: 'nv-henry', player: 'Derrick Henry', coef: 0.06, yes: [{ odds: 0.57, size: 10 }], no: [{ odds: 0.46, size: 5000 }] })], { polledAt: now });
 
 let m = tb.legMulti({ id: HENRY, side: 'yes' });
-const kNo = 0.47 + 0.07 * 0.47 * 0.53; const pNo = 0.44 + 0.0695 * 0.44 * 0.56;
+const kNo = 0.47 + 0.07 * 0.47 * 0.53; const pNo = 0.44 + 0.095 * 0.44 * 0.56;
 assert.strictEqual(m.best, 'polymarket');
 assert(Math.abs(m.p - (1 - pNo)) < 1e-9);
 const by = Object.fromEntries(m.sources.map((s) => [s.venue, s]));

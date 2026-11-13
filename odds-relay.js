@@ -19,9 +19,6 @@ const prophetxFeed = require('./prophetx-feed');
 const US_WS_URL = 'wss://api.polymarket.us/v1/ws/markets';
 const US_WS_PATH = '/v1/ws/markets';
 const US_GATEWAY = 'https://gateway.polymarket.us';
-const CLOB_WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
-const POLY_GAMMA = 'https://gamma-api.polymarket.com';
-const POLY_CLOB = 'https://clob.polymarket.com';
 const KALSHI_REST = 'https://api.elections.kalshi.com/trade-api/v2';
 const KALSHI_WS_URL = 'wss://external-api-ws.kalshi.com/trade-api/ws/v2';
 const KALSHI_WS_SIGN_PATH = '/trade-api/ws/v2';
@@ -1729,138 +1726,7 @@ function startPolymarketUs(state, deps) {
   };
 }
 
-function startClob(state, deps) {
-  const fetchFn = (deps && deps.fetchFn) || fetch;
-  const WS = loadWebSocket(deps);
-  let stopped = false;
-  let ws = null;
-  let ping = null;
-  let retry = null;
-  let backoff = 1000;
-  const catalog = new Map();
-  const levelBooks = new Map();
-  let entries = [];
-
-  const put = (quotes, mode) => {
-    for (const [league, group] of groupByLeague(quotes)) {
-      publish(state, 'polymarket', league, group, mode, 'clob');
-    }
-  };
-
-  const discover = async () => {
-    const next = [];
-    const now = Date.now();
-    for (const league of LEAGUES) {
-      if (!POLY_SERIES[league]) continue; // NBA: Polymarket US only (no international series)
-      const url = `${POLY_GAMMA}/events?series_id=${POLY_SERIES[league]}&active=true&closed=false&limit=50&order=startTime&ascending=true`;
-      const listed = await fetchJson(fetchFn, url, { timeoutMs: 8000 });
-      const events = Array.isArray(listed.body) ? listed.body : [];
-      for (const ev of events) {
-        if (!eventInWindow(ev, now)) continue;
-        next.push(...clobEntriesFromEvent(ev, league));
-      }
-    }
-    entries = next.slice(0, 400);
-    catalog.clear();
-    for (const entry of entries) catalog.set(entry.tokenId, entry);
-  };
-
-  const priceRest = async () => {
-    if (!entries.length) return;
-    const fetchedAt = Date.now();
-    const res = await fetchJson(fetchFn, `${POLY_CLOB}/books`, {
-      method: 'POST',
-      timeoutMs: 8000,
-      body: JSON.stringify(entries.map((entry) => ({ token_id: entry.tokenId }))),
-    });
-    const body = res && res.body;
-    const books = Array.isArray(body) ? body : (body && body.books) || [];
-    const quotes = [];
-    for (const book of books) {
-      const id = String(book && (book.asset_id || book.token_id) || '');
-      const entry = catalog.get(id);
-      if (!entry) continue;
-      const stateBook = levelBooks.get(id) || emptyPolymarketBook();
-      const ask = applyPolymarketBookSnapshot(stateBook, book);
-      stateBook.ts = epochMs(book.timestamp) || fetchedAt;
-      levelBooks.set(id, stateBook);
-      const quote = clobQuoteFromAsk(entry, ask, book.timestamp || fetchedAt);
-      if (quote) quotes.push(quote);
-    }
-    put(quotes, 'rest');
-  };
-
-  const openWs = () => {
-    if (stopped || !entries.length) return;
-    try { if (ws && ws.close) ws.close(); } catch (_) { /* ignore */ }
-    ws = new WS(CLOB_WS_URL);
-    ws.on('open', () => {
-      if (stopped) return;
-      backoff = 1000;
-      state.status.clob = 'up';
-      try {
-        ws.send(JSON.stringify({
-          assets_ids: entries.map((entry) => entry.tokenId),
-          type: 'market',
-          custom_feature_enabled: true,
-        }));
-      } catch (_) { /* closing */ }
-      if (ping) clearInterval(ping);
-      ping = setInterval(() => {
-        try { ws.send('PING'); } catch (_) { /* closing */ }
-      }, 10000);
-    });
-    ws.on('message', (data) => {
-      const text = String(data);
-      if (!text || text === 'PONG') return;
-      let parsed;
-      try { parsed = JSON.parse(text); } catch (_) { return; }
-      const applied = applyPolymarketStreamMessage(levelBooks, parsed);
-      if (!applied.length) return;
-      const quotes = [];
-      for (const row of applied) {
-        const entry = catalog.get(row.assetId);
-        const quote = entry && clobQuoteFromAsk(entry, row.bestAsk, row.ts);
-        if (quote) quotes.push(quote);
-      }
-      if (quotes.length) put(quotes, 'ws');
-    });
-    const reopen = () => {
-      state.status.clob = 'down';
-      if (ping) clearInterval(ping);
-      ping = null;
-      if (stopped || retry) return;
-      retry = setTimeout(() => {
-        retry = null;
-        if (!stopped) openWs();
-      }, backoff);
-      backoff = Math.min(backoff * 2, 15000);
-    };
-    ws.on('close', reopen);
-    ws.on('error', reopen);
-  };
-
-  const loop = async () => {
-    while (!stopped) {
-      try {
-        await discover();
-        if (!ws || ws.readyState === 2 || ws.readyState === 3) openWs();
-        await priceRest();
-      } catch (_) {
-        state.status.clob = state.status.clob === 'up' ? 'up' : 'down';
-      }
-      if (stopped) break;
-      await sleep(10000, () => stopped);
-    }
-  };
-  loop();
-  return () => {
-    stopped = true;
-    if (retry) clearTimeout(retry);
-    if (ping) clearInterval(ping);
-    try { if (ws && ws.close) ws.close(); } catch (_) { /* ignore */ }
-  };
-}
+function startClob() { return () => {}; } // International source removed: US only.
 
 const espnCache = new Map();
 
@@ -5470,7 +5336,6 @@ function startOddsRelay(opts = {}) {
       console.log('[odds-relay] polymarket us off (no POLYMARKET_KEY_ID). International CLOB is the book.');
     }
     stops.push(startPolymarketUs(state, opts));
-    stops.push(startClob(state, opts));
     stops.push(startKalshi(state, opts));
     stops.push(startNovig(state, opts, env));
     stops.push(startProphetX(state, opts, env));

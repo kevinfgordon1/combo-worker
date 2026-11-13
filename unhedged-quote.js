@@ -3,7 +3,7 @@
 // probs (honor yes/no). Inverse (opponent MLs): convert opponent YES to a
 // fee-included American using the *series taker* coeff (hitting the ask =
 // taker). Kalshi 2026-09-02: KXMLBGAME multiplier 0.5 → θ=0.035; KXNFLGAME
-// and KXNCAAFGAME multiplier 1 → θ=0.07. Polymarket US taker Θ=0.06 (ignore
+// and KXNCAAFGAME multiplier 1 → θ=0.07. Polymarket US taker Θ=0.095 (ignore
 // maker rebate). Best opponent American across Kalshi vs Poly, then sign-flip.
 // Kevin: Mariners 45¢ on KXMLBGAME → 0.035×0.45×0.55 ≈ 0.0087 → 0.4587 →
 // +118, invert Sox −118. Full 0.07 haircut to +114 is wrong for MLB GAME.
@@ -30,7 +30,7 @@ const DEFAULT_QUOTE_MULT = 1.05;
 const KALSHI_TAKER_BASE = 0.07;
 const KALSHI_TAKER_THETA = 0.07; // multiplier 1 (NFL / NCAAF / most markets)
 const KALSHI_MLB_TAKER_THETA = 0.035; // KXMLBGAME 0.5 × 0.07
-const POLY_TAKER_THETA = 0.06; // docs.polymarket.us/fees taker Θ; ignore rebate
+const POLY_TAKER_THETA = require('./fee-config.json').polymarketUsTakerCoefficient; // docs.polymarket.us/fees taker Θ; ignore rebate
 
 // Captured kalshi.com/fee-schedule 2026-09-02 + series API fee_multiplier.
 // Do not invent a third sport: only these GAME moneylines.
@@ -83,13 +83,13 @@ function isKalshiNflOnly(legs) {
   return legs.every((leg) => String(leg && leg.league || '').toLowerCase() === 'nfl');
 }
 
-function kalshiMakerRate(legs) {
-  return isKalshiNflOnly(legs) ? KALSHI_NFL_MAKER : KALSHI_COMBO_MAKER;
+function kalshiMakerRate(seriesOrTicker) {
+  return require('./kalshi-fee-core').fallbackMakerRate(seriesOrTicker);
 }
 
-function venueMakerRate(venue, legs, at) {
+function venueMakerRate(venue, seriesOrTicker, at) {
   if (venue === 'polymarket') return polyComboMakerRate(at);
-  if (venue === 'kalshi') return kalshiMakerRate(legs);
+  if (venue === 'kalshi') return kalshiMakerRate(seriesOrTicker);
   return null;
 }
 
@@ -167,7 +167,7 @@ function kalshiTakerTheta(seriesOrTicker) {
   if (raw === 'nfl' || raw === 'ncaaf') return KALSHI_TAKER_THETA;
   const series = kalshiSeriesTicker(seriesOrTicker);
   const mult = KALSHI_SERIES_TAKER_MULTIPLIER[series];
-  if (mult == null) return KALSHI_TAKER_THETA;
+  if (mult == null) return require('./kalshi-fee-core').takerRateFromSeries(null, null, series);
   return KALSHI_TAKER_BASE * mult;
 }
 
@@ -268,12 +268,12 @@ function annotateLegOdds(leg, quotes) {
   };
 }
 
-function priceUnhedgedCombo({ venue, legs, getOurTrue, getYesProb, margin = DEFAULT_QUOTE_MULT, at } = {}) {
+function priceUnhedgedCombo({ venue, legs, getOurTrue, getYesProb, margin = DEFAULT_QUOTE_MULT, at, ticker, series } = {}) {
   const empty = { our_fair_american: null, our_quote_american: null, fairYes: null, quoteYes: null };
   if (!venue || !Array.isArray(legs) || !legs.length) return empty;
   if (typeof getOurTrue !== 'function' && typeof getYesProb !== 'function') return empty;
 
-  const feeRate = venueMakerRate(venue, legs, at);
+  const feeRate = venueMakerRate(venue, ticker || series, at);
   if (feeRate == null) return empty;
 
   const probs = [];

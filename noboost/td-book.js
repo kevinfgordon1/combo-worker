@@ -19,7 +19,7 @@
 // Multi-venue inverse (Combo Sniper pm_inverse, legMulti): the same inverse bet, the same
 // $500 depth, 15% overround and 15s staleness rules, applied to EACH venue on its own:
 //   kalshi      the public orderbooks above (fee 0.07·p·(1−p))
-//   polymarket  Polymarket US book from the odds relay's US markets socket (/td), fee 0.0695·p·(1−p)
+//   polymarket  Polymarket US book from the odds relay's US markets socket (/td), fee 0.095·p·(1−p)
 //   novig       Novig book from the relay's signed Novig socket (/td), no fee pregame
 //               (fee.coefficient·p·(1−p) once the game is live)
 // A venue that is missing, older than staleMs, short of $500 on either side, or over the
@@ -36,7 +36,7 @@ const DEPTH_USD = 500;
 const TD_RE = /^KXNFLTD-([0-9]{2}[A-Z]{3}[0-9]{2}[A-Z]+)-([A-Z0-9]+)-1$/;
 
 const fee = (p) => THETA * p * (1 - p);
-const POLY_THETA = 0.0695;
+const POLY_THETA = require('../fee-config.json').polymarketUsTakerCoefficient;
 // levels: [[askPrice, contracts], ...] best (cheapest) first. VWAP of fee-included cost until the
 // bet can WIN $usd (depth = potential PROFIT, not stake — Kevin). availUsd is profit $; topUsd
 // stays the $ stake at the top level (display only).
@@ -99,8 +99,8 @@ function venueGameKeys(away, home, start) {
   return [`${d}|${codes}`, `${shift(-1)}|${codes}`, `${shift(1)}|${codes}`];
 }
 const VENUE_FEE = {
-  polymarket: (coef) => { const c = Number.isFinite(Number(coef)) && Number(coef) > 0 ? Number(coef) : POLY_THETA; return (p) => c * p * (1 - p); },
-  novig: (coef, live) => (live && Number(coef) > 0 ? (p) => Number(coef) * p * (1 - p) : () => 0),
+  polymarket: (coef) => { const c = POLY_THETA; return (p) => c * p * (1 - p); },
+  novig: (coef, live) => (live ? (p) => (coef != null && Number(coef)>=0 ? Number(coef) : require('../fee-config.json').novigLiveCoefficient)*p*(1-p) : () => 0),
   prophetx: () => () => 0, // relay folds ProphetX's 2% commission into the level price
 };
 const american = (p) => (p > 0 && p < 1 ? (p >= 0.5 ? -Math.round((100 * p) / (1 - p)) : Math.round((100 * (1 - p)) / p)) : null);

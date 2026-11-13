@@ -1,3 +1,4 @@
+const { isPolyComboTicker } = require('./poly-combo-classifier');
 'use strict';
 const { fillView } = require('./engine');
 const { shortId } = require('./short-id');
@@ -351,7 +352,7 @@ function isPolyishFill(row) {
   const id = String(row.fill_id || '');
   const src = String((row.raw && row.raw.source) || row.source || '');
   const ticker = String(row.ticker || '');
-  return id.startsWith('poly-') || src.startsWith('poly-') || /^caoc-/i.test(ticker);
+  return id.startsWith('poly-') || src.startsWith('poly-') || isPolyComboTicker(ticker);
 }
 
 // Real Kalshi portfolio trade (trade_id / count_fp payload). Not a live-runner

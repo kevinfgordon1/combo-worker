@@ -38,7 +38,7 @@ let f = book.legFair(GID, 'IND');
 assert.ok(f.p > 0.66 && f.p < 0.71, JSON.stringify(f)); assert.ok(/^kalshi/.test(f.best));
 // Polymarket US: identity from the slug; aec-nba-dal-ind :no = IND side... here :yes = DAL (first slug team)
 assert.strictEqual(book.ingestRelay('polymarket', [{ bet_type: 'moneyline', feed: 'polymarket-us', side: 'Mavericks', odds: 0.25, token_id: 'us:aec-nba-dal-ind-2026-10-23:yes', start: '2026-10-23T23:00:00Z', updated_at: new Date(t).toISOString(), depth: [{ odds: 0.25, size: 100000 }] }]), 1);
-f = book.legFair(GID, 'IND'); assert.strictEqual(f.best, 'polymarket'); assert.ok(Math.abs(f.p - (1 - (0.25 + 0.0695 * 0.25 * 0.75))) < 1e-9);
+f = book.legFair(GID, 'IND'); assert.strictEqual(f.best, 'polymarket'); assert.ok(Math.abs(f.p - (1 - (0.25 + 0.095 * 0.25 * 0.75))) < 1e-9);
 // slug/name disagreement => ignored
 assert.strictEqual(book.ingestRelay('polymarket', [{ bet_type: 'moneyline', feed: 'polymarket-us', side: 'Pacers', odds: 0.1, token_id: 'us:aec-nba-dal-ind-2026-10-23:yes', start: '2026-10-23T23:00:00Z', updated_at: new Date(t).toISOString(), depth: [{ odds: 0.1, size: 1e6 }] }]), 0);
 // Novig (full names, $0 pregame fee) cheaper => best

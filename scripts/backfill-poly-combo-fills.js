@@ -20,6 +20,7 @@
 // Optional: BACKFILL_DRY_RUN=1
 // Does not deploy.
 'use strict';
+const { isPolyComboTicker } = require('../poly-combo-classifier');
 const { createClient } = require('@supabase/supabase-js');
 const { createPolymarketHttp } = require('../polymarket-client');
 const { liveRunnerFillRow, claimFillKey } = require('../fills-attr');
@@ -91,7 +92,7 @@ async function loadLocks(supabase, cutoff) {
   const ids = new Set(uniqueIds(quotedQ.data, 'parlay_id'));
   for (const row of fillQ.data || []) {
     const venue = row && row.raw && row.raw.venue;
-    if (row && row.parlay_id && (venue === 'polymarket' || (row.ticker && /^caoc-/i.test(row.ticker)))) {
+    if (row && row.parlay_id && (venue === 'polymarket' || (row.ticker && isPolyComboTicker(row.ticker)))) {
       ids.add(row.parlay_id);
     }
   }

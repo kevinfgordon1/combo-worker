@@ -15,7 +15,7 @@
 //   • trade ids are deduped (WS and REST overlap on purpose);
 //   • closed with no print ⇒ outcome 'accepted_not_filled' (or 'no_trade' when the close status
 //     says cancelled / expired, or it never closed).
-// Printed prices EXCLUDE fees (Polymarket combo taker fee C·p·[0.0695(1−p) + 0.06(1−p)^4] is charged
+// Printed prices EXCLUDE fees (Polymarket combo taker fee C·p·[0.095(1−p) + 0.06(1−p)^4] is charged
 // on top; combo makers pay $0 and get no rebate).
 'use strict';
 const { classifyNfl } = require('./shadow');
@@ -23,7 +23,7 @@ const { americanFromProb } = require('./quote');
 const { createTtlSet } = require('./ttl-set');
 const { legFairsWithInverse } = require('./leg-fairs');
 
-const POLY_COMBO_TAKER = 0.0695;
+const POLY_COMBO_TAKER = require('../fee-config.json').polymarketUsTakerCoefficient;
 const POLY_COMBO_TAKER_TAIL = 0.06;
 /** Polymarket US combo taker fee per contract at combo price p (docs.polymarket.us/fees, Combo Taker Fees). */
 function polyComboTakerFee(p) { return p > 0 && p < 1 ? p * (POLY_COMBO_TAKER * (1 - p) + POLY_COMBO_TAKER_TAIL * (1 - p) ** 4) : null; }

@@ -31,7 +31,7 @@ assert.strictEqual(seriesOfTicker(null), null);
   let calls = 0;
   const ok = (body) => ({ ok: true, status: 200, json: async () => body });
   const c = createSeriesFeeCache({ fetchImpl: async (u) => { calls++; if (u.includes('KXMVECROSSCATEGORY0')) return ok({ series: { fee_type: 'quadratic', fee_multiplier: 1 } }); if (u.includes('BROKEN')) return { ok: false, status: 503 }; return ok({ series: { fee_type: 'quadratic_with_combo_maker_fees', fee_multiplier: 1 } }); } });
-  assert.strictEqual(c.rateForTicker('KXMVECROSSCATEGORY0-X-Y'), FALLBACK_MAKER_RATE); // cold → conservative
+  assert.strictEqual(c.rateForTicker('KXMVECROSSCATEGORY0-X-Y'), 0); // cold → conservative
   await c.prefetchTickers(['KXMVECROSSCATEGORY0-X-Y', 'KXMVECROSSCATEGORY-A-B', 'BROKEN-1']);
   assert.strictEqual(c.rateForTicker('KXMVECROSSCATEGORY0-Z'), 0);
   assert.strictEqual(c.rateForTicker('KXMVECROSSCATEGORY-Z'), 0.035);

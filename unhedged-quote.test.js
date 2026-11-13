@@ -43,7 +43,7 @@ assert.strictEqual(KALSHI_COMBO_MAKER, 0.035);
 assert.strictEqual(POLY_MAKER_RATE, 0);
 assert.strictEqual(KALSHI_TAKER_THETA, 0.07);
 assert.strictEqual(KALSHI_MLB_TAKER_THETA, 0.035);
-assert.strictEqual(POLY_TAKER_THETA, 0.06);
+assert.strictEqual(POLY_TAKER_THETA, 0.095);
 assert.strictEqual(KALSHI_SERIES_TAKER_MULTIPLIER.KXMLBGAME, 0.5);
 assert.strictEqual(KALSHI_SERIES_TAKER_MULTIPLIER.KXNFLGAME, 1);
 assert.strictEqual(KALSHI_SERIES_TAKER_MULTIPLIER.KXNCAAFGAME, 1);
@@ -55,7 +55,7 @@ assert.strictEqual(kalshiTakerTheta('KXNCAAFGAME'), 0.07);
 assert.strictEqual(kalshiTakerTheta('ncaaf'), 0.07);
 assert.strictEqual(takerThetaForVenue('kalshi', 'KXMLBGAME'), 0.035);
 assert.strictEqual(takerThetaForVenue('kalshi', 'KXNFLGAME'), 0.07);
-assert.strictEqual(takerThetaForVenue('polymarket'), 0.06);
+assert.strictEqual(takerThetaForVenue('polymarket'), 0.095);
 
 const nflLegs = [
   { league: 'nfl', ticker: 'KXNFLGAME-A-KC', side: 'yes' },
@@ -78,7 +78,7 @@ assert.strictEqual(isKalshiNflOnly(nflLegs), true);
 assert.strictEqual(isKalshiNflOnly(mlbLegs), false);
 assert.strictEqual(isKalshiNflOnly(ncaafLegs), false);
 assert.strictEqual(isKalshiNflOnly(mixedLegs), false);
-assert.strictEqual(kalshiMakerRate(nflLegs), 0);
+assert.strictEqual(kalshiMakerRate(nflLegs), 0.035);
 assert.strictEqual(kalshiMakerRate(mlbLegs), 0.035);
 assert.strictEqual(kalshiMakerRate(ncaafLegs), 0.035);
 assert.strictEqual(kalshiMakerRate(mixedLegs), 0.035);
@@ -135,7 +135,7 @@ function lookup(_venue, key) {
 }
 
 {
-  const nfl = priceUnhedgedCombo({ venue: 'kalshi', legs: nflLegs, getYesProb: lookup });
+  const nfl = priceUnhedgedCombo({ venue: 'kalshi', legs: nflLegs, ticker:'KXMVECROSSCATEGORY0-X', getYesProb: lookup });
   assert.strictEqual(nfl.fairYes, 0.25);
   assert.strictEqual(nfl.quoteYes, 0.27);
   assert.strictEqual(nfl.feeRate, 0);
@@ -145,7 +145,7 @@ function lookup(_venue, key) {
 }
 
 {
-  const mlb = priceUnhedgedCombo({ venue: 'kalshi', legs: mlbLegs, getYesProb: lookup });
+  const mlb = priceUnhedgedCombo({ venue: 'kalshi', ticker: 'KXMVECROSSCATEGORY-X', legs: mlbLegs, getYesProb: lookup });
   assert.strictEqual(mlb.fairYes, 0.25);
   assert.strictEqual(mlb.quoteYes, 0.27);
   assert.strictEqual(mlb.feeRate, 0.035);
@@ -155,14 +155,14 @@ function lookup(_venue, key) {
 }
 
 {
-  const ncaaf = priceUnhedgedCombo({ venue: 'kalshi', legs: ncaafLegs, getYesProb: lookup });
+  const ncaaf = priceUnhedgedCombo({ venue: 'kalshi', ticker: 'KXMVECROSSCATEGORY-X', legs: ncaafLegs, getYesProb: lookup });
   assert.strictEqual(ncaaf.feeRate, 0.035);
   assert.ok(Math.abs(ncaaf.fairYes - 0.1) < 1e-12);
   assert.strictEqual(ncaaf.quoteYes, 0.11);
 }
 
 {
-  const mixed = priceUnhedgedCombo({ venue: 'kalshi', legs: mixedLegs, getYesProb: lookup });
+  const mixed = priceUnhedgedCombo({ venue: 'kalshi', ticker: 'KXMVECROSSCATEGORY-X', legs: mixedLegs, getYesProb: lookup });
   assert.strictEqual(mixed.feeRate, 0.035);
 }
 
@@ -186,8 +186,7 @@ function lookup(_venue, key) {
 
 {
   const noSide = priceUnhedgedCombo({
-    venue: 'kalshi',
-    legs: [
+    venue: 'kalshi', legs: [
       { league: 'mlb', ticker: 'KXMLBGAME-A-CWS', side: 'no' },
       { league: 'mlb', ticker: 'KXMLBGAME-B-PIT', side: 'yes' },
     ],
@@ -198,8 +197,7 @@ function lookup(_venue, key) {
 
 {
   const missing = priceUnhedgedCombo({
-    venue: 'kalshi',
-    legs: mlbLegs,
+    venue: 'kalshi', legs: mlbLegs,
     getYesProb: (_v, key) => (key === 'KXMLBGAME-A-CWS' ? 0.5 : null),
   });
   assert.strictEqual(missing.our_fair_american, null);
@@ -207,7 +205,7 @@ function lookup(_venue, key) {
 }
 
 {
-  const noLookup = priceUnhedgedCombo({ venue: 'kalshi', legs: mlbLegs });
+  const noLookup = priceUnhedgedCombo({ venue: 'kalshi', ticker: 'KXMVECROSSCATEGORY-X', legs: mlbLegs });
   assert.strictEqual(noLookup.our_fair_american, null);
   assert.strictEqual(noLookup.our_quote_american, null);
 }
@@ -415,8 +413,7 @@ function lookup(_venue, key) {
   const wshOur = ourTrueFromOpponentYes(0.42, KALSHI_MLB_TAKER_THETA);
   const cwsOur = ourTrueFromOpponentYes(0.50, KALSHI_MLB_TAKER_THETA);
   const inverse = priceUnhedgedCombo({
-    venue: 'kalshi',
-    legs: [
+    venue: 'kalshi', legs: [
       { league: 'mlb', ticker: 'KXMLBGAME-WSHATL-WSH', side: 'yes' },
       { league: 'mlb', ticker: 'KXMLBGAME-CWSDET-CWS', side: 'yes' },
     ],
@@ -428,9 +425,7 @@ function lookup(_venue, key) {
   assert.ok(inverse.netCost > inverse.fairYes);
 
   const nflInv = priceUnhedgedCombo({
-    venue: 'kalshi',
-    legs: nflLegs,
-    getOurTrue: () => 0.5,
+    venue: 'kalshi', legs: nflLegs, ticker:'KXMVECROSSCATEGORY0-X', getOurTrue: () => 0.5,
   });
   assert.strictEqual(nflInv.feeRate, 0);
   assert.strictEqual(nflInv.netCost, 0.25);
@@ -448,8 +443,7 @@ function lookup(_venue, key) {
   assert.ok(polyInv.netCost !== 0.25 - (0.0125 * 0.25 * 0.75));
 
   const noSideInv = priceUnhedgedCombo({
-    venue: 'kalshi',
-    legs: [
+    venue: 'kalshi', legs: [
       { league: 'mlb', ticker: 'KXMLBGAME-WSHATL-WSH', side: 'no' },
       { league: 'mlb', ticker: 'KXMLBGAME-CWSDET-CWS', side: 'yes' },
     ],
@@ -460,8 +454,7 @@ function lookup(_venue, key) {
 
 {
   const missingOpp = priceUnhedgedCombo({
-    venue: 'kalshi',
-    legs: mlbLegs,
+    venue: 'kalshi', legs: mlbLegs,
     getOurTrue: () => null,
   });
   assert.strictEqual(missingOpp.our_fair_american, null);

@@ -288,9 +288,9 @@ function createSingleLegRunner({
       const asks = await asksFor('kalshi', h.ticker, h.side);
       const rest = SL.restCost(lockCost, asks, 0.01);
       return {
-        venue, market: h.ticker, side: h.side, tick: 0.01, makerK: k, takerK: SL.KALSHI_TAKER_K,
+        venue, market: h.ticker, side: h.side, tick: 0.01, makerK: k, takerK: seriesFees && typeof seriesFees.takerRateForTicker === 'function' ? seriesFees.takerRateForTicker(leg.ticker) : require('./kalshi-fee-core').takerRateFromSeries(null, null, leg.ticker),
         target, lockCost, restCost: rest, asks,
-        take: asks ? SL.takePlan(asks, target, SL.KALSHI_TAKER_K, Infinity) : null,
+        take: asks ? SL.takePlan(asks, target, seriesFees && typeof seriesFees.takerRateForTicker === 'function' ? seriesFees.takerRateForTicker(leg.ticker) : require('./kalshi-fee-core').takerRateFromSeries(null, null, leg.ticker), Infinity) : null,
       };
     }
     const pm = await polyMarketFor(leg);

@@ -60,7 +60,7 @@ assert.strictEqual(cashBig.reason, 'rfq_too_large');
 // small cash RFQ fits
 const cashOk = ev({ id: 'e', cashOrderQty: '10' });
 assert.strictEqual(cashOk.action, 'quoteable');
-assert.strictEqual(cashOk.decision.contracts, 41.84); // venue size: 41.84 × 0.222 + $0.71 taker fee ≤ $10
+assert.strictEqual(cashOk.decision.contracts, 41.10); // venue size: 41.10 × 0.222 + $0.71 taker fee ≤ $10
 
 // No per-fill hedge-mode limit (Kevin Nov 4 2026): only the user's cap (remaining) limits size.
 const bigCap = { ...lock, max_contracts: 100000 };
@@ -125,8 +125,8 @@ assert.strictEqual(acceptedVenueQty({ quote: {} }, 'SIDE_BUY'), 0);
     const out2 = await loop.handleQuoteAccepted({ quote: { id: 'q-cash-big', rfqId: 'r2', acceptedSide: 'SIDE_BUY' } });
     assert.strictEqual(out2.confirmed, false);
     assert.strictEqual(out2.reason, 'cap_exceeded');
-    // $100 cash at 0.222: the venue creates 418.6 (C·p + taker fee ≤ $100), still far over the 116 cap
-    assert.strictEqual(maxPolymarketFillSize({ contracts: 100, cashOrderQty: 100, buyPrice: '0.2220' }, null), 418.6);
+    // $100 cash at 0.222: the venue creates 411.03 (C·p + taker fee ≤ $100), still far over the 116 cap
+    assert.strictEqual(maxPolymarketFillSize({ contracts: 100, cashOrderQty: 100, buyPrice: '0.2220' }, null), 411.03);
 
     // a quote that fits (venue size == ours <= remaining) confirms
     pending.set('q-fits', { parlayId: 'lk', contracts: 100, maxContracts: 116, rfqId: 'r3', label: lock.label, rfqQty: 100 });

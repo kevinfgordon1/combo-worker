@@ -5,17 +5,17 @@
 const assert = require('assert');
 const Q = require('./polymarket-quote');
 
-const rawFee = (C, p) => C * p * (0.0695 * (1 - p) + 0.06 * (1 - p) ** 4);
+const rawFee = (C, p) => C * p * (0.095 * (1 - p) + 0.06 * (1 - p) ** 4);
 
 // fee: docs.polymarket.us/fees (combo taker, schedule from 2026-10-19 1:00 PM ET), half-even cents
-assert.strictEqual(Q.polyComboTakerFeeDollars(100, 0.25), 1.78);
+assert.strictEqual(Q.polyComboTakerFeeDollars(100, 0.25), 2.26);
 assert.strictEqual(Q.polyComboTakerFeeDollars(0, 0.25), 0);
 assert.strictEqual(Q.polyComboTakerFeeDollars(10, 0), 0);
 assert.strictEqual(Q.polyComboTakerFeeDollars(10, 1), 0);
 
-// REAL Polymarket cash fills (venue-recorded contracts):
-assert.strictEqual(Q.polyCashContracts(5, 0.1471, {}), 31.13); // floor said 33
-assert.strictEqual(Q.polyCashContracts(3, 0.138, {}), 19.86); // floor said 21
+// Tier 1 sizing for historical RFQ cash/price inputs (not historical fill replay):
+assert.strictEqual(Q.polyCashContracts(5, 0.1471, {}), 30.52); // floor said 33
+assert.strictEqual(Q.polyCashContracts(3, 0.138, {}), 19.49); // floor said 21
 
 // largest fitting size on the 0.01 grid, at many prices (+100 … +5000)
 for (let p = 0.02; p < 0.6; p += 0.0137) {
@@ -29,12 +29,12 @@ for (let p = 0.02; p < 0.6; p += 0.0137) {
   }
 }
 // the overstatement is the 7–11% Kevin saw (+300 … +1900)
-for (const [am, lo, hi] of [[300, 0.06, 0.08], [900, 0.09, 0.11], [1900, 0.10, 0.125]]) {
+for (const [am, lo, hi] of [[300, 0.08, 0.095], [900, 0.12, 0.135], [1900, 0.135, 0.145]]) {
   const p = 100 / (am + 100);
   const C = Q.polyCashContracts(100, p, {});
   const over = (100 / p) / C - 1;
   assert.ok(over > lo && over < hi, `+${am}: ${over}`);
-  assert.ok(Math.abs(rawFee(C, p) / (C * p) - (0.0695 * (1 - p) + 0.06 * (1 - p) ** 4)) < 1e-9);
+  assert.ok(Math.abs(rawFee(C, p) / (C * p) - (0.095 * (1 - p) + 0.06 * (1 - p) ** 4)) < 1e-9);
 }
 
 // kill switch restores floor(cash / price)

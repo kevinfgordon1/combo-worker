@@ -93,8 +93,8 @@ const T0 = KICK - 4 * 3600_000;
   assert.strictEqual(netPerContract('kalshi', 0.5, 10, cfg), 0.505);
   // taker 100 @ 50c: 0.07*100*.25 = $1.75
   assert.strictEqual(roundedFee('kalshi', 0.5, 100, cfg, 'taker'), 1.75);
-  // selling 10 @ 40c as Polymarket taker: fee 0.0695*10*.24=0.1668 -> .17
-  assert.strictEqual(takerProceedsPerContract('polymarket', 0.4, 10, cfg), (4 - 0.17) / 10);
+  // selling 10 @ 40c as Polymarket taker: fee 0.095*10*.24=0.228 -> .23
+  assert.strictEqual(takerProceedsPerContract('polymarket', 0.4, 10, cfg), (4 - 0.23) / 10);
   // env override back to zero
   assert.strictEqual(readConfig({ MM_KALSHI_MAKER_COEFF: '0' }).kalshiMakerCoeff, 0);
 }
