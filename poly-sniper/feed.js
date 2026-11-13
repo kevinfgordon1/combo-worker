@@ -20,6 +20,7 @@ const { createLimiter } = require('../sniper/limiter');
 const { ALL_VENUES } = require('../sniper/fair');
 const { createKalshiIndex } = require('./map');
 const { startTdCrosswalkRefresher } = require('./prop-xwalk');
+const { enterTask } = require('../loop-lag');
 
 const ORIGIN = 'https://api.elections.kalshi.com';
 const POLY_GATEWAY = 'https://gateway.polymarket.us';
@@ -242,12 +243,17 @@ function createPolySniperFeed({ env = process.env, log = console.log, fetchImpl 
   }
   async function pollOddsKickoffs() {
     if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) return;
-    const hdr = { apikey: env.SUPABASE_SERVICE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}` };
-    for (const [sport, fn] of [['americanfootball_nfl', oddsKickoffs], ['americanfootball_ncaaf', oddsNcaafKickoffs]]) {
-      if (sport.endsWith('ncaaf') && !ncaafBook) continue;
-      const r = await fetchImpl(`${env.SUPABASE_URL}/rest/v1/odds_cache?sport=eq.${sport}&select=data,fetched_at&order=fetched_at.desc&limit=1`, { headers: hdr });
-      if (r.ok) { const j = await r.json(); kickoffs.setKickoffs(fn(j[0] && j[0].data)); }
-    }
+    // The odds blob is only ~2MB (parse is tens of ms). The label is here so a
+    // future stall during this parse shows up in the loop-lag log.
+    const leave = enterTask('odds-kickoffs');
+    try {
+      const hdr = { apikey: env.SUPABASE_SERVICE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}` };
+      for (const [sport, fn] of [['americanfootball_nfl', oddsKickoffs], ['americanfootball_ncaaf', oddsNcaafKickoffs]]) {
+        if (sport.endsWith('ncaaf') && !ncaafBook) continue;
+        const r = await fetchImpl(`${env.SUPABASE_URL}/rest/v1/odds_cache?sport=eq.${sport}&select=data,fetched_at&order=fetched_at.desc&limit=1`, { headers: hdr });
+        if (r.ok) { const j = JSON.parse(await r.text()); kickoffs.setKickoffs(fn(j[0] && j[0].data)); }
+      }
+    } finally { leave(); }
   }
   const timers = [];
   let stopped = false;

@@ -37,6 +37,7 @@ const { isPolyComboTicker } = require('./poly-combo-classifier');
 // fallback for unmatched executed quotes.
 'use strict';
 const { polyComboMakerFeeForFill } = require('./poly-combo-fee');
+const { enterTask } = require('./loop-lag');
 
 const USER_FILTER_SELF = 'USER_FILTER_SELF';
 const QUOTE_STATUS_EXECUTED = 'QUOTE_STATUS_EXECUTED';
@@ -934,9 +935,49 @@ function uniqueLockForMarket(locks, title, slug, slugMap) {
   return lockMatchForActivity(locks, title, slug, slugMap).lock;
 }
 
-function lockMatchForActivity(locks, title, slug, slugMap) {
-  const mapped = lockForMappedSlug(locks, slug, slugMap);
-  const titleHits = (locks || []).filter((p) => p && lockLabelMatchesMarket(p.label, title, slug));
+// Label text is parsed once per lock per reconcile, not once per activity.
+// The old path re-split every lock label for every activity (~1,000 locks ×
+// ~1,500 activity rows) and blocked the event loop for ~1.5–1.9s.
+function prepareLockMatch(locks) {
+  const byId = new Map();
+  const rows = [];
+  for (const p of locks || []) {
+    if (!p) continue;
+    if (p.id != null && !byId.has(p.id)) byId.set(p.id, p);
+    rows.push({
+      p,
+      nick: lockTeamNicknames(p.label),
+      tokens: significantLockTokens(p.label),
+    });
+  }
+  return { byId, rows };
+}
+
+function rowMatchesHay(row, hay) {
+  if (!hay || !String(hay).trim()) return false;
+  if (row.nick.length >= 2 && row.nick.every((t) => hay.includes(t))) return true;
+  if (row.tokens.length < 2) return false;
+  return row.tokens.every((t) => hay.includes(t));
+}
+
+function mappedLock(prep, slug, slugMap) {
+  const key = normalizeMarketSlug(slug);
+  if (!key || !slugMap || !prep) return null;
+  const id = slugMap instanceof Map ? slugMap.get(key) : slugMap[key];
+  if (!id) return null;
+  return prep.byId.get(id) || null;
+}
+
+function lockMatchForActivity(locks, title, slug, slugMap, prep) {
+  const prepared = prep || null;
+  const hay = `${title || ''} ${slug || ''}`.toUpperCase();
+  const mapped = prepared ? mappedLock(prepared, slug, slugMap) : lockForMappedSlug(locks, slug, slugMap);
+  const titleHits = [];
+  if (prepared) {
+    if (hay.trim()) for (const row of prepared.rows) if (rowMatchesHay(row, hay)) titleHits.push(row.p);
+  } else {
+    for (const p of locks || []) if (p && lockLabelMatchesMarket(p.label, title, slug)) titleHits.push(p);
+  }
   const titled = titleHits.length === 1 ? titleHits[0] : null;
   if (mapped) {
     return { lock: mapped, via: titled && titled.id === mapped.id ? 'both' : 'slug' };
@@ -1390,11 +1431,12 @@ function matchActivitiesToLocks(activities, locks, {
   const quoteSizes = quotedByLock instanceof Map
     ? quotedByLock
     : quotedSizesByLock(quotedByLock);
+  const prep = prepareLockMatch(locks);
   for (const activity of activities || []) {
     const trade = tradeFromActivity(activity);
     if (!trade) continue;
     if (requireMaker && trade.isAggressor) continue;
-    const hit = lockMatchForActivity(locks, trade.hay || trade.title, trade.marketSlug, map);
+    const hit = lockMatchForActivity(locks, trade.hay || trade.title, trade.marketSlug, map, prep);
     const lock = hit.lock;
     if (!lock) continue;
     if (activityTooOld(trade, maxAgeMs, nowMs)) {
@@ -1429,6 +1471,29 @@ function matchActivitiesToLocks(activities, locks, {
   }
   events.matchedLockIds = matchedLockIds;
   return events;
+}
+
+// Same match, but yield every few hundred rows so a full activity page cannot
+// freeze quoting. Results match matchActivitiesToLocks.
+async function matchActivitiesToLocksYielding(activities, locks, opts) {
+  const list = activities || [];
+  const leave = enterTask('fill-activity-match');
+  try {
+    if (list.length <= 300) return matchActivitiesToLocks(list, locks, opts);
+    const merged = [];
+    const matchedLockIds = new Set();
+    for (let i = 0; i < list.length; i += 300) {
+      const part = matchActivitiesToLocks(list.slice(i, i + 300), locks, opts);
+      for (const id of part.matchedLockIds || []) matchedLockIds.add(id);
+      for (const evt of part) {
+        if (merged.some((e) => e.fillId === evt.fillId)) continue;
+        merged.push(evt);
+      }
+      if (i + 300 < list.length) await new Promise((r) => setImmediate(r));
+    }
+    merged.matchedLockIds = matchedLockIds;
+    return merged;
+  } finally { leave(); }
 }
 
 async function listActivitiesPage(http, { limit = 100, maxPages = 8, marketSlug, pageGapMs = 0, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
@@ -1566,7 +1631,7 @@ async function reconcileLockActivityEvents(http, {
       );
     } catch (_) { /* global page still used */ }
   }
-  const events = matchActivitiesToLocks(activities, locks, {
+  const events = await matchActivitiesToLocksYielding(activities, locks, {
     seenFillIds,
     slugMap: map,
     bookedFills: booked,
@@ -1576,15 +1641,18 @@ async function reconcileLockActivityEvents(http, {
     ...events.map((e) => e.parlayId).filter(Boolean),
     ...(events.matchedLockIds || []),
   ]);
+  // One pass over booked rows, not locks × rows. A lock is covered when any
+  // booked poly combo fill belongs to it (same predicate as the old .some()).
+  const bookedComboLocks = new Set();
+  for (const row of booked) {
+    if (!isPolyFillRecord(row)) continue;
+    const id = parlayIdOfRecord(row);
+    if (!id || bookedComboLocks.has(id)) continue;
+    if (isComboActivitySlug(slugOfRecord(row)) && polyFillQty(row) > 0) bookedComboLocks.add(id);
+  }
   for (const lock of locks) {
     if (!lock || !lock.id || covered.has(lock.id)) continue;
-    const already = booked.some((row) => (
-      isPolyFillRecord(row)
-      && parlayIdOfRecord(row) === lock.id
-      && isComboActivitySlug(slugOfRecord(row))
-      && polyFillQty(row) > 0
-    ));
-    if (already) covered.add(lock.id);
+    if (bookedComboLocks.has(lock.id)) covered.add(lock.id);
   }
   if (!includePositions || typeof http.listPositions !== 'function') return events;
   const uncovered = locks.filter((p) => p && p.id && !covered.has(p.id));
@@ -1743,6 +1811,8 @@ module.exports = {
   activityMarketHay,
   activityFillEvent,
   matchActivitiesToLocks,
+  matchActivitiesToLocksYielding,
+  prepareLockMatch,
   activityTooOld,
   DEFAULT_ACTIVITY_MAX_AGE_MS,
   listAllActivities,

@@ -70,14 +70,19 @@ async function testUnrecovered() {
 }
 
 class FakeSock extends EventEmitter {
-  constructor() { super(); this.pings = 0; }
-  send() {} ping() { this.pings += 1; }
-  close() { this.emit('close', 1000); }
-  terminate() { setImmediate(() => this.emit('close', 1006)); }
+  constructor() { super(); this.pings = 0; this.sent = []; }
+  send(m) { this.sent.push(m); } ping() { this.pings += 1; }
+  close(code, reason) {
+    this.closed = true;
+    this.closeCode = code;
+    this.closeReason = Buffer.isBuffer(reason) ? reason.toString('utf8') : (reason || '');
+    this.emit('close', code == null ? 1000 : code, reason);
+  }
+  terminate() { this.terminated = true; setImmediate(() => this.emit('close', 1006)); }
 }
 
 function testClientDiagnostics() {
-  assert.strictEqual(DEFAULT_WS_STALL_MS, 10000, 'default stall window is 10s');
+  assert.strictEqual(DEFAULT_WS_STALL_MS, 5000, 'default stall window is 5s');
   let t = 1_000_000;
   const socks = []; const stalls = [];
   const ws = createPolymarketRfqWs({
@@ -150,15 +155,20 @@ function testOutageNoFalseRecovery() {
   });
   ws.start();
   const errMsg = Buffer.from(JSON.stringify({ error: { message: 'unavailable' } }));
+  // Polymarket closing the socket (not our watchdog) still backs off 1s → 30s.
   for (let k = 0; k < 4; k++) {
     const s = socks[socks.length - 1];
     s.emit('open'); s.emit('message', errMsg);
-    t += 35000; ws.checkStall(); fns.shift()();
+    s.emit('close', 1001, Buffer.from('going away'));
+    fns.shift()();
   }
   global.setTimeout = realST;
   assert.strictEqual(rec.length, 0, 'error replies must not count as recovered');
   const w = statuses.filter(([s]) => s === 'reconnecting').map(([, i]) => i.wait);
-  assert.deepStrictEqual(w, [1000, 2000, 4000, 8000], 'backoff grows during outage');
+  assert.deepStrictEqual(w, [1000, 2000, 4000, 8000], 'backoff grows when Polymarket closes the socket');
+  const closed = statuses.filter(([s]) => s === 'closed');
+  assert.strictEqual(closed[0][1].code, 1001);
+  assert.strictEqual(closed[0][1].reason, 'going away');
   ws.stop();
 }
 
@@ -169,19 +179,66 @@ function testRealDataRecoversAndResetsBackoff() {
   global.setTimeout = (fn) => { fns.push(fn); return 0; };
   const ws = createPolymarketRfqWs({
     keyId: 'k', secretKey: SEED_B64, stallMs: 30000, stallCheckMs: 3_600_000, now: () => t,
-    WebSocketImpl: function F() { const s = new FakeSock(); s.terminate = () => s.emit('close', 1006); socks.push(s); return s; },
+    WebSocketImpl: function F() { const s = new FakeSock(); socks.push(s); return s; },
     onRecovered: (i) => rec.push(i), onStatus: (s, i) => statuses.push([s, i]),
   });
   ws.start();
-  socks[0].emit('open'); t += 31000; ws.checkStall(); fns.shift()();
-  socks[1].emit('open'); t += 31000; ws.checkStall(); fns.shift()();
+  socks[0].emit('open');
+  t += 31000; ws.checkStall(); // immediate replacement, wait 0
+  socks[1].emit('open');
+  t += 31000; ws.checkStall();
   socks[2].emit('open');
   socks[2].emit('message', Buffer.from(JSON.stringify({ rfqEvent: { rfqCreated: { rfq: { id: 'y' } } } })));
   assert.strictEqual(rec.length, 1, 'real RFQ recovers');
-  t += 31000; ws.checkStall();
+  // After real data the remote-close backoff is back to 1s, not the grown value.
+  socks[2].emit('close', 1006, Buffer.from('bye'));
   global.setTimeout = realST;
   const w = statuses.filter(([s]) => s === 'reconnecting').map(([, i]) => i.wait);
-  assert.deepStrictEqual(w, [1000, 2000, 1000], 'backoff resets only after real data');
+  assert.deepStrictEqual(w, [0, 0, 1000], 'watchdog reconnects immediately; backoff resets only after real data');
+  assert.strictEqual(fns.length, 1, 'only the remote close scheduled a delayed reconnect');
+  ws.stop();
+}
+
+function testWatchdogMakeBeforeBreak() {
+  let t = 4_000_000;
+  const socks = []; const events = []; const statuses = [];
+  const ws = createPolymarketRfqWs({
+    keyId: 'k', secretKey: SEED_B64, stallMs: 5000, stallCheckMs: 3_600_000, now: () => t,
+    WebSocketImpl: function F() {
+      const s = new FakeSock();
+      // Hold the close event so an in-flight message on the old socket can still arrive.
+      s.close = (code, reason) => {
+        s.closed = true;
+        s.closeCode = code;
+        s.closeReason = Buffer.isBuffer(reason) ? reason.toString('utf8') : String(reason || '');
+      };
+      socks.push(s);
+      return s;
+    },
+    onEvent: (e) => events.push(e),
+    onStatus: (s, i) => statuses.push([s, i]),
+  });
+  ws.start();
+  socks[0].emit('open');
+  const rfq = (id) => Buffer.from(JSON.stringify({ rfqEvent: { rfqCreated: { rfq: { id } } } }));
+  socks[0].emit('message', rfq('a'));
+  t += 5000;
+  ws.checkStall();
+  assert.strictEqual(socks.length, 2, 'replacement socket is opened immediately');
+  assert.ok(!socks[0].closed, 'stalled socket stays open until the new one subscribes');
+  const waits = statuses.filter(([s]) => s === 'reconnecting').map(([, i]) => i.wait);
+  assert.deepStrictEqual(waits, [0], 'watchdog reconnect does not wait the 1s backoff');
+  socks[1].emit('open');
+  assert.ok(socks[0].closed, 'old socket is closed only after the new one is open');
+  assert.strictEqual(socks[0].closeCode, 4000);
+  assert.strictEqual(socks[0].closeReason, 'stall-replaced');
+  assert.ok(socks[1].sent.some((m) => String(m).includes('SUBSCRIPTION_TYPE_RFQ')), 'subscribed before close');
+  socks[0].emit('message', rfq('b'));
+  socks[1].emit('message', rfq('b'));
+  const ids = events.filter((e) => e.type === 'rfqCreated').map((e) => e.rfq.id);
+  assert.deepStrictEqual(ids, ['a', 'b', 'b'], 'both sockets deliver during the overlap; dedupe is by RFQ id upstream');
+  socks[0].emit('close', 4000, Buffer.from('stall-replaced'));
+  assert.strictEqual(socks.length, 2, 'closing the replaced socket does not open another');
   ws.stop();
 }
 
@@ -189,6 +246,7 @@ function testRealDataRecoversAndResetsBackoff() {
   await testRestNote();
   testRealDataRecoversAndResetsBackoff();
   testOutageNoFalseRecovery();
+  testWatchdogMakeBeforeBreak();
   await testPolicy();
   await testUnrecovered();
   testClientDiagnostics();

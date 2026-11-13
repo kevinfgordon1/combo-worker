@@ -23,7 +23,11 @@ const DEFAULT_PAGE_LIMIT = 100;
 const DEFAULT_MAX_PAGES = 100;
 const DEFAULT_PAGE_DELAY_MS = 1200; // GET /v1/rfqs is 1 req/s per IP (docs.polymarket.us rate limits) → ≤0.83 req/s
 const DEFAULT_HEARTBEAT_MS = 60000;
-const WS_SEEN_MAX = 30000;
+// 55+ RFQs/s, and bursts well above that. 30k ids was about 1–2 minutes, so a
+// post-stall REST crawl re-counted several thousand already-seen RFQs as
+// REST-only. Keep at least 10 minutes, and never more than ~300k ids.
+const WS_SEEN_MAX = 300000;
+const WS_SEEN_TTL_MS = 10 * 60 * 1000;
 const MAX_REASON_KEYS = 64;
 
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -183,17 +187,45 @@ function formatPolyHeartbeat(snap) {
   );
 }
 
-// Bounded insertion-ordered id set (Map keeps order; evict oldest).
-function createWsSeenSet(max = WS_SEEN_MAX) {
-  const m = new Map();
+// Insertion-ordered id set. Entries older than ttlMs are forgotten, and the
+// set never grows past max (oldest id dropped). A number argument is the cap
+// (tests); an options object sets max, ttlMs, and now.
+function createWsSeenSet(maxOrOpts = WS_SEEN_MAX, nowFn) {
+  let cap = WS_SEEN_MAX;
+  let ttlMs = WS_SEEN_TTL_MS;
+  let now = typeof nowFn === 'function' ? nowFn : () => Date.now();
+  if (typeof maxOrOpts === 'number') cap = maxOrOpts;
+  else if (maxOrOpts && typeof maxOrOpts === 'object') {
+    if (maxOrOpts.max != null) cap = maxOrOpts.max;
+    if (maxOrOpts.ttlMs != null) ttlMs = maxOrOpts.ttlMs;
+    if (typeof maxOrOpts.now === 'function') now = maxOrOpts.now;
+  }
+  const m = new Map(); // id -> seenAt ms
+  function prune(t) {
+    while (m.size) {
+      const oldest = m.entries().next().value;
+      if (!oldest) break;
+      const [id, at] = oldest;
+      const expired = ttlMs > 0 && t - at >= ttlMs;
+      if (expired || m.size > cap) m.delete(id);
+      else break;
+    }
+  }
   return {
     add(id) {
       if (!id) return;
+      const t = now();
       if (m.has(id)) m.delete(id);
-      m.set(id, 1);
-      while (m.size > max) m.delete(m.keys().next().value);
+      m.set(id, t);
+      prune(t);
     },
-    has: (id) => m.has(id),
+    has(id) {
+      const at = m.get(id);
+      if (at == null) return false;
+      const t = now();
+      if (ttlMs > 0 && t - at >= ttlMs) { m.delete(id); return false; }
+      return true;
+    },
     delete: (id) => m.delete(id),
     get size() { return m.size; },
   };
@@ -285,6 +317,7 @@ module.exports = {
   DEFAULT_PAGE_DELAY_MS,
   DEFAULT_HEARTBEAT_MS,
   WS_SEEN_MAX,
+  WS_SEEN_TTL_MS,
   envInt,
   yieldLoop,
   createPolyIntakeStats,

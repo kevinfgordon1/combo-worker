@@ -11,6 +11,7 @@
 const { createClient } = require('@supabase/supabase-js');
 const { createIntakeWorker } = require('./intake-host');
 const { maybeStartCpuProfile } = require('./cpu-prof');
+const { enterTask } = require('../loop-lag');
 const { withBreaker, getDbBreaker } = require('../db-breaker');
 const { createBatchedLedgerStore, ledgerBatchEnabled } = require('./ledger-batch');
 const { createReleaseBatcher, withReserveTimeout, isSkipDecision } = require('./release-batch');
@@ -404,16 +405,21 @@ async function main(env = process.env) {
   }
   async function pollOddsKickoffs() {
     if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) return;
-    const r = await fetch(`${env.SUPABASE_URL}/rest/v1/odds_cache?sport=eq.americanfootball_nfl&select=data,fetched_at&order=fetched_at.desc&limit=1`,
-      { headers: { apikey: env.SUPABASE_SERVICE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}` } });
-    if (!r.ok) throw new Error(`odds_cache ${r.status}`);
-    const j = await r.json();
-    kickoffs.setKickoffs(oddsKickoffs(j[0] && j[0].data));
-    if (ncaafBook) {
-      const c = await fetch(`${env.SUPABASE_URL}/rest/v1/odds_cache?sport=eq.americanfootball_ncaaf&select=data,fetched_at&order=fetched_at.desc&limit=1`,
+    // ~2MB odds blob. Parsing it is tens of milliseconds; the label is so a
+    // block inside this parse is named in the loop-lag log.
+    const leave = enterTask('odds-kickoffs');
+    try {
+      const r = await fetch(`${env.SUPABASE_URL}/rest/v1/odds_cache?sport=eq.americanfootball_nfl&select=data,fetched_at&order=fetched_at.desc&limit=1`,
         { headers: { apikey: env.SUPABASE_SERVICE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}` } });
-      if (c.ok) { const cj = await c.json(); kickoffs.setKickoffs(oddsNcaafKickoffs(cj[0] && cj[0].data)); }
-    }
+      if (!r.ok) throw new Error(`odds_cache ${r.status}`);
+      const j = JSON.parse(await r.text());
+      kickoffs.setKickoffs(oddsKickoffs(j[0] && j[0].data));
+      if (ncaafBook) {
+        const c = await fetch(`${env.SUPABASE_URL}/rest/v1/odds_cache?sport=eq.americanfootball_ncaaf&select=data,fetched_at&order=fetched_at.desc&limit=1`,
+          { headers: { apikey: env.SUPABASE_SERVICE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}` } });
+        if (c.ok) { const cj = JSON.parse(await c.text()); kickoffs.setKickoffs(oddsNcaafKickoffs(cj[0] && cj[0].data)); }
+      }
+    } finally { leave(); }
   }
   loop(pollKickoffs, 'espn_kickoffs', num(env.SNIPER_ESPN_POLL_MS, 60000));
   loop(pollOddsKickoffs, 'odds_kickoffs', num(env.SNIPER_ODDS_KICKOFF_POLL_MS, 300000));
