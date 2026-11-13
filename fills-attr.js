@@ -328,7 +328,7 @@ function isLiveRunnerTwin(row) {
 function isQuoteExecutionStub(row) {
   if (!row || isPolyishFill(row)) return false;
   const raw = row.raw || {};
-  if (raw.venue === 'polymarket' || row.venue === 'polymarket') return false;
+  if (raw.venue === 'polymarket' || row.venue === 'polymarket' || isNovigFill(row)) return false;
   if (raw.source === 'live-runner') return true;
   if (row.fill_id && row.order_id && row.fill_id === row.order_id && !raw.trade_id && raw.count_fp == null) {
     return true;
@@ -347,6 +347,14 @@ function countsTowardCap(row) {
   return true;
 }
 
+function isNovigFill(row) {
+  if (!row) return false;
+  const raw = row.raw || {};
+  if (raw.venue === 'novig' || row.venue === 'novig') return true;
+  if (String(raw.source || row.source || '') === 'novig-rfq') return true;
+  return String(row.fill_id || '').startsWith('novig:');
+}
+
 function isPolyishFill(row) {
   if (!row) return false;
   const id = String(row.fill_id || '');
@@ -358,7 +366,7 @@ function isPolyishFill(row) {
 // Real Kalshi portfolio trade (trade_id / count_fp payload). Not a live-runner
 // order stub (fill_id === order_id, raw.source=live-runner, no trade payload).
 function isKalshiTradeFill(row) {
-  if (!row || isLiveRunnerTwin(row) || isPolyishFill(row)) return false;
+  if (!row || isLiveRunnerTwin(row) || isPolyishFill(row) || isNovigFill(row)) return false;
   if (row.raw && (row.raw.trade_id || row.raw.count_fp != null)) return true;
   return !!(row.fill_id && row.order_id && row.fill_id !== row.order_id);
 }
@@ -367,7 +375,7 @@ function isKalshiTradeFill(row) {
 function selectLiveRunnerStubsToDrop(rows) {
   const byOrder = new Map();
   for (const row of rows || []) {
-    if (!row || !row.order_id || isPolyishFill(row)) continue;
+    if (!row || !row.order_id || isPolyishFill(row) || isNovigFill(row)) continue;
     if (!byOrder.has(row.order_id)) byOrder.set(row.order_id, []);
     byOrder.get(row.order_id).push(row);
   }
@@ -476,6 +484,7 @@ module.exports = {
   isQuoteExecutionStub,
   countsTowardCap,
   isPolyishFill,
+  isNovigFill,
   isKalshiTradeFill,
   selectLiveRunnerStubsToDrop,
   pickFillForSum,

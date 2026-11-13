@@ -24,6 +24,12 @@ assert.strictEqual(resolveSplit({ COMBO_ROLE: 'poly', COMBO_VENUE_COORD: '0' }).
 assert.ok(splitConfigError(resolveSplit({ COMBO_ROLE: 'poly' }), {}));
 assert.strictEqual(splitConfigError(resolveSplit({ COMBO_ROLE: 'poly' }), { COMBO_CAP_AT_CONFIRM: '1' }), null);
 assert.strictEqual(splitConfigError(resolveSplit({}), {}), null);
+assert.deepStrictEqual(
+  [resolveSplit({ COMBO_ROLE: 'novig' }).role, resolveSplit({ COMBO_ROLE: 'novig' }).runKalshi, resolveSplit({ COMBO_ROLE: 'novig' }).runPoly, resolveSplit({ COMBO_ROLE: 'novig' }).runNovig, resolveSplit({ COMBO_ROLE: 'novig' }).venue],
+  ['novig', false, false, true, 'novig']
+);
+assert.strictEqual(splitConfigError(resolveSplit({ COMBO_ROLE: 'novig' }), {}), null);
+assert.strictEqual(splitConfigError(resolveSplit({ COMBO_ROLE: 'novig', COMBO_CAP_AT_CONFIRM: '1' }), { COMBO_CAP_AT_CONFIRM: '1' }), null);
 
 // The Polymarket role must never construct the Kalshi firehose: it returns
 // before createKalshiFirehose is reached in main().

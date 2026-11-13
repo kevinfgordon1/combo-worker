@@ -4,6 +4,8 @@ const { VENUE_LABELS, venueLabel, formatAlertStatus } = require('./venue-alert')
 
 assert.strictEqual(VENUE_LABELS.kalshi, 'Kalshi');
 assert.strictEqual(VENUE_LABELS.polymarket, 'Polymarket');
+assert.strictEqual(VENUE_LABELS.novig, 'Novig');
+assert.strictEqual(formatAlertStatus('✅ QUOTED', 'novig'), '✅ QUOTED (Novig)');
 
 assert.strictEqual(venueLabel('kalshi'), 'Kalshi');
 assert.strictEqual(venueLabel('KALSHI'), 'Kalshi');

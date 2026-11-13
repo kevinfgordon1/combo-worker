@@ -1,0 +1,44 @@
+# Fly app for the Novig RFQ maker. NOT deployed by this change.
+# When Kevin approves: flyctl deploy . -c fly/novig-worker.toml --ha=false
+# Secrets are set with `fly secrets` per app, never in this file. Names only:
+#   NOVIG_KEY_ID          maker subaccount key id
+#   NOVIG_PRIVATE_KEY     PKCS#8 PEM. Shadow: trading::read. Live: trading.
+#   SUPABASE_URL
+#   SUPABASE_SERVICE_KEY
+#   TELEGRAM_BOT_TOKEN        optional, same alert path as the other workers
+#   TELEGRAM_ALERT_CHAT_ID    optional
+# Do not set Kalshi or Polymarket keys on this app.
+app = "kaygo-novig-worker"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "../Dockerfile"
+
+# Shadow only. Live quoting needs NOVIG_DRY_RUN=0 and NOVIG_RFQ_LIVE=1
+# after the SQL, the trading key, and subaccount funding. Cap-at-confirm
+# stays off: Novig reserves the full quote before it sends.
+[env]
+  COMBO_ROLE = "novig"
+  NOVIG_DRY_RUN = "1"
+  NOVIG_RFQ_LIVE = "0"
+  NOVIG_SHADOW = "1"
+  COMBO_CAP_AT_CONFIRM = "0"
+  COMBO_VENUE_COORD = "1"
+  NOVIG_API_BASE = "https://api.novig.com"
+
+[processes]
+  app = "npm run start:novig"
+
+[deploy]
+  strategy = "immediate"
+
+[[vm]]
+  size = "performance-1x"
+  memory = "2gb"
+
+# One machine. No Kalshi socket and no Polymarket client.
+# iad is Ashburn, Virginia. Production also runs a location check
+# (restricted states are Arizona, Michigan, and Nevada). Confirm iad
+# before the first live quote. Paper (api.paper.novig.com) has no location check.

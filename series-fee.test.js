@@ -49,6 +49,10 @@ assert.strictEqual(seriesOfTicker(null), null);
   const c = createSeriesFeeCache({ fetchImpl: async () => { calls++; return { ok: false, status: 404 }; } });
   assert.strictEqual(seriesOfTicker('caoc-1b70a2b8e7c44c8f'), null);
   assert.strictEqual(c.rateForTicker('caoc-1b70a2b8e7c44c8f'), 0);
+  assert.strictEqual(c.rateForTicker('novig'), 0);
+  assert.strictEqual(c.rateForTicker('novig:rfq'), 0);
   assert.strictEqual(calls, 0);
+  const { makerRateForVenue } = require('./series-fee');
+  assert.strictEqual(makerRateForVenue('novig', 'KXMVECROSSCATEGORY0-X'), 0);
   console.log('ok caoc → poly maker rate 0, no Kalshi lookup');
 }

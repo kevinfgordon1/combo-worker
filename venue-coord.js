@@ -1,11 +1,12 @@
 // Cross-process confirm holds for Combo Locks (Kalshi in combo-worker,
-// Polymarket in combo-poly).
+// Polymarket in combo-poly, Novig in kaygo-novig-worker).
 //
 // Each process keeps its own in-memory cap book. This module:
-//   1. claim(): at confirm, atomically inserts this venue's hold into
-//      combo_venue_holds under a per-lock advisory lock and returns the OTHER
-//      venue's live holds. Two simultaneous confirms on one lock are serialized
-//      by Postgres, so the second one always sees the first (no double fill).
+//   1. claim(): inserts this venue's hold into combo_venue_holds under a
+//      per-lock advisory lock and returns the OTHER venue's live holds.
+//      Novig claims the full payout before it quotes. Kalshi and Polymarket
+//      claim at confirm when COMBO_CAP_AT_CONFIRM is on. Two simultaneous
+//      claims on one lock are serialized by Postgres.
 //   2. mirrors reduce/release of local holds to the table (async, batched,
 //      off the quote path; a late delete only over-counts, which is safe).
 //   3. polls the other venue's holds every pollMs into memory so quote-time

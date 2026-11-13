@@ -161,6 +161,7 @@ const {
 const { startHeartbeat } = require('./heartbeat');
 const { createLatencyStats, createLoopLagSampler } = require('./latency-stats');
 const { startPolymarketRfqLoop } = require('./polymarket-rfq');
+const { startNovigRfqLoop } = require('./novig-rfq');
 const { createPolySniper } = require('./poly-sniper');
 const { shortId } = require('./short-id');
 const {
@@ -242,6 +243,7 @@ const { createPolymarketHttp } = require('./polymarket-client');
 const { createPolymarketMarketsWs } = require('./poly-markets-ws');
 const { sharedPolyLimiter } = require('./poly-limiter');
 // COMBO_ROLE=poly runs this file as the Polymarket-only service (no Kalshi WS).
+// COMBO_ROLE=novig runs the Novig RFQ maker only (no Kalshi or Polymarket keys).
 const SPLIT = resolveSplit(process.env);
 const MODE = SPLIT.mode;
 const { createTelegramGate } = require('./tg-gate');
@@ -3117,7 +3119,9 @@ async function main() {
   }
   if ((SPLIT.runKalshi && (!KEY_ID || !PEM)) || !process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
     console.error(
-      `[${MODE}] missing env: need KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY`
+      SPLIT.runKalshi
+        ? `[${MODE}] missing env: need KALSHI_KEY_ID, Kalshi_combo_key, SUPABASE_URL, SUPABASE_SERVICE_KEY`
+        : `[${MODE}] missing env: need SUPABASE_URL, SUPABASE_SERVICE_KEY`
     );
     process.exit(1);
   }
@@ -3128,10 +3132,11 @@ async function main() {
   }
   console.log(
     `[${MODE}] role=${SPLIT.role} kalshi=${SPLIT.runKalshi ? 'on' : 'off'} ` +
-    `polymarket=${SPLIT.runPoly ? 'on' : 'off'} venueCoord=${SPLIT.coord ? 'on' : 'off'}`
+    `polymarket=${SPLIT.runPoly ? 'on' : 'off'} novig=${SPLIT.runNovig ? 'on' : 'off'} ` +
+    `venueCoord=${SPLIT.coord ? 'on' : 'off'}`
   );
-  if (SPLIT.role === 'poly' && runUnhedged) {
-    console.error(`[${MODE}] COMBO_ROLE=poly cannot run unhedged (WORKER_MODE=all) — refusing to start`);
+  if ((SPLIT.role === 'poly' || SPLIT.role === 'novig') && runUnhedged) {
+    console.error(`[${MODE}] COMBO_ROLE=${SPLIT.role} cannot run unhedged (WORKER_MODE=all) — refusing to start`);
     process.exit(1);
   }
   if (SCOPE.invalid) {
@@ -3265,7 +3270,7 @@ async function main() {
       reconcileSkipTapes().catch((e) => console.error(`[${MODE}] skip-tape tick`, e.message));
     }), SKIP_TAPE_TICK_MS);
   } else {
-    console.log(`[${MODE}] Kalshi skip-tape OFF (COMBO_ROLE=poly, no Kalshi key)`);
+    console.log(`[${MODE}] Kalshi skip-tape OFF (COMBO_ROLE=${SPLIT.role}, no Kalshi key)`);
   }
 
   // Step 2 — pre-warm + keep warm (15s so LB idle-kill cannot cold-start POST)
@@ -3352,6 +3357,39 @@ async function main() {
         console.log(`[${MODE}] [POLY-LOSS] loss tape on (POLY_LOSS_TAPE=0 to disable)`);
       }
     } catch (e) { console.error(`[${MODE}] poly loss tape not started: ${e.message}`); polyLossTape = null; }
+  }
+  if (SPLIT.runNovig) {
+    const novig = startNovigRfqLoop({
+      env: process.env,
+      supabase,
+      getParlays: () => comboLocksOnly(parlays),
+      filledFor: filledSoFarFor,
+      otherHeld: (id) => (venueCoord ? venueCoord.otherSum(id) : 0),
+      claim: venueCoord
+        ? (row) => venueCoord.claim(row)
+        : async () => { throw new Error('novig live quotes need COMBO_VENUE_COORD'); },
+      release: (row) => {
+        if (venueCoord && venueCoord.remote) venueCoord.remote.unclaim(row.parlayId, row.quoteId);
+      },
+      killEngaged: killEngagedFor,
+      isPaused: (id) => pausedParlayIds.has(id) || (probePauseUntil && probePauseUntil.has(id)),
+      started: (lock) => startedForParlay(lock),
+      onFill: (info) => {
+        if (!info || !info.parlayId || !(info.contracts > 0)) return;
+        sessionFilledByParlay[info.parlayId] = (sessionFilledByParlay[info.parlayId] || 0) + info.contracts;
+      },
+      alert: (text) => sendAlert(text),
+      log: (m) => console.log(`[${MODE}] ${m}`),
+    });
+    process.on('SIGINT', async () => {
+      try { novig.stop(); } catch (_) { /* stopping */ }
+      Promise.resolve(venueCoord && venueCoord.stop()).finally(() => {
+        console.log(`[${MODE}] final`, counts);
+        process.exit(0);
+      });
+    });
+    process.on('SIGTERM', () => process.emit('SIGINT'));
+    return; // Novig service: no Kalshi WebSocket, no Polymarket client.
   }
   const poly = !SPLIT.runPoly ? null : startPolymarketRfqLoop({
     lossTape: polyLossTape,
