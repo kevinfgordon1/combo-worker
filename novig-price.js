@@ -2,13 +2,15 @@
 // same number Combo Locks stores). Maker fee on an RFQ parlay is $0, so the
 // win probability is that American price with no fee gross-up.
 //
-// Novig's order-book grid snaps DOWN because every order buys. An RFQ quote
-// is the opposite: the lowest win probability wins, so we snap UP. A higher
-// price pays the user less and never beats the lock.
+// RFQ V3 takes any 0.001 price from 0.001 to 0.999. The docs only reject a
+// price outside that range. The order book is coarser (0.005 steps from
+// 0.055 to 0.945, and 0.051–0.054 are not book prices), and live RFQ
+// executions print off that book grid, including 0.051–0.054. This file
+// quotes RFQs only. It does not build book orders.
 //
-// Grid (docs: Monetary representations), in thousandths:
-//   1..50 and 950..999 step 1; 55..945 step 5.
-//   51..54 round up to 55; 946..949 round up to 950.
+// The lowest win probability wins, so we snap UP to the next 0.001 and never
+// down. +350 is 0.22222… and quotes 0.223 (about +348). +400 is 0.200 and
+// stays. A higher price pays the user less and never beats the lock.
 'use strict';
 
 const { makerRateForVenue } = require('./series-fee');
@@ -18,23 +20,17 @@ const PRICE_MAX_MILLI = 999;
 const CONFIRM_RATE_FLOOR = 0.995;
 
 function onGrid(milli) {
-  if (milli >= 1 && milli <= 50) return true;
-  if (milli >= 55 && milli <= 945 && milli % 5 === 0) return true;
-  if (milli >= 950 && milli <= 999) return true;
-  return false;
+  return Number.isInteger(milli) && milli >= PRICE_MIN_MILLI && milli <= PRICE_MAX_MILLI;
 }
 
+// Ceil onto a thousandth. The 1e-9 slack matches milliFromAmerican so a value
+// that is already an exact milli does not bump because of binary noise.
+// Anything that would land above 0.999 is refused (we do not snap down).
 function snapUpMilli(milli) {
-  const m = Math.round(milli);
+  if (milli == null || !Number.isFinite(Number(milli))) return null;
+  const m = Math.ceil(Number(milli) - 1e-9);
   if (m > PRICE_MAX_MILLI) return null;
   if (m < PRICE_MIN_MILLI) return PRICE_MIN_MILLI;
-  if (m <= 50) return m;
-  if (m < 55) return 55;
-  if (m <= 945) {
-    const rem = m % 5;
-    return rem === 0 ? m : m + (5 - rem);
-  }
-  if (m < 950) return 950;
   return m;
 }
 
