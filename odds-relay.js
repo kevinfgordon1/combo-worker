@@ -1923,11 +1923,18 @@ function startKalshi(state, deps) {
 }
 
 // ------------------------------------------------------------------ Novig
-// Kept inside odds-relay.js on purpose: the Railway odds-relay service only
-// redeploys on changes to odds-relay.js (see its watch patterns), and the
-// Combo Locks / Unhedged services ignore this file.
+// Signing lives in novig-sign.js so the RFQ maker and this relay share one
+// NOVIG-V3 implementation. This file still calls it, so a relay redeploy that
+// watches odds-relay.js still picks up a signer change here.
 const novigFeed = (() => {
-  const crypto = require('crypto');
+  const {
+    normalizePem,
+    novigKey,
+    canonicalQuery,
+    stringToSign,
+    signString,
+    signedHeaders,
+  } = require('./novig-sign');
   // Novig v3 feed for the New Odds Board relay.
   //
   // Prices come from Novig's public v3 REST (no key, no signature, throttled
@@ -1954,7 +1961,6 @@ const novigFeed = (() => {
   const boardTypesFor = (league) => (league === 'NCAAB' ? ['MONEY'] : BOARD_TYPES);
   const WINDOW_BACK_MS = 8 * 3600 * 1000;
   const WINDOW_AHEAD_MS = 8 * 24 * 3600 * 1000;
-  const EMPTY_BODY_HASH = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
   const WS_WEIGHT_BOOK = 16;
   const WS_UPGRADE_COST = 32;
   // Stream bucket. Docs (api/throttling, GET /v3/limits example): capacity 512,
@@ -1997,87 +2003,6 @@ const novigFeed = (() => {
     u.search = '';
     u.hash = '';
     return u.toString();
-  }
-
-  function normalizePem(raw) {
-    let text = String(raw || '').trim();
-    if (!text) return '';
-    if (!text.includes('\n') && text.includes('\\n')) text = text.replace(/\\n/g, '\n');
-    if (!text.includes('-----BEGIN')) {
-      // Bare base64 body.
-      const body = text.replace(/\s+/g, '').match(/.{1,64}/g) || [];
-      text = `-----BEGIN PRIVATE KEY-----\n${body.join('\n')}\n-----END PRIVATE KEY-----`;
-    }
-    return text.endsWith('\n') ? text : `${text}\n`;
-  }
-
-  function novigKey(env = process.env) {
-    const id = String(env.NOVIG_KEY_ID || '').trim();
-    const pem = normalizePem(env.NOVIG_PRIVATE_KEY || '');
-    if (!id || !pem) return null;
-    try {
-      const key = crypto.createPrivateKey(pem);
-      return { id, key, type: key.asymmetricKeyType };
-    } catch (_) {
-      return { id, key: null, type: null, error: 'bad_private_key' };
-    }
-  }
-
-  // ---------------------------------------------------------------- signing
-
-  function encodePart(s) {
-    let out = '';
-    for (const b of Buffer.from(s, 'utf8')) {
-      const c = String.fromCharCode(b);
-      if (/[A-Za-z0-9\-._~]/.test(c)) out += c;
-      else out += `%${b.toString(16).toUpperCase().padStart(2, '0')}`;
-    }
-    return out;
-  }
-
-  function decodePart(s) {
-    try { return decodeURIComponent(s); } catch (_) { return s; }
-  }
-
-  function canonicalQuery(raw) {
-    const q = String(raw || '').replace(/^\?/, '');
-    if (!q) return '';
-    const pairs = q.split('&').map((pair) => {
-      const i = pair.indexOf('=');
-      const name = i < 0 ? pair : pair.slice(0, i);
-      const value = i < 0 ? '' : pair.slice(i + 1);
-      return [encodePart(decodePart(name)), encodePart(decodePart(value))];
-    });
-    pairs.sort((a, b) => {
-      const n = Buffer.compare(Buffer.from(a[0]), Buffer.from(b[0]));
-      return n || Buffer.compare(Buffer.from(a[1]), Buffer.from(b[1]));
-    });
-    return pairs.map(([n, v]) => `${n}=${v}`).join('&');
-  }
-
-  function stringToSign({ timestamp, method, path, query, body }) {
-    const hash = body && body.length
-      ? crypto.createHash('sha256').update(body).digest('hex')
-      : EMPTY_BODY_HASH;
-    return ['NOVIG-V3', String(timestamp), String(method).toUpperCase(), path, canonicalQuery(query), hash].join('\n');
-  }
-
-  function signString(keyObject, text) {
-    const data = Buffer.from(text, 'utf8');
-    if (keyObject.asymmetricKeyType === 'ed25519') {
-      return crypto.sign(null, data, keyObject).toString('base64');
-    }
-    return crypto.sign('sha256', data, { key: keyObject, dsaEncoding: 'der' }).toString('base64');
-  }
-
-  function signedHeaders(key, { method = 'GET', path, query = '', body = '', nowMs = Date.now() }) {
-    const timestamp = String(Math.floor(nowMs));
-    const text = stringToSign({ timestamp, method, path, query, body });
-    return {
-      'Novig-Key-Id': key.id,
-      'Novig-Timestamp': timestamp,
-      'Novig-Signature': signString(key.key, text),
-    };
   }
 
   // ---------------------------------------------------------------- books

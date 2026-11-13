@@ -7,6 +7,9 @@ All build from the root `Dockerfile`; `fly/<svc>.toml` sets the command and size
 - Polymarket keys: poly-worker, odds-relay, mm-paper, noboost-paper. combo-worker
   still reads them today (single-leg Polymarket REST, bucket-manager cash alert,
   balance-reporter); see the PR.
+- novig-worker (`kaygo-novig-worker`, `fly/novig-worker.toml`): Novig RFQ maker.
+  One machine, iad. Shadow by default. Secrets by name are in `docs/NOVIG-RFQ.md`.
+  It does not use Kalshi or Polymarket keys. Not deployed with the app toml.
 - Deploy workflow is staged at `fly/fly-deploy.workflow.yml` (workflow_dispatch only). Move it to `.github/workflows/` to enable; the bot token lacks GitHub `workflow` scope.
 
 ## combo-testers (kaygo-combo-testers)

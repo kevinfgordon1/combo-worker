@@ -157,5 +157,14 @@ function side(db, venue) {
     assert.strictEqual(r.ok, false);
     assert.ok(!r.crossVenue);
   }
+  // A Novig hold is the other venue's contracts. Kalshi's poll counts it.
+  {
+    const db = fakeDb();
+    db.rows.set('novig|nq', { venue: 'novig', quote_id: 'nq', parlay_id: 'L7', contracts: 40, created_at: new Date().toISOString() });
+    const k = side(db, 'kalshi');
+    await k.coord.poll();
+    assert.strictEqual(k.coord.otherSum('L7'), 40);
+    assert.strictEqual(k.book.sum('L7'), 40);
+  }
   console.log('venue-coord tests ok');
 })().catch((e) => { console.error(e); process.exit(1); });

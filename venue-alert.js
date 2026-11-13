@@ -6,6 +6,7 @@
 const VENUE_LABELS = Object.freeze({
   kalshi: 'Kalshi',
   polymarket: 'Polymarket',
+  novig: 'Novig',
 });
 
 function venueLabel(venue) {
