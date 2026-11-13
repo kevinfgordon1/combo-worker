@@ -1335,6 +1335,35 @@ function comboTrade(id, qty, { aggressor = false, payout } = {}) {
     assert.strictEqual(fresh.length, 1, 'a trade from 40 minutes ago is still recovered');
   }
 
+  // The 5-minute fill check used to block the event loop ~1.5–1.9s here
+  // (1,000 recent locks × ~1,500 activities, label re-parsed every pair).
+  {
+    const { performance } = require('perf_hooks');
+    const locks = [];
+    for (let i = 0; i < 1000; i += 1) {
+      locks.push({ id: `p${i}`, label: `Cleveland Guardians ML + New York Yankees ML + San Francisco Giants ${i % 50}` });
+    }
+    const activities = [];
+    for (let i = 0; i < 1500; i += 1) {
+      activities.push({
+        type: 'ACTIVITY_TYPE_TRADE',
+        trade: {
+          id: `t${i}`, qtyDecimal: '12.5', price: '0.42', isAggressor: i % 5 === 0,
+          marketSlug: i % 4 === 0 ? `caoc-${i % 800}` : 'aec-mlb-nyy-bos-2026-10-01',
+          title: 'Guardians vs Yankees', createTime: new Date().toISOString(),
+          marketMetadata: { slug: `caoc-${i}`, title: 'Guardians vs Yankees', legs: [{ name: 'Guardians' }] },
+        },
+      });
+    }
+    const slugMap = new Map();
+    for (let i = 0; i < 800; i += 2) slugMap.set(`caoc-${i}`, `p${i % 1000}`);
+    const t0 = performance.now();
+    const events = matchActivitiesToLocks(activities, locks, { slugMap, bookedFills: [] });
+    const ms = performance.now() - t0;
+    assert.ok(events.length > 0);
+    assert.ok(ms < 250, `fill activity match blocked ${ms.toFixed(0)}ms (must stay under 250ms)`);
+  }
+
   console.log('polymarket-fill-reconcile.test.js ok');
 })().catch((e) => {
   console.error(e);

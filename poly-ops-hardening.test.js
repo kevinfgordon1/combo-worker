@@ -58,7 +58,12 @@ class FakeSock extends EventEmitter {
   constructor() { super(); this.terminated = false; this.sent = []; }
   send(m) { this.sent.push(m); }
   ping() {}
-  close() { this.emit('close', 1000); }
+  close(code, reason) {
+    this.closed = true;
+    this.closeCode = code;
+    this.closeReason = reason;
+    this.emit('close', code == null ? 1000 : code, reason);
+  }
   terminate() { this.terminated = true; setImmediate(() => this.emit('close', 1006)); }
 }
 
@@ -93,11 +98,14 @@ async function testWsWatchdog() {
   ws.checkStall();
   assert.strictEqual(stalls.length, 1);
   assert.ok(stalls[0].silentMs >= 60000);
-  assert.ok(socks[0].terminated, 'stalled socket terminated');
+  assert.strictEqual(socks.length, 2, 'replacement opened immediately');
+  assert.ok(!socks[0].closed, 'stalled socket stays open until the replacement subscribes');
   ws.checkStall();
-  assert.strictEqual(stalls.length, 1, 'does not re-fire immediately');
-  await sleep(1300); // close -> reconnect (1s backoff)
-  assert.strictEqual(socks.length, 2, 'reconnected after stall');
+  assert.strictEqual(stalls.length, 1, 'does not re-fire while the handoff is in progress');
+  assert.strictEqual(socks.length, 2, 'no delayed second reconnect');
+  socks[1].emit('open');
+  assert.ok(socks[0].closed, 'old socket closed after the new one subscribed');
+  assert.strictEqual(socks[0].closeCode, 4000);
   assert.ok(statuses.includes('stalled') && statuses.includes('reconnecting'));
   socks[1].emit('open');
   assert.strictEqual(recovered.length, 0);

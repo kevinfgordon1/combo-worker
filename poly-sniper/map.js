@@ -12,6 +12,7 @@
 //           'line_meta_pending' (feed fetches it from the public gateway; later RFQs map).
 'use strict';
 const L = require('../leg-identity');
+const { enterTask } = require('../loop-lag');
 
 const LINE_TICKER_RE = /^KX(NFL|NCAAF|NBA)(SPREAD|TOTAL)-/;
 const isKalshiLineTicker = (t) => LINE_TICKER_RE.test(String(t || '').toUpperCase());
@@ -57,6 +58,12 @@ function createKalshiIndex() {
   const lines = { seen: 0, indexed: 0, rejected: 0 };
   const tdMarkets = new Map(); // ticker -> market (kept so a crosswalk refresh can re-index)
   function ingestMarkets(markets) {
+    const leave = enterTask('kalshi-market-index');
+    let n = 0;
+    try { n = ingestMarketsBody(markets); } finally { leave(); }
+    return n;
+  }
+  function ingestMarketsBody(markets) {
     let n = 0;
     for (const m of markets || []) {
       const t = String((m && m.ticker) || '').toUpperCase();

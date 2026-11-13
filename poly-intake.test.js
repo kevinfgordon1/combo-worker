@@ -3,6 +3,8 @@ const assert = require('assert');
 const {
   createPolyIntakeStats,
   createWsSeenSet,
+  WS_SEEN_MAX,
+  WS_SEEN_TTL_MS,
   formatPolyHeartbeat,
   crawlOpenRfqs,
   prioritizeRfqs,
@@ -122,6 +124,17 @@ const mk = (id) => ({ id, status: 'RFQ_STATUS_OPEN', qtyDecimal: '10', comboLegs
     ['a', 'b', 'c', 'd'].forEach((x) => s.add(x));
     assert.strictEqual(s.size, 3);
     assert.ok(!s.has('a') && s.has('d'));
+    assert.ok(WS_SEEN_MAX >= 300000);
+    assert.ok(WS_SEEN_TTL_MS >= 10 * 60 * 1000);
+    let now = 1_000_000;
+    const timed = createWsSeenSet({ max: 10, ttlMs: 10 * 60 * 1000, now: () => now });
+    timed.add('old');
+    now += 10 * 60 * 1000 - 1;
+    assert.ok(timed.has('old'), 'still inside the 10 minute window');
+    now += 1;
+    assert.ok(!timed.has('old'), 'dropped once the window has passed');
+    timed.add('fresh');
+    assert.strictEqual(timed.size, 1);
   }
 
   // ── stats: seen / sources / reasons / matched / quoted, interval roll ────
@@ -278,6 +291,28 @@ const mk = (id) => ({ id, status: 'RFQ_STATUS_OPEN', qtyDecimal: '10', comboLegs
       Date.now = realNow;
       resetLockDiagLogs();
     }
+  }
+
+  // Overlap: the same RFQ id on two sockets is handled once.
+  {
+    const http = {
+      async getUserId() { return {}; },
+      async listRfqs() { return { rfqs: [] }; },
+      async listQuotes() { return { quotes: [] }; },
+      close() {},
+    };
+    const loop = startPolymarketRfqLoop({
+      env: { POLYMARKET_KEY_ID: 'k', POLYMARKET_SECRET_KEY: SEED_B64, POLYMARKET_RFQ_LIVE: 'false' },
+      http, startWs: false, crawl: false,
+      getParlays: () => [], filledSoFarFor: () => 0, getOutstanding: () => 0,
+      pendingQuotes: new Map(), reconcileMs: 3_600_000, fillReconcileMs: 3_600_000,
+    });
+    const rfq = { id: 'rfq-overlap', qtyDecimal: '1', comboLegs: [] };
+    loop.onWsEvent({ type: 'rfqCreated', rfq });
+    loop.onWsEvent({ type: 'rfqCreated', rfq });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(loop.intake.peek().ws, 1, 'duplicate RFQ id across the socket overlap is handled once');
+    loop.stop();
   }
 
   console.log('poly-intake.test.js ok');

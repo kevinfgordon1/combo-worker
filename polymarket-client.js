@@ -510,13 +510,17 @@ function executionsFromOrderUpdate(update) {
   return [];
 }
 
-// RFQ flow never drops below ~55 msg/s (~220 msg/s even at 12:30 AM ET), so
-// 10s of silence is already a dead socket. Polymarket's silent freezes
-// (pongs still answered, zero data, a fresh socket gets data within ~1s) were
-// costing ~31-36s of WS intake each at the old 30s window; 10s + a 2s check
-// cuts that to ~10-12s. Override with POLY_WS_STALL_MS (0 disables).
-const DEFAULT_WS_STALL_MS = 10000;
-const DEFAULT_WS_STALL_CHECK_MS = 2000;
+// RFQ flow never drops below ~55 msg/s, so 5s of silence means the stream is
+// dead (pongs can keep arriving the whole time). Polymarket also closes the
+// socket about every 45-75 min. Override the silence window with
+// POLY_WS_STALL_MS (0 disables). The check runs every 1s so a dead stream is
+// replaced within about a second of crossing the threshold.
+//
+// TODO: do not open a second permanent RFQ socket. Polymarket US has not
+// confirmed that one key may hold two private sockets. Make-before-break
+// overlaps two sockets only for the handoff, then closes the stalled one.
+const DEFAULT_WS_STALL_MS = 5000;
+const DEFAULT_WS_STALL_CHECK_MS = 1000;
 function envStallMs() {
   const raw = process.env.POLY_WS_STALL_MS;
   if (raw == null || raw === '') return DEFAULT_WS_STALL_MS;
@@ -566,11 +570,13 @@ function createPolymarketRfqWs({
   keyId = normalizeCred(keyId);
   secretKey = normalizeCred(secretKey);
   let ws = null;
+  const live = new Set(); // sockets whose messages still count (overlap during a handoff)
   let pingTimer = null;
   let stallTimer = null;
   let reconnectTimer = null;
   let backoff = 1000;
   let closedByUs = false;
+  let handoff = false; // a replacement socket is connecting; the old close must not reconnect too
   let lastMessageAt = 0;
   let connectedAt = 0;
   let stalls = 0;
@@ -587,7 +593,15 @@ function createPolymarketRfqWs({
   let pingsAtLastPong = 0;
   const status = (s, i) => { try { onStatus && onStatus(s, i); } catch (_) {} };
 
-  function sendSubscribe() {
+  function closeReasonText(reason) {
+    if (reason == null || reason === '') return '';
+    const s = Buffer.isBuffer(reason) ? reason.toString('utf8') : String(reason);
+    return s.replace(/[\r\n\0]/g, ' ').slice(0, 200);
+  }
+
+  function sendSubscribe(sock) {
+    const target = sock || ws;
+    if (!target) return;
     const reqs = [
       { subscribe: { requestId: 'rfq-sub-1', subscriptionType: 'SUBSCRIPTION_TYPE_RFQ' } },
     ];
@@ -607,12 +621,24 @@ function createPolymarketRfqWs({
       reqs.push({ subscribe: { requestId: 'position-sub-1', subscriptionType: 'SUBSCRIPTION_TYPE_POSITION' } });
     }
     for (const body of reqs) {
-      try { ws.send(JSON.stringify(body)); } catch (_) {}
+      try { target.send(JSON.stringify(body)); } catch (_) {}
+    }
+  }
+
+  function armTimers(sock) {
+    clearInterval(pingTimer);
+    pingTimer = setInterval(() => {
+      try { sock.ping(); pingsSent += 1; lastPingAt = now(); } catch (_) {}
+    }, 10000);
+    clearInterval(stallTimer);
+    if (stallMs > 0) {
+      stallTimer = setInterval(checkStall, stallCheckMs);
+      if (stallTimer.unref) stallTimer.unref();
     }
   }
 
   function checkStall() {
-    if (closedByUs || !ws || !(stallMs > 0)) return;
+    if (closedByUs || handoff || !ws || !(stallMs > 0)) return;
     const t = now();
     const ref = lastMessageAt || connectedAt;
     const silentMs = t - ref;
@@ -636,56 +662,69 @@ function createPolymarketRfqWs({
           : (lastPongAt && t - lastPongAt <= 25000 ? 'pong-ok (socket alive, no data)' : 'pong-missing (socket dead)'),
       },
     };
-    status('stalled', { message: `no ws message for ${Math.round(silentMs / 1000)}s - reconnecting` });
+    status('stalled', { message: `no ws message for ${Math.round(silentMs / 1000)}s - opening replacement` });
     try { onStall && onStall(info); } catch (_) {}
-    // Reset the clock so a socket that stays dead after reconnect is re-flagged
-    // after another full window rather than every check tick.
-    lastMessageAt = 0;
-    connectedAt = t;
-    try { ws.terminate(); } catch (_) {}
+    // Watchdog reconnects immediately (no 1s backoff) and opens the replacement
+    // before the stalled socket is closed. The silence clock restarts when the
+    // new socket subscribes, so a still-dead replacement is re-flagged after
+    // another full window rather than every check tick.
+    handoff = true;
+    status('reconnecting', { wait: 0 });
+    reconnects += 1;
+    connect({ replacing: true });
   }
 
-  function connect() {
+  function connect({ replacing = false } = {}) {
     reconnectTimer = null;
     const headers = authHeaders({
       keyId, secretKey, method: 'GET', path: WS_SIGN_PATH,
     });
     status('connecting', { url });
-    connectedAt = now();
-    lastMessageAt = 0;
-    lastMessageType = null;
-    messagesThisConn = 0;
-    pingsSent = 0; pongsRecv = 0; lastPingAt = 0; lastPongAt = 0; pingsAtLastPong = 0;
+    if (!replacing) {
+      connectedAt = now();
+      lastMessageAt = 0;
+      lastMessageType = null;
+      messagesThisConn = 0;
+      pingsSent = 0; pongsRecv = 0; lastPingAt = 0; lastPongAt = 0; pingsAtLastPong = 0;
+    }
     const sock = new WebSocketImpl(url, { headers });
-    ws = sock;
+    live.add(sock);
+    if (!replacing) ws = sock;
 
     sock.on('open', () => {
-      if (ws !== sock) return;
+      if (!live.has(sock) || closedByUs) return;
       // Do not reset backoff on open: Polymarket can accept the socket and then
       // reply with an error / send nothing (outage). Reset only on real data.
+      const prev = replacing && ws && ws !== sock ? ws : null;
+      ws = sock;
+      handoff = false;
       connectedAt = now();
-      sendSubscribe();
+      lastMessageAt = 0;
+      lastMessageType = null;
+      messagesThisConn = 0;
+      pingsSent = 0; pongsRecv = 0; lastPingAt = 0; lastPongAt = 0; pingsAtLastPong = 0;
+      sendSubscribe(sock);
       status('subscribed');
-      clearInterval(pingTimer);
-      pingTimer = setInterval(() => {
-        try { sock.ping(); pingsSent += 1; lastPingAt = now(); } catch (_) {}
-      }, 10000);
-      clearInterval(stallTimer);
-      if (stallMs > 0) {
-        stallTimer = setInterval(checkStall, stallCheckMs);
-        if (stallTimer.unref) stallTimer.unref();
+      armTimers(sock);
+      // Subscribe first, then close the stalled socket. Its in-flight messages
+      // are still delivered until its close event (deduped by RFQ id upstream).
+      if (prev) {
+        prev._replaced = true;
+        try { prev.close(4000, 'stall-replaced'); } catch (_) {
+          try { prev.terminate(); } catch (__) {}
+        }
       }
     });
 
     sock.on('pong', () => {
-      if (ws !== sock) return;
+      if (!live.has(sock)) return;
       pongsRecv += 1;
       lastPongAt = now();
       pingsAtLastPong = pingsSent;
     });
 
     sock.on('message', (d) => {
-      if (ws !== sock) return;
+      if (!live.has(sock)) return;
       lastMessageAt = now();
       messagesThisConn += 1;
       const parsed = parsePrivateMessage(d.toString());
@@ -707,18 +746,42 @@ function createPolymarketRfqWs({
       try { onEvent && onEvent(parsed); } catch (e) { console.error('[POLY] ws event', e && e.message); }
     });
 
-    sock.on('close', (c) => {
-      if (ws !== sock) return; // superseded socket
+    sock.on('close', (code, reason) => {
+      live.delete(sock);
+      status('closed', { code, reason: closeReasonText(reason) });
+      if (sock._replaced || closedByUs) {
+        if (sock === ws) {
+          clearInterval(pingTimer);
+          clearInterval(stallTimer);
+          ws = null;
+        }
+        return;
+      }
+      if (sock !== ws) {
+        // Replacement died before it subscribed. Drop the stalled socket and
+        // reconnect with the normal backoff (the immediate attempt already failed).
+        handoff = false;
+        const stale = ws;
+        if (stale && stale !== sock) {
+          stale._replaced = true;
+          try { stale.terminate(); } catch (_) {}
+        }
+        ws = null;
+        clearInterval(pingTimer);
+        clearInterval(stallTimer);
+        reconnect();
+        return;
+      }
       clearInterval(pingTimer);
       clearInterval(stallTimer);
-      status('closed', { code: c });
-      if (!closedByUs) reconnect();
+      ws = null;
+      if (!handoff) reconnect();
     });
     sock.on('error', (e) => status('error', { message: e && e.message }));
   }
 
   function reconnect() {
-    if (reconnectTimer) return;
+    if (reconnectTimer || handoff || closedByUs) return;
     const wait = Math.min(backoff, 30000);
     status('reconnecting', { wait });
     reconnects += 1;
@@ -729,10 +792,13 @@ function createPolymarketRfqWs({
     start() { closedByUs = false; connect(); },
     stop() {
       closedByUs = true;
+      handoff = false;
       clearInterval(pingTimer);
       clearInterval(stallTimer);
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-      try { ws && ws.close(); } catch (_) {}
+      for (const sock of [...live]) {
+        try { sock.close(); } catch (_) {}
+      }
     },
     // Exposed for tests/heartbeat: run one watchdog pass.
     checkStall,

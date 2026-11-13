@@ -2994,6 +2994,8 @@ function startPolymarketRfqLoop(ctx = {}) {
     if (evt.type === 'rfqCreated') {
       const wsRaw = evt.rfq || evt;
       const wsId = rowId(wsRaw);
+      // Make-before-break overlaps two sockets. The same RFQ id on both is one RFQ.
+      if (wsId && wsSeen.has(wsId)) return;
       if (wsId) wsSeen.add(wsId);
       handleRfq(wsRaw, 'ws').catch((e) => console.error(`[${MODE}] onRfq`, e.message));
     } else if (evt.type === 'rfqClosed') {
@@ -3047,7 +3049,13 @@ function startPolymarketRfqLoop(ctx = {}) {
       keyId,
       secretKey,
       onStatus: (s, i) => {
-        console.log(`[${MODE}] ws:${s}`, i && i.message ? i.message : (i && i.wait != null ? `wait=${i.wait}` : ''));
+        if (s === 'closed') {
+          const code = i && i.code != null ? i.code : '?';
+          const reason = i && i.reason ? ` reason=${JSON.stringify(String(i.reason).slice(0, 200))}` : '';
+          console.log(`[${MODE}] ws:closed code=${code}${reason}`);
+        } else {
+          console.log(`[${MODE}] ws:${s}`, i && i.message ? i.message : (i && i.wait != null ? `wait=${i.wait}` : ''));
+        }
         // A reconnect may have missed order/position pushes: check REST once.
         if (s === 'subscribed') {
           if (wsEverSubscribed && polyRole) fillScheduler.trigger('ws-reconnect');
@@ -3062,7 +3070,7 @@ function startPolymarketRfqLoop(ctx = {}) {
         if (sniperRouter) sniperSafe(() => sniperRouter.onWsStall(info));
         console.error(
           `[${MODE}] WS STALL no message for ${Math.round(info.silentMs / 1000)}s ` +
-          `(stalls=${info.stalls}) - terminating socket and reconnecting | cause: ` +
+          `(stalls=${info.stalls}) - opening a replacement socket before closing the stalled one | cause: ` +
           `lastMsg=${info.lastMessageType || 'none'} msSinceLastMsg=${info.silentMs} ` +
           `msgsOnSocket=${info.messagesThisConn} socketAgeMs=${info.socketAgeMs} ` +
           `readyState=${info.readyState} ping=${info.ping ? info.ping.state : 'n/a'} ` +

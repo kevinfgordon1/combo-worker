@@ -160,6 +160,7 @@ const {
 } = require('./cap-confirm');
 const { startHeartbeat } = require('./heartbeat');
 const { createLatencyStats, createLoopLagSampler } = require('./latency-stats');
+const { startLoopLagMonitor } = require('./loop-lag');
 const { startPolymarketRfqLoop } = require('./polymarket-rfq');
 const { createPolySniper } = require('./poly-sniper');
 const { shortId } = require('./short-id');
@@ -3281,6 +3282,9 @@ async function main() {
     );
   }
   loopLag = createLoopLagSampler();
+  // Logs any event-loop block over 250ms with the active task label, when one
+  // was marked (fill reconcile, odds parse, market index, …).
+  startLoopLagMonitor({ log: (m) => console.warn(`[${MODE}] ${m}`) });
   const partialTimer = setInterval(() => { partialQuote.tick(); }, 60 * 1000);
   if (partialTimer.unref) partialTimer.unref();
   let polyHeartbeatSnap = null;
