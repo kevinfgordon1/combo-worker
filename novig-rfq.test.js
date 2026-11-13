@@ -21,22 +21,32 @@ const { summarizeShadowRows } = require('./scripts/novig-shadow-summary');
 
 const T0 = Date.parse('2026-09-13T17:00:00Z');
 
-// Price grid. Round UP. +400 is 0.200 and stays. +350 is 0.222… and steps to 0.225.
+// RFQ price. Snap UP to the next 0.001, never down. Every thousandth from
+// 0.001 to 0.999 is legal. +400 is 0.200 and stays. +350 is 0.22222… and
+// quotes 0.223 (about +348). +1000 quotes 0.091. 0.052 is allowed.
 assert.strictEqual(quotePriceFromAmerican(400), '0.200');
 assert.strictEqual(formatAmerican(americanFromMilli(200)), '+400');
-assert.strictEqual(quotePriceFromAmerican(350), '0.225');
-assert.strictEqual(formatAmerican(americanFromMilli(225)), '+344');
+assert.strictEqual(quotePriceFromAmerican(350), '0.223');
+assert.strictEqual(formatAmerican(americanFromMilli(223)), '+348');
+assert.strictEqual(quotePriceFromAmerican(1000), '0.091');
 assert.strictEqual(quotePriceFromAmerican(-150), '0.600');
 assert.strictEqual(formatAmerican(americanFromMilli(600)), '-150');
-assert.strictEqual(snapUpMilli(51), 55);
+assert.strictEqual(snapUpMilli(222.22), 223);
+assert.strictEqual(snapUpMilli(200), 200);
+assert.strictEqual(snapUpMilli(52), 52);
+assert.strictEqual(snapUpMilli(51), 51);
+assert.strictEqual(snapUpMilli(54), 54);
 assert.strictEqual(snapUpMilli(50), 50);
 assert.strictEqual(snapUpMilli(665), 665);
-assert.strictEqual(snapUpMilli(667), 670);
+assert.strictEqual(snapUpMilli(667), 667);
 assert.strictEqual(snapUpMilli(945), 945);
-assert.strictEqual(snapUpMilli(946), 950);
+assert.strictEqual(snapUpMilli(946), 946);
 assert.strictEqual(snapUpMilli(999), 999);
+assert.strictEqual(snapUpMilli(999.1), null);
 assert.strictEqual(snapUpMilli(1000), null);
-assert.ok(onGrid(55) && onGrid(670) && !onGrid(667) && !onGrid(51));
+assert.strictEqual(snapUpMilli(0.2), 1);
+assert.ok(onGrid(1) && onGrid(52) && onGrid(223) && onGrid(667) && onGrid(999));
+assert.ok(!onGrid(0) && !onGrid(1000) && !onGrid(52.4));
 assert.strictEqual(quotePriceFromAmerican(0), null);
 
 // maxWager is the user stake. Collateral is stake × (1 − price) / price.

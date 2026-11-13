@@ -6,7 +6,7 @@ Shadow first. This process does not quote until `NOVIG_DRY_RUN=0` and `NOVIG_RFQ
 
 Novig sends parlay RFQs on one signed websocket, `GET /rfq/v3/ws`. We subscribe to `rfq`, `quotes`, and `executions`. A quote is `{rfqId, price, maxWager, clientId}`. `price` is the parlay's win probability. The lowest price wins. There is no update and no cancel. The auction is 3 seconds. On `quote_accepted` we have 1 second to confirm.
 
-We quote only when the RFQ's outcome ids are exactly one active Combo Lock. The price is the lock's `fill_american` turned into a win probability and rounded **up** onto Novig's price grid (maker fee is $0). `maxWager` is the user stake, capped by remaining payout, the subaccount balance, and the hard collateral caps. Before the quote is sent we insert a `combo_venue_holds` row (`venue = novig`) for the full payout (`maxWager / price`), which is the unit Kalshi and Polymarket already sum. Confirm does not re-check the cap. `COMBO_CAP_AT_CONFIRM` does not apply.
+We quote only when the RFQ's outcome ids are exactly one active Combo Lock. The price is the lock's `fill_american` turned into a win probability and rounded **up** to the next 0.001, never down, and kept inside 0.001–0.999 (maker fee is $0). RFQ accepts every thousandth in that range. It does not use the order book's 0.005 steps. `maxWager` is the user stake, capped by remaining payout, the subaccount balance, and the hard collateral caps. Before the quote is sent we insert a `combo_venue_holds` row (`venue = novig`) for the full payout (`maxWager / price`), which is the unit Kalshi and Polymarket already sum. Confirm does not re-check the cap. `COMBO_CAP_AT_CONFIRM` does not apply.
 
 A hard fault (game already started, socket or catalog older than a few seconds, hold missing, kill switch, lock pause) rejects that last look and stops new quotes until the process is restarted. The trailing confirm rate pausing below 99.5% does the same. Novig's own bar is 99% over 24 hours, with a 5-minute lockout.
 
@@ -52,7 +52,6 @@ A voided leg settles at its fair value, not as a push. The parlay pays the user 
 
 ## Open questions for Novig
 
-- Confirm RFQ `price` uses the same 279-price grid as the order book. We round up (the book snaps down, because those orders buy).
 - Is there a quote rate limit on the RFQ socket beyond the 256-frame outbound queue?
 - What is `minSample` on `GET /rfq/v3/maker` during beta? We pause ourselves below 99.5% from the first last look.
 - Does Paper publish RFQ traffic we can shadow before production?
