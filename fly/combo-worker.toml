@@ -27,6 +27,10 @@ kill_timeout = "30s"
 # EXACTLY ONE machine, ever. No [http_service], so Fly never auto-starts/stops it.
 # Never 'fly scale count' above 1; stop Railway combo-worker before the first start.
 [env]
+  # SNIPER_SHADOW_MIN_EDGE is intentionally unset. Set it (for example 0.03)
+  # only with Kevin's OK, then deploy this app. The shadow path reads the
+  # Kalshi RFQs this process already receives. SNIPER_ENABLED stays unset
+  # and the shadow path has no quote client.
   COMBO_POLY_ENABLED = "0"
   # Oct 25: decode the Kalshi feed on a worker thread (main thread was lagging ~1.1s at kickoff volume).
   COMBO_INTAKE_WORKER = "1"

@@ -36,7 +36,8 @@ function guarded(sources, venues, rogue, noVenueReason, mid, own) {
   const mcfg = mid || envMid();
   const m = midGuard(1 - b.cost, b.venue, sources, venues, mcfg, own);
   if (m.skip && mcfg.mode === 'enforce') return { p: null, reason: m.skip, guard: m.ev, rogue: rogueEv.length ? rogueEv : undefined };
-  return { p: 1 - b.cost, ref: m.ref != null ? m.ref : null, guardShadow: m.ev || undefined, best: `${b.venue}${b.via && b.via !== 'td_opposite' ? ':' + b.via : ''}`, venue: b.venue, depthUsd: b.availUsd != null ? b.availUsd : null, rogue: rogueEv.length ? rogueEv : undefined };
+  const ageMs = b.ageMs != null && Number.isFinite(Number(b.ageMs)) ? Math.round(Number(b.ageMs)) : null;
+  return { p: 1 - b.cost, ref: m.ref != null ? m.ref : null, guardShadow: m.ev || undefined, best: `${b.venue}${b.via && b.via !== 'td_opposite' ? ':' + b.via : ''}`, venue: b.venue, depthUsd: b.availUsd != null ? b.availUsd : null, ageMs, rogue: rogueEv.length ? rogueEv : undefined };
 }
 function legFairDepth(leg, { pmLive, tdBook, venues, ncaafBook, linesBook = null, nbaBook = null, ncaabBook = null, rogue, mid }) {
   if (leg.kind === 'ncaab') { // men's college basketball moneyline (sniper/ncaab.js); no NCAAB lines

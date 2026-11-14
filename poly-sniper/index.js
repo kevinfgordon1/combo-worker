@@ -11,10 +11,13 @@ const { enabled, assertValidMode, assertNoTradingClient } = require('./guard');
 const { createPolySniperLive } = require('./live');
 const { createPolySniperStore } = require('./store');
 const { createPolySniperFeed } = require('./feed');
-const { decidePoly, polySniperConfig, createVenueLedger } = require('./engine');
+const { decidePoly, polySniperConfig, polyMinRoi, createVenueLedger } = require('./engine');
+const { polyComboMakerFeeDollars } = require('../poly-combo-fee');
+const { shadowMinEdge, shadowThenLive, createShadowLogger } = require('../sniper/shadow');
 
-// Local read-only normalizer (same fields as polymarket-rfq.js normalizePolymarketRfq). Kept here so
-// this module never loads the Polymarket HTTP/trading client.
+// Local read-only normalizer (same pricing fields as polymarket-rfq.js
+// normalizePolymarketRfq, plus quotes / a print when the payload already has
+// them). Kept here so this module never loads the Polymarket HTTP/trading client.
 function normalizePolymarketRfq(raw) {
   const r = raw && raw.rfq && typeof raw.rfq === 'object' ? raw.rfq : raw;
   if (!r || typeof r !== 'object') return null;
@@ -27,6 +30,10 @@ function normalizePolymarketRfq(raw) {
     comboLegs: Array.isArray(legs) ? legs : null,
     createdTime: r.createdTime || r.created_time || null,
     tickSize: r.tickSize != null ? r.tickSize : (r.tick_size != null ? r.tick_size : null),
+    quotes: Array.isArray(r.quotes) ? r.quotes : (Array.isArray(r.competingQuotes) ? r.competingQuotes : null),
+    tradedYes: r.tradedYes != null ? r.tradedYes : (r.traded_yes != null ? r.traded_yes : null),
+    status: r.status || null,
+    filled: r.filled === true ? true : (r.filled === false ? false : null),
   };
 }
 
@@ -119,6 +126,8 @@ function createPolySniper({ env = process.env, supabase = null, log = console.lo
   const mode = assertValidMode(env); // throws unless POLY_SNIPER_DRY_RUN is exactly '1' or '0'
   assertNoTradingClient({ feed });
   const config = polySniperConfig(env);
+  const shadowEdge = shadowMinEdge(env);
+  const shadowLogger = shadowEdge != null ? createShadowLogger({ supabase, log, label: 'POLY-SNIPER' }) : null;
   const f = feed || createPolySniperFeed({ env, log });
   const ledger = createVenueLedger('polymarket');
   const logger = createDecisionLogger({ supabase, log, logSkips: String(env.POLY_SNIPER_LOG_SKIPS || '1') !== '0', skipSample: skipSampleFrom(env) });
@@ -141,6 +150,33 @@ function createPolySniper({ env = process.env, supabase = null, log = console.lo
     const t1 = now();
     const created = Date.parse(rfq.createdTime || '');
     const ageMs = Number.isFinite(created) ? t1 - created : null;
+    if (shadowLogger) {
+      try {
+        const legs = Array.isArray(d.legs) ? d.legs : null;
+        const tick = Number(rfq.tickSize);
+        shadowThenLive({
+          shadowEdge,
+          liveEdge: d.minRoi != null ? d.minRoi : (legs ? polyMinRoi(legs, config) : null),
+          venue: 'polymarket',
+          rfq: { rfqId: rfq.rfqId, symbol: rfq.symbol || null, marketTicker: rfq.symbol || null, quotes: rfq.quotes || null, tradedYes: rfq.tradedYes, traded_yes: rfq.traded_yes, status: rfq.status, filled: rfq.filled },
+          row: legs ? {
+            legs,
+            contracts: Number(rfq.qtyDecimal) > 0 ? Number(rfq.qtyDecimal) : null,
+            cash_size: Number(rfq.cashOrderQty) > 0 ? Number(rfq.cashOrderQty) : null,
+          } : null,
+          decision: d,
+          makerRate: 0,
+          feeDollars: (n, q) => polyComboMakerFeeDollars(n, q, t0),
+          tick: tick > 0 && tick < 0.1 ? tick : 0.001,
+          nowMs: t0,
+          rfqAgeMs: ageMs,
+          maxAgeMs: 0,
+          pricesHealthy: f.pricesHealthy(t0),
+        }, shadowLogger);
+      } catch (e) {
+        if (!observe.shadowWarned) { observe.shadowWarned = true; log(`[POLY-SNIPER] shadow note failed: ${e.message}`); }
+      }
+    }
     if (d.action === 'quote') counts.quote += 1; else counts.skip[d.reason] = (counts.skip[d.reason] || 0) + 1;
     const row = (_d, extra = {}) => ({
       rfq_id: rfq.rfqId, venue: 'polymarket', dry_run: !goLive, source: src || null, symbol: rfq.symbol || null,
@@ -186,7 +222,8 @@ function createPolySniper({ env = process.env, supabase = null, log = console.lo
     if (!live) throw new Error('poly-sniper: POLY_SNIPER_DRY_RUN=1 (dry run) never takes a trading client');
     return live.attach(deps);
   }
-  async function shutdown(reason) { if (live) await live.shutdown(reason || 'shutdown'); await logger.flush(); }
-  return { mode, live, router, attachTrading, shutdown, start: () => { if (!feed) f.start(); log(`[POLY-SNIPER] ${live ? 'LIVE-CAPABLE (POLY_SNIPER_DRY_RUN=0) started; posts only while poly_sniper_control.live is on' : 'DRY RUN started (posts nothing)'}. fair venues=${f.venues.join('+')} depth game=$${f.depths ? f.depths.game : '?'} td=$${f.depths ? f.depths.td : '?'} minEdge=ml:${(config.minRoiNflMl * 100).toFixed(1)}%,nfl:${(config.minRoiNfl * 100).toFixed(1)}%,ncaaf:${(config.minRoiNcaaf * 100).toFixed(1)}%,td:${(config.minRoiTd * 100).toFixed(1)}%,nba:${(config.minRoiNba * 100).toFixed(1)}% nba=${config.nba && !!f.nbaBook ? 'on' : 'off'} lines=${config.lines && !!f.linesBook ? 'on' : 'off'}`); }, observe, counts, ledger, flush: logger.flush };
+  async function shutdown(reason) { if (live) await live.shutdown(reason || 'shutdown'); await logger.flush(); if (shadowLogger) await shadowLogger.flush(); }
+  async function flushAll() { await logger.flush(); if (shadowLogger) await shadowLogger.flush(); }
+  return { mode, live, router, attachTrading, shutdown, start: () => { if (!feed) f.start(); if (shadowEdge != null) log(`[POLY-SNIPER] shadow min edge ${(shadowEdge * 100).toFixed(2)}% ON — sniper_shadow_quotes only, never posts`); log(`[POLY-SNIPER] ${live ? 'LIVE-CAPABLE (POLY_SNIPER_DRY_RUN=0) started; posts only while poly_sniper_control.live is on' : 'DRY RUN started (posts nothing)'}. fair venues=${f.venues.join('+')} depth game=$${f.depths ? f.depths.game : '?'} td=$${f.depths ? f.depths.td : '?'} minEdge=ml:${(config.minRoiNflMl * 100).toFixed(1)}%,nfl:${(config.minRoiNfl * 100).toFixed(1)}%,ncaaf:${(config.minRoiNcaaf * 100).toFixed(1)}%,td:${(config.minRoiTd * 100).toFixed(1)}%,nba:${(config.minRoiNba * 100).toFixed(1)}% nba=${config.nba && !!f.nbaBook ? 'on' : 'off'} lines=${config.lines && !!f.linesBook ? 'on' : 'off'}`); }, observe, counts, ledger, flush: flushAll };
 }
 module.exports = { createPolySniper, normalizePolymarketRfq, createDecisionLogger, legRows, skipSampleFrom };

@@ -163,6 +163,8 @@ const { createLatencyStats, createLoopLagSampler } = require('./latency-stats');
 const { startPolymarketRfqLoop } = require('./polymarket-rfq');
 const { startNovigRfqLoop } = require('./novig-rfq');
 const { createPolySniper } = require('./poly-sniper');
+const { shadowMinEdge } = require('./sniper/shadow');
+const { createSniperShadow } = require('./sniper/shadow-host');
 const { shortId } = require('./short-id');
 const {
   classifySkip,
@@ -3320,6 +3322,20 @@ async function main() {
   const polyAppAlerts = createAppAlerts({ client: SCOPE.isTester ? null : supabase });
   const polyStallAlerts = createPolyStallAlerts({ appAlerts: polyAppAlerts, log: console.log });
   { const t = setInterval(() => { polyStallAlerts.tick().catch(() => {}); }, 30000); if (t.unref) t.unref(); }
+  // Combo Sniper shadow tape. Independent of SNIPER_ENABLED / POLY_SNIPER_ENABLED
+  // (both stay off). Reads RFQs this process already has: Kalshi on
+  // kaygo-combo-worker, Polymarket US on kaygo-poly-worker. No quote client.
+  let sniperShadow = null;
+  if (shadowMinEdge(process.env) != null && !SCOPE.isTester && !SPLIT.runNovig) {
+    try {
+      sniperShadow = createSniperShadow({ env: process.env, supabase: SCOPE.isTester ? null : supabase, log: console.log });
+      if (sniperShadow) sniperShadow.start();
+    } catch (e) { console.error(`[${MODE}] sniper shadow not started: ${e.message}`); sniperShadow = null; }
+  }
+  function noteSniperShadowKalshi(rfq) {
+    if (!sniperShadow || !SPLIT.runKalshi || !rfq) return;
+    setImmediate(() => { sniperShadow.onKalshiRfq(rfq).catch(() => {}); });
+  }
   // Polymarket combo sniper (poly-sniper/). Off unless POLY_SNIPER_ENABLED=1; refuses to start unless
   // POLY_SNIPER_DRY_RUN is exactly 1 (dry run: RFQ payloads only, never the Polymarket client or keys) or
   // 0 (live-capable: this process attaches its own client below; quotes only while
@@ -3393,7 +3409,12 @@ async function main() {
   }
   const poly = !SPLIT.runPoly ? null : startPolymarketRfqLoop({
     lossTape: polyLossTape,
-    onRfqObserved: polySniper ? (raw, src) => { setImmediate(() => { try { polySniper.observe(raw, src); } catch (_) { /* never into the Combo Locks path */ } }); } : null,
+    onRfqObserved: (polySniper || (sniperShadow && SPLIT.runPoly)) ? (raw, src) => { setImmediate(() => {
+      try { if (polySniper) polySniper.observe(raw, src); } catch (_) { /* never into the Combo Locks path */ }
+      // The enabled sniper already writes the shadow row from observe(). This
+      // path is the one that runs while POLY_SNIPER_ENABLED is off.
+      try { if (sniperShadow && !polySniper) sniperShadow.onPolyRfq(raw, src); } catch (_) { /* never into the Combo Locks path */ }
+    }); } : null,
     sniperRouter: polySniper && polySniper.router ? polySniper.router : null,
     pendingQuotes: polyPendingQuotes,
     kalshiPendingQuotes: pendingQuotes,
@@ -3568,7 +3589,7 @@ async function main() {
     dropDeleted: !(runUnhedged || dropDeletedDisabled(process.env)),
     openIds: () => { const ids = []; pendingQuotes.forEach((q) => { if (q && q.rfqId) ids.push(q.rfqId); }); return ids; },
     onStatus: (s, info) => noteWsStatus(s, info),
-    onRfqCreated: (rfq, env) => onRfq(rfq, env).catch((e) => console.error('onRfq', e)),
+    onRfqCreated: (rfq, env) => { noteSniperShadowKalshi(rfq); onRfq(rfq, env).catch((e) => console.error('onRfq', e)); },
     onRfqDeleted: (evt, env) => { try { onRfqDeleted(evt, env); } catch (e) { console.error('onRfqDeleted', e); } },
     onQuoteAccepted: (evt) => onQuoteAccepted(evt).catch((e) => console.error('onQuoteAccepted', e)),
     onQuoteExecuted: (evt) => onQuoteExecuted(evt).catch((e) => console.error('onQuoteExecuted', e)),
@@ -3585,7 +3606,7 @@ async function main() {
     shouldDropDeleted: (runUnhedged || dropDeletedDisabled(process.env))
       ? undefined
       : createDeletedFilter((cb) => { pendingQuotes.forEach((q) => cb(q && q.rfqId)); }),
-    onRfqCreated: (rfq, env) => onRfq(rfq, env).catch((e) => console.error('onRfq', e)),
+    onRfqCreated: (rfq, env) => { noteSniperShadowKalshi(rfq); onRfq(rfq, env).catch((e) => console.error('onRfq', e)); },
     onRfqDeleted: (evt, env) => { try { onRfqDeleted(evt, env); } catch (e) { console.error('onRfqDeleted', e); } },
     onQuoteAccepted: (evt) => onQuoteAccepted(evt).catch((e) => console.error('onQuoteAccepted', e)),
     onQuoteExecuted: (evt) => onQuoteExecuted(evt).catch((e) => console.error('onQuoteExecuted', e)),

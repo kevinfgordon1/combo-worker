@@ -50,6 +50,9 @@ kill_timeout = "60s"   # Oct 25: room to cancel every open quote on SIGTERM
   MLB_ENABLED = "0"              # Kevin Oct 30: no ESPN MLB schedule pulls (season over). "1" = back on
   SNIPER_FETCH_TIMEOUT_MS = "30000"   # Kevin Oct 24: 8s cut off Kalshi book pulls
   SNIPER_PER_GAME_CAP = "1500"
+  # The 3% shadow tape does not run on this app. It rides the Kalshi feed on
+  # kaygo-combo-worker and the Polymarket US feed on kaygo-poly-worker.
+  # SNIPER_SHADOW_MIN_EDGE stays unset here. SNIPER_ENABLED stays unset.
   SNIPER_MIN_ROI = "0.08"         # Kevin Nov 1: every sport 8% (was all-NFL 5%); Oct 27 5%, Oct 24 4%
   SNIPER_MIN_ROI_TD = "0.08"      # Kevin Nov 1: 8% (was 7%); highest rule wins
   SNIPER_MIN_ROI_NCAAF = "0.08"   # Kevin Nov 1: college 8% (was 6%)

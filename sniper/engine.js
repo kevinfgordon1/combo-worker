@@ -115,9 +115,10 @@ function classifyLegs(rfq, { td, ncaaf, lines = false, nba = false, ncaab = fals
 }
 
 // -> { decision, row } ; decision.action 'quote' | 'skip'
-function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBook = null, nbaBook = null, ncaabBook = null, venues, kickoffFor, makerRate, nowMs, bufferMs = 30 * 60 * 1000, pricesHealthy = true, totalCapFor = null }) {
+function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBook = null, nbaBook = null, ncaabBook = null, venues, kickoffFor, makerRate, nowMs, bufferMs = 30 * 60 * 1000, pricesHealthy = true, totalCapFor = null, shadow = false }) {
   const skip = (reason) => ({ decision: { action: 'skip', reason } });
-  if (!config.enabled) return skip('kill_switch');
+  // shadow: price the RFQ even when SNIPER_ENABLED is off. Does not reserve or quote.
+  if (!config.enabled && !shadow) return skip('kill_switch');
   if (!rfq || !rfq.rfqId || !Array.isArray(rfq.legKeys)) return skip('bad_rfq');
   if (!pricesHealthy) return skip('prices_stale');
   const cls = classifyLegs(rfq, { td: !!tdBook, ncaaf: config.ncaaf !== false, lines: !!linesBook, nba: !!nbaBook && !!config.nba, ncaab: !!ncaabBook && !!config.ncaab });
@@ -140,7 +141,7 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
     if (f.rogue && f.rogue.length) rogue.push(...f.rogue.map((e) => ({ ...e, ticker, side: side || 'yes' })));
     if (f.p == null && MID_GUARD_REASONS.has(f.reason)) guardHits.push({ ...(f.guard || { kind: f.reason }), ticker, side: side || 'yes' });
     else if (f.guardShadow) guardHits.push({ ...f.guardShadow, ticker, side: side || 'yes', shadow: true });
-    return { ticker, side: side || 'yes', fair_yes: f.p, ref: f.ref != null ? f.ref : null, fair_best: f.best || null, venue: f.venue || null, depth_usd: f.depthUsd != null ? Math.round(f.depthUsd) : null, name: (tdBook && tdBook.names && tdBook.names.get && tdBook.names.get(String(ticker).toUpperCase())) || null, date: legDate(ticker) };
+    return { ticker, side: side || 'yes', fair_yes: f.p, age_ms: f.ageMs != null ? f.ageMs : null, ref: f.ref != null ? f.ref : null, fair_best: f.best || null, venue: f.venue || null, depth_usd: f.depthUsd != null ? Math.round(f.depthUsd) : null, name: (tdBook && tdBook.names && tdBook.names.get && tdBook.names.get(String(ticker).toUpperCase())) || null, date: legDate(ticker) };
   });
   const hardGuard = guardHits.filter((h) => !h.shadow);
   if (hardGuard.length) return { decision: { action: 'skip', reason: hardGuard[0].kind, rfqId: rfq.rfqId, guard: guardHits, rogue: rogue.length ? rogue : undefined } };
@@ -170,6 +171,7 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
   // every other minimum is unchanged and the highest applicable one still wins.
   const hasNcaab = cls.legs.some((l) => l && l.kind === 'ncaab');
   if (hasNcaab) minRoi = Math.max(minRoi, config.minRoiNcaab != null ? config.minRoiNcaab : 0.07);
+  if (shadow) return { decision: { action: 'shadow', reason: null, rfqId: rfq.rfqId, minRoi }, row };
   // Per-parlay total cap (sniper/soon-cap.js): <= soonHours to settle may use the sniper's cash.
   const settleAt0 = settleAtMs(keys, kickoffFor, config.gameHours, config.nbaGameHours, config.ncaabGameHours);
   const totalCap = totalCapFor ? totalCapFor(settleAt0, nowMs) : config.totalExposureCap;
@@ -181,6 +183,7 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
   else if (d.action === 'skip' && d.reason === 'roi_below_min' && hasLine) d.reason = 'roi_below_min_lines';
   if (rogue.length) d.rogue = rogue;
   if (guardHits.length) d.guard = guardHits;
+  d.minRoi = minRoi;
   if (d.action === 'quote') {
     d.releaseAt = releaseAtMs(legs, nowMs);
     d.settleAt = settleAt0;
