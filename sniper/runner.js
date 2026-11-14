@@ -101,7 +101,7 @@ async function main(env = process.env) {
   const alert = (m) => { log(m); if (tg) tg(tgLabel(m)); };
   if (!config.enabled) {
     log('[SNIPER] SNIPER_ENABLED is off — idling (kill switch).');
-    if (shadowEdge != null) log('[SNIPER] shadow min edge is set, but the kill switch is off, so no RFQs are read and no shadow rows are written.');
+    if (shadowEdge != null) log('[SNIPER] shadow min edge is set, but this process reads no RFQs while SNIPER_ENABLED is off. The tape runs on kaygo-combo-worker (Kalshi) and kaygo-poly-worker (Polymarket US).');
     setInterval(() => {}, 1 << 30); return;
   }
   const gate = liveGate(env);

@@ -115,9 +115,10 @@ function classifyLegs(rfq, { td, ncaaf, lines = false, nba = false, ncaab = fals
 }
 
 // -> { decision, row } ; decision.action 'quote' | 'skip'
-function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBook = null, nbaBook = null, ncaabBook = null, venues, kickoffFor, makerRate, nowMs, bufferMs = 30 * 60 * 1000, pricesHealthy = true, totalCapFor = null }) {
+function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBook = null, nbaBook = null, ncaabBook = null, venues, kickoffFor, makerRate, nowMs, bufferMs = 30 * 60 * 1000, pricesHealthy = true, totalCapFor = null, shadow = false }) {
   const skip = (reason) => ({ decision: { action: 'skip', reason } });
-  if (!config.enabled) return skip('kill_switch');
+  // shadow: price the RFQ even when SNIPER_ENABLED is off. Does not reserve or quote.
+  if (!config.enabled && !shadow) return skip('kill_switch');
   if (!rfq || !rfq.rfqId || !Array.isArray(rfq.legKeys)) return skip('bad_rfq');
   if (!pricesHealthy) return skip('prices_stale');
   const cls = classifyLegs(rfq, { td: !!tdBook, ncaaf: config.ncaaf !== false, lines: !!linesBook, nba: !!nbaBook && !!config.nba, ncaab: !!ncaabBook && !!config.ncaab });
@@ -170,6 +171,7 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
   // every other minimum is unchanged and the highest applicable one still wins.
   const hasNcaab = cls.legs.some((l) => l && l.kind === 'ncaab');
   if (hasNcaab) minRoi = Math.max(minRoi, config.minRoiNcaab != null ? config.minRoiNcaab : 0.07);
+  if (shadow) return { decision: { action: 'shadow', reason: null, rfqId: rfq.rfqId, minRoi }, row };
   // Per-parlay total cap (sniper/soon-cap.js): <= soonHours to settle may use the sniper's cash.
   const settleAt0 = settleAtMs(keys, kickoffFor, config.gameHours, config.nbaGameHours, config.ncaabGameHours);
   const totalCap = totalCapFor ? totalCapFor(settleAt0, nowMs) : config.totalExposureCap;
