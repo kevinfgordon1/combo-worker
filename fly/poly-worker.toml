@@ -18,6 +18,8 @@ kill_timeout = "30s"
   COMBO_VENUE_COORD = "1"
   # Poly sniper fair = full 4-venue inverse method incl. Polymarket (Kevin Oct 23). Sniper stays DRY (secrets).
   POLY_SNIPER_FAIR_INCLUDE_POLY = "1"
+  # SNIPER_SHADOW_MIN_EDGE is intentionally unset here too. The Polymarket
+  # sniper only sees RFQs while POLY_SNIPER_ENABLED=1, which stays unset.
   # Kevin Nov 1: every sniper minimum edge is 8% (inverse bet method pricing unchanged). All six set here so
   # no code default (5-6%) can apply in prod. The post cushion below still adds 0.5% when posting.
   POLY_SNIPER_MIN_ROI_TD = "0.08"      # was 6%

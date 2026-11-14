@@ -125,7 +125,7 @@ function decidePoly(rfq, { feed, config, ledger, nowMs = Date.now(), skipLedger 
   for (let i = 0; i < m.legKeys.length; i += 1) {
     const [ticker, side] = m.legKeys[i].split(':');
     const f = legFairDepth(cls.legs[i], { pmLive: feed.pmLive, tdBook: feed.tdBook, ncaafBook: feed.ncaafBook, linesBook: linesOn ? feed.linesBook : null, nbaBook: nbaOn ? feed.nbaBook : null, ncaabBook: ncaabOn ? feed.ncaabBook : null, venues: feed.venues });
-    const leg = { polySymbol: comboLegs[i].symbol, polySide: comboLegs[i].side, ticker, side, kind: cls.legs[i].kind || 'ml', league: cls.legs[i].league || null, fair: f.p, venue: f.venue || null, best: f.best || null, depthUsd: f.depthUsd != null ? Math.round(f.depthUsd) : null, reason: f.reason || null, date: legDate(ticker) };
+    const leg = { polySymbol: comboLegs[i].symbol, polySide: comboLegs[i].side, ticker, side, kind: cls.legs[i].kind || 'ml', league: cls.legs[i].league || null, fair: f.p, ageMs: f.ageMs != null ? f.ageMs : null, venue: f.venue || null, best: f.best || null, depthUsd: f.depthUsd != null ? Math.round(f.depthUsd) : null, reason: f.reason || null, date: legDate(ticker) };
     legs.push(leg);
     if (!(f.p > 0 && f.p < 1)) return skip(f.reason || 'leg_no_fair', { legs });
     if (f.p < config.minLegFair || f.p > config.maxLegFair) return skip('leg_fair_out_of_range', { legs });

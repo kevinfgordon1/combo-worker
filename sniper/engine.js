@@ -140,7 +140,7 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
     if (f.rogue && f.rogue.length) rogue.push(...f.rogue.map((e) => ({ ...e, ticker, side: side || 'yes' })));
     if (f.p == null && MID_GUARD_REASONS.has(f.reason)) guardHits.push({ ...(f.guard || { kind: f.reason }), ticker, side: side || 'yes' });
     else if (f.guardShadow) guardHits.push({ ...f.guardShadow, ticker, side: side || 'yes', shadow: true });
-    return { ticker, side: side || 'yes', fair_yes: f.p, ref: f.ref != null ? f.ref : null, fair_best: f.best || null, venue: f.venue || null, depth_usd: f.depthUsd != null ? Math.round(f.depthUsd) : null, name: (tdBook && tdBook.names && tdBook.names.get && tdBook.names.get(String(ticker).toUpperCase())) || null, date: legDate(ticker) };
+    return { ticker, side: side || 'yes', fair_yes: f.p, age_ms: f.ageMs != null ? f.ageMs : null, ref: f.ref != null ? f.ref : null, fair_best: f.best || null, venue: f.venue || null, depth_usd: f.depthUsd != null ? Math.round(f.depthUsd) : null, name: (tdBook && tdBook.names && tdBook.names.get && tdBook.names.get(String(ticker).toUpperCase())) || null, date: legDate(ticker) };
   });
   const hardGuard = guardHits.filter((h) => !h.shadow);
   if (hardGuard.length) return { decision: { action: 'skip', reason: hardGuard[0].kind, rfqId: rfq.rfqId, guard: guardHits, rogue: rogue.length ? rogue : undefined } };
@@ -181,6 +181,7 @@ function decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook = null, linesBo
   else if (d.action === 'skip' && d.reason === 'roi_below_min' && hasLine) d.reason = 'roi_below_min_lines';
   if (rogue.length) d.rogue = rogue;
   if (guardHits.length) d.guard = guardHits;
+  d.minRoi = minRoi;
   if (d.action === 'quote') {
     d.releaseAt = releaseAtMs(legs, nowMs);
     d.settleAt = settleAt0;

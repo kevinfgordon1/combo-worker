@@ -40,6 +40,7 @@ const { createCloseSnapshot } = require('./close-snapshot');
 const { RESERVE_TTL_MS } = require('../reserve');
 const { rogueConfig, americanOf } = require('./rogue');
 const { decide, repriceFair, pregameCheck } = require('./engine');
+const { shadowMinEdge, shadowThenLive, createShadowLogger } = require('./shadow');
 const { liveGate, sniperSubaccount } = require('./gates');
 const { createSniperTrader } = require('./trader');
 const { createSoonCap } = require('./soon-cap');
@@ -78,6 +79,7 @@ function etDayStartIso(ms) {
 
 async function main(env = process.env) {
   const config = sniperConfig(env);
+  const shadowEdge = shadowMinEdge(env);
   // Resting-quote controls (Oct 25 2026). Each has its own switch; see PR.
   //  SNIPER_QUOTE_TTL_MS: unaccepted quote life (old 20000). All 35 fills in 36h came 3.1-10.1s after reserve.
   //  SNIPER_RESTING_CAP_WEIGHT: share of a resting quote's risk counted toward total/game/leg caps (1 = old).
@@ -97,11 +99,16 @@ async function main(env = process.env) {
   // Every sniper Telegram message is labelled so it can never be read as a Combo Locks alert.
   const tgLabel = (m) => (/^🎯 SNIPER/.test(m) ? m : `🎯 SNIPER (not Combo Locks) — ${String(m).replace(/^\[SNIPER\]\s*/, '')}`);
   const alert = (m) => { log(m); if (tg) tg(tgLabel(m)); };
-  if (!config.enabled) { log('[SNIPER] SNIPER_ENABLED is off — idling (kill switch).'); setInterval(() => {}, 1 << 30); return; }
+  if (!config.enabled) {
+    log('[SNIPER] SNIPER_ENABLED is off — idling (kill switch).');
+    if (shadowEdge != null) log('[SNIPER] shadow min edge is set, but the kill switch is off, so no RFQs are read and no shadow rows are written.');
+    setInterval(() => {}, 1 << 30); return;
+  }
   const gate = liveGate(env);
   config.dryRun = !gate.live;
   if (String(env.SNIPER_DRY_RUN) === '0' && !gate.live) alert(`[SNIPER] SNIPER_DRY_RUN=0 but live gate closed (${gate.why.join(', ')}) — staying DRY RUN.`);
   log(`[SNIPER] boot enabled=${config.enabled} mode=${gate.live ? 'LIVE' : 'DRY_RUN'} depth=game:$${gameDepth},td:$${depth} venues=${venues.join('+')} prophetx=${hasProphetXCreds(env) ? 'on' : 'off'} minEdge=ml:${(config.minRoi * 100).toFixed(1)}%,lines:${(config.minRoiLines * 100).toFixed(1)}%,td:${(config.minRoiTd * 100).toFixed(1)}% ncaaf=${config.ncaaf ? `on(min ${(config.minRoiNcaaf * 100).toFixed(1)}%)` : 'off'} lines=${String(env.SNIPER_LINES || '0') === '1' ? 'on' : 'off'} nba=${config.nba ? `on(min ${(config.minRoiNba * 100).toFixed(1)}%, ${config.nbaHours}h)` : 'off'} ncaab=${config.ncaab ? `on(ML only, min ${(config.minRoiNcaab * 100).toFixed(1)}%, ${config.ncaabHours}h)` : 'off'} caps=total:$${config.totalExposureCap},long:$${config.longExposureCap}(>${config.shortSettleHours}h),game:$${config.perGameCap},leg:$${config.perLegCap},quote:$${config.maxRisk},dailyRisk:$${config.dailyRiskCap},dailyLoss:$${config.dailyLossCap}`);
+  if (shadowEdge != null) log(`[SNIPER] shadow min edge ${(shadowEdge * 100).toFixed(2)}% ON — writes sniper_shadow_quotes only and never posts. The other column is that RFQ's live minimum.`);
   // Effective caps after env overrides, published on every summary heartbeat so the dashboard
   // header can't drift from what the sniper actually enforces (audit Oct 24).
   const effectiveCaps = { totalOpen: config.totalExposureCap, longDatedOpen: config.longExposureCap, perGame: config.perGameCap, perLeg: config.perLegCap, dailyLoss: config.dailyLossCap, dailyNewRisk: config.dailyRiskCap, perQuoteRisk: config.maxRisk, minEdge: config.minRoi, minEdgeLines: config.minRoiLines, minEdgeNcaaf: config.minRoiNcaaf, minEdgeNba: config.minRoiNba, minEdgeTd: config.minRoiTd, depthGame: gameDepth, depthTd: depth };
@@ -421,6 +428,10 @@ async function main(env = process.env) {
 
   // ── Ledger (persistent) ──
   const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, withBreaker({ auth: { persistSession: false } }, env));
+  const shadowLogger = shadowEdge != null ? createShadowLogger({
+    supabase: createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, withBreaker({ auth: { persistSession: false } }, env)),
+    log,
+  }) : null;
   const store = createLedgerStore({ supabase, log });
   // Decision-log writes (one insert per quote / abort / summary) on their own client so they never
   // queue ahead of reserves, lock polls and the combo_submissions check. SNIPER_DECISION_CLIENT=0 = shared.
@@ -657,6 +668,7 @@ async function main(env = process.env) {
     const t = setTimeout(() => process.exit(0), num(env.SNIPER_SHUTDOWN_MS, 45000)); if (t.unref) t.unref(); // fly kill_timeout 60s
     try { const n = await liveSniper.shutdown(); log(`[SNIPER] ${sig}: cancelled ${n} open quote(s), exiting`); } catch (e) { log(`[SNIPER] ${sig} shutdown error: ${e.message}`); }
     if (batchStore) { try { await batchStore.flush(); await batchStore.flush(); } catch (_) { /* best effort */ } }
+    if (shadowLogger) { try { await shadowLogger.flush(); } catch (_) { /* best effort */ } }
     process.exit(0);
   };
   process.once('SIGTERM', () => { onStop('SIGTERM'); });
@@ -747,11 +759,31 @@ async function main(env = process.env) {
     let makerRate = null;
     try { const e = await fees.prefetch(seriesOfTicker(rfq.marketTicker)); makerRate = e ? e.rate : null; } catch (_) { makerRate = null; }
     const nowMs = Date.now();
-    const { decision: d } = decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook, linesBook, nbaBook, ncaabBook, venues, kickoffFor, makerRate, nowMs, pricesHealthy: pricesHealthy(), totalCapFor: soonCap.capFor });
+    const { decision: d, row } = decide(rfq, { config, ledger, pmLive, tdBook, ncaafBook, linesBook, nbaBook, ncaabBook, venues, kickoffFor, makerRate, nowMs, pricesHealthy: pricesHealthy(), totalCapFor: soonCap.capFor });
     lat.stage('handlerToDecided', Date.now() - tH);
     staleAlert.record(d.reason === 'prices_stale');
     if (d.rogue && d.rogue.length) logRogue(d);
     if (d.guard && d.guard.length) logGuard(d);
+    if (shadowLogger) {
+      try {
+        shadowThenLive({
+          shadowEdge,
+          liveEdge: d && d.minRoi != null ? d.minRoi : null,
+          venue: 'kalshi',
+          rfq,
+          row,
+          decision: d,
+          makerRate,
+          tick: config.tick,
+          nowMs,
+          rfqAgeMs: rfqAgeMs(rfq.createdTs, signedNow()),
+          maxAgeMs,
+          pricesHealthy: pricesHealthy(),
+        }, shadowLogger);
+      } catch (e) {
+        if (!onRfq.shadowWarned) { onRfq.shadowWarned = true; log(`[SNIPER] shadow note failed: ${e.message}`); }
+      }
+    }
     if (d.action !== 'quote') { counts.skips[d.reason] = (counts.skips[d.reason] || 0) + 1; return; }
     // Re-check age right before the DB reserve (fees prefetch can await on a cold series).
     if (tooOld(rfq, signedNow(), maxAgeMs) != null) {
